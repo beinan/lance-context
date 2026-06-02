@@ -541,7 +541,7 @@ impl ContextStore {
         Dataset::write(batches, uri, Some(params)).await
     }
 
-    fn records_to_batch(entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
+    pub fn records_to_batch(entries: &[ContextRecord]) -> LanceResult<RecordBatch> {
         let mut id_builder = StringBuilder::new();
         let mut run_id_builder = StringBuilder::new();
         let mut bot_id_builder = StringBuilder::new();
