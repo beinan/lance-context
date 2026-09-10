@@ -67,7 +67,9 @@ pub use rollout_store::{
 };
 // Schema declaration lives in the API crate: it is part of the wire contract.
 pub use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
-pub use storage::{create_local_dir_if_needed, join_uri, validate_store_name, MAX_STORE_NAME_LEN};
+pub use storage::{
+    create_local_dir_if_needed, join_uri, remove_dataset, validate_store_name, MAX_STORE_NAME_LEN,
+};
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
     IdIndexType, ReadProjection,

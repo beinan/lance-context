@@ -237,6 +237,12 @@ pub struct ContextStore {
     /// one owner. Sharing the base is also what makes clones agree about the
     /// resident writer instead of each opening their own.
     base: StorageBase,
+    /// Keep uniqueness validation and the subsequent visible append atomic
+    /// with respect to other adds through this handle. Separate processes still
+    /// require application-level coordination for globally unique keys.
+    /// Trusted deferred-seal bulk writers opt out of read-back guarantees and
+    /// retain their concurrent append behavior.
+    add_lock: Option<Mutex<()>>,
     compaction_state: Arc<Mutex<CompactionState>>,
     pub compaction_config: CompactionConfig,
     blob_columns: HashSet<String>,
@@ -627,6 +633,7 @@ impl ContextStore {
 
         let mut store = Self {
             base,
+            add_lock: options.seal_on_add.then(|| Mutex::new(())),
             compaction_state: Arc::new(Mutex::new(CompactionState {
                 background_task: None,
                 is_compacting: false,
@@ -681,6 +688,10 @@ impl ContextStore {
             return Ok(self.base.version());
         }
 
+        let _guard = match &self.add_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         self.validate_unique_ids(entries).await?;
         self.write_entries(entries).await
     }
@@ -2062,6 +2073,12 @@ impl ContextStore {
     /// tasks and sealing whatever it still buffers. Idempotent.
     pub async fn close(&mut self) -> LanceResult<()> {
         self.base.close().await
+    }
+
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
     }
 
     /// Fold this instance's flushed MemWAL generations into the base table when

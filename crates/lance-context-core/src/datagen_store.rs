@@ -195,6 +195,12 @@ impl DatagenStore {
         self.base.close().await
     }
 
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
+    }
+
     /// Read one item's event history without materializing blob bytes.
     pub async fn events_for_item(&self, item_id: &str) -> LanceResult<Vec<DatagenEvent>> {
         self.filtered_events(&format!("item_id = '{}'", escape_sql_literal(item_id)))

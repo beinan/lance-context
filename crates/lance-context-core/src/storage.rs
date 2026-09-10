@@ -3,6 +3,17 @@
 use std::io;
 use std::path::Path;
 
+/// Remove a dataset root through its URI's backend, without loading a manifest.
+/// This also permits retrying a partially completed deletion. Callers must
+/// stop local writers and quiesce remote writers before deleting a live store.
+pub async fn remove_dataset(uri: &str) -> lance::Result<()> {
+    let (store, path) = lance::io::ObjectStore::from_uri(uri).await?;
+    match store.remove_dir_all(path).await {
+        Err(err) if crate::store_base::is_not_found_error(&err) => Ok(()),
+        result => result,
+    }
+}
+
 /// Maximum accepted length for a context or rollout store name.
 pub const MAX_STORE_NAME_LEN: usize = 128;
 

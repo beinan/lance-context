@@ -158,13 +158,14 @@ impl BlobBudget {
         loop {
             // Admit when it fits, or when the instance is otherwise idle (so a
             // single request bigger than the whole budget can still proceed).
-            let fits = current + bytes <= self.limit;
+            let next = current.checked_add(bytes)?;
+            let fits = next <= self.limit;
             if !fits && current != 0 {
                 return None;
             }
             match self.used.compare_exchange_weak(
                 current,
-                current + bytes,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -177,6 +178,25 @@ impl BlobBudget {
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    /// Admit one unknown-size materialization only while the budget is idle.
+    /// Missing or client-supplied payload sizes cannot safely predict the
+    /// allocation. Holding the full budget excludes other blob allocations.
+    pub fn try_acquire_unknown(self: &Arc<Self>) -> Option<BlobReservation> {
+        self.try_acquire(self.limit.max(1))
+    }
+}
+
+impl BlobReservation {
+    /// After an exclusive load, return unused capacity for concurrent responses.
+    /// An oversized blob keeps the full reservation until it is released.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        let retained = bytes.min(self.bytes);
+        self.budget
+            .used
+            .fetch_sub(self.bytes - retained, std::sync::atomic::Ordering::AcqRel);
+        self.bytes = retained;
     }
 }
 
@@ -363,22 +383,30 @@ impl AppState {
     /// handle. Returns whether the store existed.
     pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
-        let existed = self
-            .rollout_registry
-            .write()
-            .await
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let mut registry = self.rollout_registry.write().await;
+        if !registry
             .contains(name)
             .await
-            .map_err(AppError::from_lance)?;
-        if !existed {
+            .map_err(AppError::from_lance)?
+        {
             return Ok(false);
         }
-        self.rollout_registry
-            .write()
-            .await
-            .remove(name)
-            .await
-            .map_err(AppError::from_lance)?;
+        let cached = self.rollout_stores.lock().await.peek(name).cloned();
+        if let Some(store) = cached {
+            store
+                .write()
+                .await
+                .delete_data()
+                .await
+                .map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&self.rollout_uri(name))
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
         self.rollout_stores.lock().await.pop(name);
         Ok(true)
     }
@@ -426,6 +454,18 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
+        // Recheck after the slow open while excluding a concurrent deletion
+        // through registry removal and cache insertion.
+        let mut registry = self.rollout_registry.write().await;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Err(AppError::NotFound(format!(
+                "Store '{name}' was deleted while opening"
+            )));
+        }
 
         // Insert under the lock, re-checking for a store another request may
         // have opened concurrently while we were loading.
@@ -513,22 +553,30 @@ impl AppState {
     /// handle. Returns whether the store existed.
     pub async fn unregister_datagen(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
-        let existed = self
-            .datagen_registry
-            .write()
-            .await
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let mut registry = self.datagen_registry.write().await;
+        if !registry
             .contains(name)
             .await
-            .map_err(AppError::from_lance)?;
-        if !existed {
+            .map_err(AppError::from_lance)?
+        {
             return Ok(false);
         }
-        self.datagen_registry
-            .write()
-            .await
-            .remove(name)
-            .await
-            .map_err(AppError::from_lance)?;
+        let cached = self.datagen_stores.lock().await.peek(name).cloned();
+        if let Some(store) = cached {
+            store
+                .write()
+                .await
+                .delete_data()
+                .await
+                .map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&self.datagen_uri(name))
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
         self.datagen_stores.lock().await.pop(name);
         Ok(true)
     }
@@ -565,6 +613,18 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
+        // Recheck after the slow open while excluding a concurrent deletion
+        // through registry removal and cache insertion.
+        let mut registry = self.datagen_registry.write().await;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Err(AppError::NotFound(format!(
+                "Store '{name}' was deleted while opening"
+            )));
+        }
 
         let mut cache = self.datagen_stores.lock().await;
         if let Some(existing) = cache.get(name) {
@@ -619,22 +679,30 @@ impl AppState {
     /// Returns whether the store existed.
     pub async fn unregister_generic(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
-        let existed = self
-            .generic_registry
-            .write()
-            .await
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let mut registry = self.generic_registry.write().await;
+        if !registry
             .contains(name)
             .await
-            .map_err(AppError::from_lance)?;
-        if !existed {
+            .map_err(AppError::from_lance)?
+        {
             return Ok(false);
         }
-        self.generic_registry
-            .write()
-            .await
-            .remove(name)
-            .await
-            .map_err(AppError::from_lance)?;
+        let cached = self.generic_stores.lock().await.peek(name).cloned();
+        if let Some(store) = cached {
+            store
+                .write()
+                .await
+                .delete_data()
+                .await
+                .map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&self.generic_uri(name))
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
         self.generic_stores.lock().await.pop(name);
         Ok(true)
     }
@@ -674,6 +742,18 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
+        // Recheck after the slow open while excluding a concurrent deletion
+        // through registry removal and cache insertion.
+        let mut registry = self.generic_registry.write().await;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Err(AppError::NotFound(format!(
+                "Store '{name}' was deleted while opening"
+            )));
+        }
 
         let mut cache = self.generic_stores.lock().await;
         if let Some(existing) = cache.get(name) {
@@ -852,6 +932,16 @@ impl AppState {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn blob_budget_rejects_counter_overflow() {
+        let budget = BlobBudget::new(1024);
+        let oversized = budget.try_acquire(usize::MAX).unwrap();
+        assert!(budget.try_acquire(1).is_none());
+        assert!(budget.try_acquire_unknown().is_none());
+        drop(oversized);
+        assert!(budget.try_acquire_unknown().is_some());
+    }
 
     #[test]
     fn blob_budget_admits_until_full_then_releases_on_drop() {

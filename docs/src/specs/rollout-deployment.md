@@ -179,6 +179,8 @@ The caps form an **OR**: whichever binds first ends the pass. Bytes are measured
 
 The manifest reclaims whole generations, so a generation is the smallest indivisible merge unit. A pass always finishes the generation that reaches the budget, even if its first generation alone is oversized. Thus the read buffer can exceed the budget by up to one generation; this is not a hard process-RSS limit, and scan, deduplication and commit allocations need additional headroom.
 
+**Blob request admission.** `ROLLOUT_MAX_INFLIGHT_BLOB_BYTES` (default `0`, disabled) separately controls concurrent HTTP blob requests. Known-length uploads reserve their declared body size. Unknown-length uploads and blob downloads reserve the whole budget before buffering or loading; they are admitted only when it is idle. Download sizes cannot be trusted from optional, caller-supplied `payload_size` metadata. After loading, a smaller download releases unused capacity for known-length uploads and holds the remaining reservation through the response lifetime. A lone oversized request is still admitted. This conservative policy can reduce concurrency when the budget is enabled.
+
 Only merged generation ids and directories are removed. Leftovers stay pending and drain on subsequent passes. The caps apply independently of the count-trigger threshold (`--rollout-merge-after-generations`), including when time-triggered cleanup merges at a threshold of one generation. Server-managed rollout, datagen and generic stores share these settings.
 
 This is the "external compactor" path that Lance's MemWAL LSM design explicitly anticipates. Two properties make it safe under the §2 deployment model:
@@ -216,7 +218,7 @@ rows = await store.list(filters={
 })
 ```
 
-`checkout` remains available for base-table time travel, but is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that `learner_iteration` is likewise a column, not a dataset version.)
+`checkout` selects a fixed base-table version and excludes live WAL generations, including unmerged writes made before checkout. Periodic WAL merging does not advance a pinned handle. It is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that `learner_iteration` is likewise a column, not a dataset version.)
 
 ---
 

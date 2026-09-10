@@ -362,6 +362,12 @@ impl GenericStore {
         self.base.close().await
     }
 
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
+    }
+
     /// Merge flushed generations into the base table once the count trigger is
     /// met. Returns how many were reclaimed.
     pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {

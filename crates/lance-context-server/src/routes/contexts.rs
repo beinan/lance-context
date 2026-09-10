@@ -109,18 +109,14 @@ pub async fn delete_context(
     Path(name): Path<String>,
 ) -> Result<axum::http::StatusCode, AppError> {
     AppState::validate_name(&name)?;
-    let mut stores = state.stores.write().await;
-    if stores.remove(&name).is_none() {
-        return Err(AppError::NotFound(format!(
-            "Context '{}' does not exist",
-            name
-        )));
-    }
-
-    let uri = state.context_uri(&name);
-    if let Err(e) = tokio::fs::remove_dir_all(&uri).await {
-        tracing::warn!("Failed to remove context data at {}: {}", uri, e);
-    }
+    let store = state.get_or_open_context_store(&name).await?;
+    store
+        .write()
+        .await
+        .delete_data()
+        .await
+        .map_err(AppError::from_lance)?;
+    state.stores.write().await.remove(&name);
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

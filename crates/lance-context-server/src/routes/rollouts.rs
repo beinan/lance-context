@@ -60,15 +60,12 @@ fn blob_stream_body(
     Body::from_stream(stream)
 }
 
-/// Parse the `Content-Length` header into a byte count, defaulting to `0` when
-/// absent or unparsable (a chunked upload without a declared length reserves
-/// nothing up-front; the body-size limit still caps it).
-fn content_length(headers: &header::HeaderMap) -> usize {
+/// Unknown lengths need exclusive admission before any body buffering.
+fn content_length(headers: &header::HeaderMap) -> Option<usize> {
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
 }
 
 /// Whether the request asked for a synchronous flush via `?flush=true`.
@@ -133,17 +130,37 @@ fn observe_blob_sizes(state: &AppState, experiment: &str, records: &[AddRolloutR
 /// budget is configured (`None`) this is a no-op that always admits.
 fn acquire_blob_budget(
     state: &AppState,
-    bytes: usize,
+    bytes: Option<usize>,
 ) -> Result<Option<crate::state::BlobReservation>, AppError> {
     match &state.blob_budget {
         None => Ok(None),
-        Some(budget) => budget.try_acquire(bytes).map(Some).ok_or_else(|| {
-            metrics::counter!("rollout_blob_budget_rejections_total").increment(1);
-            AppError::Overloaded(
-                "server is at its in-flight blob memory limit; retry shortly".to_string(),
+        Some(budget) => bytes
+            .map_or_else(
+                || budget.try_acquire_unknown(),
+                |bytes| budget.try_acquire(bytes),
             )
-        }),
+            .map(Some)
+            .ok_or_else(|| {
+                metrics::counter!("rollout_blob_budget_rejections_total").increment(1);
+                AppError::Overloaded(
+                    "server is at its in-flight blob memory limit; retry shortly".to_string(),
+                )
+            }),
     }
+}
+
+/// Reserve before polling a payload read. Stored payload_size is optional and
+/// caller supplied, so it cannot be used to admit an allocation safely.
+async fn load_blob_with_budget(
+    state: &AppState,
+    load: impl std::future::Future<Output = Result<Option<Vec<u8>>, AppError>>,
+) -> Result<(Option<Vec<u8>>, Option<crate::state::BlobReservation>), AppError> {
+    let mut reservation = acquire_blob_budget(state, None)?;
+    let bytes = load.await?;
+    if let Some(reservation) = reservation.as_mut() {
+        reservation.shrink_to(bytes.as_ref().map_or(0, Vec::len));
+    }
+    Ok((bytes, reservation))
 }
 
 /// Response for the internal WAL-merge trigger: how many flushed generations
@@ -257,11 +274,6 @@ pub async fn delete_rollout_store(
         )));
     }
 
-    let uri = state.rollout_uri(&name);
-    if let Err(e) = tokio::fs::remove_dir_all(&uri).await {
-        tracing::warn!("Failed to remove rollout data at {}: {}", uri, e);
-    }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -307,8 +319,8 @@ pub async fn add_rollouts(
     let flush = flush_requested(req.uri().query());
 
     // Admit against the in-flight blob budget before buffering the body, using
-    // the declared Content-Length as the reservation size. Held for the whole
-    // handler so concurrent uploads cannot collectively exceed the budget and
+    // the declared Content-Length, or exclusive admission for an unknown size.
+    // Held for the whole handler so concurrent uploads cannot collectively exceed the budget and
     // OOM the worker; dropped when the request completes.
     let _budget = acquire_blob_budget(&state, content_length(req.headers()))?;
 
@@ -592,15 +604,13 @@ pub async fn fetch_rollout_blob(
 ) -> Result<Response, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let bytes = get_rollout_blob_refreshing_on_miss(&store_lock, &id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
-
-    // Reserve now that the payload size is known, and hold the reservation for
-    // the whole streamed send (moved into the body): a slow client keeps the
-    // blob resident until the last frame flushes, so the budget must account for
-    // it until then. Reject with 503 if the budget is currently exhausted.
-    let reservation = acquire_blob_budget(&state, bytes.len())?;
+    let (bytes, reservation) = load_blob_with_budget(
+        &state,
+        get_rollout_blob_refreshing_on_miss(&store_lock, &id),
+    )
+    .await?;
+    let bytes =
+        bytes.ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
 
     let len = bytes.len();
     Response::builder()
@@ -826,11 +836,11 @@ mod tests {
     }
 
     #[test]
-    fn content_length_parses_or_defaults_zero() {
+    fn content_length_distinguishes_unknown_from_empty() {
         let mut headers = header::HeaderMap::new();
-        assert_eq!(content_length(&headers), 0);
+        assert_eq!(content_length(&headers), None);
         headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(4096));
-        assert_eq!(content_length(&headers), 4096);
+        assert_eq!(content_length(&headers), Some(4096));
     }
 
     /// The threshold is inclusive and `0` disables the log entirely, so an
@@ -893,6 +903,180 @@ mod tests {
         observed.sort_by(f64::total_cmp);
         // The payload-less record contributes nothing: two samples, not three.
         assert_eq!(observed, vec![512.0, 2048.0]);
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_respects_exhausted_budget() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        let budget = crate::state::BlobBudget::new(1024);
+        state.blob_budget = Some(budget.clone());
+        let state = Arc::new(state);
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _occupied = budget.try_acquire(1024).unwrap();
+        assert!(budget.try_acquire(1).is_none());
+        let body = serde_json::json!({"records":[{
+            "id":"chunked-blob", "rollout_id":"r", "problem_id":"p",
+            "sequence_order":0, "role":"assistant", "content_type":"application/octet-stream",
+            "binary_payload":"eA=="
+        }]})
+        .to_string();
+        let known_length = Request::builder()
+            .method("POST")
+            .uri("/rollouts/rl/records?flush=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert!(matches!(
+            add_rollouts(State(state.clone()), Path("rl".to_string()), known_length).await,
+            Err(AppError::Overloaded(_))
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rollouts/rl/records?flush=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(Body::from(body))
+            .unwrap();
+        assert!(request.headers().get(header::CONTENT_LENGTH).is_none());
+        let result = add_rollouts(State(state), Path("rl".to_string()), request).await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "a blob upload must not bypass an exhausted global budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_uri_store_does_not_resurrect_rows() {
+        let dir = TempDir::new().unwrap();
+        let base_uri = std::path::PathBuf::from(format!("file://{}", dir.path().display()));
+        let state = Arc::new(AppState::new_for_test(base_uri).await);
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("?flush=true", "deleted-row"),
+        )
+        .await
+        .unwrap();
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        cached.write().await.cleanup_own_shard().await.unwrap();
+        assert_eq!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let reopened = state.get_or_open_rollout_store("rl").await.unwrap();
+        let rows = reopened.read().await.list(None, None).await.unwrap();
+        let ids: Vec<_> = rows.into_iter().map(|r| r.id).collect();
+        assert!(
+            ids.is_empty(),
+            "deleted rows reappeared after recreation: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_budget_admits_before_loading_and_releases_on_cancellation() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        let budget = crate::state::BlobBudget::new(1024);
+        state.blob_budget = Some(budget.clone());
+        let occupied = budget.try_acquire(1024).unwrap();
+        let loaded = std::cell::Cell::new(false);
+        let result = load_blob_with_budget(&state, async {
+            loaded.set(true);
+            Ok(Some(vec![0; 256]))
+        })
+        .await;
+        assert!(matches!(result, Err(AppError::Overloaded(_))));
+        assert!(
+            !loaded.get(),
+            "admission must happen before payload allocation"
+        );
+        drop(occupied);
+
+        let (bytes, guard) = load_blob_with_budget(&state, async { Ok(Some(vec![0; 256])) })
+            .await
+            .unwrap();
+        assert_eq!(bytes.unwrap().len(), 256);
+        let remaining = budget.try_acquire(768).unwrap();
+        assert!(budget.try_acquire_unknown().is_none());
+        drop(remaining);
+        drop(guard);
+
+        let mut pending = Box::pin(load_blob_with_budget(&state, std::future::pending()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert!(budget.try_acquire(1).is_none());
+        drop(pending);
+        assert!(budget.try_acquire(1024).is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_deletion_retains_registry_and_can_be_retried() {
+        let (state, dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        cached.write().await.close().await.unwrap();
+        let path = std::path::PathBuf::from(state.rollout_uri("rl"));
+        let saved = dir.path().join("saved-dataset");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::write(&path, b"not a directory").unwrap();
+        assert!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(state
+            .rollout_registry
+            .write()
+            .await
+            .contains("rl")
+            .await
+            .unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!path.exists());
+        assert!(!state
+            .rollout_registry
+            .write()
+            .await
+            .contains("rl")
+            .await
+            .unwrap());
+        let row = rollout_record_from_add_request(&record_with_size("late-write", None));
+        assert!(cached.read().await.add(&[row]).await.is_err());
     }
 
     async fn rollout_state() -> (Arc<AppState>, TempDir) {

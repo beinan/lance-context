@@ -111,10 +111,6 @@ pub async fn delete_datagen_store(
             name
         )));
     }
-    let uri = state.datagen_uri(&name);
-    if let Err(e) = tokio::fs::remove_dir_all(&uri).await {
-        tracing::warn!("Failed to remove datagen data at {}: {}", uri, e);
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
