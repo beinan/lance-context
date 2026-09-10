@@ -45,6 +45,112 @@ fn rec(id: &str) -> RolloutRecord {
     }
 }
 
+#[tokio::test]
+async fn review_pinned_add_preserves_external_id_uniqueness() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ContextStore::open(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    store.checkout(store.version()).await.unwrap();
+    let request: AddRecordRequest = serde_json::from_value(serde_json::json!({
+        "text_payload": "hello", "external_id": "same-key"
+    }))
+    .unwrap();
+    let left = record_from_add_request(&request, "left".into(), "r".into());
+    let right = record_from_add_request(&request, "right".into(), "r".into());
+    for record in [&left, &right] {
+        let err = store.add(std::slice::from_ref(record)).await.unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
+    assert!(store.is_version_pinned());
+    store.refresh_latest().await.unwrap();
+    assert!(store.list(None, None).await.unwrap().is_empty());
+    store.add(&[left]).await.unwrap();
+    assert!(store.add(&[right]).await.is_err());
+    assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pinned_context_rejects_mutations_without_unpinning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = ContextStore::open(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let request: AddRecordRequest = serde_json::from_value(serde_json::json!({
+        "text_payload": "hello", "external_id": "same-key"
+    }))
+    .unwrap();
+    let row = record_from_add_request(&request, "original".into(), "r".into());
+    store.add(&[row]).await.unwrap();
+    store.cleanup_wal().await.unwrap();
+    let version = store.version();
+    store.checkout(version).await.unwrap();
+    let replacement = record_from_add_request(&request, "replacement".into(), "r".into());
+    let patch = lance_context_core::RecordPatch {
+        source: Some("updated".into()),
+        ..Default::default()
+    };
+    assert!(store
+        .upsert_by_external_id(replacement.clone())
+        .await
+        .is_err());
+    assert!(store
+        .upsert_many_by_external_id(vec![replacement])
+        .await
+        .is_err());
+    assert!(store.update_by_id("original", patch).await.is_err());
+    let patch = lance_context_core::RecordPatch {
+        source: Some("updated".into()),
+        ..Default::default()
+    };
+    assert!(store
+        .update_by_external_id("same-key", patch)
+        .await
+        .is_err());
+    assert!(store.delete_by_id("original").await.is_err());
+    assert!(store.delete_by_external_id("same-key").await.is_err());
+    assert!(store.migrate_relationships_column().await.is_err());
+    assert!(store.compact(None).await.is_err());
+    assert!(store.create_id_index().await.is_err());
+    let payload = dir.path().join("payload.bin");
+    assert!(store
+        .put_payload(payload.to_str().unwrap(), b"payload")
+        .await
+        .is_err());
+    assert!(!payload.exists());
+    assert!(store.is_version_pinned());
+    assert_eq!(store.version(), version);
+    store.refresh_latest().await.unwrap();
+    assert_eq!(store.version(), version);
+    assert_eq!(store.list(None, None).await.unwrap()[0].id, "original");
+    assert!(store.delete_by_id("original").await.unwrap());
+}
+
+#[tokio::test]
+async fn pinned_rollout_rejects_writes_until_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    let version = store.version();
+    store.checkout(version).await.unwrap();
+    assert!(store
+        .add(&[rec("blocked")])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("read-only"));
+    assert!(store.compact(None).await.is_err());
+    assert!(store.create_id_zonemap_index().await.is_err());
+    assert!(store.is_version_pinned());
+    store.refresh_latest().await.unwrap();
+    assert_eq!(store.version(), version);
+    store.add(&[rec("allowed")]).await.unwrap();
+    store.flush().await.unwrap();
+    assert_eq!(store.list(None, None).await.unwrap()[0].id, "allowed");
+    store.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_keeps_rows_after_peer_merge() {
     let dir = tempfile::tempdir().unwrap();

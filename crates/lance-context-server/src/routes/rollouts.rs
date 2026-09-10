@@ -175,6 +175,7 @@ pub async fn create_rollout_store(
     Json(req): Json<CreateRolloutStoreRequest>,
 ) -> Result<(StatusCode, Json<RolloutStoreInfo>), AppError> {
     AppState::validate_name(&req.name)?;
+    let mut handle = state.rollout_handles.lock(&req.name).await;
     // Existence is tracked durably in the registry, not by cache membership.
     if state
         .rollout_registry
@@ -210,7 +211,9 @@ pub async fn create_rollout_store(
     // Record in the durable registry and the LRU. WAL cleanup is handled by the
     // single process-wide sweeper (see `AppState::spawn_global_sweeper`), so no
     // per-store timer is started here.
-    state.register_rollout(&req.name, &uri, store).await?;
+    state
+        .register_rollout(&req.name, &uri, store, &mut handle)
+        .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -1077,6 +1080,51 @@ mod tests {
             .unwrap());
         let row = rollout_record_from_add_request(&record_with_size("late-write", None));
         assert!(cached.read().await.add(&[row]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn review_evicted_handle_cannot_write_after_delete() {
+        let (state, _dir) = rollout_state().await;
+        let in_flight = state.get_or_open_rollout_store("rl").await.unwrap();
+        let row = rollout_record_from_add_request(&record_with_size("before-delete", None));
+        in_flight.read().await.add(&[row]).await.unwrap();
+        // Reopening an evicted but live store must reuse its writer.
+        state.rollout_stores.lock().await.pop("rl");
+        let reopened = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(Arc::ptr_eq(&in_flight, &reopened));
+        state.rollout_stores.lock().await.pop("rl");
+        delete_rollout_store(State(state.clone()), Path("rl".into()))
+            .await
+            .unwrap();
+        let row = rollout_record_from_add_request(&record_with_size("late-write", None));
+        assert!(in_flight
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .is_err());
+        assert!(state.get_or_open_rollout_store("rl").await.is_err());
+
+        // Recreation gets a new writable handle; the old request stays fenced.
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".into(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let recreated = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(!Arc::ptr_eq(&in_flight, &recreated));
+        assert!(in_flight
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .is_err());
+        recreated.read().await.add(&[row]).await.unwrap();
+        recreated.write().await.close().await.unwrap();
     }
 
     async fn rollout_state() -> (Arc<AppState>, TempDir) {

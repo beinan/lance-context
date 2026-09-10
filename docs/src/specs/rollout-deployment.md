@@ -218,7 +218,7 @@ rows = await store.list(filters={
 })
 ```
 
-`checkout` selects a fixed base-table version and excludes live WAL generations, including unmerged writes made before checkout. Periodic WAL merging does not advance a pinned handle. It is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that `learner_iteration` is likewise a column, not a dataset version.)
+`checkout` selects a fixed base-table version and excludes live WAL generations, including unmerged writes made before checkout. Pinned handles reject appends, compaction, index creation, and schema changes. Call Rust `refresh_latest()` to return the handle to the latest writable view. Periodic WAL merging does not advance a pinned handle. It is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that `learner_iteration` is likewise a column, not a dataset version.)
 
 ---
 

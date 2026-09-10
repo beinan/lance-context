@@ -26,6 +26,7 @@ pub async fn create_datagen_store(
     Json(req): Json<CreateDatagenStoreRequest>,
 ) -> Result<(StatusCode, Json<DatagenStoreInfo>), AppError> {
     AppState::validate_name(&req.name)?;
+    let mut handle = state.datagen_handles.lock(&req.name).await;
     if state
         .datagen_registry
         .write()
@@ -55,7 +56,9 @@ pub async fn create_datagen_store(
     let version = store.version();
 
     let store = Arc::new(RwLock::new(store));
-    state.register_datagen(&req.name, &uri, store).await?;
+    state
+        .register_datagen(&req.name, &uri, store, &mut handle)
+        .await?;
 
     Ok((
         StatusCode::CREATED,

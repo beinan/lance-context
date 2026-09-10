@@ -513,7 +513,8 @@ impl RolloutStore {
     }
 
     /// Check out an immutable base-table version. Live WAL generations are
-    /// excluded; unmerged appends are not part of a base version.
+    /// excluded; unmerged appends are not part of a base version. Writes are
+    /// rejected until `refresh_latest` is called.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.base.checkout(version_id).await
     }
@@ -581,6 +582,7 @@ impl RolloutStore {
     /// visibility; call [`Self::flush`] instead. Retained only for API
     /// compatibility — see the module docs on reproducibility.
     pub async fn add(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
+        self.base.ensure_writable()?;
         if records.is_empty() {
             return Ok(self.base.version());
         }
@@ -2197,6 +2199,124 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "merged-during-read");
+    }
+
+    #[tokio::test]
+    async fn review_list_retries_when_merge_committed_before_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        let record = assistant_record("already-committed");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+        // Pause a merge after its base commit, before manifest drain and GC.
+        let batch = writer.records_to_batch(&[record]).unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        writer.base.dataset.append(batches, None).await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let snapshot = &snapshots[0];
+                        let store = dataset.object_store(None).await.unwrap();
+                        let path = dataset.branch_location().path.clone();
+                        let manifests = ShardManifestStore::new(
+                            store.clone(),
+                            &path,
+                            snapshot.shard_id,
+                            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                        );
+                        let current = manifests.read_latest().await.unwrap().unwrap();
+                        manifests
+                            .commit_update(current.writer_epoch, |m| ShardManifest {
+                                version: m.version + 1,
+                                flushed_generations: vec![],
+                                ..m.clone()
+                            })
+                            .await
+                            .unwrap();
+                        for generation in &snapshot.flushed_generations {
+                            store
+                                .remove_dir_all(
+                                    path.clone()
+                                        .join("_mem_wal")
+                                        .join(snapshot.shard_id.to_string().as_str())
+                                        .join(generation.path.as_str()),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "read failed instead of retrying: {result:?}; attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn consistent_read_bounds_missing_generation_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let missing = |_, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(LanceError::dataset_not_found(
+                    "missing-generation",
+                    "missing".into(),
+                ))
+            }
+        };
+        let err = store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LanceError::DatasetNotFound { .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        store.checkout(store.version()).await.unwrap();
+        assert!(store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "pinned reads must not retry against newer snapshots"
+        );
+
+        store.refresh_latest().await.unwrap();
+        attempts.store(0, Ordering::SeqCst);
+        let result = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(LanceError::invalid_input("bad filter")) }
+            })
+            .await;
+        assert!(matches!(result, Err(LanceError::InvalidInput { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

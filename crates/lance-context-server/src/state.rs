@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use lance_context_core::{
@@ -10,7 +11,7 @@ use lance_context_core::{
     RolloutStoreOptions, Session,
 };
 use lru::LruCache;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::config::ServerConfig;
@@ -21,6 +22,58 @@ use crate::sweeper;
 /// not specify one. Sized for peak *concurrent* experiments, not the total
 /// number of experiments (which may be hundreds of thousands).
 pub const DEFAULT_ROLLOUT_CACHE_CAPACITY: usize = 2000;
+
+type StoreSlot<T> = Arc<Mutex<Weak<RwLock<T>>>>;
+
+/// Weak handles survive LRU eviction without retaining datasets. The per-name
+/// lock serializes create/open/delete across storage I/O, so an evicted handle
+/// is reused and an old open cannot cross a delete/recreate boundary.
+pub(crate) struct StoreHandles<T> {
+    slots: std::sync::Mutex<HandleSlots<T>>,
+}
+
+struct HandleSlots<T> {
+    by_name: HashMap<String, StoreSlot<T>>,
+    prune_at: usize,
+}
+
+impl<T> Default for HandleSlots<T> {
+    fn default() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            prune_at: 64,
+        }
+    }
+}
+
+impl<T> Default for StoreHandles<T> {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+        }
+    }
+}
+
+impl<T> StoreHandles<T> {
+    pub(crate) async fn lock(&self, name: &str) -> OwnedMutexGuard<Weak<RwLock<T>>> {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap();
+            if !slots.by_name.contains_key(name) && slots.by_name.len() >= slots.prune_at {
+                // Amortize collection and keep slots with either a live store
+                // or an operation holding/waiting for the per-name lock.
+                slots.by_name.retain(|_, slot| {
+                    Arc::strong_count(slot) > 1
+                        || slot
+                            .try_lock()
+                            .map_or(true, |handle| handle.strong_count() > 0)
+                });
+                slots.prune_at = (slots.by_name.len() * 2).max(64);
+            }
+            slots.by_name.entry(name.to_string()).or_default().clone()
+        };
+        slot.lock_owned().await
+    }
+}
 
 pub struct AppState {
     pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
@@ -47,6 +100,7 @@ pub struct AppState {
     /// the `Arc`. Both cases are logged (see that `Drop` impl) rather than
     /// silently stranding rows.
     pub rollout_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
+    pub(crate) rollout_handles: StoreHandles<RolloutStore>,
     /// Durable directory of which rollout stores exist. Consulted on a cache
     /// miss (existence check) and to back the list endpoint. Guarded by a lock
     /// because every operation refreshes the snapshot and therefore takes
@@ -91,6 +145,7 @@ pub struct AppState {
     /// experiment, so the same residency bound and durable-registry existence
     /// model applies.
     pub datagen_stores: Mutex<LruCache<String, Arc<RwLock<DatagenStore>>>>,
+    pub(crate) datagen_handles: StoreHandles<DatagenStore>,
     /// Durable directory of which datagen stores exist. A separate registry
     /// dataset from [`Self::rollout_registry`] so the two store kinds never
     /// collide on a shared name.
@@ -98,6 +153,7 @@ pub struct AppState {
     /// Bounded LRU of resident generic-store handles, mirroring
     /// [`Self::rollout_stores`].
     pub generic_stores: Mutex<LruCache<String, Arc<RwLock<GenericStore>>>>,
+    pub(crate) generic_handles: StoreHandles<GenericStore>,
     /// Durable directory of which generic stores exist.
     ///
     /// Records only name and URI: a generic store's **schema is stored in its
@@ -249,6 +305,7 @@ impl AppState {
         Ok(Self {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
+            rollout_handles: StoreHandles::default(),
             rollout_registry: RwLock::new(registry),
             base_uri,
             instance_id,
@@ -261,8 +318,10 @@ impl AppState {
             rollout_large_blob_log_bytes: config.rollout_large_blob_log_bytes,
             rollout_session,
             datagen_stores: Mutex::new(LruCache::new(capacity)),
+            datagen_handles: StoreHandles::default(),
             datagen_registry: RwLock::new(datagen_registry),
             generic_stores: Mutex::new(LruCache::new(capacity)),
+            generic_handles: StoreHandles::default(),
             generic_registry: RwLock::new(generic_registry),
         })
     }
@@ -311,6 +370,7 @@ impl AppState {
             rollout_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
+            rollout_handles: StoreHandles::default(),
             rollout_registry: RwLock::new(registry),
             base_uri,
             instance_id,
@@ -325,10 +385,12 @@ impl AppState {
             generic_stores: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
+            generic_handles: StoreHandles::default(),
             generic_registry: RwLock::new(generic_registry),
             datagen_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
+            datagen_handles: StoreHandles::default(),
             datagen_registry: RwLock::new(datagen_registry),
         }
     }
@@ -355,14 +417,21 @@ impl AppState {
     }
 
     /// Record that a rollout store exists, in both the durable registry and the
-    /// in-memory LRU. Called by the create route after the dataset is written.
+    /// in-memory LRU. The caller must hold this name's handle lock throughout
+    /// the existence check, dataset creation, and registration.
     pub async fn register_rollout(
         &self,
         name: &str,
         uri: &str,
         store: Arc<RwLock<RolloutStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<RolloutStore>>>,
     ) -> Result<(), AppError> {
         Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
         self.rollout_registry
             .write()
             .await
@@ -372,6 +441,7 @@ impl AppState {
         // Insertion may evict the LRU's least-recently-used entry; dropping the
         // returned handle releases it (no per-store timer to abort — cleanup is
         // now global).
+        **handle = Arc::downgrade(&store);
         self.rollout_stores
             .lock()
             .await
@@ -383,6 +453,7 @@ impl AppState {
     /// handle. Returns whether the store existed.
     pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
+        let mut handle = self.rollout_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
         let mut registry = self.rollout_registry.write().await;
@@ -393,8 +464,8 @@ impl AppState {
         {
             return Ok(false);
         }
-        let cached = self.rollout_stores.lock().await.peek(name).cloned();
-        if let Some(store) = cached {
+        let live = handle.upgrade();
+        if let Some(store) = live {
             store
                 .write()
                 .await
@@ -408,6 +479,7 @@ impl AppState {
         }
         registry.remove(name).await.map_err(AppError::from_lance)?;
         self.rollout_stores.lock().await.pop(name);
+        *handle = Weak::new();
         Ok(true)
     }
 
@@ -432,6 +504,15 @@ impl AppState {
         }
         metrics::counter!("rollout_store_cache_misses_total").increment(1);
 
+        let mut handle = self.rollout_handles.lock(name).await;
+        if let Some(store) = handle.upgrade() {
+            self.rollout_stores
+                .lock()
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
+        }
+
         // Existence is the registry's job, not the cache's.
         let exists = self
             .rollout_registry
@@ -454,8 +535,7 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
-        // Recheck after the slow open while excluding a concurrent deletion
-        // through registry removal and cache insertion.
+        // Also observe registry removal by another server during the open.
         let mut registry = self.rollout_registry.write().await;
         if !registry
             .contains(name)
@@ -466,13 +546,10 @@ impl AppState {
                 "Store '{name}' was deleted while opening"
             )));
         }
-
-        // Insert under the lock, re-checking for a store another request may
-        // have opened concurrently while we were loading.
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
         let mut cache = self.rollout_stores.lock().await;
-        if let Some(existing) = cache.get(name) {
-            return Ok(existing.clone());
-        }
         cache.put(name.to_string(), opened.clone());
         metrics::gauge!("rollout_stores_resident").set(cache.len() as f64);
         Ok(opened)
@@ -528,20 +605,28 @@ impl AppState {
     }
 
     /// Record that a datagen store exists, in both the durable registry and the
-    /// in-memory LRU. Called by the create route after the dataset is written.
+    /// in-memory LRU. The caller must hold this name's handle lock throughout
+    /// the existence check, dataset creation, and registration.
     pub async fn register_datagen(
         &self,
         name: &str,
         uri: &str,
         store: Arc<RwLock<DatagenStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<DatagenStore>>>,
     ) -> Result<(), AppError> {
         Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
         self.datagen_registry
             .write()
             .await
             .upsert(name, uri)
             .await
             .map_err(AppError::from_lance)?;
+        **handle = Arc::downgrade(&store);
         self.datagen_stores
             .lock()
             .await
@@ -553,6 +638,7 @@ impl AppState {
     /// handle. Returns whether the store existed.
     pub async fn unregister_datagen(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
+        let mut handle = self.datagen_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
         let mut registry = self.datagen_registry.write().await;
@@ -563,8 +649,8 @@ impl AppState {
         {
             return Ok(false);
         }
-        let cached = self.datagen_stores.lock().await.peek(name).cloned();
-        if let Some(store) = cached {
+        let live = handle.upgrade();
+        if let Some(store) = live {
             store
                 .write()
                 .await
@@ -578,6 +664,7 @@ impl AppState {
         }
         registry.remove(name).await.map_err(AppError::from_lance)?;
         self.datagen_stores.lock().await.pop(name);
+        *handle = Weak::new();
         Ok(true)
     }
 
@@ -592,6 +679,15 @@ impl AppState {
         Self::validate_name(name)?;
         if let Some(store) = self.datagen_stores.lock().await.get(name) {
             return Ok(store.clone());
+        }
+
+        let mut handle = self.datagen_handles.lock(name).await;
+        if let Some(store) = handle.upgrade() {
+            self.datagen_stores
+                .lock()
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
         }
 
         let exists = self
@@ -613,8 +709,7 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
-        // Recheck after the slow open while excluding a concurrent deletion
-        // through registry removal and cache insertion.
+        // Also observe registry removal by another server during the open.
         let mut registry = self.datagen_registry.write().await;
         if !registry
             .contains(name)
@@ -625,11 +720,10 @@ impl AppState {
                 "Store '{name}' was deleted while opening"
             )));
         }
-
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
         let mut cache = self.datagen_stores.lock().await;
-        if let Some(existing) = cache.get(name) {
-            return Ok(existing.clone());
-        }
         cache.put(name.to_string(), opened.clone());
         Ok(opened)
     }
@@ -654,20 +748,27 @@ impl AppState {
     }
 
     /// Record that a generic store exists, in both the durable registry and the
-    /// in-memory LRU.
+    /// in-memory LRU. The caller holds the name's handle lock throughout creation.
     pub async fn register_generic(
         &self,
         name: &str,
         uri: &str,
         store: Arc<RwLock<GenericStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<GenericStore>>>,
     ) -> Result<(), AppError> {
         Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
         self.generic_registry
             .write()
             .await
             .upsert(name, uri)
             .await
             .map_err(AppError::from_lance)?;
+        **handle = Arc::downgrade(&store);
         self.generic_stores
             .lock()
             .await
@@ -679,6 +780,7 @@ impl AppState {
     /// Returns whether the store existed.
     pub async fn unregister_generic(&self, name: &str) -> Result<bool, AppError> {
         Self::validate_name(name)?;
+        let mut handle = self.generic_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
         let mut registry = self.generic_registry.write().await;
@@ -689,8 +791,8 @@ impl AppState {
         {
             return Ok(false);
         }
-        let cached = self.generic_stores.lock().await.peek(name).cloned();
-        if let Some(store) = cached {
+        let live = handle.upgrade();
+        if let Some(store) = live {
             store
                 .write()
                 .await
@@ -704,6 +806,7 @@ impl AppState {
         }
         registry.remove(name).await.map_err(AppError::from_lance)?;
         self.generic_stores.lock().await.pop(name);
+        *handle = Weak::new();
         Ok(true)
     }
 
@@ -719,6 +822,15 @@ impl AppState {
         Self::validate_name(name)?;
         if let Some(store) = self.generic_stores.lock().await.get(name) {
             return Ok(store.clone());
+        }
+
+        let mut handle = self.generic_handles.lock(name).await;
+        if let Some(store) = handle.upgrade() {
+            self.generic_stores
+                .lock()
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
         }
 
         let exists = self
@@ -742,8 +854,7 @@ impl AppState {
             .await
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
-        // Recheck after the slow open while excluding a concurrent deletion
-        // through registry removal and cache insertion.
+        // Also observe registry removal by another server during the open.
         let mut registry = self.generic_registry.write().await;
         if !registry
             .contains(name)
@@ -754,11 +865,10 @@ impl AppState {
                 "Store '{name}' was deleted while opening"
             )));
         }
-
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
         let mut cache = self.generic_stores.lock().await;
-        if let Some(existing) = cache.get(name) {
-            return Ok(existing.clone());
-        }
         cache.put(name.to_string(), opened.clone());
         Ok(opened)
     }
@@ -1083,7 +1193,12 @@ mod tests {
 
         let generic = Arc::new(RwLock::new(generic));
         state
-            .register_generic("g1", &generic_uri, generic.clone())
+            .register_generic(
+                "g1",
+                &generic_uri,
+                generic.clone(),
+                &mut state.generic_handles.lock("g1").await,
+            )
             .await
             .unwrap();
 
@@ -1104,7 +1219,12 @@ mod tests {
         );
         let datagen = Arc::new(RwLock::new(datagen));
         state
-            .register_datagen("d1", &datagen_uri, datagen.clone())
+            .register_datagen(
+                "d1",
+                &datagen_uri,
+                datagen.clone(),
+                &mut state.datagen_handles.lock("d1").await,
+            )
             .await
             .unwrap();
 
@@ -1139,6 +1259,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn evicted_datagen_and_generic_handles_are_fenced_by_delete() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+        let uri = state.datagen_uri("dg");
+        let datagen = Arc::new(RwLock::new(DatagenStore::open(&uri).await.unwrap()));
+        state
+            .register_datagen(
+                "dg",
+                &uri,
+                datagen.clone(),
+                &mut state.datagen_handles.lock("dg").await,
+            )
+            .await
+            .unwrap();
+        datagen
+            .write()
+            .await
+            .append(&[datagen_event()])
+            .await
+            .unwrap();
+        state.datagen_stores.lock().await.pop("dg");
+        assert!(Arc::ptr_eq(
+            &datagen,
+            &state.get_or_open_datagen_store("dg").await.unwrap()
+        ));
+        state.datagen_stores.lock().await.pop("dg");
+        assert!(state.unregister_datagen("dg").await.unwrap());
+        assert!(datagen
+            .write()
+            .await
+            .append(&[datagen_event()])
+            .await
+            .is_err());
+        assert!(state.get_or_open_datagen_store("dg").await.is_err());
+
+        let uri = state.generic_uri("g");
+        let schema = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let generic = Arc::new(RwLock::new(
+            GenericStore::open(&uri, schema, GenericStoreOptions::default())
+                .await
+                .unwrap(),
+        ));
+        state
+            .register_generic(
+                "g",
+                &uri,
+                generic.clone(),
+                &mut state.generic_handles.lock("g").await,
+            )
+            .await
+            .unwrap();
+        let row = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+            serde_json::json!({"id": "r1"}),
+        )
+        .unwrap();
+        generic
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        state.generic_stores.lock().await.pop("g");
+        assert!(Arc::ptr_eq(
+            &generic,
+            &state.get_or_open_generic_store("g").await.unwrap()
+        ));
+        state.generic_stores.lock().await.pop("g");
+        assert!(state.unregister_generic("g").await.unwrap());
+        assert!(generic.read().await.add(&[row]).await.is_err());
+        assert!(state.get_or_open_generic_store("g").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn weak_handles_release_stores_and_preserve_active_name_locks() {
+        let handles = StoreHandles::<()>::default();
+        let store = Arc::new(RwLock::new(()));
+        let weak = Arc::downgrade(&store);
+        *handles.lock("live").await = weak.clone();
+        let held = handles.lock("opening").await;
+        // Trigger collection repeatedly while a same-name open/delete is held.
+        for n in 0..200 {
+            drop(handles.lock(&format!("cold-{n}")).await);
+        }
+        assert!(handles.lock("live").await.upgrade().is_some());
+        let waiting = handles.lock("opening");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(held);
+        drop(waiting.await);
+        drop(store);
+        assert!(
+            weak.upgrade().is_none(),
+            "the registry must not retain datasets"
+        );
+        for n in 200..400 {
+            drop(handles.lock(&format!("cold-{n}")).await);
+        }
+        let slots = handles.slots.lock().unwrap();
+        assert!(
+            slots.by_name.len() < 64,
+            "dead names must not grow without bound"
+        );
+        assert!(!slots.by_name.contains_key("live"));
+    }
+
     /// `shutdown` drains resident rollout writers by awaiting `close()` on each
     /// (idempotent: `close` is a no-op when no writer is resident), so
     /// `ShardWriter` background tasks are reclaimed deterministically instead of
@@ -1163,7 +1393,12 @@ mod tests {
             .unwrap();
         let store = Arc::new(RwLock::new(store));
         state
-            .register_rollout("exp", &uri, store.clone())
+            .register_rollout(
+                "exp",
+                &uri,
+                store.clone(),
+                &mut state.rollout_handles.lock("exp").await,
+            )
             .await
             .unwrap();
 

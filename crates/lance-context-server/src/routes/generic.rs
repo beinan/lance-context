@@ -33,6 +33,7 @@ pub async fn create_generic_store(
     Json(req): Json<CreateGenericStoreRequest>,
 ) -> Result<(StatusCode, Json<GenericStoreInfo>), AppError> {
     AppState::validate_name(&req.name)?;
+    let mut handle = state.generic_handles.lock(&req.name).await;
     // Reject an invalid schema before creating anything, so a bad declaration
     // cannot leave an empty dataset behind.
     req.schema.validate().map_err(AppError::InvalidRequest)?;
@@ -67,7 +68,9 @@ pub async fn create_generic_store(
     let version = store.version();
 
     let store = Arc::new(RwLock::new(store));
-    state.register_generic(&req.name, &uri, store).await?;
+    state
+        .register_generic(&req.name, &uri, store, &mut handle)
+        .await?;
 
     Ok((
         StatusCode::CREATED,

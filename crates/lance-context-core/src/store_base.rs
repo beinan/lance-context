@@ -447,7 +447,7 @@ impl StorageBase {
         self.dataset.manifest.version
     }
 
-    /// Check out a specific base dataset version (time travel).
+    /// Check out a read-only base dataset version. Call `refresh_latest` to resume writes.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.dataset = self.dataset.checkout_version(version_id).await?;
         self.pinned_version = Some(version_id);
@@ -472,10 +472,19 @@ impl StorageBase {
         Ok(())
     }
 
-    /// Mark this handle as no longer pinned after a concrete store mutates the
-    /// dataset directly.
-    pub(crate) fn clear_version_pin(&mut self) {
-        self.pinned_version = None;
+    /// Reject mutations on historical snapshots and on handles being deleted.
+    pub(crate) fn ensure_writable(&self) -> LanceResult<()> {
+        if self.deleted {
+            return Err(LanceError::invalid_input(
+                "store deletion has started; reopen after recreation",
+            ));
+        }
+        if self.is_version_pinned() {
+            return Err(LanceError::invalid_input(
+                "checked-out store is read-only; call refresh_latest before writing",
+            ));
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- writes
@@ -510,11 +519,7 @@ impl StorageBase {
     /// de-duplicated by the key column at read time, so a retried append can
     /// never double-count.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
-        if self.deleted {
-            return Err(LanceError::invalid_input(
-                "store deletion has started; reopen after recreation",
-            ));
-        }
+        self.ensure_writable()?;
         if batches.is_empty() {
             return Ok(());
         }
@@ -1103,6 +1108,7 @@ impl StorageBase {
     /// columns, type changes, and missing required columns remain hard errors.
     /// A no-op when the store declared no `latest_schema`.
     pub async fn ensure_latest_schema(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
         let Some(latest_schema) = self.latest_schema.clone() else {
             return Ok(());
         };
@@ -1167,6 +1173,7 @@ impl StorageBase {
         &mut self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
+        self.ensure_writable()?;
         let config = options.unwrap_or_default();
 
         let lance_options = CompactionOptions {
@@ -1242,6 +1249,7 @@ impl StorageBase {
     /// rows still living in unmerged WAL generations are found by the normal
     /// scan of those generations.
     pub async fn create_key_zonemap_index(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
         info!(column = %self.key_column, "creating ZoneMap index on key column");
         self.dataset
             .create_index_builder(
@@ -1458,7 +1466,8 @@ impl StorageBase {
 
     /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
     /// commits base before draining/deleting its generations, so an unchanged
-    /// base version brackets a valid read. Never return a partial result after
+    /// base version brackets a successful read. Retry missing generations even
+    /// when the base version is unchanged. Never return a partial result after
     /// a generation disappears. Ordinary WAL appends do not change base and do
     /// not force retries. Pinned reads use only their selected base version.
     pub async fn read_consistent<T, F, Fut>(
@@ -1470,7 +1479,7 @@ impl StorageBase {
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
         Fut: std::future::Future<Output = LanceResult<T>>,
     {
-        for _ in 0..3 {
+        for attempt in 0..3 {
             let mut dataset = self.dataset.clone();
             if !self.is_version_pinned() {
                 dataset.checkout_latest().await?;
@@ -1486,9 +1495,13 @@ impl StorageBase {
                 return result;
             }
             if let Err(err) = &result {
-                if !is_not_found_error(err) {
+                if !is_not_found_error(err) || attempt == 2 {
                     return result;
                 }
+                // A merge may already have committed before this read began.
+                // Its later WAL GC can invalidate our snapshot without changing
+                // the base version. Refresh both snapshots even in that case.
+                continue;
             }
             dataset.checkout_latest().await?;
             if dataset.manifest.version == version {
