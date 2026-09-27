@@ -44,6 +44,10 @@ use crate::task_store::{TaskClaim, TaskKinds};
 /// anything still over the threshold is picked up by the next tick.
 const MAX_SWEEP_ENQUEUE: usize = 256;
 
+/// How long a finished compaction waits for the `stats-writer` lock to refresh
+/// its stats row before giving up and leaving it to the next scan round.
+const STATS_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// Task-target prefix marking a generic store. Store names match
 /// `[A-Za-z0-9_][A-Za-z0-9._-]*`, so a `:` can never appear in a bare name
 /// and the prefix is unambiguous. Carrying the kind in the target string --
@@ -383,11 +387,28 @@ async fn merge_wal_one(http: &reqwest::Client, url: &str) -> Result<WorkerMerge,
 
 /// Refresh the stats row for `name` after a successful compaction: re-observe
 /// fragment/row counts and bump `last_compaction`/`total_compactions`.
+///
+/// Best-effort. The compaction itself is already committed, and the next scan
+/// round refreshes the row anyway, so this never waits long for the
+/// `stats-writer` lock: a holder mid-maintenance would otherwise pin this
+/// task's concurrency slot on every master for as long as it runs.
 async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, store: &RolloutStore) {
-    let guard = match state.task_store.coordination_lock("stats-writer").await {
-        Ok(guard) => guard,
-        Err(e) => {
+    let guard = match tokio::time::timeout(
+        STATS_REFRESH_LOCK_WAIT,
+        state.task_store.coordination_lock("stats-writer"),
+    )
+    .await
+    {
+        Ok(Ok(guard)) => guard,
+        Ok(Err(e)) => {
             tracing::warn!(store = %name, error = %e, "stats writer lock failed");
+            return;
+        }
+        Err(_) => {
+            tracing::info!(
+                store = %name,
+                "stats writer busy; leaving the post-compaction refresh to the next scan"
+            );
             return;
         }
     };

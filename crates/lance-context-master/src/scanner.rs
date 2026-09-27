@@ -28,11 +28,10 @@ use lance_context_api::ExperimentSummary;
 /// scan round.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on one steady-state `_stats` maintenance pass so a slow object store
-/// cannot wedge the scanner loop.
+/// Bound on the compaction half of one `_stats` maintenance pass, which runs
+/// under the store lock, so a slow object store cannot wedge the scanner loop.
 ///
-/// Deliberately not applied to the first pass after startup: see
-/// [`maintain_stats`].
+/// The cleanup half is not bounded: see [`maintain_stats`].
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Bound on the merge and compaction steps of retiring one experiment. Larger
@@ -47,50 +46,61 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(600);
 /// one per round and this pass is cheap. It remains necessary to reclaim those
 /// versions, and to recover deployments that ran the old per-row path.
 ///
-/// # The first pass runs without a timeout
+/// # The store lock is held only for the compaction
 ///
-/// A deployment upgraded from the per-row path can arrive with a chain
-/// hundreds of thousands of versions long (246k+ observed). Compacting and
-/// pruning that cannot finish inside `MAINTENANCE_TIMEOUT`, so every pass timed
-/// out, rolled back, and left the table exactly as bloated as before — the
-/// bound guaranteed the table could never recover. The first pass after startup
-/// therefore runs unbounded, and subsequent passes take the bound: by then the
-/// backlog is gone and any pass exceeding it is a genuine fault.
+/// Compaction rewrites the table and must exclude other writers, so it runs
+/// under `state.stats`. The cleanup that follows deletes objects no live
+/// version references; it needs no exclusive access, only time -- a backlog of
+/// tens of thousands of versions is tens of thousands of deletes against a
+/// remote object store. It used to run under the same lock, and every sweep
+/// and every post-compaction stats refresh on every master waited behind it
+/// (36 minutes observed after a routine restart). It now runs on a detached
+/// handle with the lock released; the store is re-opened afterwards so its
+/// in-memory handle never points at a pruned manifest.
+///
+/// The cleanup is deliberately unbounded. Lance deletes as it goes, so a
+/// timeout would only abandon the pass mid-way, not undo it, and with the lock
+/// released nothing waits on it any more. Only the compaction is bounded by
+/// [`MAINTENANCE_TIMEOUT`].
 ///
 /// Callers must hold the `stats-writer` coordination lock so only one replica
 /// ever rewrites the dataset.
 pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
     let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
     let start = std::time::Instant::now();
-    let mut stats = state.stats.lock().await;
 
-    // `swap` so exactly one pass per process is unbounded, even if several
-    // scanner ticks race here.
-    let first_pass = state.stats_maintenance_done.swap(true, Ordering::SeqCst);
-    let outcome = if first_pass {
-        tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.maintain(ttl))
+    let compacted = {
+        let mut stats = state.stats.lock().await;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.compact())
             .await
-            .unwrap_or_else(|_| Err(lance::Error::io("stats maintenance timed out")))
-    } else {
-        tracing::info!(
-            version = stats.version(),
-            "running first stats maintenance pass without a timeout; \
-             a table carried over from the per-row write path can take a while to reclaim"
-        );
-        stats.maintain(ttl).await
+            .unwrap_or_else(|_| Err(lance::Error::io("stats compaction timed out")))
     };
+    let outcome = match compacted {
+        Ok((compaction, cleaner)) => {
+            let removal = cleaner.cleanup(ttl).await;
+            // Re-open regardless of the cleanup's outcome: a failed cleanup
+            // may still have deleted manifests the current handle references.
+            let reload = state.stats.lock().await.reload().await;
+            match (removal, reload) {
+                (Ok(removal), Ok(())) => Ok((compaction, removal)),
+                (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let version = state.stats.lock().await.version();
 
     match outcome {
         Ok((compaction, removal)) => {
             state.stats_maintenance_failures.store(0, Ordering::Relaxed);
             state
                 .stats_last_reclaimed_version
-                .store(stats.version(), Ordering::Relaxed);
+                .store(version, Ordering::Relaxed);
             metrics::histogram!("master_stats_maintenance_duration_seconds")
                 .record(start.elapsed().as_secs_f64());
             metrics::counter!("master_stats_versions_removed_total")
                 .increment(removal.old_versions);
-            metrics::gauge!("master_stats_version").set(stats.version() as f64);
+            metrics::gauge!("master_stats_version").set(version as f64);
             metrics::gauge!("master_stats_maintenance_consecutive_failures").set(0.0);
             metrics::gauge!("master_stats_unreclaimed_versions").set(0.0);
             tracing::info!(
@@ -98,7 +108,8 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
                 fragments_added = compaction.fragments_added,
                 old_versions_removed = removal.old_versions,
                 bytes_removed = removal.bytes_removed,
-                version = stats.version(),
+                version,
+                elapsed_secs = start.elapsed().as_secs(),
                 "stats maintenance complete"
             );
             Ok(())
@@ -121,7 +132,7 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
                 .fetch_add(1, Ordering::Relaxed)
                 + 1;
             let last_reclaimed = state.stats_last_reclaimed_version.load(Ordering::Relaxed);
-            let unreclaimed = stats.version().saturating_sub(last_reclaimed);
+            let unreclaimed = version.saturating_sub(last_reclaimed);
 
             metrics::counter!("master_stats_maintenance_failures_total").increment(1);
             metrics::gauge!("master_stats_maintenance_consecutive_failures").set(failures as f64);
@@ -131,7 +142,7 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
                 error = %e,
                 consecutive_failures = failures,
                 unreclaimed_versions = unreclaimed,
-                version = stats.version(),
+                version,
                 "stats maintenance failed; old manifests are not being reclaimed"
             );
             Err(e)

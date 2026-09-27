@@ -104,13 +104,6 @@ pub struct MasterState {
     pub http: reqwest::Client,
     /// Process-wide compaction permits shared by scheduler and retirement work.
     pub(crate) compaction_permits: Arc<Semaphore>,
-    /// Whether this process has already run one `_stats` maintenance pass.
-    ///
-    /// The first pass runs without a timeout so a deployment carrying a version
-    /// chain from the old per-row write path can actually reclaim it; a bounded
-    /// first pass times out forever and never recovers. See
-    /// [`crate::scanner::maintain_stats`].
-    pub stats_maintenance_done: std::sync::atomic::AtomicBool,
     /// Consecutive `_stats` maintenance failures, for alerting.
     ///
     /// Failure was previously silent: the success counter simply stopped
@@ -167,7 +160,6 @@ impl MasterState {
             task_store,
             http: reqwest::Client::new(),
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
-            stats_maintenance_done: std::sync::atomic::AtomicBool::new(false),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
             stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
         });

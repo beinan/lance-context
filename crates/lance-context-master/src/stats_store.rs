@@ -544,10 +544,23 @@ impl StatsStore {
     ///
     /// Callers must serialize this with other mutations (it takes `&mut self`)
     /// and, across master replicas, hold the `stats-writer` coordination lock.
+    /// Callers that share this store behind a lock should prefer
+    /// [`Self::compact`] followed by [`Self::cleanup`] on the returned handle,
+    /// so the lock is not held for the cleanup's many object-store deletes.
     pub async fn maintain(
         &mut self,
         older_than: Duration,
     ) -> LanceResult<(CompactionMetrics, RemovalStats)> {
+        let (compaction, cleaner) = self.compact().await?;
+        let removal = cleaner.cleanup(older_than).await?;
+        self.reload().await?;
+        Ok((compaction, removal))
+    }
+
+    /// The compaction half of [`Self::maintain`]: rewrite the table's fragments
+    /// into one. Returns a [`StatsCleaner`] that prunes old versions *without*
+    /// borrowing the store, so a caller can release its lock first.
+    pub async fn compact(&mut self) -> LanceResult<(CompactionMetrics, StatsCleaner)> {
         self.dataset.checkout_latest().await?;
 
         let options = CompactionOptions {
@@ -560,16 +573,45 @@ impl StatsStore {
         };
         let compaction = compact_files(&mut self.dataset, options, None).await?;
 
-        // Re-open so the handle (and the cleanup below) sees the rewritten
-        // version rather than the pre-compaction manifest.
-        self.dataset = Self::load(&self.uri, self.storage_options.clone()).await?;
+        // Re-open so the handle (and the cleanup) sees the rewritten version
+        // rather than the pre-compaction manifest.
+        self.reload().await?;
+        Ok((
+            compaction,
+            StatsCleaner {
+                dataset: self.dataset.clone(),
+            },
+        ))
+    }
 
+    /// Re-open the dataset at its latest version. Call after a
+    /// [`StatsCleaner::cleanup`] so the in-memory handle does not reference
+    /// manifests the cleanup removed.
+    pub async fn reload(&mut self) -> LanceResult<()> {
+        self.dataset = Self::load(&self.uri, self.storage_options.clone()).await?;
+        Ok(())
+    }
+}
+
+/// A detached handle for the old-version cleanup half of maintenance.
+///
+/// Cleanup only reads manifests and deletes objects no live version references,
+/// so it needs no exclusive access to the store: readers on the current
+/// version, and even writers committing new versions, are unaffected. What it
+/// does need is time -- tens of thousands of deletes against a remote object
+/// store -- and holding the store's lock for that stalled every sweep and
+/// every post-compaction stats refresh on every master for the duration.
+pub struct StatsCleaner {
+    dataset: Dataset,
+}
+
+impl StatsCleaner {
+    /// Drop manifest versions older than `older_than` and the files only they
+    /// referenced.
+    pub async fn cleanup(self, older_than: Duration) -> LanceResult<RemovalStats> {
         let grace = chrono::TimeDelta::from_std(older_than)
             .map_err(|e| LanceError::io(format!("invalid stats history TTL: {e}")))?;
-        let removal = self.dataset.cleanup_old_versions(grace, None, None).await?;
-        self.dataset = Self::load(&self.uri, self.storage_options.clone()).await?;
-
-        Ok((compaction, removal))
+        self.dataset.cleanup_old_versions(grace, None, None).await
     }
 }
 
@@ -693,6 +735,37 @@ mod tests {
         let (_, removal) = s.maintain(Duration::from_secs(86_400)).await.unwrap();
         assert_eq!(removal.old_versions, 0);
         assert_eq!(s.list(None, 10, 0).await.unwrap().len(), 1);
+    }
+
+    /// The cleanup half of maintenance runs on a detached handle so the master
+    /// can release its store lock first. The store must stay fully usable --
+    /// reads and writes -- while that cleanup runs, and be intact after it.
+    #[tokio::test]
+    async fn cleanup_runs_detached_from_the_store() {
+        let dir = TempDir::new().unwrap();
+        let mut s = new_store(&dir).await;
+        for i in 0..20 {
+            s.upsert(&sample("exp-a", i)).await.unwrap();
+            s.upsert(&sample("exp-b", i)).await.unwrap();
+        }
+        let (compaction, cleaner) = s.compact().await.unwrap();
+        assert!(compaction.fragments_removed > 0, "nothing compacted");
+
+        // The store is free while the cleaner exists: write through it.
+        s.upsert(&sample("exp-c", 1)).await.unwrap();
+        assert_eq!(s.count(None).await.unwrap(), 3);
+
+        let removal = cleaner.cleanup(Duration::from_secs(0)).await.unwrap();
+        assert!(removal.old_versions > 0, "no versions reclaimed");
+
+        // The write that landed during cleanup is the live version; reloading
+        // onto it keeps every row.
+        s.reload().await.unwrap();
+        let rows = s.list(None, 10, 0).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].row_count, 19);
+        s.upsert(&sample("exp-d", 1)).await.unwrap();
+        assert_eq!(s.count(None).await.unwrap(), 4);
     }
 
     #[tokio::test]
