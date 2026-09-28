@@ -99,6 +99,13 @@ pub struct MasterConfig {
     #[arg(long, env = "COMPACTION_MAX_SOURCE_FRAGMENTS", default_value_t = 32)]
     pub compaction_max_source_fragments: usize,
 
+    /// Rebuild the `id` ZoneMap index after every compaction that rewrote
+    /// fragments, as a dependent `IndexId` task. Compaction replaces the
+    /// fragments the index describes, so without this the index only ever
+    /// covers whatever was on disk when it was last built by hand.
+    #[arg(long, env = "INDEX_AFTER_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
+    pub index_after_compaction: bool,
+
     /// Maximum bytes per compacted output file. `0` uses Lance's default.
     #[arg(
         long,
