@@ -74,7 +74,7 @@ pub use storage::{
 };
 pub use store::{
     CompactionConfig, CompactionStats, ContextStore, ContextStoreOptions, DistanceMetric,
-    IdIndexType, ReadProjection,
+    DroppedFragment, IdIndexType, ReadProjection, RepairReport,
 };
 
 // Re-export CompactionMetrics from lance for Python bindings

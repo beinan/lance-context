@@ -71,7 +71,7 @@ use crate::merge_budget::{MergeMemoryBudget, MergeReservation};
 use crate::metrics::{
     count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
 };
-use crate::store::{CompactionConfig, CompactionStats};
+use crate::store::{CompactionConfig, CompactionStats, DroppedFragment, RepairReport};
 
 /// Number of shard manifest files to scan per batch when discovering the latest
 /// shard state.
@@ -1330,6 +1330,108 @@ impl StorageBase {
                 Err(e)
             }
         }
+    }
+
+    /// Relative paths (under `data/`) of every data file the base table's
+    /// current manifest references, in fragment order. For tests and
+    /// diagnostics.
+    pub fn base_data_files(&self) -> Vec<String> {
+        self.dataset
+            .fragments()
+            .iter()
+            .flat_map(|f| f.files.iter().map(|d| d.path.clone()))
+            .collect()
+    }
+
+    /// Drop every base-table fragment whose data or deletion file is missing
+    /// from storage, so the manifest stops naming files that do not exist.
+    ///
+    /// A manifest can outlive its files (a cleanup that ran against a stale
+    /// listing, an object-store soft-delete that expired, an interrupted
+    /// rewrite). From then on every scan, merge and compaction of the table
+    /// fails with `Not found: .../data/<file>.lance` and nothing retries it
+    /// into existence: the rows in those fragments are already gone. This
+    /// commits a `Delete` of exactly those fragment ids, which is the same
+    /// transaction a row delete that empties a fragment would commit, and
+    /// leaves every other fragment and every WAL generation untouched.
+    ///
+    /// Returns what was dropped so the caller can record it. A dataset with
+    /// nothing missing commits nothing and returns an empty report.
+    pub async fn repair_missing_fragments(&mut self) -> LanceResult<RepairReport> {
+        use lance::dataset::transaction::{Operation, Transaction};
+        use lance::dataset::write::CommitBuilder;
+
+        self.ensure_writable()?;
+        self.reload().await?;
+        let object_store = self.dataset.object_store(None).await?;
+        let data_dir = self.dataset.data_dir();
+        let deletions_dir = self.dataset.deletions_dir();
+        let read_version = self.dataset.version().version;
+
+        let mut dropped = Vec::new();
+        for fragment in self.dataset.fragments().iter() {
+            let mut missing = Vec::new();
+            for file in &fragment.files {
+                let path = data_dir.clone().join(file.path.as_str());
+                if !object_store.exists(&path).await? {
+                    missing.push(file.path.clone());
+                }
+            }
+            if let Some(deletion) = &fragment.deletion_file {
+                // Mirrors lance_table::io::deletion::deletion_file_path.
+                let name = format!(
+                    "{}-{}-{}.{}",
+                    fragment.id,
+                    deletion.read_version,
+                    deletion.id,
+                    deletion.file_type.suffix()
+                );
+                let path = deletions_dir.clone().join(name.as_str());
+                if !object_store.exists(&path).await? {
+                    missing.push(format!("_deletions/{name}"));
+                }
+            }
+            if !missing.is_empty() {
+                dropped.push(DroppedFragment {
+                    id: fragment.id,
+                    physical_rows: fragment.physical_rows,
+                    missing_files: missing,
+                });
+            }
+        }
+        if dropped.is_empty() {
+            return Ok(RepairReport {
+                read_version,
+                committed_version: None,
+                dropped,
+            });
+        }
+
+        let operation = Operation::Delete {
+            updated_fragments: Vec::new(),
+            deleted_fragment_ids: dropped.iter().map(|d| d.id).collect(),
+            predicate: "repair: fragment data file missing from storage".to_string(),
+        };
+        let committed = CommitBuilder::new(Arc::new(self.dataset.clone()))
+            .execute(Transaction::new(read_version, operation, None))
+            .await?;
+        let committed_version = committed.version().version;
+        self.reload().await?;
+        warn!(
+            read_version,
+            committed_version,
+            fragments = dropped.len(),
+            rows = dropped
+                .iter()
+                .map(|d| d.physical_rows.unwrap_or(0))
+                .sum::<usize>(),
+            "repaired base table: dropped fragments whose files are missing from storage"
+        );
+        Ok(RepairReport {
+            read_version,
+            committed_version: Some(committed_version),
+            dropped,
+        })
     }
 
     /// Build a ZoneMap scalar index on the base table's key column.

@@ -16,7 +16,7 @@ use etcd_client::{
     Certificate, Client, Compare, CompareOp, ConnectOptions, GetOptions, Identity, PutOptions,
     TlsOptions, Txn, TxnOp,
 };
-use lance_context_api::{TaskCooldown, TaskKind, TaskRecord, TaskState};
+use lance_context_api::{RepairRecord, TaskCooldown, TaskKind, TaskRecord, TaskState};
 use lance_context_core::generate_id;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -62,7 +62,8 @@ impl TaskKinds {
         match kind {
             TaskKind::Compact => self.compact,
             TaskKind::MergeWal => self.merge_wal,
-            TaskKind::IndexId => self.index_id,
+            // Repair is a base-table write like IndexId and shares its pool.
+            TaskKind::IndexId | TaskKind::Repair => self.index_id,
         }
     }
 }
@@ -269,6 +270,19 @@ impl TaskStore {
     /// Every target currently in cooldown, for operators.
     pub async fn list_cooldowns(&self) -> lance::Result<Vec<TaskCooldown>> {
         self.inner.list_cooldowns().await
+    }
+
+    /// Persist what a repair dropped, keyed by target and time, so it can be
+    /// answered for later. Kept for `history_ttl_secs` like task history.
+    pub async fn record_repair(&self, record: &RepairRecord) -> lance::Result<()> {
+        self.inner
+            .record_repair(record, self.history_ttl_secs)
+            .await
+    }
+
+    /// Every recorded repair, most recent first.
+    pub async fn list_repairs(&self) -> lance::Result<Vec<RepairRecord>> {
+        self.inner.list_repairs().await
     }
 
     /// Try to acquire a named coordination lock without waiting. This is used
@@ -1102,6 +1116,50 @@ impl EtcdTaskStore {
             .collect()
     }
 
+    fn repairs_prefix(&self) -> String {
+        format!("{}/repairs/", self.prefix)
+    }
+
+    async fn record_repair(&self, record: &RepairRecord, ttl_secs: u64) -> lance::Result<()> {
+        let mut client = self.client.clone();
+        let lease = client
+            .lease_grant(ttl_secs.max(60) as i64, None)
+            .await
+            .map_err(etcd_error("grant repair lease"))?
+            .id();
+        let key = format!(
+            "{}{}/{}",
+            self.repairs_prefix(),
+            encode_segment(&record.target),
+            record.repaired_at_ms
+        );
+        let value = serde_json::to_vec(record)
+            .map_err(|e| lance::Error::io(format!("encode repair: {e}")))?;
+        client
+            .put(key, value, Some(PutOptions::new().with_lease(lease)))
+            .await
+            .map_err(etcd_error("put repair"))?;
+        Ok(())
+    }
+
+    async fn list_repairs(&self) -> lance::Result<Vec<RepairRecord>> {
+        let mut client = self.client.clone();
+        let response = client
+            .get(self.repairs_prefix(), Some(GetOptions::new().with_prefix()))
+            .await
+            .map_err(etcd_error("list repairs"))?;
+        let mut out = response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                serde_json::from_slice::<RepairRecord>(kv.value())
+                    .map_err(|e| lance::Error::io(format!("decode repair: {e}")))
+            })
+            .collect::<lance::Result<Vec<_>>>()?;
+        out.sort_by_key(|r| std::cmp::Reverse(r.repaired_at_ms));
+        Ok(out)
+    }
+
     fn dedupe_key(&self, kind: TaskKind, target: &str, depends_on: &[String]) -> Option<String> {
         should_dedupe(kind, depends_on).then(|| {
             format!(
@@ -1174,12 +1232,15 @@ fn should_dedupe(kind: TaskKind, depends_on: &[String]) -> bool {
     depends_on.is_empty()
         && matches!(
             kind,
-            TaskKind::Compact | TaskKind::IndexId | TaskKind::MergeWal
+            TaskKind::Compact | TaskKind::IndexId | TaskKind::MergeWal | TaskKind::Repair
         )
 }
 
 fn requires_target_lock(kind: TaskKind) -> bool {
-    matches!(kind, TaskKind::Compact | TaskKind::IndexId)
+    matches!(
+        kind,
+        TaskKind::Compact | TaskKind::IndexId | TaskKind::Repair
+    )
 }
 
 fn kind_label(kind: TaskKind) -> &'static str {
@@ -1187,6 +1248,7 @@ fn kind_label(kind: TaskKind) -> &'static str {
         TaskKind::Compact => "compact",
         TaskKind::MergeWal => "merge-wal",
         TaskKind::IndexId => "index-id",
+        TaskKind::Repair => "repair",
     }
 }
 

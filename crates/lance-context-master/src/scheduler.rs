@@ -82,6 +82,7 @@ fn kind_label(kind: TaskKind) -> &'static str {
         TaskKind::Compact => "compact",
         TaskKind::MergeWal => "merge_wal",
         TaskKind::IndexId => "index_id",
+        TaskKind::Repair => "repair",
     }
 }
 
@@ -146,6 +147,7 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
         TaskKind::Compact => run_compaction(state, &task).await,
         TaskKind::MergeWal => run_merge_wal(state, &task.target).await,
         TaskKind::IndexId => run_index_id(state, &task.target).await,
+        TaskKind::Repair => run_repair(state, &task).await,
     };
     let work_elapsed = started.elapsed();
     let result = if outcome.is_ok() { "success" } else { "failed" };
@@ -162,6 +164,12 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
 
     if let Err(error) = &outcome {
         tracing::warn!(task = %task.id, target = %task.target, error, "task failed");
+        if task.kind != TaskKind::Repair && is_missing_fragment_error(error) {
+            // The manifest names a file storage does not have. No retry and
+            // no cooldown changes that; a repair does, so enqueue one now
+            // and re-run this task behind it.
+            schedule_repair(state, &task).await;
+        }
     }
     let commit_start = std::time::Instant::now();
     let finished = state.task_store.finish(claim, outcome).await;
@@ -170,6 +178,107 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
     if let Err(error) = finished {
         tracing::error!(task = %task.id, error = %error, "failed to persist task completion");
     }
+}
+
+/// Whether a task error is the deterministic "manifest names a data file
+/// that is not there" failure. Every scan of the base table then fails the
+/// same way, from the master's compaction and from every worker's merge
+/// alike, until the fragment is dropped.
+fn is_missing_fragment_error(error: &str) -> bool {
+    error.contains("Not found")
+        && (error.contains("/data/") || error.contains("/_deletions/"))
+        && (error.contains(".lance") || error.contains(".arrow") || error.contains(".bin"))
+}
+
+/// Enqueue a `Repair` for the failed task's target, then the original task
+/// again depending on it. Both are best-effort: the failure is already
+/// recorded, and the next sweep enqueues the original kind anyway.
+async fn schedule_repair(state: &Arc<MasterState>, failed: &TaskRecord) {
+    let repair = match enqueue(state, TaskKind::Repair, &failed.target).await {
+        Ok(repair) => repair,
+        Err(error) => {
+            tracing::warn!(target = %failed.target, %error, "failed to enqueue repair");
+            return;
+        }
+    };
+    tracing::warn!(
+        target = %failed.target,
+        after = ?failed.kind,
+        repair = %repair.id,
+        "base table names missing files; repair enqueued"
+    );
+    if let Err(error) = enqueue_with_deps(state, failed.kind, &failed.target, vec![repair.id]).await
+    {
+        tracing::warn!(target = %failed.target, %error, "failed to re-enqueue after repair");
+    }
+}
+
+/// Drop base-table fragments whose files are missing (see
+/// `StorageBase::repair_missing_fragments`) and record what was dropped.
+async fn run_repair(state: &Arc<MasterState>, task: &TaskRecord) -> Result<String, String> {
+    let (kind, name) = parse_target(&task.target);
+    if kind != StoreKind::Rollout {
+        return Err(format!("repair is not implemented for {kind:?} stores"));
+    }
+    let uri = state.rollout_uri(name);
+    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+        .await
+        .map_err(|e| e.to_string())?;
+    let report = store
+        .repair_missing_fragments()
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(committed_version) = report.committed_version else {
+        return Ok("nothing missing; no repair needed".to_string());
+    };
+    let rows: usize = report
+        .dropped
+        .iter()
+        .map(|d| d.physical_rows.unwrap_or(0))
+        .sum();
+    // The task whose failure scheduled this repair is the one re-enqueued
+    // behind it (see `schedule_repair`); a manual repair has none.
+    let triggered_by = state
+        .task_store
+        .list()
+        .await
+        .ok()
+        .and_then(|tasks| {
+            tasks
+                .into_iter()
+                .find(|t| t.depends_on.contains(&task.id))
+                .map(|t| t.kind)
+        })
+        .unwrap_or(TaskKind::Repair);
+    let record = lance_context_api::RepairRecord {
+        target: task.target.clone(),
+        repaired_at_ms: chrono::Utc::now().timestamp_millis(),
+        read_version: report.read_version,
+        committed_version,
+        triggered_by,
+        dropped: report
+            .dropped
+            .iter()
+            .map(|d| lance_context_api::RepairedFragment {
+                id: d.id,
+                physical_rows: d.physical_rows,
+                missing_files: d.missing_files.clone(),
+            })
+            .collect(),
+    };
+    if let Err(error) = state.task_store.record_repair(&record).await {
+        tracing::warn!(target = %task.target, %error, "failed to record repair");
+    }
+    metrics::counter!("master_repairs_total").increment(1);
+    metrics::counter!("master_repair_fragments_dropped_total")
+        .increment(report.dropped.len() as u64);
+    Ok(format!(
+        "dropped {} fragments ({} rows) whose files were missing; version {} -> {}",
+        report.dropped.len(),
+        rows,
+        report.read_version,
+        committed_version
+    ))
 }
 
 /// Compact one experiment. The task-store claim owns the per-experiment write
@@ -917,6 +1026,110 @@ mod tests {
             .filter(|task| task.kind == TaskKind::IndexId)
             .count();
         assert_eq!(indexes, 1);
+
+        worker.abort();
+    }
+
+    #[test]
+    fn missing_fragment_error_is_recognised() {
+        assert!(is_missing_fragment_error(
+            "Wrapped error: Not found: rocketkeep/x.rollout.lance/data/0101abcd.lance, /rustc/..."
+        ));
+        assert!(is_missing_fragment_error(
+            "LanceError(IO): Not found: rocketkeep/x.rollout.lance/_deletions/3-12-7.arrow"
+        ));
+        // A missing manifest or WAL generation is a different failure.
+        assert!(!is_missing_fragment_error(
+            "Not found: rocketkeep/x.rollout.lance/_versions/12.manifest"
+        ));
+        assert!(!is_missing_fragment_error(
+            "Not found: rocketkeep/x.rollout.lance/_mem_wal/shard/gen_5/_versions"
+        ));
+        assert!(!is_missing_fragment_error("HTTP 500 Internal Server Error"));
+    }
+
+    /// A base table whose manifest names a missing data file fails every
+    /// compaction with `Not found`. That failure enqueues a `Repair` and the
+    /// compaction again behind it; the repair drops the dead fragment and is
+    /// recorded, and the re-run compaction succeeds.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn missing_fragment_failure_triggers_repair_and_rerun() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let name = "exp";
+        let uri = state.rollout_uri(name);
+        let victim_path = {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            for i in 0..4 {
+                store
+                    .add(&[rollout_record(&format!("r{i}"))])
+                    .await
+                    .unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            store.base_data_files()[1].clone()
+        };
+        std::fs::remove_file(
+            dir.path()
+                .join(format!("{name}.rollout.lance/data/{victim_path}")),
+        )
+        .unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
+        let failed = await_terminal(&state, &compact.id).await;
+        assert_eq!(failed.state, TaskState::Failed, "got {failed:?}");
+        assert!(
+            failed.error.as_deref().unwrap_or("").contains("Not found"),
+            "{failed:?}"
+        );
+
+        // The failure enqueued a repair and a dependent compaction.
+        let tasks = state.task_store.list().await.unwrap();
+        let repair = tasks
+            .iter()
+            .find(|t| t.kind == TaskKind::Repair && t.target == name)
+            .expect("repair enqueued")
+            .clone();
+        let rerun = tasks
+            .iter()
+            .find(|t| t.kind == TaskKind::Compact && t.target == name && t.id != compact.id)
+            .expect("compaction re-enqueued")
+            .clone();
+        assert_eq!(rerun.depends_on, vec![repair.id.clone()]);
+
+        let repair = await_terminal(&state, &repair.id).await;
+        assert_eq!(repair.state, TaskState::Done, "got {repair:?}");
+        assert!(repair
+            .detail
+            .as_deref()
+            .unwrap()
+            .starts_with("dropped 1 fragments (1 rows)"));
+        let rerun = await_terminal(&state, &rerun.id).await;
+        assert_eq!(rerun.state, TaskState::Done, "got {rerun:?}");
+
+        let repairs = state.task_store.list_repairs().await.unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].target, name);
+        assert_eq!(repairs[0].triggered_by, TaskKind::Compact);
+        assert_eq!(repairs[0].dropped.len(), 1);
+        assert_eq!(repairs[0].dropped[0].missing_files, vec![victim_path]);
+
+        // Three rows remain readable.
+        let store = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(store.list(None, None).await.unwrap().len(), 3);
 
         worker.abort();
     }

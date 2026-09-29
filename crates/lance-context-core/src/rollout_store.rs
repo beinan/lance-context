@@ -691,6 +691,16 @@ impl RolloutStore {
         self.base.compact(options).await
     }
 
+    /// See `StorageBase::base_data_files`.
+    pub fn base_data_files(&self) -> Vec<String> {
+        self.base.base_data_files()
+    }
+
+    /// See `StorageBase::repair_missing_fragments`.
+    pub async fn repair_missing_fragments(&mut self) -> LanceResult<crate::RepairReport> {
+        self.base.repair_missing_fragments().await
+    }
+
     /// Build a ZoneMap scalar index on the base table's `id` column. Idempotent.
     /// See `StorageBase::create_key_zonemap_index`.
     pub async fn create_id_zonemap_index(&mut self) -> LanceResult<()> {
@@ -3584,6 +3594,93 @@ mod tests {
             store.flush().await.unwrap();
             store.flush().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    /// A manifest that names a data file storage no longer has makes every
+    /// scan, merge and compaction fail with `Not found`, and no retry fixes
+    /// it. `repair_missing_fragments` drops exactly those fragments and
+    /// commits, after which the table works again minus the rows that were
+    /// already gone.
+    #[test]
+    fn repair_drops_fragments_whose_files_are_missing() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    pending_generations_warn: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            // Three fragments of one row each.
+            for i in 0..3 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
+            }
+            assert_eq!(store.base.dataset.count_fragments(), 3);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+
+            // Nothing missing: no commit.
+            let v = store.version();
+            let report = store.repair_missing_fragments().await.unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(report.committed_version, None);
+            assert_eq!(store.version(), v);
+
+            // Lose the second fragment's data file behind Lance's back.
+            let victim = store.base.dataset.fragments()[1].clone();
+            let victim_id = victim.id;
+            let victim_path = victim.files[0].path.clone();
+            std::fs::remove_file(dir.path().join("data").join(&victim_path)).unwrap();
+
+            // The table is now broken the way production stores were.
+            let mut broken =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            let err = broken
+                .compact(Some(CompactionConfig {
+                    min_fragments: 1,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Not found"), "{err}");
+
+            let report = store.repair_missing_fragments().await.unwrap();
+            assert_eq!(report.dropped.len(), 1);
+            assert_eq!(report.dropped[0].id, victim_id);
+            assert_eq!(report.dropped[0].physical_rows, Some(1));
+            assert_eq!(report.dropped[0].missing_files, vec![victim_path]);
+            assert!(report.committed_version.unwrap() > report.read_version);
+
+            // Two rows remain and the table compacts again.
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            store
+                .compact(Some(CompactionConfig {
+                    min_fragments: 1,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
         });
     }
 

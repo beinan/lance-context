@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use lance_context_api::{
     CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
-    ExperimentRecordsResponse, ExperimentSummary, SqlQueryRequest, SqlQueryResponse, TaskCooldown,
-    TaskKind, TaskListResponse, TaskRecord, TaskState,
+    ExperimentRecordsResponse, ExperimentSummary, RepairRecord, SqlQueryRequest, SqlQueryResponse,
+    TaskCooldown, TaskKind, TaskListResponse, TaskRecord, TaskState,
 };
 use lance_context_core::{rollout_record_to_dto, ListSource, RolloutFilters, RolloutStore};
 use tokio::sync::RwLock;
@@ -548,6 +548,20 @@ pub async fn list_cooldowns(
         .map_err(MasterError::from_lance)
 }
 
+/// `GET /api/v1/scheduler/repairs` — base-table repairs the master performed,
+/// most recent first: which fragments were dropped from which store, when,
+/// and how many rows they held.
+pub async fn list_repairs(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<RepairRecord>>, MasterError> {
+    state
+        .task_store
+        .list_repairs()
+        .await
+        .map(Json)
+        .map_err(MasterError::from_lance)
+}
+
 /// `GET /api/v1/tasks` — paginated tasks (queue + recent history), newest first.
 pub async fn list_tasks(
     State(state): State<Arc<MasterState>>,
@@ -601,6 +615,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/experiments/{name}/compact/status", get(compact_status))
         .route("/tasks", post(enqueue_task).get(list_tasks))
         .route("/scheduler/cooldowns", get(list_cooldowns))
+        .route("/scheduler/repairs", get(list_repairs))
         .route("/tasks/{id}", get(get_task))
         .route("/rescan", post(rescan))
 }

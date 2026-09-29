@@ -175,6 +175,27 @@ impl DistanceMetric {
     }
 }
 
+/// One fragment dropped by `repair_missing_fragments`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DroppedFragment {
+    pub id: u64,
+    /// Rows the fragment held, if the manifest recorded it. These rows are
+    /// gone; the repair only makes the manifest say so.
+    pub physical_rows: Option<usize>,
+    /// The files the manifest named that storage does not have.
+    pub missing_files: Vec<String>,
+}
+
+/// What a `repair_missing_fragments` pass did.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RepairReport {
+    /// Manifest version the repair inspected.
+    pub read_version: u64,
+    /// Version the repair committed; `None` when nothing was missing.
+    pub committed_version: Option<u64>,
+    pub dropped: Vec<DroppedFragment>,
+}
+
 /// Statistics about compaction status and history.
 #[derive(Debug, Clone)]
 pub struct CompactionStats {

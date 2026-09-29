@@ -1486,6 +1486,11 @@ pub enum TaskKind {
     /// Runs on the master; serialized per experiment against `Compact` because
     /// both mutate the shared base table.
     IndexId,
+    /// Drop base-table fragments whose data files are missing from storage,
+    /// so a manifest that names files that no longer exist stops failing
+    /// every merge and compaction. Enqueued automatically when a task fails
+    /// with that error; the rows in those fragments are already gone.
+    Repair,
 }
 
 /// Lifecycle state of a scheduled task, generalized from [`CompactJobStatus`]
@@ -1504,6 +1509,31 @@ pub enum TaskState {
 }
 
 /// One unit of scheduled work plus its lifecycle, as surfaced to the queue UI.
+/// One fragment a repair dropped from a base table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairedFragment {
+    pub id: u64,
+    pub physical_rows: Option<usize>,
+    pub missing_files: Vec<String>,
+}
+
+/// A base-table repair the master performed. Reported by
+/// `GET /api/v1/scheduler/repairs`, most recent first, so anyone asking why a
+/// store has fewer rows than expected can see when and what was dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairRecord {
+    pub target: String,
+    /// Unix ms when the repair committed.
+    pub repaired_at_ms: i64,
+    /// Manifest version the repair read and the one it committed.
+    pub read_version: u64,
+    pub committed_version: u64,
+    /// The task whose failure triggered the repair; `Repair` when it was
+    /// enqueued by hand.
+    pub triggered_by: TaskKind,
+    pub dropped: Vec<RepairedFragment>,
+}
+
 /// A task target the master's sweeps are skipping because it has failed
 /// repeatedly. Reported by `GET /api/v1/scheduler/cooldowns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
