@@ -19,11 +19,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use chrono::Utc;
 use futures::TryStreamExt;
+use lance::dataset::cleanup::RemovalStats;
+use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, Dataset, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
@@ -347,6 +350,73 @@ impl RolloutRegistry {
     pub fn uri(&self) -> &str {
         &self.uri
     }
+
+    /// Current dataset version (manifest chain head).
+    pub fn version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    /// Fold the one-row append fragments produced by [`Self::upsert`] into a
+    /// few, then drop manifest versions older than `older_than`.
+    ///
+    /// Every `create` is a delete plus an append, so the registry gains two
+    /// versions and one fragment per store. Lance keeps every manifest until
+    /// cleaned, and every manifest lists every fragment, so an unmaintained
+    /// registry grows quadratically: 34k versions of ~840 KB each (29 GB of
+    /// manifests) for a 10k-row, three-column table was observed in
+    /// production, and each `contains`/`get` re-reads the head manifest.
+    ///
+    /// Callers that share this registry behind a lock should prefer
+    /// [`Self::compact`] followed by [`RegistryCleaner::cleanup`] so the lock
+    /// is not held across the cleanup's object-store deletes.
+    pub async fn maintain(
+        &mut self,
+        older_than: Duration,
+    ) -> LanceResult<(CompactionMetrics, RemovalStats)> {
+        let (compaction, cleaner) = self.compact().await?;
+        let removal = cleaner.cleanup(older_than).await?;
+        self.reload().await?;
+        Ok((compaction, removal))
+    }
+
+    /// The compaction half of [`Self::maintain`]. Returns a
+    /// [`RegistryCleaner`] that prunes old versions without borrowing the
+    /// registry.
+    pub async fn compact(&mut self) -> LanceResult<(CompactionMetrics, RegistryCleaner)> {
+        self.reload().await?;
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1_048_576,
+            materialize_deletions: true,
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        };
+        let compaction = compact_files(&mut self.dataset, options, None).await?;
+        self.reload().await?;
+        Ok((
+            compaction,
+            RegistryCleaner {
+                dataset: self.dataset.clone(),
+            },
+        ))
+    }
+}
+
+/// A detached handle for the old-version cleanup half of registry
+/// maintenance. See `StatsCleaner` in the master for why this is split off:
+/// cleanup deletes objects no live version references, so it needs no
+/// exclusive access, only time.
+pub struct RegistryCleaner {
+    dataset: Dataset,
+}
+
+impl RegistryCleaner {
+    /// Drop manifest versions older than `older_than` and the files only they
+    /// referenced.
+    pub async fn cleanup(self, older_than: Duration) -> LanceResult<RemovalStats> {
+        let grace = chrono::TimeDelta::from_std(older_than)
+            .map_err(|e| LanceError::io(format!("invalid registry history TTL: {e}")))?;
+        self.dataset.cleanup_old_versions(grace, None, None).await
+    }
 }
 
 #[cfg(test)]
@@ -359,6 +429,90 @@ mod tests {
         RolloutRegistry::open_or_create(uri.to_str().unwrap(), None)
             .await
             .unwrap()
+    }
+
+    /// Maintenance folds the per-upsert fragments and prunes old manifests
+    /// while keeping every live row; the registry keeps working afterwards.
+    #[tokio::test]
+    async fn maintain_bounds_versions_and_preserves_rows() {
+        let dir = TempDir::new().unwrap();
+        let mut r = new_registry(&dir).await;
+        for i in 0..20 {
+            r.upsert(&format!("exp-{i}"), &format!("/data/exp-{i}.lance"))
+                .await
+                .unwrap();
+        }
+        let before = r.version();
+        assert!(
+            before >= 40,
+            "expected two versions per upsert, got {before}"
+        );
+
+        let (compaction, removal) = r.maintain(Duration::from_secs(0)).await.unwrap();
+        assert!(compaction.fragments_removed > 0, "nothing compacted");
+        assert!(removal.old_versions > 0, "no versions reclaimed");
+
+        let mut names: Vec<String> = r
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 20);
+        assert_eq!(names[0], "exp-0");
+        assert!(r.contains("exp-19").await.unwrap());
+        r.upsert("exp-new", "/data/exp-new.lance").await.unwrap();
+        assert!(r.contains("exp-new").await.unwrap());
+    }
+
+    /// A second handle on the same URI (a worker) keeps creating stores while
+    /// another (the master) maintains. Nothing the worker wrote is lost and
+    /// both handles see every row afterwards.
+    #[tokio::test]
+    async fn maintenance_does_not_lose_concurrent_worker_upserts() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("_registry.lance");
+        let uri = uri.to_str().unwrap();
+        let mut master = RolloutRegistry::open_or_create(uri, None).await.unwrap();
+        let mut worker = RolloutRegistry::open_or_create(uri, None).await.unwrap();
+        for i in 0..20 {
+            worker.upsert(&format!("old-{i}"), "/x").await.unwrap();
+        }
+
+        let (_, cleaner) = master.compact().await.unwrap();
+        // Worker writes land between the compaction and the cleanup ...
+        for i in 0..5 {
+            worker.upsert(&format!("mid-{i}"), "/x").await.unwrap();
+        }
+        cleaner.cleanup(Duration::from_secs(0)).await.unwrap();
+        master.reload().await.unwrap();
+        // ... and after it.
+        worker.upsert("late", "/x").await.unwrap();
+
+        assert_eq!(master.list().await.unwrap().len(), 26);
+        assert_eq!(worker.list().await.unwrap().len(), 26);
+        assert!(master.contains("mid-3").await.unwrap());
+        assert!(worker.contains("late").await.unwrap());
+    }
+
+    /// The cleanup half runs on a detached handle: the registry stays usable
+    /// (reads and writes) while the cleaner is outstanding.
+    #[tokio::test]
+    async fn cleanup_runs_detached_from_the_registry() {
+        let dir = TempDir::new().unwrap();
+        let mut r = new_registry(&dir).await;
+        for i in 0..20 {
+            r.upsert(&format!("exp-{i}"), "/x").await.unwrap();
+        }
+        let (_, cleaner) = r.compact().await.unwrap();
+        r.upsert("during", "/x").await.unwrap();
+        assert!(r.contains("during").await.unwrap());
+        let removal = cleaner.cleanup(Duration::from_secs(0)).await.unwrap();
+        assert!(removal.old_versions > 0);
+        r.reload().await.unwrap();
+        assert_eq!(r.list().await.unwrap().len(), 21);
     }
 
     #[tokio::test]

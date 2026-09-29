@@ -14,7 +14,8 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use lance_context_core::{
-    CompactionConfig, GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions,
+    CompactionConfig, GenericStore, GenericStoreOptions, RolloutRegistry, RolloutStore,
+    RolloutStoreOptions,
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -150,6 +151,55 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
     }
 }
 
+/// Compact a store registry and prune its old manifest versions.
+///
+/// Workers write the registry on every store create/delete as a delete plus an
+/// append, so it gains two versions and one fragment per store and, without
+/// this, every manifest lists every fragment: 34k versions of ~840 KB each
+/// were observed for a 10k-row table, and every `create`/`get` re-read one.
+///
+/// Same shape as [`maintain_stats`]: the compaction (a `Rewrite` that must not
+/// race another master's) runs under `state.stats`-style exclusion via the
+/// registry lock, bounded by [`MAINTENANCE_TIMEOUT`]; the cleanup runs on a
+/// detached handle with the lock released. Workers keep appending in between:
+/// Lance retries their commits past the rewrite, and the grace window keeps
+/// any version a worker may still be reading.
+async fn maintain_registry(
+    state: &Arc<MasterState>,
+    label: &'static str,
+    registry: &tokio::sync::RwLock<RolloutRegistry>,
+) -> lance::Result<()> {
+    let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
+    let start = std::time::Instant::now();
+    let (compaction, cleaner) = {
+        let mut registry = registry.write().await;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, registry.compact())
+            .await
+            .unwrap_or_else(|_| Err(lance::Error::io("registry compaction timed out")))?
+    };
+    let removal = cleaner.cleanup(ttl).await;
+    let reload = registry.write().await.reload().await;
+    let removal = match (removal, reload) {
+        (Ok(removal), Ok(())) => removal,
+        (Err(e), _) | (Ok(_), Err(e)) => return Err(e),
+    };
+    let version = registry.read().await.version();
+    metrics::counter!("master_registry_versions_removed_total", "registry" => label)
+        .increment(removal.old_versions);
+    metrics::gauge!("master_registry_version", "registry" => label).set(version as f64);
+    tracing::info!(
+        registry = label,
+        fragments_removed = compaction.fragments_removed,
+        fragments_added = compaction.fragments_added,
+        old_versions_removed = removal.old_versions,
+        bytes_removed = removal.bytes_removed,
+        version,
+        elapsed_secs = start.elapsed().as_secs(),
+        "registry maintenance complete"
+    );
+    Ok(())
+}
+
 /// Run a single scan pass: refresh every experiment's stats row and drop rows
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
@@ -178,6 +228,14 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     if maintain {
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
+        }
+        for (label, registry) in [
+            ("rollout", &state.registry),
+            ("generic", &state.generic_registry),
+        ] {
+            if let Err(e) = maintain_registry(state, label, registry).await {
+                tracing::warn!(registry = label, error = %e, "registry maintenance failed");
+            }
         }
     }
     let release = state.task_store.release_coordination_lock(guard).await;
