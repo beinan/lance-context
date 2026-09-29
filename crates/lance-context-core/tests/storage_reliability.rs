@@ -141,7 +141,7 @@ async fn pinned_rollout_rejects_writes_until_refresh() {
         .to_string()
         .contains("read-only"));
     assert!(store.compact(None).await.is_err());
-    assert!(store.create_id_zonemap_index().await.is_err());
+    assert!(store.create_id_btree_index().await.is_err());
     assert!(store.is_version_pinned());
     store.refresh_latest().await.unwrap();
     assert_eq!(store.version(), version);

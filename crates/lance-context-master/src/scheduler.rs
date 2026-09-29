@@ -336,10 +336,10 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
         .await
         .map_err(|e| e.to_string())?;
     store
-        .create_id_zonemap_index()
+        .create_id_btree_index()
         .await
         .map_err(|e| e.to_string())?;
-    Ok("built zonemap index on id".to_string())
+    Ok("built btree index on id".to_string())
 }
 
 async fn compact_inner(
@@ -376,12 +376,51 @@ struct MergeWalReply {
 /// its own shard; a worker that owns no data for `name` reports 0 (or 404, which
 /// we tolerate). Succeeds if at least one endpoint responded; fails only when
 /// there are no endpoints or every one errored.
+/// Make sure the target's base table has a BTree index on `id` before the
+/// workers merge into it.
+///
+/// `merge_insert` without an exact-answer index on the join key reads the
+/// whole base table into a hash join, so a merge's memory and time scale with
+/// the base table rather than with the WAL rows being merged. Building the
+/// index once here turns every later merge into an indexed probe. This is a
+/// base-table write like compaction; the merge task already holds nothing on
+/// the table, and `replace(true)` makes a race with a concurrent `IndexId`
+/// harmless. Skipped when the index is already present (one manifest read).
+async fn ensure_id_btree_index(state: &Arc<MasterState>, name: &str) -> Result<(), String> {
+    let uri = state.rollout_uri(name);
+    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+        .await
+        .map_err(|e| e.to_string())?;
+    if store
+        .has_id_btree_index()
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    store
+        .create_id_btree_index()
+        .await
+        .map_err(|e| format!("building id index before merge: {e}"))?;
+    metrics::counter!("master_merge_wal_index_built_total").increment(1);
+    tracing::info!(
+        target = %name,
+        elapsed_secs = started.elapsed().as_secs(),
+        "built id BTree index before merge-wal so merge_insert probes instead of scanning"
+    );
+    Ok(())
+}
+
 async fn run_merge_wal(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
     let endpoints = &state.config.worker_endpoints;
     if endpoints.is_empty() {
         return Err("no worker endpoints configured (--worker-endpoints)".to_string());
     }
     let (kind, name) = parse_target(target);
+    if kind == StoreKind::Rollout && state.config.index_before_merge {
+        ensure_id_btree_index(state, name).await?;
+    }
     let route = match kind {
         StoreKind::Rollout => "api/v1/internal/merge-wal",
         StoreKind::Generic => "api/v1/generic",
@@ -871,6 +910,7 @@ mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
             merge_wal_interval_secs: 0,
             merge_wal_min_generations: 2,
@@ -1009,7 +1049,7 @@ mod tests {
         assert_eq!(index.depends_on, vec![compact.id.clone()]);
         let status = await_terminal(&state, &index.id).await;
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
-        assert_eq!(status.detail.as_deref(), Some("built zonemap index on id"));
+        assert_eq!(status.detail.as_deref(), Some("built btree index on id"));
 
         // A second compaction with nothing to rewrite does not enqueue another.
         let again = enqueue(&state, TaskKind::Compact, name).await.unwrap();
@@ -1046,6 +1086,66 @@ mod tests {
             "Not found: rocketkeep/x.rollout.lance/_mem_wal/shard/gen_5/_versions"
         ));
         assert!(!is_missing_fragment_error("HTTP 500 Internal Server Error"));
+    }
+
+    /// A merge-wal on a store with no id BTree builds one before fanning out,
+    /// so the workers' `merge_insert` probes instead of scanning; a second
+    /// merge finds it present and builds nothing.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_wal_builds_the_id_btree_first() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post(|| async { Json(serde_json::json!({ "reclaimed": 0 })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.worker_endpoints = vec![format!("http://{addr}")];
+        cfg.index_before_merge = true;
+        let state = MasterState::new(cfg).await.unwrap();
+        let worker = spawn_scheduler(&state);
+
+        let name = "exp";
+        let uri = state.rollout_uri(name);
+        {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[rollout_record("r0")]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+        }
+        state
+            .registry
+            .write()
+            .await
+            .upsert(name, &uri)
+            .await
+            .unwrap();
+
+        let rec = enqueue(&state, TaskKind::MergeWal, name).await.unwrap();
+        assert_eq!(await_terminal(&state, &rec.id).await.state, TaskState::Done);
+        let store = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert!(
+            store.has_id_btree_index().await.unwrap(),
+            "merge built the index"
+        );
+        let version_after_first = store.version();
+
+        // Present now: the next merge does not rebuild it.
+        let rec = enqueue(&state, TaskKind::MergeWal, name).await.unwrap();
+        assert_eq!(await_terminal(&state, &rec.id).await.state, TaskState::Done);
+        let store = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(store.version(), version_after_first);
+
+        worker.abort();
     }
 
     /// A base table whose manifest names a missing data file fails every
@@ -1164,7 +1264,7 @@ mod tests {
         let rec = enqueue(&state, TaskKind::IndexId, name).await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
-        assert_eq!(status.detail.as_deref(), Some("built zonemap index on id"));
+        assert_eq!(status.detail.as_deref(), Some("built btree index on id"));
 
         worker.abort();
     }

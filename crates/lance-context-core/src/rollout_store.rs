@@ -702,9 +702,14 @@ impl RolloutStore {
     }
 
     /// Build a ZoneMap scalar index on the base table's `id` column. Idempotent.
-    /// See `StorageBase::create_key_zonemap_index`.
-    pub async fn create_id_zonemap_index(&mut self) -> LanceResult<()> {
-        self.base.create_key_zonemap_index().await
+    /// See `StorageBase::create_key_btree_index`.
+    pub async fn create_id_btree_index(&mut self) -> LanceResult<()> {
+        self.base.create_key_btree_index().await
+    }
+
+    /// See `StorageBase::has_key_btree_index`.
+    pub async fn has_id_btree_index(&self) -> LanceResult<bool> {
+        self.base.has_key_btree_index().await
     }
 
     /// Whether the base table has accumulated at least `min_fragments`
@@ -4196,9 +4201,80 @@ mod tests {
         });
     }
 
+    /// The whole point of the id index: `merge_insert` must take the indexed
+    /// probe path, not a full-table hash join. Lance's `explain_plan` only
+    /// renders the full-scan plan and returns `NotSupported` when the job
+    /// would use a scalar index, so "explain refuses" is the observable
+    /// signal that the merge will probe. Without the index (and with a
+    /// ZoneMap, which cannot answer equality exactly) explain succeeds and
+    /// shows a HashJoin over a LanceScan of the base table.
     #[test]
-    fn create_id_zonemap_index_builds_and_is_idempotent() {
-        // Building the ZoneMap index on `id` must succeed even though the
+    fn merge_insert_probes_the_id_btree_instead_of_scanning() {
+        use lance::dataset::MergeInsertBuilder;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let plan_for = |s: &RolloutStore| {
+                let dataset = Arc::new(s.base.dataset.clone());
+                async move {
+                    let mut b =
+                        MergeInsertBuilder::try_new(dataset, vec!["id".to_string()]).unwrap();
+                    b.when_matched(lance::dataset::WhenMatched::UpdateAll);
+                    b.try_build().unwrap().explain_plan(None, false).await
+                }
+            };
+
+            // No index: full-table join.
+            let plan = plan_for(&store).await.expect("full-scan plan renders");
+            assert!(plan.contains("HashJoin"), "{plan}");
+
+            // ZoneMap: still a full-table join (not an exact-answer index).
+            store
+                .base
+                .dataset
+                .create_index_builder(
+                    &["id"],
+                    lance_index::IndexType::ZoneMap,
+                    &lance_index::scalar::ScalarIndexParams::default(),
+                )
+                .name(ROLLOUT_ID_INDEX_NAME.to_string())
+                .replace(true)
+                .await
+                .unwrap();
+            store.base.reload().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            let plan = plan_for(&store)
+                .await
+                .expect("ZoneMap does not change the plan");
+            assert!(plan.contains("HashJoin"), "{plan}");
+
+            // BTree: indexed path, which explain_plan cannot render.
+            store.create_id_btree_index().await.unwrap();
+            assert!(store.has_id_btree_index().await.unwrap());
+            let err = plan_for(&store).await.expect_err("indexed path");
+            assert!(
+                err.to_string().contains("scalar-index"),
+                "expected the scalar-index refusal, got: {err}"
+            );
+
+            // And a real merge through the index still works.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn create_id_btree_index_builds_and_is_idempotent() {
+        // Building the BTree index on `id` must succeed even though the
         // rollout table also carries a (fieldless) MemWAL index, and calling it
         // twice must not error (replace(true) rebuilds in place).
         let dir = TempDir::new().unwrap();
@@ -4213,7 +4289,12 @@ mod tests {
             store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
 
-            store.create_id_zonemap_index().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            store.create_id_btree_index().await.unwrap();
+            assert!(
+                store.has_id_btree_index().await.unwrap(),
+                "the id index must be a BTree: merge_insert only probes an exact-answer index"
+            );
             let has_id_index = |s: &RolloutStore| {
                 let dataset = s.base.dataset.clone();
                 async move {
@@ -4228,7 +4309,7 @@ mod tests {
             assert!(has_id_index(&store).await, "id index should exist");
 
             // Idempotent: a second build replaces in place without erroring.
-            store.create_id_zonemap_index().await.unwrap();
+            store.create_id_btree_index().await.unwrap();
             assert!(has_id_index(&store).await, "id index should still exist");
 
             // Rows remain readable exactly once after indexing.

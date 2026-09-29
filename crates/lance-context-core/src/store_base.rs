@@ -1434,28 +1434,39 @@ impl StorageBase {
         })
     }
 
-    /// Build a ZoneMap scalar index on the base table's key column.
+    /// Build a BTree scalar index on the base table's key column, or report
+    /// whether one already exists.
     ///
-    /// The key column is the table's (unenforced) primary key, so a lightweight
-    /// per-fragment min/max index accelerates point lookups and range scans on
-    /// the already-flushed base table. `replace(true)` makes this idempotent.
+    /// The key column is the table's (unenforced) primary key. The index does
+    /// two jobs:
+    ///
+    /// - point lookups and range scans on the already-merged base table;
+    /// - **the MemWAL merge itself**. `merge_insert` joins the WAL rows to the
+    ///   base table on the key. With a scalar index that answers equality
+    ///   exactly it probes only the fragments holding the source keys; without
+    ///   one it reads the *whole* base table into a hash join. On a 2 TB /
+    ///   5.8M-row table that full join ran for every 64-generation merge and
+    ///   took every worker with it (18/20 OOMKilled together, 2026-09-29).
+    ///
+    /// It must be a BTree: Lance's `merge_insert` only takes the indexed path
+    /// for an index whose plugin `provides_exact_answer()`, and ZoneMap (a
+    /// per-fragment min/max) does not, so a ZoneMap here changed nothing for
+    /// the merge. `replace(true)` makes rebuilding idempotent.
     ///
     /// # MemWAL interaction
     ///
-    /// The base table carries a fieldless MemWAL index, and Lance's MemWAL does
-    /// not *maintain* ZoneMap indices across WAL flushes (it only keeps the
-    /// indices named in `maintained_indexes`). That does not affect correctness:
-    /// rows are de-duplicated by the key column at read time, so the ZoneMap
-    /// only ever needs to describe the base table's already-merged fragments —
-    /// rows still living in unmerged WAL generations are found by the normal
-    /// scan of those generations.
-    pub async fn create_key_zonemap_index(&mut self) -> LanceResult<()> {
+    /// Lance's MemWAL does not maintain this index across WAL flushes (it only
+    /// keeps the indices named in `maintained_indexes`). That does not affect
+    /// correctness: rows are de-duplicated by the key column at read time, so
+    /// the index only ever needs to describe the base table's already-merged
+    /// fragments, and compaction rebuilds it (see the master's `IndexId`).
+    pub async fn create_key_btree_index(&mut self) -> LanceResult<()> {
         self.ensure_writable()?;
-        info!(column = %self.key_column, "creating ZoneMap index on key column");
+        info!(column = %self.key_column, "creating BTree index on key column");
         self.dataset
             .create_index_builder(
                 &[self.key_column.as_str()],
-                IndexType::ZoneMap,
+                IndexType::BTree,
                 &ScalarIndexParams::default(),
             )
             .name(ID_INDEX_NAME.to_string())
@@ -1464,6 +1475,20 @@ impl StorageBase {
         // Reload the handle so subsequent reads on this instance observe the new
         // index (mirrors the reload done after `compact`).
         self.reload().await
+    }
+
+    /// Whether the base table's key column has a BTree index (the one
+    /// `merge_insert` can use). A ZoneMap under the same name does not count.
+    pub async fn has_key_btree_index(&self) -> LanceResult<bool> {
+        let indices = self.dataset.load_indices().await?;
+        for index in indices.iter().filter(|i| i.name == ID_INDEX_NAME) {
+            if let Some(details) = &index.index_details {
+                if details.type_url.ends_with("BTreeIndexDetails") {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Whether the base table has accumulated at least `min_fragments`

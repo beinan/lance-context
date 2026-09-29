@@ -423,7 +423,7 @@ impl DatagenStore {
     /// Idempotent. Datagen previously had no scalar index, so every point
     /// lookup by event id scanned.
     pub async fn create_event_id_index(&mut self) -> LanceResult<()> {
-        self.base.create_key_zonemap_index().await
+        self.base.create_key_btree_index().await
     }
 
     /// Seal the active memtable. A no-op here in normal operation, since

@@ -453,7 +453,7 @@ impl GenericStore {
 
     /// Build a ZoneMap scalar index on `id`. Idempotent.
     pub async fn create_id_index(&mut self) -> LanceResult<()> {
-        self.base.create_key_zonemap_index().await
+        self.base.create_key_btree_index().await
     }
 
     /// Row count of the base table. Excludes rows still in unmerged
