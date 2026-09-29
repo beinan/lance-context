@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use lance_context_core::etcd::open_registry;
 use lance_context_core::{
     join_uri, validate_store_name, ContextStore, ContextStoreOptions, DatagenStore,
-    DatagenStoreOptions, GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutRegistry,
-    RolloutStore, RolloutStoreOptions, Session,
+    DatagenStoreOptions, GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutStore,
+    RolloutStoreOptions, Session, StoreRegistry,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore};
@@ -106,7 +107,7 @@ pub struct AppState {
     /// miss (existence check) and to back the list endpoint. Guarded by a lock
     /// because every operation refreshes the snapshot and therefore takes
     /// `&mut`.
-    pub rollout_registry: RwLock<RolloutRegistry>,
+    pub rollout_registry: Arc<dyn StoreRegistry>,
     pub base_uri: String,
     /// Stable identity of this server instance, used as the MemWAL shard key for
     /// every server-managed store so each instance owns exactly one shard.
@@ -158,7 +159,7 @@ pub struct AppState {
     /// Durable directory of which datagen stores exist. A separate registry
     /// dataset from [`Self::rollout_registry`] so the two store kinds never
     /// collide on a shared name.
-    pub datagen_registry: RwLock<RolloutRegistry>,
+    pub datagen_registry: Arc<dyn StoreRegistry>,
     /// Bounded LRU of resident generic-store handles, mirroring
     /// [`Self::rollout_stores`].
     pub generic_stores: Mutex<LruCache<String, Arc<RwLock<GenericStore>>>>,
@@ -171,7 +172,7 @@ pub struct AppState {
     /// refactor exists to remove. The cost is that listing stores cannot report
     /// their schemas without opening each dataset, which is why
     /// `GenericStoreInfo::schema` is `None` in list responses.
-    pub generic_registry: RwLock<RolloutRegistry>,
+    pub generic_registry: Arc<dyn StoreRegistry>,
 }
 
 /// Process-wide admission control for the total artifact-blob payload held in
@@ -305,30 +306,51 @@ impl AppState {
     pub async fn new(config: ServerConfig) -> Result<Self, AppError> {
         let instance_id = config.resolved_instance_id();
         let base_uri = config.data_dir.clone();
-        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
-        let registry = RolloutRegistry::open_or_create(&registry_uri, None)
-            .await
-            .map_err(AppError::from_lance)?;
+        let etcd_client = if config.etcd.is_configured()
+            && (matches!(
+                config.registry.registry_backend,
+                lance_context_core::etcd::RegistryBackend::Etcd
+            ) || config.registry.registry_mirror.is_some())
+        {
+            Some(config.etcd.connect().await.map_err(AppError::from_lance)?)
+        } else {
+            None
+        };
+        let etcd = etcd_client.as_ref().map(|c| (c, config.etcd.prefix()));
+        let registry = open_registry(
+            "rollout",
+            &join_uri(&base_uri, "_registry.rollout.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
         let capacity = NonZeroUsize::new(config.rollout_cache_capacity)
             .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap());
         let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
             .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
-        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
-        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None)
-            .await
-            .map_err(AppError::from_lance)?;
-        let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
-        let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
-            .await
-            .map_err(AppError::from_lance)?;
+        let generic_registry = open_registry(
+            "generic",
+            &join_uri(&base_uri, "_registry.generic.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
         config
             .merge_rollout
             .validate()
             .map_err(AppError::InvalidRequest)?;
-        if !config.merge_rollout.owned_targets.is_empty()
-            && config.merge_etcd.etcd_endpoints.is_empty()
-        {
+        if !config.merge_rollout.owned_targets.is_empty() && config.etcd.etcd_endpoints.is_empty() {
             return Err(AppError::InvalidRequest(
                 "owned targets require ETCD_ENDPOINTS".into(),
             ));
@@ -343,7 +365,7 @@ impl AppState {
         }
         Ok(Self {
             merge_executions: crate::merge_execution::Executions::configured(
-                config.merge_etcd.clone(),
+                config.merge_etcd_config(),
                 config.merge_rollout.clone(),
                 config.merge_execution_timeout_secs,
                 config.merge_queue_timeout_secs,
@@ -352,7 +374,7 @@ impl AppState {
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
             rollout_handles: StoreHandles::default(),
-            rollout_registry: RwLock::new(registry),
+            rollout_registry: registry,
             base_uri,
             instance_id,
             rollout_merge_after_generations: config.rollout_merge_after_generations,
@@ -371,10 +393,10 @@ impl AppState {
             rollout_session,
             datagen_stores: Mutex::new(LruCache::new(capacity)),
             datagen_handles: StoreHandles::default(),
-            datagen_registry: RwLock::new(datagen_registry),
+            datagen_registry,
             generic_stores: Mutex::new(LruCache::new(capacity)),
             generic_handles: StoreHandles::default(),
-            generic_registry: RwLock::new(generic_registry),
+            generic_registry,
         })
     }
 
@@ -405,18 +427,31 @@ impl AppState {
         instance_id: Option<String>,
     ) -> Self {
         let base_uri = base_path.to_string_lossy().to_string();
-        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
-        let registry = RolloutRegistry::open_or_create(&registry_uri, None)
-            .await
-            .expect("open test registry");
-        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
-        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None)
-            .await
-            .expect("open test generic registry");
-        let datagen_registry_uri = join_uri(&base_uri, "_registry.datagen.lance");
-        let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
-            .await
-            .expect("open test datagen registry");
+        let lance_only = lance_context_core::etcd::RegistryConfig::default();
+        let registry = open_registry(
+            "rollout",
+            &join_uri(&base_uri, "_registry.rollout.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test registry");
+        let generic_registry = open_registry(
+            "generic",
+            &join_uri(&base_uri, "_registry.generic.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test generic registry");
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test datagen registry");
         Self {
             merge_executions: crate::merge_execution::Executions::new(None, 600),
             stores: RwLock::new(std::collections::HashMap::new()),
@@ -424,7 +459,7 @@ impl AppState {
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
             rollout_handles: StoreHandles::default(),
-            rollout_registry: RwLock::new(registry),
+            rollout_registry: registry,
             base_uri,
             instance_id,
             rollout_merge_after_generations: 0,
@@ -443,12 +478,12 @@ impl AppState {
                 std::num::NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
             generic_handles: StoreHandles::default(),
-            generic_registry: RwLock::new(generic_registry),
+            generic_registry,
             datagen_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
             )),
             datagen_handles: StoreHandles::default(),
-            datagen_registry: RwLock::new(datagen_registry),
+            datagen_registry,
         }
     }
 
@@ -493,8 +528,6 @@ impl AppState {
             )));
         }
         self.rollout_registry
-            .write()
-            .await
             .upsert(name, uri)
             .await
             .map_err(AppError::from_lance)?;
@@ -516,7 +549,7 @@ impl AppState {
         let mut handle = self.rollout_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
-        let mut registry = self.rollout_registry.write().await;
+        let registry = &self.rollout_registry;
         if !registry
             .contains(name)
             .await
@@ -576,8 +609,6 @@ impl AppState {
         // Existence is the registry's job, not the cache's.
         let exists = self
             .rollout_registry
-            .write()
-            .await
             .contains(name)
             .await
             .map_err(AppError::from_lance)?;
@@ -596,7 +627,7 @@ impl AppState {
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
         // Also observe registry removal by another server during the open.
-        let mut registry = self.rollout_registry.write().await;
+        let registry = &self.rollout_registry;
         if !registry
             .contains(name)
             .await
@@ -684,8 +715,6 @@ impl AppState {
             )));
         }
         self.datagen_registry
-            .write()
-            .await
             .upsert(name, uri)
             .await
             .map_err(AppError::from_lance)?;
@@ -704,7 +733,7 @@ impl AppState {
         let mut handle = self.datagen_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
-        let mut registry = self.datagen_registry.write().await;
+        let registry = &self.datagen_registry;
         if !registry
             .contains(name)
             .await
@@ -755,8 +784,6 @@ impl AppState {
 
         let exists = self
             .datagen_registry
-            .write()
-            .await
             .contains(name)
             .await
             .map_err(AppError::from_lance)?;
@@ -773,7 +800,7 @@ impl AppState {
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
         // Also observe registry removal by another server during the open.
-        let mut registry = self.datagen_registry.write().await;
+        let registry = &self.datagen_registry;
         if !registry
             .contains(name)
             .await
@@ -829,8 +856,6 @@ impl AppState {
             )));
         }
         self.generic_registry
-            .write()
-            .await
             .upsert(name, uri)
             .await
             .map_err(AppError::from_lance)?;
@@ -849,7 +874,7 @@ impl AppState {
         let mut handle = self.generic_handles.lock(name).await;
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
-        let mut registry = self.generic_registry.write().await;
+        let registry = &self.generic_registry;
         if !registry
             .contains(name)
             .await
@@ -901,8 +926,6 @@ impl AppState {
 
         let exists = self
             .generic_registry
-            .write()
-            .await
             .contains(name)
             .await
             .map_err(AppError::from_lance)?;
@@ -921,7 +944,7 @@ impl AppState {
             .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
         // Also observe registry removal by another server during the open.
-        let mut registry = self.generic_registry.write().await;
+        let registry = &self.generic_registry;
         if !registry
             .contains(name)
             .await

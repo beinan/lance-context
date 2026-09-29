@@ -29,8 +29,6 @@ pub async fn create_datagen_store(
     let mut handle = state.datagen_handles.lock(&req.name).await;
     if state
         .datagen_registry
-        .write()
-        .await
         .contains(&req.name)
         .await
         .map_err(AppError::from_lance)?
@@ -78,8 +76,6 @@ pub async fn list_datagen_stores(
 ) -> Result<Json<ListDatagenStoresResponse>, AppError> {
     let entries = state
         .datagen_registry
-        .write()
-        .await
         .list()
         .await
         .map_err(AppError::from_lance)?;

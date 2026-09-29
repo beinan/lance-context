@@ -181,35 +181,15 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
-    /// Comma-separated etcd v3 endpoints. Scheduler state (task queue,
-    /// lease-based claims, per-experiment write locks) lives in etcd so several
-    /// stateless master replicas can share one queue. Required.
-    #[arg(long, env = "ETCD_ENDPOINTS", value_delimiter = ',')]
-    pub etcd_endpoints: Vec<String>,
+    /// etcd connection. Scheduler state (task queue, lease-based claims,
+    /// per-experiment write locks) lives in etcd so several stateless master
+    /// replicas can share one queue. `ETCD_ENDPOINTS` is required.
+    #[command(flatten)]
+    pub etcd: lance_context_core::etcd::EtcdConfig,
 
-    /// Namespace for all lance-context master keys in etcd.
-    #[arg(long, env = "ETCD_PREFIX", default_value = "/lance-context/master")]
-    pub etcd_prefix: String,
-
-    /// Optional etcd username. `ETCD_PASSWORD` must also be set.
-    #[arg(long, env = "ETCD_USERNAME")]
-    pub etcd_username: Option<String>,
-
-    /// Optional etcd password. `ETCD_USERNAME` must also be set.
-    #[arg(long, env = "ETCD_PASSWORD")]
-    pub etcd_password: Option<String>,
-
-    /// Optional PEM CA certificate path for etcd TLS.
-    #[arg(long, env = "ETCD_CA_CERT")]
-    pub etcd_ca_cert: Option<String>,
-
-    /// Optional PEM client certificate path for etcd mutual TLS.
-    #[arg(long, env = "ETCD_CLIENT_CERT")]
-    pub etcd_client_cert: Option<String>,
-
-    /// Optional PEM client private-key path for etcd mutual TLS.
-    #[arg(long, env = "ETCD_CLIENT_KEY")]
-    pub etcd_client_key: Option<String>,
+    /// Which backend the store registries (rollout, generic) live in.
+    #[command(flatten)]
+    pub registry: lance_context_core::etcd::RegistryConfig,
 
     /// TTL for etcd task claims and distributed locks. The master renews leases
     /// while work is running; orphaned tasks are requeued after expiry.

@@ -40,8 +40,6 @@ pub async fn create_generic_store(
 
     if state
         .generic_registry
-        .write()
-        .await
         .contains(&req.name)
         .await
         .map_err(AppError::from_lance)?
@@ -95,8 +93,6 @@ pub async fn list_generic_stores(
 ) -> Result<Json<ListGenericStoresResponse>, AppError> {
     let entries = state
         .generic_registry
-        .write()
-        .await
         .list()
         .await
         .map_err(AppError::from_lance)?;

@@ -3,9 +3,10 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lance_context_core::etcd::open_registry;
 use lance_context_core::{
-    join_uri, CompactionConfig, GenericStoreOptions, RolloutRegistry, RolloutStore,
-    RolloutStoreOptions, Session,
+    backfill_registry, join_uri, CompactionConfig, GenericStoreOptions, MirroredRegistry,
+    RolloutStore, RolloutStoreOptions, Session, StoreRegistry,
 };
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -60,7 +61,7 @@ fn build_compaction_config(config: &MasterConfig) -> CompactionConfig {
 /// mutating methods take `&mut self`.
 pub struct MasterState {
     /// Durable directory of which rollout stores exist.
-    pub registry: RwLock<RolloutRegistry>,
+    pub registry: Arc<dyn StoreRegistry>,
     /// Durable directory of which generic stores exist. Same registry format
     /// as rollout (the data plane writes `_registry.generic.lance` with the
     /// same `RolloutRegistry` type); read here so the stats scan and the
@@ -69,7 +70,7 @@ pub struct MasterState {
     /// to commit into one base table and lost to `Too many concurrent writers`
     /// while the master -- whose etcd-locked MergeWal task exists to serialize
     /// exactly that -- never heard of them.
-    pub generic_registry: RwLock<RolloutRegistry>,
+    pub generic_registry: Arc<dyn StoreRegistry>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
     /// Last snapshot written to the stats table, kept in memory so
@@ -136,20 +137,38 @@ impl MasterState {
         let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
         let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
         let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
-        let mut registry = RolloutRegistry::open_or_create(&registry_uri, None).await?;
-        let generic_registry = RolloutRegistry::open_or_create(&generic_registry_uri, None).await?;
-        let backfilled = discovery::backfill_registry(&config.data_dir, &mut registry).await?;
+        let etcd = Some((task_store.etcd_client(), config.etcd.prefix()));
+        let registry = open_registry("rollout", &registry_uri, etcd, &config.registry).await?;
+        let generic_registry =
+            open_registry("generic", &generic_registry_uri, etcd, &config.registry).await?;
+        let backfilled = discovery::backfill_registry(&config.data_dir, &*registry).await?;
         if backfilled > 0 {
             tracing::info!(
                 experiments = backfilled,
                 "backfilled rollout registry from data directory"
             );
         }
+        // With a mirror configured, seed it from the primary so a backend
+        // switch finds every store already there. Repeated on every
+        // maintenance round; this covers the very first start.
+        for (label, reg) in [("rollout", &registry), ("generic", &generic_registry)] {
+            if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
+                match backfill_registry(&*m.primary, &*m.mirror).await {
+                    Ok(copied) if copied > 0 => {
+                        tracing::info!(registry = label, copied, "seeded registry mirror")
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(registry = label, %error, "registry mirror seed failed")
+                    }
+                }
+            }
+        }
         let stats = StatsStore::open_or_create(&stats_uri, None).await?;
         task_store.release_coordination_lock(init_guard).await?;
         let state = Arc::new(Self {
-            registry: RwLock::new(registry),
-            generic_registry: RwLock::new(generic_registry),
+            registry,
+            generic_registry,
             stats: Mutex::new(stats),
             stats_cache: RwLock::new(Arc::new(Vec::new())),
             record_stores: Mutex::new(LruCache::new(
@@ -265,15 +284,14 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
-            etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
-                .map(|value| value.split(',').map(str::to_string).collect())
-                .unwrap_or_default(),
-            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
-            etcd_username: None,
-            etcd_password: None,
-            etcd_ca_cert: None,
-            etcd_client_cert: None,
-            etcd_client_key: None,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
+                    .map(|value| value.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                etcd_prefix: format!("/lance-context/test/{}", generate_id()),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
@@ -315,7 +333,7 @@ mod tests {
         RolloutStore::open(uri.to_str().unwrap()).await.unwrap();
 
         let state = MasterState::new(test_config(&dir)).await.unwrap();
-        let entries = state.registry.write().await.list().await.unwrap();
+        let entries = state.registry.list().await.unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "legacy");

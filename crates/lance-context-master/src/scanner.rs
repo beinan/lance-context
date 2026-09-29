@@ -14,8 +14,8 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use lance_context_core::{
-    CompactionConfig, GenericStore, GenericStoreOptions, RolloutRegistry, RolloutStore,
-    RolloutStoreOptions,
+    CompactionConfig, GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions,
+    StoreRegistry,
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -167,23 +167,27 @@ pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
 async fn maintain_registry(
     state: &Arc<MasterState>,
     label: &'static str,
-    registry: &tokio::sync::RwLock<RolloutRegistry>,
+    registry: &Arc<dyn StoreRegistry>,
 ) -> lance::Result<()> {
+    // etcd-backed registries need no maintenance.
+    let Some(table) = registry.lance_table() else {
+        return Ok(());
+    };
     let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
     let start = std::time::Instant::now();
     let (compaction, cleaner) = {
-        let mut registry = registry.write().await;
-        tokio::time::timeout(MAINTENANCE_TIMEOUT, registry.compact())
+        let mut table = table.lock().await;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, table.compact())
             .await
             .unwrap_or_else(|_| Err(lance::Error::io("registry compaction timed out")))?
     };
     let removal = cleaner.cleanup(ttl).await;
-    let reload = registry.write().await.reload().await;
+    let reload = table.lock().await.reload().await;
     let removal = match (removal, reload) {
         (Ok(removal), Ok(())) => removal,
         (Err(e), _) | (Ok(_), Err(e)) => return Err(e),
     };
-    let version = registry.read().await.version();
+    let version = table.lock().await.version();
     metrics::counter!("master_registry_versions_removed_total", "registry" => label)
         .increment(removal.old_versions);
     metrics::gauge!("master_registry_version", "registry" => label).set(version as f64);
@@ -236,6 +240,20 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
             if let Err(e) = maintain_registry(state, label, registry).await {
                 tracing::warn!(registry = label, error = %e, "registry maintenance failed");
             }
+            if let Some(m) = registry
+                .as_any()
+                .downcast_ref::<lance_context_core::MirroredRegistry>()
+            {
+                match lance_context_core::backfill_registry(&*m.primary, &*m.mirror).await {
+                    Ok(copied) if copied > 0 => {
+                        tracing::info!(registry = label, copied, "healed registry mirror")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(registry = label, error = %e, "registry mirror heal failed")
+                    }
+                }
+            }
         }
     }
     let release = state.task_store.release_coordination_lock(guard).await;
@@ -254,8 +272,6 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // depend on this: the sweep reads nothing but this table.
     let mut entries: Vec<ScanEntry> = state
         .registry
-        .write()
-        .await
         .list()
         .await?
         .into_iter()
@@ -268,8 +284,6 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     entries.extend(
         state
             .generic_registry
-            .write()
-            .await
             .list()
             .await?
             .into_iter()

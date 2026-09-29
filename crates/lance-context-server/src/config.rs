@@ -4,10 +4,6 @@ use clap::Parser;
 #[command(name = "lance-context-server")]
 #[command(about = "REST API server for lance-context")]
 pub struct ServerConfig {
-    /// Connection used lazily by explicitly enabled owned merge targets.
-    #[command(flatten)]
-    pub merge_etcd: lance_context_merge::EtcdConfig,
-
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
 
@@ -211,9 +207,30 @@ pub struct ServerConfig {
     /// default session (the pre-fix, leak-prone behavior).
     #[arg(long, env = "ROLLOUT_CACHE_BYTES", default_value = "2147483648")]
     pub rollout_cache_bytes: usize,
+
+    /// Shared etcd settings for registries and lazily connected owned merges.
+    #[command(flatten)]
+    pub etcd: lance_context_core::etcd::EtcdConfig,
+
+    /// Which backend the store registries (rollout, generic, datagen) live in.
+    #[command(flatten)]
+    pub registry: lance_context_core::etcd::RegistryConfig,
 }
 
 impl ServerConfig {
+    /// Use the same namespace and credentials for lazily connected merge ownership.
+    pub(crate) fn merge_etcd_config(&self) -> lance_context_merge::EtcdConfig {
+        lance_context_merge::EtcdConfig {
+            etcd_endpoints: self.etcd.etcd_endpoints.clone(),
+            etcd_prefix: self.etcd.etcd_prefix.clone(),
+            etcd_username: self.etcd.etcd_username.clone(),
+            etcd_password: self.etcd.etcd_password.clone(),
+            etcd_ca_cert: self.etcd.etcd_ca_cert.clone(),
+            etcd_client_cert: self.etcd.etcd_client_cert.clone(),
+            etcd_client_key: self.etcd.etcd_client_key.clone(),
+        }
+    }
+
     /// Resolve the instance id used for server-managed MemWAL sharding: the
     /// explicit `--instance-id`/`INSTANCE_ID` if provided, otherwise the
     /// `HOSTNAME` environment variable (stable per-pod under a StatefulSet).

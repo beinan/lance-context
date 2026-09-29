@@ -179,8 +179,6 @@ pub async fn create_rollout_store(
     // Existence is tracked durably in the registry, not by cache membership.
     if state
         .rollout_registry
-        .write()
-        .await
         .contains(&req.name)
         .await
         .map_err(AppError::from_lance)?
@@ -236,8 +234,6 @@ pub async fn list_rollout_stores(
     // opening every dataset.
     let entries = state
         .rollout_registry
-        .write()
-        .await
         .list()
         .await
         .map_err(AppError::from_lance)?;
@@ -1067,13 +1063,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(state
-            .rollout_registry
-            .write()
-            .await
-            .contains("rl")
-            .await
-            .unwrap());
+        assert!(state.rollout_registry.contains("rl").await.unwrap());
         std::fs::remove_file(&path).unwrap();
         std::fs::rename(&saved, &path).unwrap();
         assert_eq!(
@@ -1083,13 +1073,7 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(!path.exists());
-        assert!(!state
-            .rollout_registry
-            .write()
-            .await
-            .contains("rl")
-            .await
-            .unwrap());
+        assert!(!state.rollout_registry.contains("rl").await.unwrap());
         let row = rollout_record_from_add_request(&record_with_size("late-write", None));
         assert!(cached.read().await.add(&[row]).await.is_err());
     }
@@ -1359,14 +1343,7 @@ mod tests {
             assert!(matches!(err, AppError::InvalidRequest(_)), "{name}");
         }
         assert!(state.rollout_stores.lock().await.is_empty());
-        assert!(state
-            .rollout_registry
-            .write()
-            .await
-            .list()
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(state.rollout_registry.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

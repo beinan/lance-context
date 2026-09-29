@@ -190,8 +190,6 @@ pub async fn list_experiments(
             let known: HashSet<String> = experiments.iter().map(|e| e.name.clone()).collect();
             let matches: Vec<_> = state
                 .registry
-                .write()
-                .await
                 .list()
                 .await
                 .map_err(MasterError::from_lance)?
@@ -239,8 +237,6 @@ pub async fn get_experiment(
         // side effect, then read it back.
         let entry = state
             .registry
-            .write()
-            .await
             .get(&name)
             .await
             .map_err(MasterError::from_lance)?
@@ -265,8 +261,6 @@ pub async fn get_experiment(
     // registry and observe on demand rather than reporting it as missing.
     let entry = state
         .registry
-        .write()
-        .await
         .get(&name)
         .await
         .map_err(MasterError::from_lance)?
@@ -423,8 +417,6 @@ pub async fn rescan_experiment(
 ) -> Result<Json<ExperimentDetail>, MasterError> {
     let entry = state
         .registry
-        .write()
-        .await
         .get(&name)
         .await
         .map_err(MasterError::from_lance)?
@@ -509,8 +501,6 @@ pub async fn compact_experiment(
     // Only enqueue known experiments.
     let exists = state
         .registry
-        .write()
-        .await
         .contains(&name)
         .await
         .map_err(MasterError::from_lance)?;
@@ -551,8 +541,6 @@ pub async fn enqueue_task(
 ) -> Result<(StatusCode, Json<TaskRecord>), MasterError> {
     let exists = state
         .registry
-        .write()
-        .await
         .contains(&req.target)
         .await
         .map_err(MasterError::from_lance)?;
@@ -596,6 +584,76 @@ pub async fn list_repairs(
         .await
         .map(Json)
         .map_err(MasterError::from_lance)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RegistryParams {
+    /// `rollout` (default) or `generic`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+fn registry_pair<'a>(
+    state: &'a MasterState,
+    kind: Option<&str>,
+) -> Result<(&'a Arc<dyn lance_context_core::StoreRegistry>, &'static str), MasterError> {
+    match kind.unwrap_or("rollout") {
+        "rollout" => Ok((&state.registry, "rollout")),
+        "generic" => Ok((&state.generic_registry, "generic")),
+        other => Err(MasterError::InvalidRequest(format!(
+            "unknown registry kind '{other}' (rollout|generic)"
+        ))),
+    }
+}
+
+/// `GET /api/v1/registry/diff?kind=` — names present in the primary backend
+/// but not the mirror, and vice versa. Empty on both sides means the two
+/// backends agree and a migration step can proceed. 400 when no mirror is
+/// configured, because then there is nothing to compare.
+pub async fn registry_diff(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<RegistryParams>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    let (registry, kind) = registry_pair(&state, params.kind.as_deref())?;
+    let Some(mirrored) = registry
+        .as_any()
+        .downcast_ref::<lance_context_core::MirroredRegistry>()
+    else {
+        return Err(MasterError::InvalidRequest(
+            "REGISTRY_MIRROR is not configured; nothing to diff".to_string(),
+        ));
+    };
+    let (only_primary, only_mirror) =
+        lance_context_core::diff_registries(&*mirrored.primary, &*mirrored.mirror)
+            .await
+            .map_err(MasterError::from_lance)?;
+    Ok(Json(serde_json::json!({
+        "kind": kind,
+        "only_in_primary": only_primary,
+        "only_in_mirror": only_mirror,
+    })))
+}
+
+/// `POST /api/v1/registry/backfill?kind=` — copy every primary entry the
+/// mirror lacks into the mirror. Idempotent. The master also does this on
+/// startup and every maintenance round; this is for forcing it.
+pub async fn registry_backfill(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<RegistryParams>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    let (registry, kind) = registry_pair(&state, params.kind.as_deref())?;
+    let Some(mirrored) = registry
+        .as_any()
+        .downcast_ref::<lance_context_core::MirroredRegistry>()
+    else {
+        return Err(MasterError::InvalidRequest(
+            "REGISTRY_MIRROR is not configured; nothing to backfill".to_string(),
+        ));
+    };
+    let copied = lance_context_core::backfill_registry(&*mirrored.primary, &*mirrored.mirror)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(serde_json::json!({ "kind": kind, "copied": copied })))
 }
 
 /// `GET /api/v1/tasks` — paginated tasks (queue + recent history), newest first.
@@ -653,6 +711,8 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/tasks", post(enqueue_task).get(list_tasks))
         .route("/scheduler/cooldowns", get(list_cooldowns))
         .route("/scheduler/repairs", get(list_repairs))
+        .route("/registry/diff", get(registry_diff))
+        .route("/registry/backfill", post(registry_backfill))
         .route("/tasks/{id}", get(get_task))
         .route("/rescan", post(rescan))
 }
@@ -663,8 +723,6 @@ async fn open_registered_store(
 ) -> Result<Arc<RwLock<RolloutStore>>, MasterError> {
     let entry = state
         .registry
-        .write()
-        .await
         .get(name)
         .await
         .map_err(MasterError::from_lance)?
@@ -740,13 +798,12 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
-            etcd_endpoints: test_etcd_endpoints(),
-            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
-            etcd_username: None,
-            etcd_password: None,
-            etcd_ca_cert: None,
-            etcd_client_cert: None,
-            etcd_client_key: None,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: test_etcd_endpoints(),
+                etcd_prefix: format!("/lance-context/test/{}", generate_id()),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
@@ -818,13 +875,7 @@ mod tests {
             let uri = state.rollout_uri(&name);
             // Creating the store materializes an (empty) base table on disk.
             RolloutStore::open(&uri).await.unwrap();
-            state
-                .registry
-                .write()
-                .await
-                .upsert(&name, &uri)
-                .await
-                .unwrap();
+            state.registry.upsert(&name, &uri).await.unwrap();
         }
 
         let scanned = scanner::scan_once(&state).await.unwrap();
@@ -877,13 +928,7 @@ mod tests {
             let name = format!("exp-{i}");
             let uri = state.rollout_uri(&name);
             RolloutStore::open(&uri).await.unwrap();
-            state
-                .registry
-                .write()
-                .await
-                .upsert(&name, &uri)
-                .await
-                .unwrap();
+            state.registry.upsert(&name, &uri).await.unwrap();
         }
         // Populates both the stats table and the in-memory cache.
         scanner::scan_once(&state).await.unwrap();
@@ -975,18 +1020,12 @@ mod tests {
         let name = "gone";
         let uri = state.rollout_uri(name);
         RolloutStore::open(&uri).await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         scanner::scan_once(&state).await.unwrap();
         assert!(state.stats.lock().await.get(name).await.unwrap().is_some());
 
         // Remove from registry -> next scan drops the stats row.
-        state.registry.write().await.remove(name).await.unwrap();
+        state.registry.remove(name).await.unwrap();
         scanner::scan_once(&state).await.unwrap();
         assert!(state.stats.lock().await.get(name).await.unwrap().is_none());
     }
@@ -1015,13 +1054,7 @@ mod tests {
         let name = "behind";
         let uri = state.rollout_uri(name);
         let store = RolloutStore::open(&uri).await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         scanner::scan_once(&state).await.unwrap();
         let before = state.stats.lock().await.get(name).await.unwrap().unwrap();
         assert_eq!(before.pending_wal_generations, 0);
@@ -1051,13 +1084,7 @@ mod tests {
         for name in ["target", "other"] {
             let uri = state.rollout_uri(name);
             RolloutStore::open(&uri).await.unwrap();
-            state
-                .registry
-                .write()
-                .await
-                .upsert(name, &uri)
-                .await
-                .unwrap();
+            state.registry.upsert(name, &uri).await.unwrap();
         }
 
         let Json(detail) = get_experiment(
@@ -1105,13 +1132,7 @@ mod tests {
         // the memtable is sealed into a committed WAL generation. Flush rather
         // than relaxing the assertions below.
         store.flush().await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert("records", &uri)
-            .await
-            .unwrap();
+        state.registry.upsert("records", &uri).await.unwrap();
 
         let Json(page) = list_experiment_records(
             State(state.clone()),
@@ -1180,13 +1201,7 @@ mod tests {
         // the memtable is sealed into a committed WAL generation. Flush rather
         // than relaxing the assertions below.
         store.flush().await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert("records", &uri)
-            .await
-            .unwrap();
+        state.registry.upsert("records", &uri).await.unwrap();
 
         // A valid SELECT returns rows over the merged view.
         let Json(result) = query_experiment_sql(
@@ -1258,13 +1273,7 @@ mod tests {
         // See the note in `records_endpoint_...`: rows are only visible to the
         // handle the endpoint opens after the memtable is sealed.
         store.flush().await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert("blobs", &uri)
-            .await
-            .unwrap();
+        state.registry.upsert("blobs", &uri).await.unwrap();
 
         let response = download_experiment_blob(
             State(state.clone()),

@@ -1,7 +1,7 @@
 //! Startup discovery for rollout datasets created before the registry existed.
 
 use lance::io::ObjectStore;
-use lance_context_core::{join_uri, RolloutRegistry};
+use lance_context_core::{join_uri, StoreRegistry};
 
 const ROLLOUT_SUFFIX: &str = ".rollout.lance";
 
@@ -9,7 +9,7 @@ const ROLLOUT_SUFFIX: &str = ".rollout.lance";
 /// registry rows in one batch. Returns the number of rows inserted.
 pub async fn backfill_registry(
     data_dir: &str,
-    registry: &mut RolloutRegistry,
+    registry: &dyn StoreRegistry,
 ) -> lance::Result<usize> {
     let (store, base_path) = ObjectStore::from_uri(data_dir).await?;
     let mut children = store.read_dir(base_path).await?;
@@ -32,6 +32,7 @@ pub async fn backfill_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_context_core::RolloutRegistry;
     use lance_context_core::RolloutStore;
     use tempfile::TempDir;
 
@@ -54,22 +55,24 @@ mod tests {
             .unwrap();
 
         let registry_uri = dir.path().join("_registry.rollout.lance");
-        let mut registry = RolloutRegistry::open_or_create(registry_uri.to_str().unwrap(), None)
-            .await
-            .unwrap();
+        let registry = lance_context_core::LanceRegistry::new(
+            RolloutRegistry::open_or_create(registry_uri.to_str().unwrap(), None)
+                .await
+                .unwrap(),
+        );
         registry
             .upsert("existing", existing_uri.to_str().unwrap())
             .await
             .unwrap();
 
         assert_eq!(
-            backfill_registry(dir.path().to_str().unwrap(), &mut registry)
+            backfill_registry(dir.path().to_str().unwrap(), &registry)
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
-            backfill_registry(dir.path().to_str().unwrap(), &mut registry)
+            backfill_registry(dir.path().to_str().unwrap(), &registry)
                 .await
                 .unwrap(),
             0

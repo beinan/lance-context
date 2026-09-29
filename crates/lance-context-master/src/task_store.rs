@@ -12,10 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use etcd_client::{
-    Certificate, Client, Compare, CompareOp, ConnectOptions, GetOptions, Identity, PutOptions,
-    TlsOptions, Txn, TxnOp,
-};
+use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use lance_context_api::{RepairRecord, TaskCooldown, TaskKind, TaskRecord, TaskState};
 use lance_context_core::generate_id;
 use tokio::sync::oneshot;
@@ -224,6 +221,12 @@ impl TaskStore {
                 && value["version"] == version as u64
                 && value["options"] == options,
         )
+    }
+
+    /// The underlying etcd client, for other etcd-backed components (the
+    /// store registries) that should share one connection.
+    pub fn etcd_client(&self) -> &Client {
+        &self.inner.client
     }
 
     pub async fn open(config: &MasterConfig) -> lance::Result<Self> {
@@ -478,7 +481,7 @@ fn prunable_terminal_ids(
 
 impl EtcdTaskStore {
     async fn connect(config: &MasterConfig) -> lance::Result<Self> {
-        if config.etcd_endpoints.is_empty() {
+        if !config.etcd.is_configured() {
             return Err(lance::Error::io(
                 "ETCD_ENDPOINTS is required to run the master",
             ));
@@ -486,56 +489,10 @@ impl EtcdTaskStore {
         if config.etcd_lease_ttl_secs < 5 {
             return Err(lance::Error::io("ETCD_LEASE_TTL_SECS must be at least 5"));
         }
-        let mut options = ConnectOptions::new()
-            .with_connect_timeout(Duration::from_secs(5))
-            .with_timeout(Duration::from_secs(10))
-            .with_keep_alive(Duration::from_secs(10), Duration::from_secs(3))
-            .with_require_leader(true);
-        match (&config.etcd_username, &config.etcd_password) {
-            (Some(username), Some(password)) => {
-                options = options.with_user(username, password);
-            }
-            (None, None) => {}
-            _ => {
-                return Err(lance::Error::io(
-                    "ETCD_USERNAME and ETCD_PASSWORD must be configured together",
-                ))
-            }
-        }
-        if let Some(path) = &config.etcd_ca_cert {
-            let pem = std::fs::read(path).map_err(|err| {
-                lance::Error::io(format!("failed to read ETCD_CA_CERT '{path}': {err}"))
-            })?;
-            let mut tls = TlsOptions::new().ca_certificate(Certificate::from_pem(pem));
-            match (&config.etcd_client_cert, &config.etcd_client_key) {
-                (Some(cert), Some(key)) => {
-                    let cert_pem = std::fs::read(cert).map_err(|err| {
-                        lance::Error::io(format!("failed to read ETCD_CLIENT_CERT '{cert}': {err}"))
-                    })?;
-                    let key_pem = std::fs::read(key).map_err(|err| {
-                        lance::Error::io(format!("failed to read ETCD_CLIENT_KEY '{key}': {err}"))
-                    })?;
-                    tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(lance::Error::io(
-                        "ETCD_CLIENT_CERT and ETCD_CLIENT_KEY must be configured together",
-                    ))
-                }
-            }
-            options = options.with_tls(tls);
-        } else if config.etcd_client_cert.is_some() || config.etcd_client_key.is_some() {
-            return Err(lance::Error::io(
-                "ETCD_CA_CERT is required when configuring an etcd client certificate",
-            ));
-        }
-        let client = Client::connect(config.etcd_endpoints.clone(), Some(options))
-            .await
-            .map_err(etcd_error("connect to etcd"))?;
+        let client = config.etcd.connect().await?;
         Ok(Self {
             client,
-            prefix: config.etcd_prefix.trim_end_matches('/').to_string(),
+            prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
         })
     }
@@ -1541,13 +1498,12 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
-            etcd_endpoints: vec![],
-            etcd_prefix: "/test".to_string(),
-            etcd_username: None,
-            etcd_password: None,
-            etcd_ca_cert: None,
-            etcd_client_cert: None,
-            etcd_client_key: None,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: vec![],
+                etcd_prefix: "/test".to_string(),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
             etcd_lease_ttl_secs: 30,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
@@ -1563,12 +1519,12 @@ mod tests {
     async fn merge_serializes_other_writers_and_survives_claim_loss() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
             .unwrap()
             .split(',')
             .map(str::to_string)
             .collect();
-        cfg.etcd_prefix = format!("/merge-lock-test/{}", generate_id());
+        cfg.etcd.etcd_prefix = format!("/merge-lock-test/{}", generate_id());
         let store = TaskStore::open(&cfg).await.unwrap();
         store
             .enqueue(TaskKind::MergeWal, "shared", Vec::new())
@@ -1697,7 +1653,7 @@ mod tests {
             .client
             .clone()
             .delete(
-                cfg.etcd_prefix,
+                cfg.etcd.etcd_prefix,
                 Some(etcd_client::DeleteOptions::new().with_prefix()),
             )
             .await
@@ -1792,8 +1748,8 @@ mod tests {
             .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
-        cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.etcd.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
+        cfg.etcd.etcd_prefix = format!("/lance-context/test/{}", generate_id());
         cfg.task_cooldown_after_failures = 100; // stay below threshold; count only
 
         let store = TaskStore::open(&cfg).await.unwrap();
@@ -1829,8 +1785,8 @@ mod tests {
             .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
-        cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.etcd.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
+        cfg.etcd.etcd_prefix = format!("/lance-context/test/{}", generate_id());
         cfg.etcd_lease_ttl_secs = 5;
 
         let first = TaskStore::open(&cfg).await.unwrap();
@@ -1915,10 +1871,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut client = Client::connect(cfg.etcd_endpoints, None).await.unwrap();
+        let mut client = Client::connect(cfg.etcd.etcd_endpoints, None)
+            .await
+            .unwrap();
         client
             .delete(
-                cfg.etcd_prefix,
+                cfg.etcd.etcd_prefix,
                 Some(etcd_client::DeleteOptions::new().with_prefix()),
             )
             .await
@@ -1939,8 +1897,8 @@ mod tests {
             .expect("ETCD_TEST_ENDPOINTS must point to a test etcd");
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
-        cfg.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.etcd.etcd_endpoints = endpoint.split(',').map(str::to_string).collect();
+        cfg.etcd.etcd_prefix = format!("/lance-context/test/{}", generate_id());
         cfg.etcd_lease_ttl_secs = 5;
 
         let store = TaskStore::open(&cfg).await.unwrap();
@@ -1997,10 +1955,12 @@ mod tests {
         assert_eq!(merge.task.kind, TaskKind::MergeWal);
         store.finish(merge, Ok("done".to_string())).await.unwrap();
 
-        let mut client = Client::connect(cfg.etcd_endpoints, None).await.unwrap();
+        let mut client = Client::connect(cfg.etcd.etcd_endpoints, None)
+            .await
+            .unwrap();
         client
             .delete(
-                cfg.etcd_prefix,
+                cfg.etcd.etcd_prefix,
                 Some(etcd_client::DeleteOptions::new().with_prefix()),
             )
             .await

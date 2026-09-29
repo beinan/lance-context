@@ -5,6 +5,7 @@ mod api_impl;
 mod context;
 mod datagen;
 mod datagen_store;
+pub mod etcd;
 mod eval;
 mod export;
 pub mod generic_codec;
@@ -16,6 +17,7 @@ pub mod metrics;
 mod namespace;
 mod record;
 mod registry;
+mod registry_etcd;
 mod rollout;
 mod rollout_store;
 pub mod serde;
@@ -64,7 +66,11 @@ pub use record::{
     RetrieveResult, SearchResult, StateMetadata, UpdateResult, UpsertResult, LIFECYCLE_ACTIVE,
     LIFECYCLE_CONTRADICTED,
 };
-pub use registry::{RegistryEntry, RolloutRegistry};
+pub use registry::{
+    backfill_registry, diff_registries, LanceRegistry, MirroredRegistry, RegistryEntry,
+    RolloutRegistry, StoreRegistry,
+};
+pub use registry_etcd::EtcdRegistry;
 pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};
 pub use rollout_store::{
     rollout_schema, ListSource, PreparedMerge, RolloutFilters, RolloutObservation, RolloutPage,
