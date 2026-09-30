@@ -1068,12 +1068,22 @@ mod tests {
         assert_eq!(status.state, TaskState::Done, "got {status:?}");
         assert_eq!(status.detail.as_deref(), Some("built btree index on id"));
 
-        // A second compaction with nothing to rewrite does not enqueue another.
-        let again = enqueue(&state, TaskKind::Compact, name).await.unwrap();
-        assert_eq!(
-            await_terminal(&state, &again.id).await.state,
-            TaskState::Done
-        );
+        // Compact until nothing is left to rewrite. The first merge built the
+        // id BTree over the first fragment, and Lance compacts indexed and
+        // unindexed fragments in separate groups, so reaching one fragment
+        // can take more than one pass. Only passes that rewrote fragments
+        // enqueue an IndexId; the final no-op pass must not.
+        let mut rewriting_compactions = 1;
+        loop {
+            let again = enqueue(&state, TaskKind::Compact, name).await.unwrap();
+            let status = await_terminal(&state, &again.id).await;
+            assert_eq!(status.state, TaskState::Done, "got {status:?}");
+            if status.detail.as_deref() == Some("removed 0 / added 0 fragments") {
+                break;
+            }
+            rewriting_compactions += 1;
+            assert!(rewriting_compactions <= 4, "compaction never converged");
+        }
         let indexes = state
             .task_store
             .list()
@@ -1082,7 +1092,7 @@ mod tests {
             .into_iter()
             .filter(|task| task.kind == TaskKind::IndexId)
             .count();
-        assert_eq!(indexes, 1);
+        assert_eq!(indexes, rewriting_compactions);
 
         worker.abort();
     }
