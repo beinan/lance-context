@@ -4066,6 +4066,37 @@ mod tests {
         });
     }
 
+    /// A merge into a base table that has rows but no id BTree builds the
+    /// BTree first: without it the delete-only `merge_insert` is a hash
+    /// join over the whole base table. The very first merge (empty base)
+    /// has nothing to join and builds nothing.
+    #[test]
+    fn merge_builds_the_id_btree_when_the_base_has_rows_but_no_index() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.base.dataset.count_fragments(), 1);
+            assert!(
+                !store.has_id_btree_index().await.unwrap(),
+                "empty base: nothing to index"
+            );
+
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert!(
+                store.has_id_btree_index().await.unwrap(),
+                "second merge joins against a populated base and builds the BTree first"
+            );
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
     /// The WAL merge is a delete-only `merge_insert` on the key followed by
     /// an append: an upsert would take the matched target rows with every
     /// column (multi-megabyte inline blobs included) to rewrite them.

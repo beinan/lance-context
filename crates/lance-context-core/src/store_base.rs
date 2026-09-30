@@ -1226,6 +1226,15 @@ impl StorageBase {
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
     ) -> LanceResult<()> {
+        // Without an exact-answer key index the delete-only merge_insert is
+        // a hash join over the whole base table. On a 174 GB / 67k-row store
+        // that no master had ever indexed, that join OOMKilled every worker
+        // that tried to merge it; building the BTree first took 19 s. The
+        // master builds it before fan-out (#277), but a worker's own timer
+        // or a manual merge must not depend on the master having been here.
+        if self.dataset.count_fragments() > 0 && !self.has_key_btree_index().await? {
+            self.create_key_btree_index().await?;
+        }
         let key_index = merge_schema.index_of(&self.key_column)?;
         let key_schema = Arc::new(merge_schema.project(&[key_index])?);
         let keys = batches
