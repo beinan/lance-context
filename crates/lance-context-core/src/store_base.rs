@@ -1233,6 +1233,11 @@ impl StorageBase {
         // master builds it before fan-out (#277), but a worker's own timer
         // or a manual merge must not depend on the master having been here.
         if self.dataset.count_fragments() > 0 && !self.has_key_btree_index().await? {
+            metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
+            info!(
+                uri = %self.dataset.uri(),
+                "base table has no key BTree; building it before the merge"
+            );
             self.create_key_btree_index().await?;
         }
         let key_index = merge_schema.index_of(&self.key_column)?;
@@ -1747,7 +1752,7 @@ impl StorageBase {
                         // the only cure is the merge that is already behind.
                         // Fail the read fast so the caller retries after the
                         // merge instead of taking the worker down with it.
-                        metrics::counter!("rollout_reads_refused_pending_total").increment(1);
+                        note_read_refused(&uri);
                         return Err(LanceError::io(format!(
                             "{PENDING_GENERATIONS_EXCEEDED}: shard {shard_id} has {pending} \
                              flushed generations pending merge (cap {max_at}); retry after \
@@ -1791,7 +1796,7 @@ impl StorageBase {
             .map(|snapshot| snapshot.flushed_generations.len())
             .sum();
         if max_at != 0 && total > max_at {
-            metrics::counter!("rollout_reads_refused_pending_total").increment(1);
+            note_read_refused(self.dataset.uri());
             return Err(LanceError::io(format!(
                 "{PENDING_GENERATIONS_EXCEEDED}: {total} flushed generations pending merge \
                  across {} shards (cap {max_at}); retry after the merge catches up",
@@ -2196,6 +2201,21 @@ pub(crate) fn align_batch_to_schema(
         .collect::<LanceResult<Vec<_>>>()?;
 
     Ok(RecordBatch::try_new(target_schema, columns)?)
+}
+
+/// A read refused because the store's WAL backlog is over the cap. Labeled by
+/// store so the fleet can see *which* store is unreadable, not just that one
+/// is: a single store answered 503 for five hours today before anyone
+/// noticed. The label is the dataset directory name, bounded by the number
+/// of stores a worker touches.
+fn note_read_refused(uri: &str) {
+    let store = uri
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("unknown")
+        .to_string();
+    metrics::counter!("rollout_reads_refused_pending_total", "store" => store).increment(1);
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
