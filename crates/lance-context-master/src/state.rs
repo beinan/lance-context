@@ -191,6 +191,9 @@ impl MasterState {
     pub(crate) fn rollout_store_options(&self) -> RolloutStoreOptions {
         RolloutStoreOptions {
             session: self.rollout_session.clone(),
+            // The master observes and merges shards *because* they are behind;
+            // the worker-side read cap must never hide those from it.
+            pending_generations_max: Some(0),
             ..Default::default()
         }
     }

@@ -39,6 +39,7 @@ impl DatagenStore {
             merge_max_generations: None,
             merge_max_bytes: None,
             pending_generations_warn: None,
+            pending_generations_max: None,
             merge_budget: None,
             cleanup_interval_secs: None,
         };

@@ -11,7 +11,7 @@ use lance_context_core::{
     RolloutStore, RolloutStoreOptions, Session,
 };
 use lru::LruCache;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::config::ServerConfig;
@@ -123,9 +123,12 @@ pub struct AppState {
     pub rollout_merge_max_bytes: usize,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pub rollout_wal_pending_warn_generations: usize,
+    pub rollout_wal_pending_max_generations: usize,
     /// Process-wide merge memory budget shared by every store; `None` when
     /// disabled. See `lance_context_core::merge_budget`.
     pub merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Worker-wide cap on concurrent merge-wal requests; `None` when disabled.
+    pub merge_slots: Option<Arc<Semaphore>>,
     /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
     /// global sweeper. See [`Self::spawn_global_sweeper`].
     pub rollout_cleanup_interval_secs: u64,
@@ -285,6 +288,17 @@ fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
 }
 
 impl AppState {
+    /// Wait for a merge slot (see `ServerConfig::rollout_merge_concurrency`).
+    pub async fn acquire_merge_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let slots = self.merge_slots.as_ref()?;
+        let wait = std::time::Instant::now();
+        // Only fails if the semaphore is closed, which we never do.
+        let permit = Arc::clone(slots).acquire_owned().await.ok()?;
+        metrics::histogram!("rollout_wal_merge_slot_wait_seconds")
+            .record(wait.elapsed().as_secs_f64());
+        Some(permit)
+    }
+
     /// Build the shared server state, opening (or creating) the rollout registry
     /// under `data_dir`. Async because opening the registry touches storage.
     pub async fn new(config: ServerConfig) -> Result<Self, AppError> {
@@ -318,8 +332,11 @@ impl AppState {
             rollout_merge_max_generations: config.rollout_merge_max_generations,
             rollout_merge_max_bytes: config.rollout_merge_max_bytes,
             rollout_wal_pending_warn_generations: config.rollout_wal_pending_warn_generations,
+            rollout_wal_pending_max_generations: config.rollout_wal_pending_max_generations,
             merge_budget: (config.rollout_merge_memory_bytes > 0)
                 .then(|| MergeMemoryBudget::new(config.rollout_merge_memory_bytes)),
+            merge_slots: (config.rollout_merge_concurrency > 0)
+                .then(|| Arc::new(Semaphore::new(config.rollout_merge_concurrency))),
             rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
             rollout_flush_interval_secs: config.rollout_flush_interval_secs,
             blob_budget,
@@ -386,7 +403,9 @@ impl AppState {
             rollout_merge_max_generations: 8,
             rollout_merge_max_bytes: 1024 * 1024 * 1024,
             rollout_wal_pending_warn_generations: 256,
+            rollout_wal_pending_max_generations: 0,
             merge_budget: None,
+            merge_slots: None,
             rollout_cleanup_interval_secs: 0,
             rollout_flush_interval_secs: 0,
             blob_budget: None,
@@ -423,6 +442,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),
             session: self.rollout_session.clone(),
         }
@@ -613,6 +633,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),
             cleanup_interval_secs: None,
         }
@@ -757,6 +778,7 @@ impl AppState {
             merge_max_generations: Some(self.rollout_merge_max_generations),
             merge_max_bytes: Some(self.rollout_merge_max_bytes),
             pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
             merge_budget: self.merge_budget.clone(),
             session: self.rollout_session.clone(),
             seal_on_add,

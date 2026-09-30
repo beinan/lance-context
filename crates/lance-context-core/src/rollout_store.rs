@@ -389,6 +389,8 @@ pub struct RolloutStoreOptions {
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
     /// histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// See `StorageBaseOptions::pending_generations_max`.
+    pub pending_generations_max: Option<usize>,
     /// Process-wide byte budget shared by every merge this process runs; a
     /// merge that cannot fit waits for another to release. `None` disables
     /// the bound. See [`crate::merge_budget`] for the design.
@@ -480,6 +482,7 @@ impl RolloutStore {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            pending_generations_max,
             merge_budget,
             session,
         } = options;
@@ -492,6 +495,7 @@ impl RolloutStore {
                 merge_max_generations,
                 merge_max_bytes,
                 pending_generations_warn,
+                pending_generations_max,
                 merge_budget,
                 session,
                 schema: Arc::new(rollout_schema()),
@@ -705,6 +709,11 @@ impl RolloutStore {
     /// See `StorageBase::create_key_btree_index`.
     pub async fn create_id_btree_index(&mut self) -> LanceResult<()> {
         self.base.create_key_btree_index().await
+    }
+
+    /// See `StorageBase::extend_key_btree_index`.
+    pub async fn extend_id_btree_index(&mut self) -> LanceResult<usize> {
+        self.base.extend_key_btree_index().await
     }
 
     /// See `StorageBase::has_key_btree_index`.
@@ -2525,6 +2534,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                     session: None,
                     schema: legacy_schema.clone(),
@@ -2846,6 +2856,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -2892,6 +2903,7 @@ mod tests {
                 merge_max_generations: None,
                 merge_max_bytes: None,
                 pending_generations_warn: None,
+                pending_generations_max: None,
                 merge_budget: None,
             };
 
@@ -2943,6 +2955,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -2996,6 +3009,7 @@ mod tests {
                 merge_max_generations: None,
                 merge_max_bytes: None,
                 pending_generations_warn: None,
+                pending_generations_max: None,
                 merge_budget: None,
             };
 
@@ -3219,6 +3233,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                     ..Default::default()
                 },
@@ -3283,6 +3298,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                     ..Default::default()
                 },
@@ -3385,6 +3401,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3445,6 +3462,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3486,6 +3504,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3623,6 +3642,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3711,6 +3731,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3799,6 +3820,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3848,6 +3870,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3919,6 +3942,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -3958,6 +3982,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -4018,6 +4043,7 @@ mod tests {
                         merge_max_generations: None,
                         merge_max_bytes: None,
                         pending_generations_warn: None,
+                        pending_generations_max: None,
                         merge_budget: None,
                     },
                 )
@@ -4061,6 +4087,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -4269,6 +4296,107 @@ mod tests {
             store.flush().await.unwrap();
             store.cleanup_own_shard().await.unwrap();
             assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    /// Every merge appends fragments the id BTree does not cover, and
+    /// `merge_insert` full-scans exactly those. `extend_id_btree_index`
+    /// appends an index delta over them; a fully covered table is a no-op
+    /// and a table without the BTree is left alone.
+    #[test]
+    fn extend_id_btree_index_covers_fragments_added_since_build() {
+        use lance::index::DatasetIndexInternalExt as _;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            // No BTree yet: nothing to extend.
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            store.create_id_btree_index().await.unwrap();
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            // Two merges land two fragments the index knows nothing about.
+            for id in ["a-1", "a-2"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let unindexed = |s: &RolloutStore| {
+                let dataset = s.base.dataset.clone();
+                async move {
+                    dataset
+                        .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                        .await
+                        .unwrap()
+                        .len()
+                }
+            };
+            assert_eq!(unindexed(&store).await, 2);
+
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 2);
+            assert_eq!(unindexed(&store).await, 0);
+            assert!(store.has_id_btree_index().await.unwrap());
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            // Rows are still merged correctly through the extended index.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+        });
+    }
+
+    /// Reads open every flushed generation pending merge. Past the cap the
+    /// read is refused with a recognizable error (the server maps it to 503)
+    /// instead of holding a worker's memory hostage; at the cap it passes.
+    #[test]
+    fn reads_are_refused_past_the_pending_generation_cap() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    pending_generations_warn: None,
+                    pending_generations_max: Some(2),
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            for id in ["a-0", "a-1"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+            }
+            // At the cap: still readable.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+
+            store.add(&[assistant_record("a-2")]).await.unwrap();
+            store.flush().await.unwrap();
+            let err = store.list(None, None).await.expect_err("over the cap");
+            assert!(
+                crate::store_base::is_pending_generations_exceeded(&err),
+                "{err}"
+            );
+            assert!(err.to_string().contains("3 flushed generations"), "{err}");
+
+            // The merge drains the backlog and reads resume.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 3);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
         });
     }
 
@@ -4638,6 +4766,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                     ..Default::default()
                 },
@@ -4738,6 +4867,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )
@@ -4772,6 +4902,7 @@ mod tests {
                     merge_max_generations: None,
                     merge_max_bytes: None,
                     pending_generations_warn: None,
+                    pending_generations_max: None,
                     merge_budget: None,
                 },
             )

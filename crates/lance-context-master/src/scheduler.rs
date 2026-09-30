@@ -396,6 +396,23 @@ async fn ensure_id_btree_index(state: &Arc<MasterState>, name: &str) -> Result<(
         .await
         .map_err(|e| e.to_string())?
     {
+        // The BTree exists but every merge and compaction since it was built
+        // added fragments it does not cover, and `merge_insert` full-scans
+        // those. Append an index delta over them so the probe stays a probe.
+        let started = std::time::Instant::now();
+        let covered = store
+            .extend_id_btree_index()
+            .await
+            .map_err(|e| format!("extending id index before merge: {e}"))?;
+        if covered > 0 {
+            metrics::counter!("master_merge_wal_index_extended_total").increment(1);
+            tracing::info!(
+                target = %name,
+                fragments = covered,
+                elapsed_secs = started.elapsed().as_secs(),
+                "extended id BTree index over fragments added since it was built"
+            );
+        }
         return Ok(());
     }
     let started = std::time::Instant::now();

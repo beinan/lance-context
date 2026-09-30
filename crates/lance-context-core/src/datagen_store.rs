@@ -65,6 +65,8 @@ pub struct DatagenStoreOptions {
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
     /// histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// See `StorageBaseOptions::pending_generations_max`.
+    pub pending_generations_max: Option<usize>,
     /// Process-wide byte budget shared by every merge this process runs; a
     /// merge that cannot fit waits for another to release. `None` disables
     /// the bound. See [`crate::merge_budget`] for the design.
@@ -114,6 +116,7 @@ impl DatagenStore {
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
                 pending_generations_warn: options.pending_generations_warn,
+                pending_generations_max: options.pending_generations_max,
                 merge_budget: options.merge_budget.clone(),
                 session: None,
                 schema: Arc::new(datagen_log_schema()),

@@ -60,6 +60,7 @@ pub async fn create_generic_store(
         merge_max_generations: Some(state.rollout_merge_max_generations),
         merge_max_bytes: Some(state.rollout_merge_max_bytes),
         pending_generations_warn: Some(state.rollout_wal_pending_warn_generations),
+        pending_generations_max: Some(state.rollout_wal_pending_max_generations),
         merge_budget: state.merge_budget.clone(),
         session: None,
         seal_on_add: req.seal_on_add,
@@ -272,6 +273,7 @@ pub async fn merge_generic_wal(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let _slot = state.acquire_merge_slot().await;
     let store = state.get_or_open_generic_store(&name).await?;
     // Same prepare/commit split as the sweeper: the object-storage read of the
     // generations runs under the shared lock so the store keeps serving.

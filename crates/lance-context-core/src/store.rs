@@ -329,6 +329,8 @@ pub struct ContextStoreOptions {
     /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
     /// histogram is emitted regardless.
     pub pending_generations_warn: Option<usize>,
+    /// Refuse reads once more than this many flushed generations are pending merge.
+    pub pending_generations_max: Option<usize>,
     /// Process-wide byte budget shared by every merge this process runs; a
     /// merge that cannot fit waits for another to release. `None` disables
     /// the bound. See [`crate::merge_budget`] for the design.
@@ -365,6 +367,7 @@ impl Default for ContextStoreOptions {
             merge_max_generations: None,
             merge_max_bytes: None,
             pending_generations_warn: None,
+            pending_generations_max: None,
             merge_budget: None,
             // Read-your-write by default; see the field docs.
             seal_on_add: true,
@@ -648,6 +651,7 @@ impl ContextStore {
                 merge_max_generations: options.merge_max_generations,
                 merge_max_bytes: options.merge_max_bytes,
                 pending_generations_warn: options.pending_generations_warn,
+                pending_generations_max: options.pending_generations_max,
                 merge_budget: options.merge_budget.clone(),
                 session: None,
                 schema: Arc::new(arrow_schema.clone()),
@@ -2273,6 +2277,7 @@ impl ContextStore {
             merge_max_generations: None,
             merge_max_bytes: None,
             pending_generations_warn: None,
+            pending_generations_max: None,
             merge_budget: None,
             // A compactor never appends, so the seal mode is irrelevant to it;
             // deferring keeps it from ever emitting a generation.

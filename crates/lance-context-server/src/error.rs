@@ -30,6 +30,9 @@ impl AppError {
         // Checked before the typed match: the compaction-in-progress signal is an
         // Arrow-wrapped error with no dedicated variant, so only its text
         // distinguishes it.
+        if lance_context_core::is_pending_generations_exceeded(&err) {
+            return AppError::Overloaded(err.to_string());
+        }
         if err.to_string().contains("already in progress") {
             return AppError::CompactionInProgress;
         }
@@ -107,6 +110,15 @@ mod tests {
             AppError::from_lance(LanceError::io("disk gone".to_string())),
             AppError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn pending_generation_cap_is_overloaded() {
+        let err = LanceError::io(format!(
+            "{}: shard rollout-0 has 5000 flushed generations pending merge (cap 4096)",
+            lance_context_core::PENDING_GENERATIONS_EXCEEDED
+        ));
+        assert!(matches!(AppError::from_lance(err), AppError::Overloaded(_)));
     }
 
     #[test]

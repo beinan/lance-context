@@ -200,6 +200,7 @@ pub async fn create_rollout_store(
         merge_max_generations: Some(state.rollout_merge_max_generations),
         merge_max_bytes: Some(state.rollout_merge_max_bytes),
         pending_generations_warn: Some(state.rollout_wal_pending_warn_generations),
+        pending_generations_max: Some(state.rollout_wal_pending_max_generations),
         merge_budget: state.merge_budget.clone(),
         session: state.rollout_session.clone(),
     };
@@ -727,6 +728,7 @@ pub async fn merge_wal(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
+    let _slot = state.acquire_merge_slot().await;
     let store_lock = state.get_or_open_rollout_store(&name).await?;
     // Split by lock scope: seal + read every flushed generation under the
     // *read* lock so ingest on this store keeps running, then take the write

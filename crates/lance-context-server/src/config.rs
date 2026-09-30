@@ -62,6 +62,18 @@ pub struct ServerConfig {
     )]
     pub rollout_wal_pending_warn_generations: usize,
 
+    /// Refuse a read whose MemWAL shard has more than this many flushed
+    /// generations pending merge (HTTP 503) instead of
+    /// opening every one of them. A read over a 16k-generation shard held a
+    /// worker at its 32 GiB memory limit; the merge that fixes it is the same
+    /// merge the read was competing with. `0` disables the cap.
+    #[arg(
+        long,
+        env = "ROLLOUT_WAL_PENDING_MAX_GENERATIONS",
+        default_value = "4096"
+    )]
+    pub rollout_wal_pending_max_generations: usize,
+
     /// Process-wide byte budget for MemWAL merges, shared by every merge
     /// this worker runs regardless of what triggered it (its own sweepers, the
     /// count trigger, the manual route, or the master's fan-out).
@@ -71,6 +83,15 @@ pub struct ServerConfig {
     /// another to release instead of failing. Default 3 GiB; `0` disables.
     #[arg(long, env = "ROLLOUT_MERGE_MEMORY_BYTES", default_value = "3221225472")]
     pub rollout_merge_memory_bytes: usize,
+
+    /// Maximum merge-wal requests this worker runs at once; later ones wait
+    /// for a slot. The master's `MERGE_WAL_CONCURRENCY` bounds tasks *per
+    /// master*, and every task fans out to every worker, so six masters at 4
+    /// put 24 merges on each worker at the same time -- each with its own
+    /// `LANCE_MEM_POOL_SIZE x LANCE_CPU_THREADS` execution pool, which the
+    /// merge memory budget does not count. Default 4; `0` disables.
+    #[arg(long, env = "ROLLOUT_MERGE_CONCURRENCY", default_value_t = 4)]
+    pub rollout_merge_concurrency: usize,
 
     /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
     /// non-zero, the global sweeper folds this instance's flushed MemWAL

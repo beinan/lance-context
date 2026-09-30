@@ -161,6 +161,18 @@ async fn compact_files_incremental(
 /// every store, so all tables index their primary key identically.
 pub(crate) const ID_INDEX_NAME: &str = "id_idx";
 
+/// Error-message prefix for a read refused because a shard has too many
+/// flushed generations pending merge. Servers match on it to answer 503.
+pub const PENDING_GENERATIONS_EXCEEDED: &str = "too many pending WAL generations";
+
+/// Default for [`StorageBaseOptions::pending_generations_max`].
+pub const DEFAULT_PENDING_GENERATIONS_MAX: usize = 4096;
+
+/// Whether `err` is a read refused by the pending-generations cap.
+pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
+    err.to_string().contains(PENDING_GENERATIONS_EXCEEDED)
+}
+
 /// What a [`StorageBase::flush`] actually did, for the `outcome` metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlushOutcome {
@@ -245,6 +257,11 @@ pub(crate) struct StorageBaseOptions {
     /// pending merge (sampled on every LSM read). `None` uses the crate default
     /// (256); `Some(0)` disables the warning. The metric is always emitted.
     pub pending_generations_warn: Option<usize>,
+    /// Refuse a read whose shard has more flushed generations pending than
+    /// this, instead of opening every one of them. `None` uses the crate
+    /// default (4096); `Some(0)` disables the cap. See
+    /// [`StorageBase::wal_shard_snapshots`].
+    pub pending_generations_max: Option<usize>,
     /// Process-wide byte budget shared by every merge this process runs.
     /// `merge_max_bytes` bounds one merge; this bounds all of them together,
     /// and a merge that cannot fit waits for another to release. `None`
@@ -313,6 +330,9 @@ pub(crate) struct StorageBase {
     merge_max_bytes: usize,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pending_generations_warn: usize,
+    /// Refuse reads that would open more flushed generations than this per
+    /// shard (0 = unbounded). See [`Self::wal_shard_snapshots`].
+    pending_generations_max: usize,
     /// Process-wide merge byte budget; `None` means unbounded.
     merge_budget: Option<Arc<MergeMemoryBudget>>,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
@@ -372,6 +392,7 @@ impl StorageBase {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            pending_generations_max,
             merge_budget,
             session,
             schema,
@@ -404,6 +425,7 @@ impl StorageBase {
                 merge_max_generations,
                 merge_max_bytes,
                 pending_generations_warn,
+                pending_generations_max,
                 merge_budget,
                 session,
                 schema,
@@ -430,6 +452,7 @@ impl StorageBase {
             merge_max_generations,
             merge_max_bytes,
             pending_generations_warn,
+            pending_generations_max,
             merge_budget,
             session,
             schema,
@@ -458,6 +481,8 @@ impl StorageBase {
             merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
             pending_generations_warn: pending_generations_warn
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
+            pending_generations_max: pending_generations_max
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
             merge_budget,
             last_compaction: None,
             total_compactions: 0,
@@ -1477,6 +1502,48 @@ impl StorageBase {
         self.reload().await
     }
 
+    /// Extend the key column's BTree index over every base-table fragment it
+    /// does not yet cover, appending an index delta rather than rebuilding.
+    ///
+    /// Lance's `merge_insert` probes the index for the fragments it covers and
+    /// **scans** every fragment it does not (its plan is a `Union` of the two).
+    /// Every WAL merge appends fragments the index has never seen, so between
+    /// rebuilds each merge reads those fragments whole: 6.5 GB for a 2,046-row
+    /// merge into a 22-fragment table was observed, and that read is what
+    /// spiked workers to 20-29 GiB after the BTree itself was in place.
+    /// Calling this before a merge keeps the unindexed set empty, so the scan
+    /// arm reads nothing.
+    ///
+    /// Returns how many fragments were unindexed beforehand (0 = no commit).
+    /// A table without the BTree at all is left alone; the caller builds it
+    /// with [`Self::create_key_btree_index`] first.
+    pub async fn extend_key_btree_index(&mut self) -> LanceResult<usize> {
+        use lance::index::{DatasetIndexExt as _, DatasetIndexInternalExt as _};
+        use lance_index::optimize::OptimizeOptions;
+
+        self.ensure_writable()?;
+        self.reload().await?;
+        if !self.has_key_btree_index().await? {
+            return Ok(0);
+        }
+        let unindexed = self.dataset.unindexed_fragments(ID_INDEX_NAME).await?.len();
+        if unindexed == 0 {
+            return Ok(0);
+        }
+        self.dataset
+            .optimize_indices(
+                &OptimizeOptions::append().index_names(vec![ID_INDEX_NAME.to_string()]),
+            )
+            .await?;
+        self.reload().await?;
+        info!(
+            column = %self.key_column,
+            fragments = unindexed,
+            "extended key index over newly appended fragments"
+        );
+        Ok(unindexed)
+    }
+
     /// Whether the base table's key column has a BTree index (the one
     /// `merge_insert` can use). A ZoneMap under the same name does not count.
     pub async fn has_key_btree_index(&self) -> LanceResult<bool> {
@@ -1613,6 +1680,7 @@ impl StorageBase {
         let branch_path = self.dataset.branch_location().path.clone();
         let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
         let warn_at = self.pending_generations_warn;
+        let max_at = self.pending_generations_max;
         let uri: Arc<str> = Arc::from(self.dataset.uri());
 
         let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
@@ -1632,6 +1700,21 @@ impl StorageBase {
                     };
                     let pending = manifest.flushed_generations.len();
                     observe_value!(crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS, pending);
+                    if max_at != 0 && pending > max_at {
+                        // A read over this shard would open `pending` datasets
+                        // and hold their metadata at once. Past the cap that is
+                        // gigabytes per request (a 16k-generation shard took a
+                        // worker to its 32 GiB limit on one point lookup), and
+                        // the only cure is the merge that is already behind.
+                        // Fail the read fast so the caller retries after the
+                        // merge instead of taking the worker down with it.
+                        metrics::counter!("rollout_reads_refused_pending_total").increment(1);
+                        return Err(LanceError::io(format!(
+                            "{PENDING_GENERATIONS_EXCEEDED}: shard {shard_id} has {pending} \
+                             flushed generations pending merge (cap {max_at}); retry after \
+                             the merge catches up"
+                        )));
+                    }
                     if warn_at != 0 && pending >= warn_at {
                         // Every pending generation is one more dataset this read
                         // must open; past this point the shard's owner has stopped
