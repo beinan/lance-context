@@ -4355,6 +4355,57 @@ mod tests {
     /// Reads open every flushed generation pending merge. Past the cap the
     /// read is refused with a recognizable error (the server maps it to 503)
     /// instead of holding a worker's memory hostage; at the cap it passes.
+    /// The cap holds for the store as a whole: two writer shards each under
+    /// it still add up to a read that opens every generation of both.
+    #[test]
+    fn pending_generation_cap_counts_every_shard() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let open = |shard: &str| {
+                RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        storage_options: None,
+                        session: None,
+                        shard_id: Some(shard.to_string()),
+                        merge_after_generations: None,
+                        merge_max_generations: None,
+                        merge_max_bytes: None,
+                        pending_generations_warn: None,
+                        pending_generations_max: Some(3),
+                        merge_budget: None,
+                    },
+                )
+            };
+            let mut a = open("rollout-a").await.unwrap();
+            let b = open("rollout-b").await.unwrap();
+            for id in ["a-0", "a-1"] {
+                a.add(&[assistant_record(id)]).await.unwrap();
+                a.flush().await.unwrap();
+            }
+            b.add(&[assistant_record("b-0")]).await.unwrap();
+            b.flush().await.unwrap();
+            // 2 + 1 = 3: at the cap, every shard well under it.
+            assert_eq!(a.list(None, None).await.unwrap().len(), 3);
+
+            b.add(&[assistant_record("b-1")]).await.unwrap();
+            b.flush().await.unwrap();
+            // 2 + 2 = 4: no shard exceeds the cap, the store does.
+            let err = a.list(None, None).await.expect_err("over the cap in total");
+            assert!(
+                crate::store_base::is_pending_generations_exceeded(&err),
+                "{err}"
+            );
+            assert!(err.to_string().contains("across 2 shards"), "{err}");
+
+            // Merging one shard brings the total back under.
+            assert_eq!(a.cleanup_own_shard().await.unwrap(), 2);
+            assert_eq!(b.list(None, None).await.unwrap().len(), 4);
+        });
+    }
+
     #[test]
     fn reads_are_refused_past_the_pending_generation_cap() {
         let dir = TempDir::new().unwrap();

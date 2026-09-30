@@ -257,10 +257,10 @@ pub(crate) struct StorageBaseOptions {
     /// pending merge (sampled on every LSM read). `None` uses the crate default
     /// (256); `Some(0)` disables the warning. The metric is always emitted.
     pub pending_generations_warn: Option<usize>,
-    /// Refuse a read whose shard has more flushed generations pending than
-    /// this, instead of opening every one of them. `None` uses the crate
-    /// default (4096); `Some(0)` disables the cap. See
-    /// [`StorageBase::wal_shard_snapshots`].
+    /// Refuse a read that would open more flushed generations than this, in
+    /// any one shard or across all shards, instead of opening every one of
+    /// them. `None` uses the crate default (4096); `Some(0)` disables the
+    /// cap. See [`StorageBase::wal_shard_snapshots`].
     pub pending_generations_max: Option<usize>,
     /// Process-wide byte budget shared by every merge this process runs.
     /// `merge_max_bytes` bounds one merge; this bounds all of them together,
@@ -330,8 +330,8 @@ pub(crate) struct StorageBase {
     merge_max_bytes: usize,
     /// Per-shard pending-generation count at which reads warn; `0` disables.
     pending_generations_warn: usize,
-    /// Refuse reads that would open more flushed generations than this per
-    /// shard (0 = unbounded). See [`Self::wal_shard_snapshots`].
+    /// Refuse reads that would open more flushed generations than this, per
+    /// shard or in total (0 = unbounded). See [`Self::wal_shard_snapshots`].
     pending_generations_max: usize,
     /// Process-wide merge byte budget; `None` means unbounded.
     merge_budget: Option<Arc<MergeMemoryBudget>>,
@@ -1742,7 +1742,24 @@ impl StorageBase {
             .try_collect()
             .await?;
 
-        Ok(snapshots.into_iter().flatten().collect())
+        let snapshots: Vec<ShardSnapshot> = snapshots.into_iter().flatten().collect();
+        // A read opens every pending generation of every shard, so the cap
+        // has to hold for the store as a whole, not just the worst shard: 20
+        // writer shards at ~1,400 generations each passed the per-shard check
+        // and still opened 25k datasets on one lookup (OOMKilled the worker).
+        let total: usize = snapshots
+            .iter()
+            .map(|snapshot| snapshot.flushed_generations.len())
+            .sum();
+        if max_at != 0 && total > max_at {
+            metrics::counter!("rollout_reads_refused_pending_total").increment(1);
+            return Err(LanceError::io(format!(
+                "{PENDING_GENERATIONS_EXCEEDED}: {total} flushed generations pending merge \
+                 across {} shards (cap {max_at}); retry after the merge catches up",
+                snapshots.len()
+            )));
+        }
+        Ok(snapshots)
     }
 
     /// Number of flushed MemWAL generations pending merge into the base table
