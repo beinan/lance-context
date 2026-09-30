@@ -1,0 +1,6 @@
+# Debug builds walk DataFusion's optimizer recursively inside Lance's
+# merge_insert; with two commits per WAL merge (delete-only merge_insert,
+# then append) that walk overflows the 2 MiB default stack of a test thread
+# under `cargo test`. Release builds fit. Give test threads 8 MiB.
+[env]
+RUST_MIN_STACK = "8388608"

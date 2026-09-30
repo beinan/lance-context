@@ -17,6 +17,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C debuginfo=1"
+  # See .cargo/config.toml: debug-build DataFusion plan walks in the WAL
+  # merge need more than the 2 MiB default test-thread stack.
+  RUST_MIN_STACK: "8388608"
   RUST_BACKTRACE: "1"
   CARGO_INCREMENTAL: "0"
 

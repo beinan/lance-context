@@ -55,7 +55,7 @@ use lance::dataset::optimize::{
 };
 use lance::dataset::{
     builder::DatasetBuilder, Dataset, MergeInsertBuilder, NewColumnTransform, WhenMatched,
-    WriteMode, WriteParams,
+    WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -1017,7 +1017,7 @@ impl StorageBase {
         if !batches.is_empty() {
             observe_phase!(
                 "append",
-                self.merge_prepared_batches(batches, merge_schema).await
+                Box::pin(self.merge_prepared_batches(batches, merge_schema)).await
             )?;
             self.pinned_version = None;
         }
@@ -1204,25 +1204,55 @@ impl StorageBase {
     /// Merge prepared WAL rows into the base table by primary key.
     ///
     /// `read_flushed_generations` has already reduced the source to one newest
-    /// row per key. `UpdateAll` preserves normal LSM last-write-wins semantics
-    /// while also making a retry after an interrupted manifest drain idempotent.
+    /// row per key. The merge is two commits: a delete-only `merge_insert` on
+    /// the key column, then a plain append of the rows.
+    ///
+    /// Not `WhenMatched::UpdateAll`, deliberately. An upsert takes the matched
+    /// target rows *with every column* to join and rewrite them, and rollout
+    /// rows carry multi-megabyte inline blobs: in production one merge of
+    /// 17k matched rows read 7.6 GB (459 KB/row), one of 1.4k rows read
+    /// 4.0 GB (3 MB/row), and two of those in flight held a worker at its
+    /// 32 GiB limit. The delete-only merge probes the id index and touches
+    /// only the key column and deletion vectors; the append streams the new
+    /// rows straight to fresh fragments. Neither ever holds a target blob.
+    ///
+    /// Last-write-wins and retry idempotence are preserved: a crash between
+    /// the two commits leaves the old rows deleted and the new ones still in
+    /// the WAL, and the retry deletes nothing and appends them once. A crash
+    /// after the append but before the manifest drain retries as delete (of
+    /// what was just appended) + append, the same end state.
     async fn merge_prepared_batches(
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
     ) -> LanceResult<()> {
-        let reader = RecordBatchIterator::new(
-            batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
-            merge_schema,
+        let key_index = merge_schema.index_of(&self.key_column)?;
+        let key_schema = Arc::new(merge_schema.project(&[key_index])?);
+        let keys = batches
+            .iter()
+            .map(|batch| batch.project(&[key_index]))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        let key_reader = RecordBatchIterator::new(
+            keys.into_iter().map(Ok::<RecordBatch, ArrowError>),
+            key_schema,
         );
         let mut builder = MergeInsertBuilder::try_new(
             Arc::new(self.dataset.clone()),
             vec![self.key_column.clone()],
         )?;
-        builder.when_matched(WhenMatched::UpdateAll);
-        let job = builder.try_build()?;
-        let (dataset, _) = job.execute_reader(reader).await?;
+        builder
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        // Both Lance futures are large; boxing keeps them off the caller's
+        // stack (the merge runs inside sweeper and request tasks).
+        let (dataset, _) = Box::pin(builder.try_build()?.execute_reader(key_reader)).await?;
         self.dataset = Arc::unwrap_or_clone(dataset);
+
+        let reader = RecordBatchIterator::new(
+            batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
+            merge_schema,
+        );
+        Box::pin(self.dataset.append(reader, None)).await?;
         Ok(())
     }
 

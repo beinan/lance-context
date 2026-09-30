@@ -4066,6 +4066,52 @@ mod tests {
         });
     }
 
+    /// The WAL merge is a delete-only `merge_insert` on the key followed by
+    /// an append: an upsert would take the matched target rows with every
+    /// column (multi-megabyte inline blobs included) to rewrite them.
+    /// Observable shape: an overwritten key leaves the old fragment in
+    /// place with a deletion vector, and the new row lands in a fresh
+    /// fragment; last-write-wins still holds.
+    #[test]
+    fn merge_deletes_old_rows_and_appends_instead_of_rewriting_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Two keys in one fragment, so deleting one leaves the fragment
+            // (a fully-deleted fragment is dropped outright).
+            store
+                .add(&[assistant_record("k"), assistant_record("other")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            let fragments = store.base.dataset.get_fragments();
+            assert_eq!(fragments.len(), 1);
+            let first_id = fragments[0].id();
+            assert!(fragments[0].metadata().deletion_file.is_none());
+
+            let mut newer = assistant_record("k");
+            newer.content = Some("second write wins".to_string());
+            store.add(&[newer]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let fragments = store.base.dataset.get_fragments();
+            assert_eq!(fragments.len(), 2, "old fragment kept, new one appended");
+            let old = fragments.iter().find(|f| f.id() == first_id).unwrap();
+            assert!(
+                old.metadata().deletion_file.is_some(),
+                "old row is masked by a deletion vector, not rewritten"
+            );
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            let k = rows.iter().find(|r| r.id == "k").unwrap();
+            assert_eq!(k.content.as_deref(), Some("second write wins"));
+        });
+    }
+
     #[test]
     fn cleanup_own_shard_merges_whatever_is_pending() {
         // The periodic-cleanup entry point (`cleanup_own_shard`) is the time
