@@ -43,6 +43,12 @@ pub fn classify(error: &str) -> FailureClass {
         "invalid",
         "403",
         "401",
+        "permission denied",
+        "access denied",
+        "accessdenied",
+        "unauthorized",
+        "unauthenticated",
+        "forbidden",
         "protocol",
     ]
     .iter()
@@ -265,15 +271,60 @@ mod tests {
                 ShardFailure::advance("table", "worker", old, "temporary storage failure", 1000);
             assert_eq!(next.consecutive_attempts, attempt);
             assert_eq!(next.needs_attention, attempt >= 15);
-            assert!(next.next_retry_ms <= 3_601_000);
-            if attempt == 3 {
-                assert_eq!(next.next_retry_ms, 31_000);
-            }
+            let expected_secs = match attempt {
+                1 | 2 => 2,
+                3 => 30,
+                4 => 60,
+                5 => 120,
+                6 => 240,
+                7 => 480,
+                8..=14 => 900,
+                _ => 3600,
+            };
+            assert_eq!(
+                next.next_retry_ms - next.last_failure_ms,
+                expected_secs * 1000
+            );
             old = Some(next);
         }
         let broken =
             ShardFailure::advance("table", "worker", None, "Not found: /data/1.lance", 1000);
         assert!(broken.needs_attention);
         assert_eq!(broken.next_retry_ms, 3_601_000);
+    }
+
+    #[test]
+    fn permanent_failures_and_unresolved_barriers_have_distinct_probe_budgets() {
+        for error in [
+            "NotFound: data/fragment.lance",
+            "corrupt manifest",
+            "schema mismatch",
+            "Permission denied",
+            "AccessDenied",
+            "unauthenticated",
+            "HTTP 403 Forbidden",
+        ] {
+            let failure = ShardFailure::advance("table", "worker", None, error, 1000);
+            assert_eq!(failure.class, FailureClass::DataOrConfiguration);
+            assert!(failure.needs_attention);
+            assert_eq!(failure.next_retry_ms, 3_601_000);
+        }
+        let mut old = None;
+        for expected_secs in [30, 60, 120, 240, 300, 300] {
+            let next = ShardFailure::advance(
+                "table",
+                "worker",
+                old,
+                "merge ownership unresolved: recovery barrier failed: timeout",
+                1000,
+            );
+            assert_eq!(next.class, FailureClass::OwnershipUnresolved);
+            assert!(next.needs_attention);
+            assert_eq!(
+                next.next_retry_ms - next.last_failure_ms,
+                expected_secs * 1000
+            );
+            old = Some(next);
+        }
     }
 }
