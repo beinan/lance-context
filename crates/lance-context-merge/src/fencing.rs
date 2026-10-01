@@ -149,9 +149,17 @@ impl Coordinator {
         if frozen.phase != Phase::Recovering {
             return Err("execution is not recovering".into());
         }
-        let mut recovered = frozen.finished(Err(
-            "merge cancelled; admitted manifest versions fenced for recovery".into(),
-        ));
+        let cause = frozen
+            .error
+            .as_deref()
+            .unwrap_or("merge execution deadline or lost worker");
+        let cause = cause
+            .strip_prefix("merge ownership unresolved: manifest commit result unknown; ")
+            .or_else(|| cause.strip_prefix("merge ownership unresolved: "))
+            .unwrap_or(cause);
+        let mut recovered = frozen.finished(Err(format!(
+            "merge storage fenced for recovery; original failure: {cause}"
+        )));
         recovered.phase = Phase::Recovered;
         self.transact(
             vec![

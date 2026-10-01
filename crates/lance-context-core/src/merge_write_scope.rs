@@ -54,8 +54,9 @@ impl MergeWriteScope {
         })
     }
 
-    /// Only after a durable storage barrier fenced every admitted version.
-    /// Aborting before that evidence would abandon an uncertain storage write.
+    /// Only after dropping the merge future and after a durable storage
+    /// barrier fenced every admitted version. Aborting before that evidence
+    /// would abandon an uncertain storage write.
     pub async fn abort_fenced_leaves(&self) {
         self.progress.lock().unwrap().closed = true;
         for leaf in std::mem::take(&mut *self.leaves.lock().unwrap()) {
@@ -452,6 +453,44 @@ mod tests {
         ] {
             assert!(supports_version_fencing(uri), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_fence_can_abort_a_permanently_stalled_leaf() {
+        struct Writing(Arc<AtomicBool>);
+        impl Drop for Writing {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let scope = MergeWriteScope::new();
+        let writing = Arc::new(AtomicBool::new(false));
+        let flag = writing.clone();
+        let (entered, began) = oneshot::channel();
+        let worker_scope = scope.clone();
+        let caller = tokio::spawn(async move {
+            worker_scope
+                .run(shield(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    let _writing = Writing(flag);
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<()>>().await
+                }))
+                .await
+        });
+        began.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(writing.load(Ordering::SeqCst));
+        // Real base/shard barriers are exercised by the rollout fault tests.
+        // Once that proof exists, a stalled local I/O future must release too.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scope.abort_fenced_leaves(),
+        )
+        .await
+        .unwrap();
+        assert!(!writing.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

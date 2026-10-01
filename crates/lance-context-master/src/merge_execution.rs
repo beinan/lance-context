@@ -82,6 +82,9 @@ async fn recover_execution(
         let uri = match frozen.target.strip_prefix("generic:") {
             Some(name) => state.generic_uri(name), None => state.rollout_uri(&frozen.target),
         };
+        if watermarks.dataset_uri.as_deref().is_some_and(|worker_uri| worker_uri != uri) {
+            return Err("dataset URI mismatch between worker and recovery master".into());
+        }
         tokio::time::timeout(Duration::from_secs(120),
             lance_context_core::merge_write_scope::fence_manifest_versions(&uri, None, &watermarks.versions, &frozen.id)
         ).await.map_err(|_| "storage recovery barrier deadline exceeded".to_string())?
@@ -293,7 +296,7 @@ async fn reconcile_with_grace(
     let mut next_cancel = tokio::time::Instant::now();
     loop {
         if tokio::time::Instant::now() >= handoff_deadline {
-            let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained, recovery requires old writer termination evidence";
+            let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained pending storage version recovery";
             coordinator
                 .record_failure(proof, &initial.target, &initial.endpoint, error)
                 .await?;

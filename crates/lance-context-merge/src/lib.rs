@@ -539,6 +539,37 @@ mod tests {
             .authorize_commit(&running, "file:///table", "base", 11)
             .await
             .is_err());
+        // A successful barrier must not disguise a permanent data failure as
+        // another ownership failure with a short metadata-probe backoff.
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&next, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        assert!(coordinator
+            .report_uncertain(
+                &running,
+                "merge ownership unresolved: manifest commit result unknown; schema mismatch"
+                    .into(),
+            )
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        let frozen = coordinator
+            .freeze(&next, &uncertain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.finish_recovery(&next, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&next, &recovered).await.unwrap());
+        let failure = coordinator
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.class, failure::FailureClass::DataOrConfiguration);
+        assert!(failure.needs_attention);
+        assert!(failure.last_error.contains("schema mismatch"));
+        assert_eq!(failure.next_retry_ms - failure.last_failure_ms, 3_600_000);
         client
             .delete(
                 coordinator.prefix.clone(),
