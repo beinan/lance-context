@@ -174,21 +174,37 @@ async fn run(
     // Do not admit another memory-heavy merge into this slot while a
     // cancelled execution is still joining storage commits.
     drop(slot);
-    // Storage work has ended. An etcd outage may delay acknowledgement, but
-    // cannot erase the fence or cause the write to be executed twice.
+    // A completed Rust future can still have an ambiguous remote result.
+    // Preserve that distinction durably instead of authorizing another writer.
+    let uncertain = write_scope.has_uncertain_commit();
+    let mut expected = running.finished(outcome.clone());
+    if uncertain {
+        expected.phase = Phase::Uncertain;
+        expected.reclaimed = 0;
+        expected.error = Some(format!(
+            "merge ownership unresolved: manifest commit result unknown; {:?}",
+            outcome
+        ));
+    }
     loop {
-        match coordinator.finish(&running, outcome.clone()).await {
+        let acknowledged = if uncertain {
+            coordinator
+                .report_uncertain(&running, expected.error.clone().unwrap())
+                .await
+        } else {
+            coordinator.finish(&running, outcome.clone()).await
+        };
+        match acknowledged {
             Ok(true) => break,
-            Ok(false) => {
-                if coordinator.get(&execution.target).await?.as_ref()
-                    == Some(&running.finished(outcome.clone()))
-                {
-                    break;
+            Ok(false) => match coordinator.get(&execution.target).await {
+                Ok(Some(current)) if current == expected => break,
+                Ok(_) => return Err("merge execution fence changed unexpectedly".into()),
+                Err(error) => {
+                    tracing::warn!(id = %execution.id, %error, "reconciling merge outcome acknowledgement")
                 }
-                return Err("merge execution fence changed unexpectedly".into());
-            }
+            },
             Err(error) => {
-                tracing::warn!(id = %execution.id, %error, "retrying merge terminal acknowledgement")
+                tracing::warn!(id = %execution.id, %error, "retrying merge outcome acknowledgement")
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -13,7 +13,7 @@ name = "lance-context-server"
 path = "src/main.rs"
 
 [dependencies]
-lance-context-merge = { path = "../lance-context-merge" }
+lance-context-merge = { version = "0.1.0", path = "../lance-context-merge" }
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }

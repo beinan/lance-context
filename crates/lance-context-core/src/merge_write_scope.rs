@@ -22,6 +22,7 @@ tokio::task_local! { static CURRENT: Arc<MergeWriteScope>; }
 struct Progress {
     closed: bool,
     active: usize,
+    uncertain: bool,
 }
 
 #[derive(Debug, Default)]
@@ -37,6 +38,14 @@ impl MergeWriteScope {
 
     pub async fn run<F: Future>(self: &Arc<Self>, future: F) -> F::Output {
         CURRENT.scope(self.clone(), future).await
+    }
+
+    pub fn has_uncertain_commit(&self) -> bool {
+        self.progress.lock().unwrap().uncertain
+    }
+
+    fn mark_uncertain(&self) {
+        self.progress.lock().unwrap().uncertain = true;
     }
 
     /// Call only after dropping/joining the merge future. Prevent new commits
@@ -55,11 +64,17 @@ impl MergeWriteScope {
     }
 }
 
-struct Active(Arc<MergeWriteScope>);
+struct Active {
+    scope: Arc<MergeWriteScope>,
+    completed: bool,
+}
 impl Drop for Active {
     fn drop(&mut self) {
-        self.0.progress.lock().unwrap().active -= 1;
-        self.0.changed.notify_waiters();
+        let mut progress = self.scope.progress.lock().unwrap();
+        progress.active -= 1;
+        progress.uncertain |= !self.completed;
+        drop(progress);
+        self.scope.changed.notify_waiters();
     }
 }
 
@@ -79,11 +94,19 @@ where
         }
         progress.active += 1;
     }
-    let active = Active(scope);
+    let active = Active {
+        scope,
+        completed: false,
+    };
     let (send, receive) = oneshot::channel();
     tokio::spawn(async move {
-        let _active = active;
+        let mut active = active;
         let result = write.await;
+        if result.is_err() {
+            active.scope.mark_uncertain();
+        }
+        active.completed = true;
+        drop(active);
         let _ = send.send(result);
     });
     receive
@@ -111,6 +134,7 @@ impl CommitHandler for GuardedCommit {
         let mut owned_manifest = manifest.clone();
         let path = base_path.clone();
         let store = object_store.clone();
+        let scope = CURRENT.try_with(Arc::clone).ok();
         let (location, committed) = shield(async move {
             let location = inner
                 .commit(
@@ -123,6 +147,14 @@ impl CommitHandler for GuardedCommit {
                     transaction,
                 )
                 .await;
+            // Only a definite conflict proves this conditional commit did
+            // not happen. A transport/storage error can arrive after the
+            // remote service accepted it, even though the Rust future ended.
+            if matches!(&location, Err(CommitError::OtherError(_))) {
+                if let Some(scope) = scope {
+                    scope.mark_uncertain();
+                }
+            }
             Ok::<_, CommitError>((location, owned_manifest))
         })
         .await?;
@@ -197,6 +229,33 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
+    async fn failed_or_panicked_leaf_commit_needs_reconciliation() {
+        let scope = MergeWriteScope::new();
+        let result = scope
+            .run(shield(async {
+                Err::<(), _>(Error::io("lost storage response"))
+            }))
+            .await;
+        assert!(result.is_err());
+        scope.drain().await;
+        assert!(
+            scope.has_uncertain_commit(),
+            "an error is not proof that remote storage did not commit"
+        );
+        let panicked = MergeWriteScope::new();
+        let result = panicked
+            .run(shield(async {
+                panic!("commit panic");
+                #[allow(unreachable_code)]
+                Ok::<(), Error>(())
+            }))
+            .await;
+        assert!(result.is_err());
+        panicked.drain().await;
+        assert!(panicked.has_uncertain_commit());
+    }
+
+    #[tokio::test]
     async fn dropping_merge_waits_for_the_surviving_manifest_write() {
         let scope = MergeWriteScope::new();
         let (entered, began) = oneshot::channel();
@@ -227,6 +286,7 @@ mod tests {
         release.send(()).unwrap();
         drain.await.unwrap();
         assert!(committed.load(Ordering::SeqCst));
+        assert!(!scope.has_uncertain_commit());
         assert!(
             scope
                 .run(shield(async { Ok::<_, Error>(()) }))

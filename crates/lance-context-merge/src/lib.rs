@@ -23,6 +23,7 @@ pub struct ClaimProof {
 pub enum Phase {
     Reserved,
     Running,
+    Uncertain,
     Finished,
 }
 
@@ -159,6 +160,17 @@ impl Coordinator {
             return Err("execution is not running".into());
         }
         self.replace(running, &running.finished(outcome)).await
+    }
+
+    /// The Rust write future ended with an ambiguous storage result. This is
+    /// durable diagnostic evidence, not permission to hand off storage writes.
+    pub async fn report_uncertain(&self, running: &Execution, error: String) -> Result<bool> {
+        if running.phase != Phase::Running {
+            return Err("execution is not running".into());
+        }
+        let mut next = running.finished(Err(error));
+        next.phase = Phase::Uncertain;
+        self.replace(running, &next).await
     }
 
     /// Cancelling an unstarted request is a CAS. A late POST cannot start it.
@@ -443,6 +455,32 @@ mod tests {
             proof,
             lease,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn ambiguous_storage_response_cannot_release_the_execution() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&proof, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        assert!(coordinator
+            .report_uncertain(&running, "storage response lost".into())
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(uncertain.phase, Phase::Uncertain);
+        assert!(coordinator.release(&proof, &uncertain).await.is_err());
+        assert!(!coordinator.finish(&running, Ok(1)).await.unwrap());
+        client.lease_revoke(lease).await.unwrap();
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(uncertain));
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ pub(crate) async fn run_merge_wal(
     // Reconcile first, before any index/base-table mutation or new fan-out.
     if let Some(old) = coordinator.get(&claim.task.target).await? {
         let endpoint = old.endpoint.clone();
-        if old.phase == Phase::Running {
+        if matches!(old.phase, Phase::Running | Phase::Uncertain) {
             if let Some(failure) = coordinator.failure(&claim.task.target, &endpoint).await? {
                 if failure.class == lance_context_merge::failure::FailureClass::OwnershipUnresolved
                     && failure.next_retry_ms > lance_context_merge::failure::now_ms()
@@ -261,6 +261,15 @@ async fn reconcile_with_grace(
                 continue;
             }
         };
+        if current.phase == Phase::Uncertain {
+            let error = current
+                .error
+                .unwrap_or_else(|| "merge ownership unresolved: ambiguous storage commit".into());
+            coordinator
+                .record_failure(proof, &current.target, &current.endpoint, &error)
+                .await?;
+            return Err(error);
+        }
         if current.phase == Phase::Finished {
             if !coordinator.release(proof, &current).await? {
                 return Err("task claim lost while releasing terminal merge execution".into());

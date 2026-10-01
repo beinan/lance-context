@@ -21,6 +21,9 @@ remains a relative edit preserving generations flushed during recovery.
   execution, including non-deduplicated tasks in dependency chains.
 - Worker execution and the persistent target lock survive task lease loss.
   Only a terminal execution can restore the target lock to a live task lease.
+  Ambiguous manifest errors/panics publish `uncertain`, which cannot release
+  ownership: an ended Rust future is not evidence that remote storage rejected
+  its write. Definite conditional-commit conflicts are treated separately.
 - Cancelling an unstarted request uses CAS, preventing a delayed POST from
   starting after another shard has been admitted.
 - Graceful worker shutdown cancels and drains owned executions before closing
@@ -63,8 +66,8 @@ repair behavior is unchanged.
 
 ## Limits and required rollout validation
 
-This is not yet a complete automatic crash-recovery protocol. If a process dies
-or a storage commit cannot be joined, there may be no terminal acknowledgement.
+This is not yet a complete automatic crash-recovery protocol. If a process dies, a storage commit cannot be joined, or a commit returns an
+ambiguous result, there may be no terminal acknowledgement.
 After the merge deadline plus a 60-second reconciliation allowance (or 60 seconds
 for inherited work), the master records unresolved ownership, fails that task,
 and releases its scheduler slot **without deleting the execution or target
