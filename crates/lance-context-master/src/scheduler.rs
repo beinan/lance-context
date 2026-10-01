@@ -44,6 +44,10 @@ use crate::task_store::{TaskClaim, TaskKinds};
 /// anything still over the threshold is picked up by the next tick.
 const MAX_SWEEP_ENQUEUE: usize = 256;
 
+/// How many candidate rows a merge sweep reads per new task it may enqueue.
+/// Candidates already in flight are deduped and do not count against the cap.
+const SWEEP_CANDIDATE_MULTIPLIER: usize = 8;
+
 /// How long a finished compaction waits for the `stats-writer` lock to refresh
 /// its stats row before giving up and leaving it to the next scan round.
 const STATS_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -728,15 +732,26 @@ pub async fn sweep_merge_wal_candidates(state: &Arc<MasterState>) -> lance::Resu
 
 async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     let threshold = state.config.merge_wal_min_generations;
-    // See `sweep_candidates_inner`: predicate pushed down, enqueue capped.
+    // The cap bounds *new* tasks per tick, not candidates considered. The
+    // first MAX_SWEEP_ENQUEUE rows by pending count are mostly stores that
+    // already have a task queued or running (enqueue dedupes them), so a
+    // sweep that stopped there spent its whole budget on no-ops while every
+    // store ranked below the cap starved: with 286 stores over the read cap,
+    // a 500-generation store sat unreadable with no task for hours. Read
+    // more rows than the cap and keep going until the cap is spent on tasks
+    // that did not exist before.
     let rows = state
         .stats
         .lock()
         .await
-        .list_above_pending_wal(threshold, MAX_SWEEP_ENQUEUE)
+        .list_above_pending_wal(threshold, MAX_SWEEP_ENQUEUE * SWEEP_CANDIDATE_MULTIPLIER)
         .await?;
     let mut queued = 0;
+    let mut deduped = 0;
     for row in rows {
+        if queued >= MAX_SWEEP_ENQUEUE {
+            break;
+        }
         if state
             .task_store
             .is_cooling_down(TaskKind::MergeWal, &row.name)
@@ -744,9 +759,18 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
         {
             continue;
         }
-        enqueue(state, TaskKind::MergeWal, &row.name).await?;
-        queued += 1;
+        let before = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, &row.name)
+            .await?;
+        let task = enqueue(state, TaskKind::MergeWal, &row.name).await?;
+        if before.as_deref() == Some(task.id.as_str()) {
+            deduped += 1;
+        } else {
+            queued += 1;
+        }
     }
+    metrics::gauge!("master_merge_sweep_deduped").set(deduped as f64);
     Ok(queued)
 }
 
@@ -1904,6 +1928,58 @@ mod tests {
             .filter(|t| t.kind == TaskKind::MergeWal)
             .count();
         assert_eq!(merge_after, 2, "duplicate MergeWal is de-duped");
+        // And a second sweep reports 0 new tasks, not 2 no-ops.
+        assert_eq!(sweep_merge_wal_candidates(&state).await.unwrap(), 0);
+    }
+
+    /// The per-tick cap bounds new tasks, not candidates: stores that already
+    /// have a task in flight must not eat the budget and starve the rest.
+    #[tokio::test]
+    #[ignore = "needs etcd (ETCD_TEST_ENDPOINTS)"]
+    async fn sweep_budget_is_spent_on_new_tasks_not_deduped_ones() {
+        use crate::stats_store::StatRow;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_wal_min_generations = 1;
+        let state = MasterState::new(cfg).await.unwrap();
+        let seed = |name: &str, pending: i64| StatRow {
+            version: StatRow::UNKNOWN_VERSION,
+            name: name.to_string(),
+            uri: state.rollout_uri(name),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: 0,
+        };
+        {
+            let mut stats = state.stats.lock().await;
+            // MAX_SWEEP_ENQUEUE stores with the biggest backlog...
+            for i in 0..MAX_SWEEP_ENQUEUE {
+                stats
+                    .upsert(&seed(&format!("big-{i:03}"), 10_000))
+                    .await
+                    .unwrap();
+            }
+            // ...and one smaller store ranked below all of them.
+            stats.upsert(&seed("small", 500)).await.unwrap();
+        }
+        // First sweep fills the cap with the big stores.
+        assert_eq!(
+            sweep_merge_wal_candidates(&state).await.unwrap(),
+            MAX_SWEEP_ENQUEUE
+        );
+        // Second sweep: every big store dedupes; the budget must reach "small".
+        assert_eq!(sweep_merge_wal_candidates(&state).await.unwrap(), 1);
+        assert!(state
+            .task_store
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.kind == TaskKind::MergeWal && t.target == "small"));
     }
 
     /// Minimal rollout record builder for tests (the core struct has no    /// `Default`).

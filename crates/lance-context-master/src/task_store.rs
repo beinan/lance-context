@@ -251,6 +251,16 @@ impl TaskStore {
 
     /// Whether the sweeps should skip this target for now because it has
     /// failed repeatedly. Manual enqueues are not gated by this.
+    /// Id of the queued or running task that `enqueue(kind, target)` would
+    /// dedupe into, if any. Lets a sweep tell a new task from a no-op.
+    pub async fn get_active_id(
+        &self,
+        kind: TaskKind,
+        target: &str,
+    ) -> lance::Result<Option<String>> {
+        self.inner.get_active_id(kind, target).await
+    }
+
     pub async fn is_cooling_down(&self, kind: TaskKind, target: &str) -> lance::Result<bool> {
         if self.cooldown.after_failures == 0 {
             return Ok(false);
@@ -953,6 +963,22 @@ impl EtcdTaskStore {
             kind_label(kind),
             encode_segment(target)
         )
+    }
+
+    /// The queued or running task the dedupe key for `(kind, target)` points
+    /// at, if the key exists and that task is still active.
+    async fn get_active_id(&self, kind: TaskKind, target: &str) -> lance::Result<Option<String>> {
+        let Some(dedupe_key) = self.dedupe_key(kind, target, &[]) else {
+            return Ok(None);
+        };
+        let Some(existing_id) = self.get_text(&dedupe_key).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .get(&existing_id)
+            .await?
+            .filter(|t| matches!(t.state, TaskState::Queued | TaskState::Running))
+            .map(|t| t.id))
     }
 
     async fn get_cooldown(
