@@ -11,6 +11,7 @@ pub mod generic_codec;
 mod generic_store;
 mod id;
 pub mod merge_budget;
+pub mod merge_write_scope;
 pub mod metrics;
 mod namespace;
 mod record;

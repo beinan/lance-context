@@ -6349,6 +6349,7 @@ dependencies = [
  "arrow-json 58.3.0",
  "arrow-schema 58.3.0",
  "arrow-select 58.3.0",
+ "async-trait",
  "base64",
  "chrono",
  "datafusion 54.1.0",
@@ -6357,10 +6358,13 @@ dependencies = [
  "lance-context-api",
  "lance-graph",
  "lance-index 9.0.0",
+ "lance-io 9.0.0",
  "lance-namespace 9.0.0",
+ "lance-table 9.0.0",
  "lancedb",
  "metrics",
  "metrics-util",
+ "object_store 0.13.2",
  "serde",
  "serde_json",
  "tempfile",
@@ -6384,6 +6388,7 @@ dependencies = [
  "lance 9.0.0",
  "lance-context-api",
  "lance-context-core",
+ "lance-context-merge",
  "lance-context-metrics",
  "lru",
  "metrics",
@@ -6392,9 +6397,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lance-context-merge"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "etcd-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -6433,9 +6451,11 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "etcd-client",
  "futures",
  "lance-context-api",
  "lance-context-core",
+ "lance-context-merge",
  "lance-context-metrics",
  "lru",
  "metrics",

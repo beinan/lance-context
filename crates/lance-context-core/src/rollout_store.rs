@@ -2410,6 +2410,126 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
+        use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
+        use lance_table::format::{IndexMetadata, Manifest, Transaction};
+        use lance_table::io::commit::{
+            CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct PausedCommit {
+            inner: Arc<dyn CommitHandler>,
+            once: AtomicBool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        #[allow(clippy::too_many_arguments)]
+        impl CommitHandler for PausedCommit {
+            async fn commit(
+                &self,
+                manifest: &mut Manifest,
+                indices: Option<Vec<IndexMetadata>>,
+                path: &object_store::path::Path,
+                store: &lance_io::object_store::ObjectStore,
+                writer: ManifestWriter,
+                naming: ManifestNamingScheme,
+                transaction: Option<Transaction>,
+            ) -> std::result::Result<ManifestLocation, CommitError> {
+                let appending = transaction.as_ref().is_some_and(|tx| {
+                    matches!(
+                        tx.as_pb().operation,
+                        Some(lance_table::format::pb::transaction::Operation::Append(_))
+                    )
+                });
+                if appending && !self.once.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner
+                    .commit(manifest, indices, path, store, writer, naming, transaction)
+                    .await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        let bytes = vec![73u8; 2 * 1024 * 1024];
+        store
+            .add(&[artifact_record("large", &bytes)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GuardedCommit(Arc::new(PausedCommit {
+            inner: lance_table::io::commit::commit_handler_from_url(uri, &None)
+                .await
+                .unwrap(),
+            once: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+        })));
+        store.base.dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_commit_handler(handler)
+            .load()
+            .await
+            .unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let scope = MergeWriteScope::new();
+        let worker_scope = scope.clone();
+        let writer = store.clone();
+        let merge = tokio::spawn(async move {
+            worker_scope
+                .run(async { writer.lock().await.cleanup_own_shard().await })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+            .await
+            .unwrap();
+        merge.abort();
+        assert!(merge.await.unwrap_err().is_cancelled());
+        let drain_scope = scope.clone();
+        let drain = tokio::spawn(async move { drain_scope.drain().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        // Writes arriving after cancellation must survive the eventual retry.
+        {
+            let store = store.lock().await;
+            store
+                .add(&[assistant_record("arrived-during-recovery")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut store = store.lock().await;
+        assert!(flushed_generation_count(&store).await > 0);
+        store.base.refresh_latest().await.unwrap();
+        assert_eq!(
+            store.base.dataset.count_rows(None).await.unwrap(),
+            1,
+            "cancelled caller's leaf append must have committed before retry"
+        );
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(store.get_blob("large").await.unwrap().unwrap(), bytes);
+        assert!(store
+            .get_by_id("arrived-during-recovery")
+            .await
+            .unwrap()
+            .is_some());
+        store.close().await.unwrap();
+    }
+
     fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),

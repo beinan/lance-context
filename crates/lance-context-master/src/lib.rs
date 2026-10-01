@@ -3,6 +3,7 @@
 pub mod config;
 pub mod discovery;
 pub mod error;
+mod merge_execution;
 pub mod routes;
 pub mod scanner;
 pub mod scheduler;

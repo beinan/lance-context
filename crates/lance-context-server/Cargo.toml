@@ -13,6 +13,7 @@ name = "lance-context-server"
 path = "src/main.rs"
 
 [dependencies]
+lance-context-merge = { path = "../lance-context-merge" }
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
@@ -32,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+etcd-client = { version = "0.19", features = ["tls"] }
 # Snapshotting recorder so tests can assert which metric series an operation
 # emitted, without installing a process-global Prometheus exporter.
 metrics-util = { version = "0.19", default-features = false, features = [

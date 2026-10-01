@@ -149,7 +149,7 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
     let started = std::time::Instant::now();
     let outcome = match task.kind {
         TaskKind::Compact => run_compaction(state, &task).await,
-        TaskKind::MergeWal => run_merge_wal(state, &task.target).await,
+        TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
         TaskKind::IndexId => run_index_id(state, &task.target).await,
         TaskKind::Repair => run_repair(state, &task).await,
     };
@@ -168,7 +168,9 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
 
     if let Err(error) = &outcome {
         tracing::warn!(task = %task.id, target = %task.target, error, "task failed");
-        if task.kind != TaskKind::Repair && is_missing_fragment_error(error) {
+        if !matches!(task.kind, TaskKind::Repair | TaskKind::MergeWal)
+            && is_missing_fragment_error(error)
+        {
             // The manifest names a file storage does not have. No retry and
             // no cooldown changes that; a repair does, so enqueue one now
             // and re-run this task behind it.
@@ -368,214 +370,6 @@ async fn compact_inner(
         .map_err(|e| e.to_string())?;
     update_stats_after_compaction(state, name, &store).await;
     Ok(metrics)
-}
-
-/// Shape of the worker's merge-wal response (`{ "reclaimed": n }`).
-#[derive(serde::Deserialize)]
-struct MergeWalReply {
-    reclaimed: usize,
-}
-
-/// Fan a WAL-merge out to every configured worker endpoint. Each worker merges
-/// its own shard; a worker that owns no data for `name` reports 0 (or 404, which
-/// we tolerate). Succeeds if at least one endpoint responded; fails only when
-/// there are no endpoints or every one errored.
-/// Make sure the target's base table has a BTree index on `id` before the
-/// workers merge into it.
-///
-/// `merge_insert` without an exact-answer index on the join key reads the
-/// whole base table into a hash join, so a merge's memory and time scale with
-/// the base table rather than with the WAL rows being merged. Building the
-/// index once here turns every later merge into an indexed probe. This is a
-/// base-table write like compaction; the merge task already holds nothing on
-/// the table, and `replace(true)` makes a race with a concurrent `IndexId`
-/// harmless. Skipped when the index is already present (one manifest read).
-async fn ensure_id_btree_index(state: &Arc<MasterState>, name: &str) -> Result<(), String> {
-    let uri = state.rollout_uri(name);
-    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-        .await
-        .map_err(|e| e.to_string())?;
-    if store
-        .has_id_btree_index()
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        // The BTree exists but every merge and compaction since it was built
-        // added fragments it does not cover, and `merge_insert` full-scans
-        // those. Append an index delta over them so the probe stays a probe.
-        let started = std::time::Instant::now();
-        let covered = store
-            .extend_id_btree_index()
-            .await
-            .map_err(|e| format!("extending id index before merge: {e}"))?;
-        if covered > 0 {
-            metrics::counter!("master_merge_wal_index_extended_total").increment(1);
-            tracing::info!(
-                target = %name,
-                fragments = covered,
-                elapsed_secs = started.elapsed().as_secs(),
-                "extended id BTree index over fragments added since it was built"
-            );
-        }
-        return Ok(());
-    }
-    let started = std::time::Instant::now();
-    store
-        .create_id_btree_index()
-        .await
-        .map_err(|e| format!("building id index before merge: {e}"))?;
-    metrics::counter!("master_merge_wal_index_built_total").increment(1);
-    tracing::info!(
-        target = %name,
-        elapsed_secs = started.elapsed().as_secs(),
-        "built id BTree index before merge-wal so merge_insert probes instead of scanning"
-    );
-    Ok(())
-}
-
-async fn run_merge_wal(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
-    let endpoints = &state.config.worker_endpoints;
-    if endpoints.is_empty() {
-        return Err("no worker endpoints configured (--worker-endpoints)".to_string());
-    }
-    let (kind, name) = parse_target(target);
-    if kind == StoreKind::Rollout && state.config.index_before_merge {
-        ensure_id_btree_index(state, name).await?;
-    }
-    let route = match kind {
-        StoreKind::Rollout => "api/v1/internal/merge-wal",
-        StoreKind::Generic => "api/v1/generic",
-    };
-
-    let calls = endpoints.iter().map(|ep| {
-        let http = state.http.clone();
-        let url = match kind {
-            StoreKind::Rollout => format!("{}/{}/{}", ep.trim_end_matches('/'), route, name),
-            StoreKind::Generic => {
-                format!("{}/{}/{}/merge-wal", ep.trim_end_matches('/'), route, name)
-            }
-        };
-        async move {
-            // Per-worker timing: `join_all` means the slowest worker sets the
-            // whole task's latency, so without this one straggler is
-            // indistinguishable from every worker being slow. Unlabelled --
-            // outcome is carried by the counter below, which costs one series
-            // per value instead of one per bucket per value.
-            let started = std::time::Instant::now();
-            let outcome = merge_wal_one(&http, &url).await;
-            let result = match &outcome {
-                Ok(WorkerMerge::Reclaimed(_)) => "ok",
-                Ok(WorkerMerge::NotFound) => "not_found",
-                Err(WorkerMergeError::Http(_)) => "http_error",
-                Err(WorkerMergeError::Transport(_)) => "transport_error",
-            };
-            metrics::histogram!("master_merge_wal_worker_duration_seconds")
-                .record(started.elapsed().as_secs_f64());
-            // Counted per worker per attempt: a 404 is tolerated as "owns no
-            // shard" and N-1 failures still report task success, so this counter
-            // is the only place partial failure is visible at all.
-            metrics::counter!("master_merge_wal_workers_total", "result" => result).increment(1);
-            outcome
-        }
-    });
-
-    // Serial, not `join_all`: every worker's merge commits a new version of
-    // the *same* base table, and Lance's commit-conflict retry gives up after
-    // 30s of wall clock. Fanning out to 20 workers at once is 20 writers
-    // racing one commit point -- on a throttled object store the retries
-    // cannot complete in time and most of them fail with "Too many concurrent
-    // writers". The etcd target lock already guarantees one MergeWal task per
-    // store; this makes the task itself one writer at a time, which is the
-    // whole point of routing merges through the master.
-    let mut results = Vec::with_capacity(endpoints.len());
-    for call in calls {
-        results.push(call.await);
-    }
-    let total_workers = results.len();
-    let mut reclaimed = 0usize;
-    let mut ok_workers = 0usize;
-    let mut failed_workers = 0usize;
-    let mut last_err = None;
-    for r in results {
-        match r {
-            Ok(WorkerMerge::Reclaimed(n)) => {
-                reclaimed += n;
-                ok_workers += 1;
-            }
-            Ok(WorkerMerge::NotFound) => {
-                ok_workers += 1;
-            }
-            Err(e) => {
-                failed_workers += 1;
-                last_err = Some(e.to_string());
-            }
-        }
-    }
-
-    metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed as u64);
-
-    // A worker that owns no shard for this store answers 404 or reclaims 0,
-    // and that is fine -- but it must not launder a real failure elsewhere
-    // into success. If any worker errored and the task as a whole made no
-    // progress, it failed: this is what a store with a broken base table
-    // looks like (the one worker holding its data 500s, the rest have
-    // nothing), and it is what the failure cooldown needs to see. Partial
-    // progress with some errors is still success; the next sweep retries
-    // the stragglers.
-    if ok_workers == 0 || (failed_workers > 0 && reclaimed == 0) {
-        return Err(format!(
-            "{}/{total_workers} workers failed and nothing was merged: {}",
-            failed_workers,
-            last_err.unwrap_or_else(|| "all workers failed".to_string())
-        ));
-    }
-    Ok(format!(
-        "merged {reclaimed} generations across {ok_workers}/{total_workers} workers"
-    ))
-}
-
-/// One worker's response to a WAL-merge fan-out.
-enum WorkerMerge {
-    Reclaimed(usize),
-    /// The worker owns no shard for this experiment; tolerated as success.
-    NotFound,
-}
-
-enum WorkerMergeError {
-    /// A non-success HTTP status.
-    Http(String),
-    /// Connection/timeout/decode failure.
-    Transport(String),
-}
-
-impl std::fmt::Display for WorkerMergeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http(m) | Self::Transport(m) => f.write_str(m),
-        }
-    }
-}
-
-/// Issue the merge call to one worker, classifying the failure mode so the
-/// caller can label its metrics.
-async fn merge_wal_one(http: &reqwest::Client, url: &str) -> Result<WorkerMerge, WorkerMergeError> {
-    let resp = http
-        .post(url)
-        .send()
-        .await
-        .map_err(|e| WorkerMergeError::Transport(e.to_string()))?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(WorkerMerge::NotFound);
-    }
-    if !status.is_success() {
-        return Err(WorkerMergeError::Http(format!("{url}: HTTP {status}")));
-    }
-    let body: MergeWalReply = resp
-        .json()
-        .await
-        .map_err(|e| WorkerMergeError::Transport(e.to_string()))?;
-    Ok(WorkerMerge::Reclaimed(body.reclaimed))
 }
 
 /// Refresh the stats row for `name` after a successful compaction: re-observe
@@ -783,6 +577,40 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
 /// not every scheduler task -- adequate for tests, which drop the whole
 /// `MasterState` immediately after.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
+    // Retry metadata independently of coarse stats sweeps. Every replica may
+    // enqueue; the existing task dedupe/claim transaction elects one executor.
+    let retry_state = state.clone();
+    tokio::spawn(async move {
+        let coordinator = retry_state.task_store.merge_coordinator();
+        let mut cursor = None;
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            match coordinator.failure_page(cursor.as_deref(), 256).await {
+                Ok((rows, next)) => {
+                    cursor = next;
+                    let mut targets = std::collections::HashSet::new();
+                    for failure in rows {
+                        if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
+                            && retry_state
+                                .config
+                                .worker_endpoints
+                                .contains(&failure.endpoint)
+                            && targets.insert(failure.target.clone())
+                        {
+                            if let Err(error) =
+                                enqueue(&retry_state, TaskKind::MergeWal, &failure.target).await
+                            {
+                                tracing::warn!(target = %failure.target, %error, "merge recovery enqueue failed");
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "merge recovery metadata scan failed"),
+            }
+        }
+    });
+
     // Optional periodic compaction auto-sweep feeds the same queue.
     let interval_secs = state.config.compaction_interval_secs;
     if interval_secs > 0 {
@@ -1144,20 +972,35 @@ mod tests {
     /// merge finds it present and builds nothing.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
-    async fn merge_wal_builds_the_id_btree_first() {
+    async fn owned_merge_delegates_index_safety_to_worker() {
         use axum::{routing::post, Json, Router};
-        let app = Router::new().route(
-            "/api/v1/internal/merge-wal/{name}",
-            post(|| async { Json(serde_json::json!({ "reclaimed": 0 })) }),
-        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.worker_endpoints = vec![format!("http://{addr}")];
         cfg.index_before_merge = true;
+        let base = cfg.data_dir.clone();
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post(
+                move |axum::extract::Path(name): axum::extract::Path<String>| {
+                    let base = base.clone();
+                    async move {
+                        let uri =
+                            lance_context_core::join_uri(&base, &format!("{name}.rollout.lance"));
+                        let mut store = RolloutStore::open(&uri).await.unwrap();
+                        if !store.has_id_btree_index().await.unwrap() {
+                            store.create_id_btree_index().await.unwrap();
+                        }
+                        Json(serde_json::json!({"reclaimed":0}))
+                    }
+                },
+            ),
+        );
+        let app = owned_stub(app, &cfg).await;
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
 
@@ -1347,6 +1190,68 @@ mod tests {
         worker.abort();
     }
 
+    /// Wrap test workers in the production ownership wire protocol, preserving
+    /// their individual route assertions and injected delays/errors.
+    async fn owned_stub(app: axum::Router, cfg: &MasterConfig) -> axum::Router {
+        use axum::{
+            routing::{get, post},
+            Json,
+        };
+        use lance_context_merge::{Coordinator, Execution};
+        use tower::ServiceExt;
+        let client = etcd_client::Client::connect(cfg.etcd_endpoints.clone(), None)
+            .await
+            .unwrap();
+        let coordinator = Coordinator::new(client, cfg.etcd_prefix.clone());
+        axum::Router::new()
+            .route(
+                "/api/v1/internal/merge-executor",
+                get(|| async {
+                    Json(serde_json::json!({"protocol":1,"instance":"stub","timeout_secs":600}))
+                }),
+            )
+            .route(
+                "/api/v1/internal/merge-executor/start",
+                post(move |Json(execution): Json<Execution>| {
+                    let coordinator = coordinator.clone();
+                    let app = app.clone();
+                    async move {
+                        let running = coordinator.start(&execution).await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let path = match execution.target.strip_prefix("generic:") {
+                                Some(name) => format!("/api/v1/generic/{name}/merge-wal"),
+                                None => format!("/api/v1/internal/merge-wal/{}", execution.target),
+                            };
+                            let response = app
+                                .oneshot(
+                                    axum::http::Request::post(path)
+                                        .body(axum::body::Body::empty())
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            let status = response.status();
+                            let body = axum::body::to_bytes(response.into_body(), 65536)
+                                .await
+                                .unwrap();
+                            let outcome = if status.is_success() {
+                                Ok(serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+                                    ["reclaimed"]
+                                    .as_u64()
+                                    .unwrap() as usize)
+                            } else if status == axum::http::StatusCode::NOT_FOUND {
+                                Ok(0)
+                            } else {
+                                Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&body)))
+                            };
+                            assert!(coordinator.finish(&running, outcome).await.unwrap());
+                        });
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }),
+            )
+    }
+
     /// MergeWal fans out to every configured worker endpoint and sums the
     /// reclaimed counts. Uses a tiny in-process stub server per "worker".
     #[tokio::test]
@@ -1355,11 +1260,12 @@ mod tests {
         use axum::{routing::post, Json, Router};
 
         // A stub worker that always reports `reclaimed` for any merge call.
-        async fn spawn_stub(reclaimed: usize) -> String {
+        async fn spawn_stub(reclaimed: usize, cfg: &MasterConfig) -> String {
             let app = Router::new().route(
                 "/api/v1/internal/merge-wal/{name}",
                 post(move || async move { Json(serde_json::json!({ "reclaimed": reclaimed })) }),
             );
+            let app = owned_stub(app, cfg).await;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
@@ -1370,7 +1276,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.worker_endpoints = vec![spawn_stub(3).await, spawn_stub(2).await];
+        cfg.worker_endpoints = vec![spawn_stub(3, &cfg).await, spawn_stub(2, &cfg).await];
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
 
@@ -1415,11 +1321,12 @@ mod tests {
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.worker_endpoints = vec![format!("http://{addr}")];
+        let app = owned_stub(app, &cfg).await;
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
 
@@ -1444,7 +1351,7 @@ mod tests {
     async fn merge_wal_with_an_erroring_worker_and_no_progress_fails() {
         use axum::{http::StatusCode, routing::post, Json, Router};
 
-        async fn spawn(ok: bool) -> String {
+        async fn spawn(ok: bool, cfg: &MasterConfig) -> String {
             let app = Router::new().route(
                 "/api/v1/internal/merge-wal/{name}",
                 post(move || async move {
@@ -1458,6 +1365,7 @@ mod tests {
                     }
                 }),
             );
+            let app = owned_stub(app, cfg).await;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1466,14 +1374,40 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.worker_endpoints = vec![spawn(true).await, spawn(false).await];
+        cfg.worker_endpoints = vec![spawn(true, &cfg).await, spawn(false, &cfg).await];
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
 
         let rec = enqueue(&state, TaskKind::MergeWal, "broken").await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
         assert_eq!(status.state, TaskState::Failed, "got {status:?}");
-        assert!(status.error.unwrap().contains("nothing was merged"));
+        assert!(status.error.unwrap().contains("merged 0 generations"));
+        assert!(
+            state
+                .task_store
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .all(|task| task.kind != TaskKind::Repair),
+            "a merge failure must not schedule destructive fragment removal"
+        );
+        assert!(
+            !state
+                .task_store
+                .is_cooling_down(TaskKind::MergeWal, "broken")
+                .await
+                .unwrap(),
+            "one broken shard must not suppress healthy shard scheduling"
+        );
+        let (failures, _) = state
+            .task_store
+            .merge_coordinator()
+            .failure_page(None, 256)
+            .await
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].needs_attention);
         worker.abort();
     }
 
@@ -1491,7 +1425,11 @@ mod tests {
         // across the fleet through a shared counter.
         let inflight = Arc::new(AtomicUsize::new(0));
         let max_inflight = Arc::new(AtomicUsize::new(0));
-        async fn spawn_stub(inflight: Arc<AtomicUsize>, max_inflight: Arc<AtomicUsize>) -> String {
+        async fn spawn_stub(
+            inflight: Arc<AtomicUsize>,
+            max_inflight: Arc<AtomicUsize>,
+            cfg: &MasterConfig,
+        ) -> String {
             let app = Router::new().route(
                 "/api/v1/internal/merge-wal/{name}",
                 post(move || {
@@ -1506,6 +1444,7 @@ mod tests {
                     }
                 }),
             );
+            let app = owned_stub(app, cfg).await;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1515,9 +1454,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.worker_endpoints = vec![
-            spawn_stub(inflight.clone(), max_inflight.clone()).await,
-            spawn_stub(inflight.clone(), max_inflight.clone()).await,
-            spawn_stub(inflight.clone(), max_inflight.clone()).await,
+            spawn_stub(inflight.clone(), max_inflight.clone(), &cfg).await,
+            spawn_stub(inflight.clone(), max_inflight.clone(), &cfg).await,
+            spawn_stub(inflight.clone(), max_inflight.clone(), &cfg).await,
         ];
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
@@ -1598,13 +1537,14 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, hang).await.unwrap() });
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.worker_endpoints = vec![format!("http://{addr}")];
         cfg.merge_wal_concurrency = 2;
         cfg.task_concurrency = 2;
+        let hang = owned_stub(hang, &cfg).await;
+        tokio::spawn(async move { axum::serve(listener, hang).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
 
         // Build a compactable store before the dispatcher starts.
@@ -1742,23 +1682,19 @@ mod tests {
         worker.abort();
     }
 
-    /// The WAL-merge sweep enqueues a `MergeWal` only for experiments whose
-    /// pending generation count is at or above the threshold, and de-dupes so a
-    /// A target that keeps failing is skipped by the sweep after the cooldown
-    /// threshold, so a permanently broken store stops consuming task slots
-    /// and blocking healthy stores behind it. Manual enqueue bypasses the
-    /// cooldown, and a later success clears it.
+    /// Non-merge maintenance retains target-wide cooldown. Merge failures now
+    /// use the independent per-shard circuit tested in merge_execution.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
-    async fn repeated_failures_cool_the_target_down_and_sweeps_skip_it() {
+    async fn repeated_compaction_failures_cool_the_target_down_and_sweeps_skip_it() {
         use crate::stats_store::StatRow;
 
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.merge_wal_min_generations = 1;
+        cfg.min_fragments = 1;
         cfg.task_cooldown_after_failures = 2;
         cfg.task_cooldown_base_secs = 3600;
-        // No worker endpoints: every MergeWal fails immediately.
+        // Missing base dataset: every compaction fails immediately.
         cfg.worker_endpoints = vec![];
         let state = MasterState::new(cfg).await.unwrap();
         let worker = spawn_scheduler(&state);
@@ -1771,7 +1707,7 @@ mod tests {
                     name: "broken".to_string(),
                     uri: state.rollout_uri("broken"),
                     row_count: 0,
-                    fragment_count: 0,
+                    fragment_count: 50,
                     last_updated: 0,
                     pending_wal_generations: 50,
                     last_compaction: StatRow::NO_COMPACTION,
@@ -1787,19 +1723,19 @@ mod tests {
             assert!(
                 !state
                     .task_store
-                    .is_cooling_down(TaskKind::MergeWal, "broken")
+                    .is_cooling_down(TaskKind::Compact, "broken")
                     .await
                     .unwrap(),
                 "round {round}: must not cool down below the failure threshold"
             );
-            assert_eq!(sweep_merge_wal_candidates(&state).await.unwrap(), 1);
+            assert_eq!(sweep_candidates(&state).await.unwrap(), 1);
             let id = state
                 .task_store
                 .list()
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|t| t.kind == TaskKind::MergeWal && t.target == "broken")
+                .filter(|t| t.kind == TaskKind::Compact && t.target == "broken")
                 .max_by_key(|t| t.enqueued_at)
                 .unwrap()
                 .id;
@@ -1812,7 +1748,7 @@ mod tests {
         for _ in 0..40 {
             if state
                 .task_store
-                .is_cooling_down(TaskKind::MergeWal, "broken")
+                .is_cooling_down(TaskKind::Compact, "broken")
                 .await
                 .unwrap()
             {
@@ -1830,13 +1766,13 @@ mod tests {
 
         // The sweep now skips it.
         assert_eq!(
-            sweep_merge_wal_candidates(&state).await.unwrap(),
+            sweep_candidates(&state).await.unwrap(),
             0,
             "a cooled-down target must not be re-enqueued by the sweep"
         );
 
         // A manual enqueue is not gated.
-        let manual = enqueue(&state, TaskKind::MergeWal, "broken").await.unwrap();
+        let manual = enqueue(&state, TaskKind::Compact, "broken").await.unwrap();
         assert_eq!(manual.target, "broken");
         assert_eq!(
             await_terminal(&state, &manual.id).await.state,
@@ -1868,7 +1804,7 @@ mod tests {
         worker.abort();
     }
 
-    /// second sweep does not pile up a duplicate for the same target.
+    /// WAL sweeps enqueue over-threshold targets and dedupe a second sweep.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn sweep_merge_wal_enqueues_over_threshold_and_dedupes() {

@@ -13,6 +13,7 @@ name = "lance-context-master"
 path = "src/main.rs"
 
 [dependencies]
+lance-context-merge = { path = "../lance-context-merge" }
 lance-context-core = { version = "0.6.3", path = "../lance-context-core" }
 lance-context-api = { version = "0.6.3", path = "../lance-context-api" }
 lance-context-metrics = { version = "0.1.0", path = "../lance-context-metrics" }
@@ -36,4 +37,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"

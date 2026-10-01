@@ -18,6 +18,10 @@ default = ["metrics"]
 metrics = ["dep:metrics"]
 
 [dependencies]
+async-trait = "0.1"
+lance-table = "9.0.0"
+lance-io = "9.0.0"
+object_store = "0.13.2"
 base64 = "0.22"
 arrow-array = "58"
 arrow-ipc = "58"

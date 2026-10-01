@@ -4,6 +4,15 @@ use clap::Parser;
 #[command(name = "lance-context-server")]
 #[command(about = "REST API server for lance-context")]
 pub struct ServerConfig {
+    /// Configure etcd to enable the owned merge execution protocol.
+    #[command(flatten)]
+    pub merge_etcd: lance_context_merge::EtcdConfig,
+
+    /// Deadline for scoped merge work, including slot acquisition. Already
+    /// started manifest writes must drain before ownership can be released.
+    #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 600)]
+    pub merge_execution_timeout_secs: u64,
+
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,
 

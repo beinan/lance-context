@@ -273,7 +273,19 @@ pub async fn merge_generic_wal(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    if state.merge_executions.enabled() {
+        return Err(AppError::Overloaded(
+            "use the owned merge executor protocol".into(),
+        ));
+    }
     let _slot = state.acquire_merge_slot().await;
+    merge_generic_wal_owned(State(state), Path(name)).await
+}
+
+pub(crate) async fn merge_generic_wal_owned(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
     // Same prepare/commit split as the sweeper: the object-storage read of the
     // generations runs under the shared lock so the store keeps serving.

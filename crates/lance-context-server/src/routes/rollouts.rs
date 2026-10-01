@@ -728,7 +728,19 @@ pub async fn merge_wal(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
+    if state.merge_executions.enabled() {
+        return Err(AppError::Overloaded(
+            "use the owned merge executor protocol".into(),
+        ));
+    }
     let _slot = state.acquire_merge_slot().await;
+    merge_wal_owned(State(state), Path(name)).await
+}
+
+pub(crate) async fn merge_wal_owned(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
     // Split by lock scope: seal + read every flushed generation under the
     // *read* lock so ingest on this store keeps running, then take the write

@@ -18,6 +18,18 @@ use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/api/v1/internal/merge-executor",
+            get(crate::merge_execution::capabilities),
+        )
+        .route(
+            "/api/v1/internal/merge-executor/start",
+            post(crate::merge_execution::start),
+        )
+        .route(
+            "/api/v1/internal/merge-executor/cancel",
+            post(crate::merge_execution::cancel),
+        )
         .route("/api/v1/health", get(health::health_check))
         .route("/api/v1/contexts", post(contexts::create_context))
         .route("/api/v1/contexts", get(contexts::list_contexts))

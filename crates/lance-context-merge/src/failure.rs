@@ -1,0 +1,277 @@
+//! Durable shard failures: task recreation must not reset a retry budget.
+use crate::{ClaimProof, Coordinator, Execution, Result};
+use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Retryable,
+    Deadline,
+    DataOrConfiguration,
+    OwnershipUnresolved,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShardFailure {
+    pub target: String,
+    pub endpoint: String,
+    pub consecutive_attempts: u32,
+    pub class: FailureClass,
+    pub last_error: String,
+    pub last_failure_ms: u64,
+    pub next_retry_ms: u64,
+    pub needs_attention: bool,
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn classify(error: &str) -> FailureClass {
+    let error = error.to_ascii_lowercase();
+    if error.contains("ownership unresolved") {
+        FailureClass::OwnershipUnresolved
+    } else if [
+        "not found",
+        "notfound",
+        "corrupt",
+        "schema",
+        "invalid",
+        "403",
+        "401",
+        "protocol",
+    ]
+    .iter()
+    .any(|s| error.contains(s))
+    {
+        FailureClass::DataOrConfiguration
+    } else if error.contains("deadline") || error.contains("timeout") || error.contains("timed out")
+    {
+        FailureClass::Deadline
+    } else {
+        FailureClass::Retryable
+    }
+}
+
+impl ShardFailure {
+    fn advance(
+        target: &str,
+        endpoint: &str,
+        previous: Option<Self>,
+        error: &str,
+        now: u64,
+    ) -> Self {
+        let attempts = previous.map_or(1, |f| f.consecutive_attempts.saturating_add(1));
+        let class = classify(error);
+        let needs_attention = attempts >= 15
+            || matches!(
+                class,
+                FailureClass::DataOrConfiguration | FailureClass::OwnershipUnresolved
+            );
+        // First task gets three attempts. Later tasks get one half-open probe,
+        // never a fresh budget of three. Cap probing at once per hour.
+        let delay_secs = if needs_attention {
+            3600
+        } else if attempts < 3 {
+            2
+        } else {
+            (30u64.saturating_mul(1 << (attempts - 3).min(5))).min(900)
+        };
+        Self {
+            target: target.into(),
+            endpoint: endpoint.into(),
+            consecutive_attempts: attempts,
+            class,
+            last_error: error.chars().take(4096).collect(),
+            last_failure_ms: now,
+            next_retry_ms: now.saturating_add(delay_secs * 1000),
+            needs_attention,
+        }
+    }
+}
+
+impl Coordinator {
+    fn failures_prefix(&self) -> String {
+        format!("{}/merge-failures/", self.prefix.trim_end_matches('/'))
+    }
+    fn failure_key(&self, target: &str, endpoint: &str) -> String {
+        let hex = |s: &str| {
+            s.as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        format!(
+            "{}{}/{}",
+            self.failures_prefix(),
+            hex(target),
+            hex(endpoint)
+        )
+    }
+    pub async fn failure(&self, target: &str, endpoint: &str) -> Result<Option<ShardFailure>> {
+        let response = self
+            .client
+            .clone()
+            .get(self.failure_key(target, endpoint), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        response
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+    /// Commit the terminal outcome and its retry budget in the same etcd
+    /// transaction that releases execution ownership. A master crash between
+    /// release and bookkeeping cannot reset failed attempts.
+    pub(crate) async fn completion_changes(
+        &self,
+        execution: &Execution,
+    ) -> Result<(Vec<Compare>, Vec<TxnOp>)> {
+        let key = self.failure_key(&execution.target, &execution.endpoint);
+        let Some(error) = &execution.error else {
+            return Ok((Vec::new(), vec![TxnOp::delete(key, None)]));
+        };
+        let response = self
+            .client
+            .clone()
+            .get(key.clone(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let previous = response.kvs().first();
+        let old = previous
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        let failure =
+            ShardFailure::advance(&execution.target, &execution.endpoint, old, error, now_ms());
+        Ok((
+            vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                previous.map_or(0, |kv| kv.mod_revision()),
+            )],
+            vec![TxnOp::put(key, serde_json::to_vec(&failure).unwrap(), None)],
+        ))
+    }
+
+    pub async fn record_failure(
+        &self,
+        proof: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+        error: &str,
+    ) -> Result<ShardFailure> {
+        let key = self.failure_key(target, endpoint);
+        let response = self
+            .client
+            .clone()
+            .get(key.clone(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let previous = response.kvs().first();
+        let old = previous
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        let failure = ShardFailure::advance(target, endpoint, old, error, now_ms());
+        let revision = previous.map_or(0, |kv| kv.mod_revision());
+        if !self
+            .transact(
+                vec![
+                    Compare::value(proof.key.as_str(), CompareOp::Equal, proof.token.as_bytes()),
+                    Compare::mod_revision(key.clone(), CompareOp::Equal, revision),
+                ],
+                vec![TxnOp::put(key, serde_json::to_vec(&failure).unwrap(), None)],
+            )
+            .await?
+        {
+            return Err("claim or failure record changed while recording merge failure".into());
+        }
+        Ok(failure)
+    }
+    pub async fn clear_failure(
+        &self,
+        proof: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<()> {
+        if !self
+            .transact(
+                vec![Compare::value(
+                    proof.key.as_str(),
+                    CompareOp::Equal,
+                    proof.token.as_bytes(),
+                )],
+                vec![TxnOp::delete(self.failure_key(target, endpoint), None)],
+            )
+            .await?
+        {
+            return Err("claim lost while recording merge recovery".into());
+        }
+        Ok(())
+    }
+    /// Bounded, cursor-based metadata scan; never opens table data or WAL.
+    pub async fn failure_page(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<ShardFailure>, Option<String>)> {
+        let prefix = self.failures_prefix();
+        let (start, options) = match after {
+            Some(key) if key.starts_with(&prefix) => {
+                let mut end = prefix.as_bytes().to_vec();
+                *end.last_mut().unwrap() += 1;
+                (format!("{key}\0"), GetOptions::new().with_range(end))
+            }
+            Some(_) => return Err("invalid merge failure cursor".into()),
+            None => (prefix, GetOptions::new().with_prefix()),
+        };
+        let response = self
+            .client
+            .clone()
+            .get(start, Some(options.with_limit(limit.clamp(1, 256))))
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows = response
+            .kvs()
+            .iter()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>>>()?;
+        let next = if response.more() {
+            response
+                .kvs()
+                .last()
+                .map(|kv| String::from_utf8_lossy(kv.key()).into_owned())
+        } else {
+            None
+        };
+        Ok((rows, next))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn persistent_budget_backoff_and_attention() {
+        let mut old = None;
+        for attempt in 1..=20 {
+            let next =
+                ShardFailure::advance("table", "worker", old, "temporary storage failure", 1000);
+            assert_eq!(next.consecutive_attempts, attempt);
+            assert_eq!(next.needs_attention, attempt >= 15);
+            assert!(next.next_retry_ms <= 3_601_000);
+            if attempt == 3 {
+                assert_eq!(next.next_retry_ms, 31_000);
+            }
+            old = Some(next);
+        }
+        let broken =
+            ShardFailure::advance("table", "worker", None, "Not found: /data/1.lance", 1000);
+        assert!(broken.needs_attention);
+        assert_eq!(broken.next_retry_ms, 3_601_000);
+    }
+}

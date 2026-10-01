@@ -106,9 +106,9 @@ pub struct MasterConfig {
     #[arg(long, env = "INDEX_AFTER_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
     pub index_after_compaction: bool,
 
-    /// Before fanning a merge-wal out to the workers, build the `id` BTree
-    /// index on the target's base table if it is missing. Without it Lance's
-    /// `merge_insert` full-scans the base table on every merge.
+    /// Deprecated compatibility flag. Owned merge executors now ensure the id
+    /// index under the same execution fence as the merge; the master does not
+    /// mutate the base table before admitting a worker.
     #[arg(long, env = "INDEX_BEFORE_MERGE", default_value_t = true, action = clap::ArgAction::Set)]
     pub index_before_merge: bool,
 

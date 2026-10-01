@@ -76,6 +76,7 @@ impl<T> StoreHandles<T> {
 }
 
 pub struct AppState {
+    pub merge_executions: crate::merge_execution::Executions,
     pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
     /// Bounded LRU of resident rollout-store handles.
     ///
@@ -321,7 +322,35 @@ impl AppState {
         let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
             .await
             .map_err(AppError::from_lance)?;
+        if !config.merge_etcd.etcd_endpoints.is_empty()
+            && (config.rollout_merge_after_generations != 0
+                || config.rollout_cleanup_interval_secs != 0)
+        {
+            return Err(AppError::InvalidRequest(
+                "owned merge execution requires self-merge sweepers disabled".into(),
+            ));
+        }
+        let merge_coordinator = if config.merge_etcd.etcd_endpoints.is_empty() {
+            None
+        } else {
+            Some(
+                config
+                    .merge_etcd
+                    .connect()
+                    .await
+                    .map_err(AppError::Internal)?,
+            )
+        };
+        if config.merge_execution_timeout_secs == 0 {
+            return Err(AppError::InvalidRequest(
+                "MERGE_EXECUTION_TIMEOUT_SECS must be positive".into(),
+            ));
+        }
         Ok(Self {
+            merge_executions: crate::merge_execution::Executions::new(
+                merge_coordinator,
+                config.merge_execution_timeout_secs,
+            ),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
             rollout_handles: StoreHandles::default(),
@@ -391,6 +420,7 @@ impl AppState {
             .await
             .expect("open test datagen registry");
         Self {
+            merge_executions: crate::merge_execution::Executions::new(None, 600),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),

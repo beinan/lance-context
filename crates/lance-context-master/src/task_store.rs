@@ -150,6 +150,18 @@ impl Drop for LeaseKeepalive {
 }
 
 impl TaskStore {
+    pub(crate) fn merge_coordinator(&self) -> lance_context_merge::Coordinator {
+        lance_context_merge::Coordinator::new(self.inner.client.clone(), self.inner.prefix.clone())
+    }
+
+    pub(crate) fn merge_claim(&self, claim: &TaskClaim) -> lance_context_merge::ClaimProof {
+        lance_context_merge::ClaimProof {
+            key: self.inner.claim_key(&claim.task.id),
+            token: claim.backend.token.clone(),
+            lease_id: claim.backend.lease_id,
+        }
+    }
+
     pub async fn open(config: &MasterConfig) -> lance::Result<Self> {
         let store = Self {
             inner: Arc::new(EtcdTaskStore::connect(config).await?),
@@ -233,7 +245,7 @@ impl TaskStore {
         self.inner.finish(claim, outcome).await?;
         // Cooldown bookkeeping is best-effort and never fails the completion:
         // the task's terminal state is already committed above.
-        if self.cooldown.after_failures > 0 {
+        if kind != TaskKind::MergeWal && self.cooldown.after_failures > 0 {
             let result = match failed {
                 Some(error) => {
                     self.inner
@@ -262,7 +274,7 @@ impl TaskStore {
     }
 
     pub async fn is_cooling_down(&self, kind: TaskKind, target: &str) -> lance::Result<bool> {
-        if self.cooldown.after_failures == 0 {
+        if kind == TaskKind::MergeWal || self.cooldown.after_failures == 0 {
             return Ok(false);
         }
         // Below the threshold the record only carries the failure count; it is
@@ -603,6 +615,14 @@ impl EtcdTaskStore {
                     }
                 }
 
+                let merge_execution = if task.kind == TaskKind::MergeWal {
+                    lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
+                        .get(&task.target)
+                        .await
+                        .map_err(lance::Error::io)?
+                } else {
+                    None
+                };
                 let token = generate_id();
                 let lease_id = self.grant_lease().await?;
                 let claim_key = self.claim_key(&task.id);
@@ -620,7 +640,37 @@ impl EtcdTaskStore {
                     Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
                 ];
                 if let Some(key) = &target_key {
-                    compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
+                    if let Some(execution) = &merge_execution {
+                        compares.push(Compare::value(
+                            key.as_str(),
+                            CompareOp::Equal,
+                            lance_context_merge::execution_owner(execution),
+                        ));
+                    } else {
+                        compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
+                    }
+                }
+                // A lost scheduler lease does not terminate remote storage work.
+                // MergeWal may claim to reconcile it; every other writer waits.
+                if task.kind != TaskKind::MergeWal && target_key.is_some() {
+                    compares.push(Compare::version(
+                        lance_context_merge::execution_key(&self.prefix, &task.target),
+                        CompareOp::Equal,
+                        0,
+                    ));
+                }
+                // Remote execution ownership persists, but its reconciler is
+                // still exclusive and leased. Dependency-chain merge tasks
+                // must not cancel another live scheduler's execution.
+                let merge_claim_key =
+                    lance_context_merge::execution_key(&self.prefix, &task.target)
+                        .replace("/merge-executions/", "/merge-claims/");
+                if task.kind == TaskKind::MergeWal {
+                    compares.push(Compare::version(
+                        merge_claim_key.as_str(),
+                        CompareOp::Equal,
+                        0,
+                    ));
                 }
                 let lease_options = Some(PutOptions::new().with_lease(lease_id));
                 let mut operations = vec![
@@ -629,12 +679,21 @@ impl EtcdTaskStore {
                     TxnOp::put(running_key, running_value, None),
                     TxnOp::put(claim_key.as_str(), token.as_bytes(), lease_options.clone()),
                 ];
-                if let Some(key) = &target_key {
+                if task.kind == TaskKind::MergeWal {
                     operations.push(TxnOp::put(
-                        key.as_str(),
+                        merge_claim_key,
                         token.as_bytes(),
                         lease_options.clone(),
                     ));
+                }
+                if merge_execution.is_none() {
+                    if let Some(key) = &target_key {
+                        operations.push(TxnOp::put(
+                            key.as_str(),
+                            token.as_bytes(),
+                            lease_options.clone(),
+                        ));
+                    }
                 }
                 let mut client = self.client.clone();
                 let claimed = client
@@ -680,14 +739,31 @@ impl EtcdTaskStore {
             keepalive,
         } = claim.backend;
         let mut task = claim.task;
+        let unresolved = if task.kind == TaskKind::MergeWal && outcome.is_err() {
+            lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
+                .get(&task.target)
+                .await
+                .map_err(lance::Error::io)?
+        } else {
+            None
+        };
         apply_outcome(&mut task, outcome);
         let mut operations = vec![
             TxnOp::put(self.task_key(&task.id), encode_task(&task)?, None),
             TxnOp::delete(claim_key.as_str(), None),
             TxnOp::delete(self.running_key(&task.id), None),
         ];
-        if let Some(key) = &target_key {
-            operations.push(TxnOp::delete(key.as_str(), None));
+        if task.kind == TaskKind::MergeWal {
+            operations.push(TxnOp::delete(
+                lance_context_merge::execution_key(&self.prefix, &task.target)
+                    .replace("/merge-executions/", "/merge-claims/"),
+                None,
+            ));
+        }
+        if unresolved.is_none() {
+            if let Some(key) = &target_key {
+                operations.push(TxnOp::delete(key.as_str(), None));
+            }
         }
         if let Some(key) = self.dedupe_key(task.kind, &task.target, &task.depends_on) {
             operations.push(TxnOp::delete(key, None));
@@ -696,11 +772,22 @@ impl EtcdTaskStore {
         let completed = client
             .txn(
                 Txn::new()
-                    .when([Compare::value(
-                        claim_key.as_str(),
-                        CompareOp::Equal,
-                        token.as_bytes(),
-                    )])
+                    .when([
+                        Compare::value(claim_key.as_str(), CompareOp::Equal, token.as_bytes()),
+                        match &unresolved {
+                            Some(execution) => Compare::value(
+                                lance_context_merge::execution_key(&self.prefix, &task.target),
+                                CompareOp::Equal,
+                                serde_json::to_vec(execution)
+                                    .map_err(|e| lance::Error::io(e.to_string()))?,
+                            ),
+                            None => Compare::version(
+                                lance_context_merge::execution_key(&self.prefix, &task.target),
+                                CompareOp::Equal,
+                                0,
+                            ),
+                        },
+                    ])
                     .and_then(operations),
             )
             .await
@@ -1265,7 +1352,7 @@ fn should_dedupe(kind: TaskKind, depends_on: &[String]) -> bool {
 fn requires_target_lock(kind: TaskKind) -> bool {
     matches!(
         kind,
-        TaskKind::Compact | TaskKind::IndexId | TaskKind::Repair
+        TaskKind::Compact | TaskKind::IndexId | TaskKind::Repair | TaskKind::MergeWal
     )
 }
 
@@ -1362,6 +1449,152 @@ mod tests {
             task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn merge_serializes_other_writers_and_survives_claim_loss() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        cfg.etcd_prefix = format!("/merge-lock-test/{}", generate_id());
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "shared", Vec::new())
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::Compact, "shared", Vec::new())
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::IndexId, "shared", Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_next_of_kinds(TaskKinds::GENERAL)
+                .await
+                .unwrap()
+                .is_none(),
+            "merge must lock against index and compact"
+        );
+        store
+            .enqueue(TaskKind::Compact, "unrelated", Vec::new())
+            .await
+            .unwrap();
+        let other = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.task.target, "unrelated");
+        let dependency = other.task.id.clone();
+        store.finish(other, Ok("done".into())).await.unwrap();
+        // A dependency-chain task has a distinct id and bypasses dedupe.
+        store
+            .enqueue(TaskKind::MergeWal, "shared", vec![dependency])
+            .await
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let execution = lance_context_merge::Execution::new("shared", "worker", "boot", 600);
+        assert!(coordinator
+            .reserve(&store.merge_claim(&merge), &execution)
+            .await
+            .unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(
+            store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .is_none(),
+            "only one scheduler may own reconciliation, even with a persistent execution lock"
+        );
+        store.abandon_claim_for_test(merge).await.unwrap();
+        store.inner.recover_orphaned().await.unwrap();
+        assert!(
+            store
+                .claim_next_of_kinds(TaskKinds::GENERAL)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired claim is not permission to write past live worker execution"
+        );
+        let recovered = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(recovered, Err("merge ownership unresolved".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.get("shared").await.unwrap(),
+            Some(running.clone())
+        );
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .is_none());
+        let recovered = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator
+            .finish(&running, Err("cancelled".into()))
+            .await
+            .unwrap());
+        let done = coordinator.get("shared").await.unwrap().unwrap();
+        assert!(coordinator
+            .release(&store.merge_claim(&recovered), &done)
+            .await
+            .unwrap());
+        store
+            .finish(recovered, Ok("recovered".into()))
+            .await
+            .unwrap();
+        let compact = store
+            .claim_next_of_kinds(TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(compact.task.kind, TaskKind::Compact);
+        store
+            .enqueue(TaskKind::MergeWal, "shared", Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .is_none(),
+            "compact must also block a new merge"
+        );
+        store.finish(compact, Ok("done".into())).await.unwrap();
+        store
+            .inner
+            .client
+            .clone()
+            .delete(
+                cfg.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

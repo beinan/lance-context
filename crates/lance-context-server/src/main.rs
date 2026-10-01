@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod merge_execution;
 mod routes;
 mod state;
 mod sweeper;
@@ -87,6 +88,7 @@ async fn main() {
 
     // Connections have drained. Deterministically close every resident writer
     // before the runtime tears down.
+    state.merge_executions.shutdown().await;
     state.shutdown().await;
 }
 

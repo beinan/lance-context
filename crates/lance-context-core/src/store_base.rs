@@ -1015,6 +1015,10 @@ impl StorageBase {
             return Ok(false);
         }
 
+        // A prior cancelled merge may have completed a shielded manifest
+        // commit after this handle's future was dropped. Always reopen latest
+        // before retrying, including generic stores without schema evolution.
+        self.refresh_latest().await?;
         self.ensure_latest_schema().await?;
 
         if !batches.is_empty() {
@@ -1035,22 +1039,31 @@ impl StorageBase {
         // writer now owns the shard.
         let epoch = manifest.writer_epoch;
 
+        let drain_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
         observe_phase!(
             "drain",
-            manifest_store
-                .commit_update(epoch, |current| ShardManifest {
-                    version: current.version + 1,
-                    // Relative edit: retain everything we did not merge. Must
-                    // never become an absolute assignment — see the doc comment.
-                    flushed_generations: current
-                        .flushed_generations
-                        .iter()
-                        .filter(|fg| !merged_generations.contains(&fg.generation))
-                        .cloned()
-                        .collect(),
-                    ..current.clone()
-                })
-                .await
+            crate::merge_write_scope::shield(async move {
+                drain_store
+                    .commit_update(epoch, |current| ShardManifest {
+                        version: current.version + 1,
+                        // Relative edit: retain everything we did not merge. Must
+                        // never become an absolute assignment — see the doc comment.
+                        flushed_generations: current
+                            .flushed_generations
+                            .iter()
+                            .filter(|fg| !merged_generations.contains(&fg.generation))
+                            .cloned()
+                            .collect(),
+                        ..current.clone()
+                    })
+                    .await
+            })
+            .await
         )?;
 
         self.delete_merged_generation_dirs(&merged_paths).await?;
@@ -2016,7 +2029,15 @@ impl StorageBase {
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
     ) -> LanceResult<Dataset> {
-        let mut builder = DatasetBuilder::from_uri(uri);
+        let store_params = storage_options.clone().map(|options| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        });
+        let handler = lance_table::io::commit::commit_handler_from_url(uri, &store_params).await?;
+        let mut builder = DatasetBuilder::from_uri(uri)
+            .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
         if let Some(options) = storage_options {
             builder = builder.with_storage_options(options);
         }
@@ -2052,6 +2073,9 @@ impl StorageBase {
             });
         }
         params.session = session;
+        let handler =
+            lance_table::io::commit::commit_handler_from_url(uri, &params.store_params).await?;
+        params.commit_handler = Some(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
 
         Dataset::write(batches, uri, Some(params)).await
     }
