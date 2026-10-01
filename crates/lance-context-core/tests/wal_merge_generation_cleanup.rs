@@ -53,6 +53,20 @@ fn rec(id: &str) -> RolloutRecord {
     }
 }
 
+/// Merged generation directories are removed on a spawned task after the
+/// manifest drain commits (lance-context #287), so a test that asserts on
+/// the filesystem waits for the cleanup to land instead of racing it.
+async fn wait_gen_dirs_on_disk(dataset_dir: &Path, expected: usize) -> usize {
+    for _ in 0..200 {
+        let n = count_gen_dirs_on_disk(dataset_dir);
+        if n == expected {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    count_gen_dirs_on_disk(dataset_dir)
+}
+
 fn count_gen_dirs_on_disk(dataset_dir: &Path) -> usize {
     let mem_wal = dataset_dir.join("_mem_wal");
     let mut count = 0;
@@ -112,7 +126,7 @@ async fn serial_merge_deletes_merged_generation_dirs() {
     ids.sort();
     ids.dedup();
 
-    let on_disk = count_gen_dirs_on_disk(Path::new(&uri));
+    let on_disk = wait_gen_dirs_on_disk(Path::new(&uri), manifest_pending).await;
 
     eprintln!(
         "appends={n} listed={} unique_ids={} raw_row_count={} \
@@ -239,7 +253,7 @@ async fn merge_pass_is_bounded_and_leftovers_survive() {
     );
 
     // The subset drain must still delete what it merged.
-    let on_disk = count_gen_dirs_on_disk(Path::new(&uri));
+    let on_disk = wait_gen_dirs_on_disk(Path::new(&uri), 0).await;
     assert_eq!(
         on_disk, 0,
         "a bounded merge must still delete merged generation dirs"
@@ -304,7 +318,7 @@ async fn assert_blob_merge_passes(max_generations: usize, max_bytes: usize, pass
             pending as i64,
             "only merged generations may be drained"
         );
-        assert_eq!(count_gen_dirs_on_disk(tmp.path()), pending);
+        assert_eq!(wait_gen_dirs_on_disk(tmp.path(), pending).await, pending);
         // Check the union of base and pending generations after every pass,
         // including the actual inline bytes, not just ids or row counts.
         let mut listed = store.list(None, None).await.unwrap();
@@ -373,7 +387,10 @@ async fn oversized_generation_is_merged_in_full_and_makes_progress() {
             store.observe().await.unwrap().pending_wal_generations,
             pending
         );
-        assert_eq!(count_gen_dirs_on_disk(tmp.path()), pending as usize);
+        assert_eq!(
+            wait_gen_dirs_on_disk(tmp.path(), pending as usize).await,
+            pending as usize
+        );
         let listed = store.list(None, None).await.unwrap();
         assert_eq!(
             listed.len(),

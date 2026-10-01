@@ -20,6 +20,9 @@ env:
   # See .cargo/config.toml: debug-build DataFusion plan walks in the WAL
   # merge need more than the 2 MiB default test-thread stack.
   RUST_MIN_STACK: "8388608"
+  # See .cargo/config.toml: blob-row merges in tests need more than the
+  # 150 MB-per-partition DataFusion default.
+  LANCE_MEM_POOL_SIZE: "1073741824"
   RUST_BACKTRACE: "1"
   CARGO_INCREMENTAL: "0"
 
