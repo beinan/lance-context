@@ -204,20 +204,29 @@ pub(crate) async fn flush_pass<S: Sweepable>(
                 // not a flush: its outcome is reported under the cleanup
                 // counters so a failing merge cannot masquerade as a failing
                 // flush on the dashboards. It is also a merge for memory
-                // purposes: it takes the same per-worker slot the master's
-                // requests take (ROLLOUT_MERGE_CONCURRENCY), so enabling the
-                // count trigger cannot stack merges past that bound.
-                let merged = async {
-                    let _slot = match &merge_slots {
-                        Some(slots) => Some(
-                            slots
-                                .clone()
-                                .acquire_owned()
-                                .await
-                                .expect("merge slot semaphore is never closed"),
-                        ),
-                        None => None,
-                    };
+                // purposes: it shares the per-worker slot with the master's
+                // merge requests (ROLLOUT_MERGE_CONCURRENCY). The slot is only
+                // *tried*, never awaited: this pass flushes every resident
+                // store in sequence, and blocking on a busy slot here would
+                // hold up the flush of every store behind this one. When the
+                // slots are full the merge is skipped; the next pass (30 s)
+                // tries again, and the master's sweep covers the store anyway.
+                let slot = match &merge_slots {
+                    Some(slots) => match slots.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            metrics::counter!(
+                                "rollout_wal_self_merge_skipped_total",
+                                "kind" => kind
+                            )
+                            .increment(1);
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                let merged = async move {
+                    let _slot = slot;
                     store.merge_if_due().await
                 };
                 report_merge(
@@ -408,5 +417,77 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reclaimed, 3);
+    }
+
+    /// The flush pass must flush every store even when every merge slot is
+    /// taken: the self-merge only *tries* the slot and skips, it never waits.
+    /// Two stores, count trigger off, slots exhausted — both must flush, and
+    /// nothing must merge.
+    #[tokio::test]
+    async fn flush_pass_never_waits_on_a_busy_merge_slot() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        // seal_on_add is on in `generic_with_pending`, so build stores with
+        // unsealed rows by hand: count trigger off, rows left in the memtable.
+        async fn unsealed(dir: &TempDir) -> Arc<RwLock<GenericStore>> {
+            let uri = dir.path().to_string_lossy().to_string();
+            let store = GenericStore::open(
+                &uri,
+                spec(),
+                GenericStoreOptions {
+                    merge_after_generations: Some(0),
+                    seal_on_add: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            store
+                .add(&[json!({"id": "r0"}).as_object().unwrap().clone()])
+                .await
+                .unwrap();
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
+            Arc::new(RwLock::new(store))
+        }
+        let a = unsealed(&dir_a).await;
+        let b = unsealed(&dir_b).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.clone().acquire_owned().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            flush_pass(
+                vec![("a".to_string(), a.clone()), ("b".to_string(), b.clone())],
+                Duration::from_secs(5),
+                Some(slots),
+            ),
+        )
+        .await
+        .expect("flush pass must not block on the merge slot");
+
+        // Both flushed: each now has exactly one sealed generation, unmerged.
+        for store in [&a, &b] {
+            assert_eq!(
+                store.read().await.pending_wal_generations().await.unwrap(),
+                1
+            );
+        }
+    }
+
+    /// With a free slot and the count trigger set, the pass still merges.
+    #[tokio::test]
+    async fn flush_pass_merges_when_a_slot_is_free() {
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 2, 2).await;
+        flush_pass(
+            vec![("s".to_string(), store.clone())],
+            Duration::from_secs(5),
+            Some(Arc::new(Semaphore::new(1))),
+        )
+        .await;
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            0
+        );
     }
 }
