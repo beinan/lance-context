@@ -1587,9 +1587,14 @@ impl StorageBase {
         if unindexed == 0 {
             return Ok(0);
         }
+        // `merge(1)`, not `append()`: fold the new fragments into the existing
+        // delta so the index stays a single delta. Compaction refuses to bin
+        // fragments covered by different index-delta sets together, so one
+        // delta per merge would leave every fragment in its own bin and
+        // compaction would never coalesce anything.
         self.dataset
             .optimize_indices(
-                &OptimizeOptions::append().index_names(vec![ID_INDEX_NAME.to_string()]),
+                &OptimizeOptions::merge(1).index_names(vec![ID_INDEX_NAME.to_string()]),
             )
             .await?;
         self.reload().await?;
