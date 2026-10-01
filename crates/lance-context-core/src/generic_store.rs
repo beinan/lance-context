@@ -800,6 +800,53 @@ mod tests {
         });
     }
 
+    #[test]
+    fn cleanup_merge_refreshes_an_index_created_by_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let options = |shard: &str| GenericStoreOptions {
+                seal_on_add: true,
+                shard_id: Some(shard.to_string()),
+                ..Default::default()
+            };
+            let mut first = GenericStore::open(&uri, spec(), options("first"))
+                .await
+                .unwrap();
+            first
+                .add(&[row(json!({"id": "r1", "user_id": "old"}))])
+                .await
+                .unwrap();
+            assert_eq!(first.cleanup_wal().await.unwrap(), 1);
+
+            // A worker caches the unindexed base before another handle builds
+            // the index. Its next merge must observe that committed index.
+            let mut stale = GenericStore::open(&uri, spec(), options("second"))
+                .await
+                .unwrap();
+            first.create_id_index().await.unwrap();
+            assert!(first.version() > stale.version());
+            stale
+                .add(&[row(json!({"id": "r1", "user_id": "new"}))])
+                .await
+                .unwrap();
+            let (manifest_store, manifest, prepared) =
+                stale.prepare_cleanup_merge().await.unwrap().unwrap();
+            assert_eq!(
+                stale
+                    .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(stale.pending_wal_generations().await.unwrap(), 0);
+            let rows = stale.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["user_id"], json!("new"));
+        });
+    }
+
     /// Two stores share one process-wide merge budget sized so that only one
     /// merge's initial reservation fits. The second merge must wait until the
     /// first commits and releases, then complete. This is the bound that was
