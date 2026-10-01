@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use lance_context_core::{DatagenStore, GenericStore, RolloutStore};
 use lru::LruCache;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 /// A store the sweepers can maintain.
 ///
@@ -189,7 +189,11 @@ pub(crate) async fn resident<S: Clone>(cache: &Mutex<LruCache<String, S>>) -> Ve
 /// and alerts keep working; the new `kind` label is what distinguishes the
 /// store types. Renaming them would be a silent breakage for anyone graphing
 /// these today.
-pub(crate) async fn flush_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_timeout: Duration) {
+pub(crate) async fn flush_pass<S: Sweepable>(
+    stores: Vec<(String, S)>,
+    pass_timeout: Duration,
+    merge_slots: Option<Arc<Semaphore>>,
+) {
     let kind = S::kind();
     for (name, store) in stores {
         match tokio::time::timeout(pass_timeout, store.flush()).await {
@@ -199,11 +203,27 @@ pub(crate) async fn flush_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_time
                 // The count-triggered merge rides this timer, but it is a merge,
                 // not a flush: its outcome is reported under the cleanup
                 // counters so a failing merge cannot masquerade as a failing
-                // flush on the dashboards.
+                // flush on the dashboards. It is also a merge for memory
+                // purposes: it takes the same per-worker slot the master's
+                // requests take (ROLLOUT_MERGE_CONCURRENCY), so enabling the
+                // count trigger cannot stack merges past that bound.
+                let merged = async {
+                    let _slot = match &merge_slots {
+                        Some(slots) => Some(
+                            slots
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .expect("merge slot semaphore is never closed"),
+                        ),
+                        None => None,
+                    };
+                    store.merge_if_due().await
+                };
                 report_merge(
                     &name,
                     kind,
-                    tokio::time::timeout(pass_timeout, store.merge_if_due()).await,
+                    tokio::time::timeout(pass_timeout, merged).await,
                 );
             }
             Ok(Err(error)) => {

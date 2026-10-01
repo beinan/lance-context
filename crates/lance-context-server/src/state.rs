@@ -1016,15 +1016,18 @@ impl AppState {
                 tokio::join!(
                     sweeper::flush_pass(
                         sweeper::resident(&state.rollout_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        state.merge_slots.clone(),
                     ),
                     sweeper::flush_pass(
                         sweeper::resident(&state.datagen_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        state.merge_slots.clone(),
                     ),
                     sweeper::flush_pass(
                         sweeper::resident(&state.generic_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        state.merge_slots.clone(),
                     ),
                 );
             }
@@ -1264,7 +1267,12 @@ mod tests {
             .await
             .unwrap();
 
-        sweeper::flush_pass(sweeper::resident(&state.generic_stores).await, timeout).await;
+        sweeper::flush_pass(
+            sweeper::resident(&state.generic_stores).await,
+            timeout,
+            state.merge_slots.clone(),
+        )
+        .await;
         assert_eq!(
             generic.read().await.list(None, None).await.unwrap().len(),
             1,
