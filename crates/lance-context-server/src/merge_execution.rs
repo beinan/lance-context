@@ -11,6 +11,39 @@ use lance_context_merge::{execute_scoped, Coordinator, Execution, Phase};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{watch, Mutex};
 
+struct OwnedCommitGuard {
+    coordinator: Coordinator,
+    execution: Execution,
+    dataset_uri: String,
+}
+impl std::fmt::Debug for OwnedCommitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedCommitGuard")
+            .field("execution", &self.execution.id)
+            .finish()
+    }
+}
+impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuard {
+    fn authorize<'a>(
+        &'a self,
+        resource: &'a str,
+        version: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), lance_context_core::LanceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.coordinator
+                .authorize_commit(&self.execution, &self.dataset_uri, resource, version)
+                .await
+                .map_err(lance_context_core::LanceError::io)
+        })
+    }
+}
+
 pub struct Executions {
     coordinator: Option<Coordinator>,
     instance: String,
@@ -54,7 +87,7 @@ pub async fn capabilities(
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.merge_executions.coordinator()?;
     Ok(Json(
-        serde_json::json!({"protocol": 1, "instance": state.merge_executions.instance,
+        serde_json::json!({"protocol": 2, "instance": state.merge_executions.instance,
         "timeout_secs": state.merge_executions.timeout_secs}),
     ))
 }
@@ -64,7 +97,8 @@ pub async fn start(
     Json(execution): Json<Execution>,
 ) -> Result<StatusCode, AppError> {
     let coordinator = state.merge_executions.coordinator()?;
-    if execution.instance != state.merge_executions.instance
+    if execution.protocol != 2
+        || execution.instance != state.merge_executions.instance
         || execution.phase != Phase::Reserved
         || execution.timeout_secs == 0
         || execution.timeout_secs > state.merge_executions.timeout_secs
@@ -130,7 +164,14 @@ async fn run(
     };
     let target = execution.target.clone();
     let mut slot = None;
+    let uri = match target.strip_prefix("generic:") {
+        Some(name) => state.generic_uri(name),
+        None => state.rollout_uri(&target),
+    };
     let work = async {
+        if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
+            return Err("invalid storage backend for owned merge fencing".into());
+        }
         slot = state.acquire_merge_slot().await;
         let result = if let Some(name) = target.strip_prefix("generic:") {
             generic::merge_generic_wal_owned(
@@ -159,7 +200,13 @@ async fn run(
             Err(e) => Err(format!("{e:?}")),
         }
     };
-    let write_scope = lance_context_core::merge_write_scope::MergeWriteScope::new();
+    let write_scope = lance_context_core::merge_write_scope::MergeWriteScope::with_authorizer(
+        Arc::new(OwnedCommitGuard {
+            coordinator: coordinator.clone(),
+            execution: running.clone(),
+            dataset_uri: uri.clone(),
+        }),
+    );
     let outcome = std::panic::AssertUnwindSafe(execute_scoped(
         write_scope.run(work),
         Duration::from_secs(execution.timeout_secs),
@@ -170,7 +217,27 @@ async fn run(
     .unwrap_or_else(|_| Err("merge executor panicked".into()));
     // Top-level cancellation cannot acknowledge a write still in flight at
     // object storage. Join those leaf commits before publishing Finished.
-    write_scope.drain().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = write_scope.drain() => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                match coordinator.get(&execution.target).await {
+                    Ok(None) => {
+                        // Only a terminal outcome or a completed storage
+                        // barrier permits removal of this execution record.
+                        write_scope.abort_fenced_leaves().await;
+                        return Ok(());
+                    }
+                    Ok(Some(current)) if current.id != execution.id || current.phase == Phase::Recovered => {
+                        write_scope.abort_fenced_leaves().await;
+                        return Ok(());
+                    }
+                    _ => {},
+                }
+            }
+        }
+    }
     // Do not admit another memory-heavy merge into this slot while a
     // cancelled execution is still joining storage commits.
     drop(slot);
@@ -198,6 +265,13 @@ async fn run(
             Ok(true) => break,
             Ok(false) => match coordinator.get(&execution.target).await {
                 Ok(Some(current)) if current == expected => break,
+                Ok(None) => return Ok(()),
+                Ok(Some(current))
+                    if current.id != execution.id
+                        || matches!(current.phase, Phase::Recovering | Phase::Recovered) =>
+                {
+                    return Ok(())
+                }
                 Ok(_) => return Err("merge execution fence changed unexpectedly".into()),
                 Err(error) => {
                     tracing::warn!(id = %execution.id, %error, "reconciling merge outcome acknowledgement")

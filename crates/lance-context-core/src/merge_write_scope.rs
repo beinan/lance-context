@@ -12,6 +12,7 @@ use lance_table::{
 use object_store::path::Path;
 use std::{
     future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 use tokio::sync::{oneshot, Notify};
@@ -25,15 +26,42 @@ struct Progress {
     uncertain: bool,
 }
 
+pub trait CommitAuthorizer: std::fmt::Debug + Send + Sync {
+    fn authorize<'a>(
+        &'a self,
+        resource: &'a str,
+        version: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
 #[derive(Debug, Default)]
 pub struct MergeWriteScope {
     progress: Mutex<Progress>,
     changed: Notify,
+    authorizer: Option<Arc<dyn CommitAuthorizer>>,
+    leaves: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 impl MergeWriteScope {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
+        Arc::new(Self {
+            authorizer: Some(authorizer),
+            ..Self::default()
+        })
+    }
+
+    /// Only after a durable storage barrier fenced every admitted version.
+    /// Aborting before that evidence would abandon an uncertain storage write.
+    pub async fn abort_fenced_leaves(&self) {
+        self.progress.lock().unwrap().closed = true;
+        for leaf in std::mem::take(&mut *self.leaves.lock().unwrap()) {
+            leaf.abort();
+        }
+        self.drain().await;
     }
 
     pub async fn run<F: Future>(self: &Arc<Self>, future: F) -> F::Output {
@@ -62,6 +90,15 @@ impl MergeWriteScope {
             changed.await;
         }
     }
+}
+
+pub(crate) async fn authorize(resource: &str, version: u64) -> Result<()> {
+    if let Ok(scope) = CURRENT.try_with(Arc::clone) {
+        if let Some(authorizer) = &scope.authorizer {
+            authorizer.authorize(resource, version).await?;
+        }
+    }
+    Ok(())
 }
 
 struct Active {
@@ -94,12 +131,13 @@ where
         }
         progress.active += 1;
     }
+    let handles = scope.clone();
     let active = Active {
         scope,
         completed: false,
     };
     let (send, receive) = oneshot::channel();
-    tokio::spawn(async move {
+    let leaf = tokio::spawn(async move {
         let mut active = active;
         let result = write.await;
         if result.is_err() {
@@ -109,9 +147,175 @@ where
         drop(active);
         let _ = send.send(result);
     });
+    handles.leaves.lock().unwrap().push(leaf.abort_handle());
     receive
         .await
         .map_err(|_| E::from(Error::io("manifest commit executor panicked")))?
+}
+
+/// A relative shard drain with admission before *each* immutable version write.
+/// Putting one guard around commit_update's retry loop would let a revoked
+/// execution obtain new versions after recovery had already fenced it.
+pub(crate) async fn drain_generations(
+    store: lance::dataset::mem_wal::ShardManifestStore,
+    epoch: u64,
+    generations: std::collections::HashSet<u64>,
+) -> Result<lance_index::mem_wal::ShardManifest> {
+    let store = Arc::new(store);
+    let resource = format!("shard:{}", store.shard_id());
+    for _ in 0..10 {
+        let mut next = store
+            .read_latest()
+            .await?
+            .ok_or_else(|| Error::io("Shard manifest not found"))?;
+        if next.writer_epoch != epoch {
+            return Err(Error::io("merge writer epoch changed before drain"));
+        }
+        next.version = next
+            .version
+            .checked_add(1)
+            .ok_or_else(|| Error::io("manifest version overflow"))?;
+        next.flushed_generations
+            .retain(|g| !generations.contains(&g.generation));
+        authorize(&resource, next.version).await?;
+        let writer = store.clone();
+        let scope = CURRENT.try_with(Arc::clone).ok();
+        let (next, written) = shield(async move {
+            let written = writer.write(&next).await;
+            if written
+                .as_ref()
+                .is_err_and(|e| !e.to_string().contains("already exists"))
+            {
+                if let Some(scope) = scope {
+                    scope.mark_uncertain();
+                }
+            }
+            Ok::<_, Error>((next, written))
+        })
+        .await?;
+        match written {
+            Ok(_) => return Ok(next),
+            Err(error) if error.to_string().contains("already exists") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::io("shard drain exceeded conditional-write retries"))
+}
+
+/// The owned protocol is supported only with immutable conditional manifest
+/// creation, not Lance's fallback UnsafeCommitHandler or external catalogues.
+pub fn supports_version_fencing(uri: &str) -> bool {
+    let Some((scheme, _)) = uri.split_once(':') else {
+        return true;
+    };
+    let is_scheme = scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'));
+    if !is_scheme || (cfg!(windows) && scheme.len() == 1) {
+        return true;
+    }
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "file"
+            | "file-object-store"
+            | "s3"
+            | "gs"
+            | "az"
+            | "abfss"
+            | "memory"
+            | "oss"
+            | "cos"
+            | "tos"
+            | "shared-memory"
+    )
+}
+
+/// After durable commit admission has closed, occupy versions beyond its
+/// watermarks using metadata-only conditional writes. A late old PUT can then
+/// only conflict with an occupied version; it cannot change visible table/WAL
+/// state. This neither opens a shard writer nor changes its epoch or WAL list.
+pub async fn fence_manifest_versions(
+    uri: &str,
+    storage_options: Option<std::collections::HashMap<String, String>>,
+    watermarks: &std::collections::BTreeMap<String, u64>,
+    recovery_id: &str,
+) -> Result<()> {
+    if !supports_version_fencing(uri) {
+        return Err(Error::invalid_input(
+            "storage does not support merge version fencing",
+        ));
+    }
+    if watermarks.is_empty() {
+        return Ok(());
+    }
+    let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(uri);
+    if let Some(options) = storage_options {
+        builder = builder.with_storage_options(options);
+    }
+    let mut dataset = builder.load().await?;
+    if let Some(high) = watermarks.get("base") {
+        for _ in 0..64 {
+            dataset.checkout_latest().await?;
+            if dataset.version().version > *high {
+                break;
+            }
+            let marker = format!("{recovery_id}:{}", dataset.version().version);
+            dataset
+                .update_metadata([("lance-context.merge-recovery", marker.as_str())])
+                .await?;
+        }
+        dataset.checkout_latest().await?;
+        if dataset.version().version <= *high {
+            return Err(Error::io(
+                "base manifest barrier did not cross admitted versions",
+            ));
+        }
+    }
+    for (resource, high) in watermarks {
+        if resource == "base" {
+            continue;
+        }
+        let id = resource
+            .strip_prefix("shard:")
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .ok_or_else(|| Error::invalid_input("invalid shard manifest watermark"))?;
+        let store = lance::dataset::mem_wal::ShardManifestStore::new(
+            dataset.object_store(None).await?,
+            &dataset.branch_location().path,
+            id,
+            16,
+        );
+        let mut fenced = false;
+        for _ in 0..64 {
+            let mut next = store
+                .read_latest()
+                .await?
+                .ok_or_else(|| Error::io("Shard manifest missing during recovery"))?;
+            if next.version > *high {
+                fenced = true;
+                break;
+            }
+            next.version = next
+                .version
+                .checked_add(1)
+                .ok_or_else(|| Error::io("manifest version overflow"))?;
+            match store.write(&next).await {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("already exists") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !fenced {
+            return Err(Error::io(
+                "shard manifest barrier did not cross admitted versions",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -130,6 +334,7 @@ impl CommitHandler for GuardedCommit {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
+        authorize("base", manifest.version).await?;
         let inner = self.0.clone();
         let mut owned_manifest = manifest.clone();
         let path = base_path.clone();
@@ -227,6 +432,27 @@ impl CommitHandler for GuardedCommit {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn recovery_rejects_unsafe_and_external_commit_handlers() {
+        for uri in [
+            "custom:table",
+            "custom://table",
+            "https://host/table",
+            "s3+ddb://bucket/table",
+        ] {
+            assert!(!supports_version_fencing(uri), "{uri}");
+        }
+        for uri in [
+            "/tmp/table:with-colon",
+            "relative/table",
+            "file:/tmp/table",
+            "S3://bucket/table",
+            "az://container/table",
+        ] {
+            assert!(supports_version_fencing(uri), "{uri}");
+        }
+    }
 
     #[tokio::test]
     async fn failed_or_panicked_leaf_commit_needs_reconciliation() {

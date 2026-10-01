@@ -5,6 +5,7 @@
 //! and reconciles the old execution; it never clears a running fence on timeout.
 
 pub mod failure;
+pub mod fencing;
 
 use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,8 @@ pub enum Phase {
     Reserved,
     Running,
     Uncertain,
+    Recovering,
+    Recovered,
     Finished,
 }
 
@@ -37,6 +40,12 @@ pub struct Execution {
     pub phase: Phase,
     pub reclaimed: usize,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "protocol_absent")]
+    pub protocol: u32,
+}
+
+fn protocol_absent(protocol: &u32) -> bool {
+    *protocol == 0
 }
 
 impl Execution {
@@ -50,6 +59,7 @@ impl Execution {
             phase: Phase::Reserved,
             reclaimed: 0,
             error: None,
+            protocol: 2,
         }
     }
 
@@ -120,7 +130,10 @@ impl Coordinator {
 
     /// Atomic claim check and admission close the delayed-request/lease-loss race.
     pub async fn reserve(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
-        if execution.phase != Phase::Reserved || execution.timeout_secs == 0 {
+        if execution.phase != Phase::Reserved
+            || execution.timeout_secs == 0
+            || execution.protocol != 2
+        {
             return Err("invalid merge execution reservation".into());
         }
         let key = execution_key(&self.prefix, &execution.target);
@@ -188,7 +201,7 @@ impl Coordinator {
     /// Never delete on elapsed time, an HTTP error, or claim expiry. Both the
     /// terminal result and the current task claim must still match atomically.
     pub async fn release(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
-        if execution.phase != Phase::Finished {
+        if !matches!(execution.phase, Phase::Finished | Phase::Recovered) {
             return Err("cannot release a live execution".into());
         }
         let key = execution_key(&self.prefix, &execution.target);
@@ -203,6 +216,7 @@ impl Coordinator {
             ),
         ]);
         operations.extend([
+            self.remove_permits(execution),
             TxnOp::delete(key, None),
             TxnOp::put(
                 target_lock_key(&self.prefix, &execution.target),
@@ -455,6 +469,83 @@ mod tests {
             proof,
             lease,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn recovery_closes_commit_admission_and_retains_every_allowed_version() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&proof, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&running, "file:///table", "base", 7)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .authorize_commit(&running, "file:///wrong-table", "base", 8)
+            .await
+            .is_err());
+        client.lease_revoke(lease).await.unwrap();
+        // The old executor remains protected independently of its scheduler.
+        coordinator
+            .authorize_commit(&running, "file:///table", "base", 8)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .freeze(&proof, &running)
+            .await
+            .unwrap()
+            .is_none());
+        let next = ClaimProof {
+            token: "recovery-owner".into(),
+            lease_id: 0,
+            ..proof.clone()
+        };
+        client
+            .put(next.key.clone(), next.token.clone(), None)
+            .await
+            .unwrap();
+        let shard = format!("shard:{}", uuid::Uuid::new_v4());
+        coordinator
+            .authorize_commit(&running, "file:///table", &shard, 91)
+            .await
+            .unwrap();
+        let (admitted, frozen) = tokio::join!(
+            coordinator.authorize_commit(&running, "file:///table", "base", 9),
+            coordinator.freeze(&next, &running),
+        );
+        let frozen = frozen.unwrap().unwrap();
+        let plan = coordinator.watermarks(&frozen).await.unwrap();
+        assert_eq!(plan.dataset_uri.as_deref(), Some("file:///table"));
+        assert_eq!(plan.versions["base"], if admitted.is_ok() { 9 } else { 8 });
+        assert_eq!(plan.versions[&shard], 91);
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 10)
+            .await
+            .is_err());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", &shard, 92)
+            .await
+            .is_err());
+        assert!(coordinator.release(&next, &frozen).await.is_err());
+        assert!(!coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        // Storage fencing itself is tested against real manifests in core.
+        assert!(coordinator.finish_recovery(&next, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(recovered.phase, Phase::Recovered);
+        assert!(coordinator.release(&next, &recovered).await.unwrap());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 11)
+            .await
+            .is_err());
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

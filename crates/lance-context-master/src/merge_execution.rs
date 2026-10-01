@@ -24,42 +24,89 @@ pub(crate) async fn run_merge_wal(
     }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
-    // Reconcile first, before any index/base-table mutation or new fan-out.
-    if let Some(old) = coordinator.get(&claim.task.target).await? {
-        let endpoint = old.endpoint.clone();
-        if matches!(old.phase, Phase::Running | Phase::Uncertain) {
-            if let Some(failure) = coordinator.failure(&claim.task.target, &endpoint).await? {
-                if failure.class == lance_context_merge::failure::FailureClass::OwnershipUnresolved
-                    && failure.next_retry_ms > lance_context_merge::failure::now_ms()
-                {
-                    return Err(format!(
-                        "merge ownership unresolved; recovery probe at {}; {}",
-                        failure.next_retry_ms, failure.last_error
-                    ));
+    // Reconcile/fence before any other table mutation. One retry of the fan-out
+    // after a completed barrier lets healthy shards progress in this task.
+    for recovery_round in 0..2 {
+        if let Some(old) = coordinator.get(&claim.task.target).await? {
+            if old.phase == Phase::Recovering {
+                if let Some(failure) = coordinator.failure(&old.target, &old.endpoint).await? {
+                    if failure.last_error.contains("recovery barrier failed")
+                        && failure.next_retry_ms > lance_context_merge::failure::now_ms()
+                    {
+                        return Err(format!(
+                            "{}; recovery probe at {}",
+                            failure.last_error, failure.next_retry_ms
+                        ));
+                    }
+                }
+            }
+            if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            } else if let Err(error) = reconcile(&state.http, &coordinator, &proof, old, true).await
+            {
+                if let Some(current) = coordinator.get(&claim.task.target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                } else {
+                    tracing::info!(target = %claim.task.target, %error, "previous merge ended; resuming shards");
                 }
             }
         }
-        match reconcile(&state.http, &coordinator, &proof, old, true).await {
-            Ok(reclaimed) => {
-                metrics::counter!("master_merge_wal_generations_reclaimed_total")
-                    .increment(reclaimed as u64);
-            }
-            Err(error) => {
-                if coordinator.get(&claim.task.target).await?.is_some() {
-                    return Err(error);
-                }
-                tracing::info!(target = %claim.task.target, %error, "previous merge terminated; resuming shards");
-            }
+        let outcome = run_workers(
+            &state.http,
+            &coordinator,
+            &proof,
+            &claim.task.target,
+            &state.config.worker_endpoints,
+        )
+        .await;
+        if outcome.is_ok()
+            || recovery_round == 1
+            || coordinator.get(&claim.task.target).await?.is_none()
+        {
+            return outcome;
         }
     }
-    run_workers(
-        &state.http,
-        &coordinator,
-        &proof,
-        &claim.task.target,
-        &state.config.worker_endpoints,
-    )
-    .await
+    unreachable!("bounded merge recovery loop returns on last iteration")
+}
+
+async fn recover_execution(
+    state: &Arc<MasterState>,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    old: Execution,
+) -> Result<(), String> {
+    let result = async {
+        let frozen = coordinator.freeze(proof, &old).await?
+            .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
+        let watermarks = coordinator.watermarks(&frozen).await?;
+        let uri = match frozen.target.strip_prefix("generic:") {
+            Some(name) => state.generic_uri(name), None => state.rollout_uri(&frozen.target),
+        };
+        tokio::time::timeout(Duration::from_secs(120),
+            lance_context_core::merge_write_scope::fence_manifest_versions(&uri, None, &watermarks.versions, &frozen.id)
+        ).await.map_err(|_| "storage recovery barrier deadline exceeded".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !coordinator.finish_recovery(proof, &frozen).await? {
+            return Err("claim lost before publishing storage recovery barrier".into());
+        }
+        let recovered = coordinator.get(&frozen.target).await?.ok_or_else(|| "recovered execution disappeared".to_string())?;
+        if recovered.id != frozen.id || !coordinator.release(proof, &recovered).await? {
+            return Err("claim lost before releasing recovered execution".into());
+        }
+        metrics::counter!("master_merge_storage_recoveries_total", "result" => "ok").increment(1);
+        tracing::warn!(target = %frozen.target, endpoint = %frozen.endpoint, id = %frozen.id, "old merge storage commits fenced; resuming healthy shards");
+        Ok(())
+    }.await;
+    if let Err(error) = &result {
+        let message = format!("merge ownership unresolved: recovery barrier failed: {error}");
+        coordinator
+            .record_failure(proof, &old.target, &old.endpoint, &message)
+            .await?;
+        metrics::counter!("master_merge_storage_recoveries_total", "result" => "failed")
+            .increment(1);
+        return Err(message);
+    }
+    result
 }
 
 async fn run_workers(
@@ -175,7 +222,7 @@ async fn one(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    if capabilities.protocol != 1 || capabilities.timeout_secs == 0 {
+    if capabilities.protocol != 2 || capabilities.timeout_secs == 0 {
         return Err("worker lacks bounded owned-merge protocol".into());
     }
     let execution = Execution::new(
@@ -261,7 +308,7 @@ async fn reconcile_with_grace(
                 continue;
             }
         };
-        if current.phase == Phase::Uncertain {
+        if matches!(current.phase, Phase::Uncertain | Phase::Recovering) {
             let error = current
                 .error
                 .unwrap_or_else(|| "merge ownership unresolved: ambiguous storage commit".into());
@@ -270,7 +317,7 @@ async fn reconcile_with_grace(
                 .await?;
             return Err(error);
         }
-        if current.phase == Phase::Finished {
+        if matches!(current.phase, Phase::Finished | Phase::Recovered) {
             if !coordinator.release(proof, &current).await? {
                 return Err("task claim lost while releasing terminal merge execution".into());
             }
@@ -328,7 +375,7 @@ mod tests {
             .route(
                 "/api/v1/internal/merge-executor",
                 get(|| async {
-                    Json(serde_json::json!({"protocol":1,"instance":"test","timeout_secs":1}))
+                    Json(serde_json::json!({"protocol":2,"instance":"test","timeout_secs":1}))
                 }),
             )
             .route(
@@ -405,6 +452,111 @@ mod tests {
             .await
             .unwrap();
         (Coordinator::new(client, prefix), proof)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_merge_is_storage_fenced_and_healthy_shard_progresses() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let prefix = format!("/merge-orphan-tests/{}", Execution::new("", "", "", 1).id);
+        let cfg = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--etcd-endpoints",
+            &endpoints,
+            "--etcd-prefix",
+            &prefix,
+        ]);
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("table");
+        lance_context_core::RolloutStore::open(&uri)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let initial_version = lance::Dataset::open(&uri).await.unwrap().version().version;
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "healthy",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (healthy, server) = worker(good.clone()).await;
+        let lost = "http://127.0.0.1:1".to_string();
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![lost.clone(), healthy];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = state.task_store.merge_claim(&claim);
+        let execution = Execution::new("table", &lost, "dead-worker", 1);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&running, &uri, "base", initial_version + 1)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .report_uncertain(&running, "lost storage response".into())
+            .await
+            .unwrap());
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run_merge_wal(&state, &claim))
+            .await
+            .unwrap();
+        assert!(outcome.unwrap_err().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert!(lance::Dataset::open(&uri).await.unwrap().version().version > initial_version + 1);
+        assert!(coordinator
+            .authorize_commit(&running, &uri, "base", initial_version + 4)
+            .await
+            .is_err());
+
+        // A mismatched worker namespace must remain fenced, never recover by
+        // committing a barrier to an unrelated same-named table.
+        let wrong = Execution::new("table", &lost, "misconfigured-worker", 1);
+        assert!(coordinator.reserve(&proof, &wrong).await.unwrap());
+        let wrong = coordinator.start(&wrong).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&wrong, "file:///different-table", "base", 7)
+            .await
+            .unwrap();
+        let error = recover_execution(&state, &coordinator, &proof, wrong)
+            .await
+            .unwrap_err();
+        assert!(error.contains("dataset URI mismatch"));
+        assert_eq!(
+            coordinator.get("table").await.unwrap().unwrap().phase,
+            Phase::Recovering
+        );
+        state.task_store.finish(claim, Err(error)).await.unwrap();
+        server.abort();
+        let mut client =
+            etcd_client::Client::connect(endpoints.split(',').collect::<Vec<_>>(), None)
+                .await
+                .unwrap();
+        client
+            .delete(
+                prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

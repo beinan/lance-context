@@ -1047,23 +1047,8 @@ impl StorageBase {
         );
         observe_phase!(
             "drain",
-            crate::merge_write_scope::shield(async move {
-                drain_store
-                    .commit_update(epoch, |current| ShardManifest {
-                        version: current.version + 1,
-                        // Relative edit: retain everything we did not merge. Must
-                        // never become an absolute assignment — see the doc comment.
-                        flushed_generations: current
-                            .flushed_generations
-                            .iter()
-                            .filter(|fg| !merged_generations.contains(&fg.generation))
-                            .cloned()
-                            .collect(),
-                        ..current.clone()
-                    })
-                    .await
-            })
-            .await
+            crate::merge_write_scope::drain_generations(drain_store, epoch, merged_generations)
+                .await
         )?;
 
         self.delete_merged_generation_dirs(&merged_paths).await?;

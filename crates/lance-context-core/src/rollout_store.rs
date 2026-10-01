@@ -2412,12 +2412,43 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
+        cancellation_recovery_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_allows_retry_before_late_old_append_returns() {
+        cancellation_recovery_case(true).await;
+    }
+
+    async fn cancellation_recovery_case(fence_old: bool) {
         use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
         use lance_table::format::{IndexMetadata, Manifest, Transaction};
         use lance_table::io::commit::{
             CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
         };
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        #[derive(Debug, Default)]
+        struct Gate {
+            closed: AtomicBool,
+            high: AtomicU64,
+        }
+        impl crate::merge_write_scope::CommitAuthorizer for Gate {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(lance::Error::io("execution fenced"));
+                    }
+                    assert_eq!(resource, "base");
+                    self.high.fetch_max(version, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
 
         #[derive(Debug)]
         struct PausedCommit {
@@ -2479,7 +2510,8 @@ mod tests {
             .await
             .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
-        let scope = MergeWriteScope::new();
+        let gate = Arc::new(Gate::default());
+        let scope = MergeWriteScope::with_authorizer(gate.clone());
         let worker_scope = scope.clone();
         let writer = store.clone();
         let merge = tokio::spawn(async move {
@@ -2505,18 +2537,37 @@ mod tests {
                 .unwrap();
             store.flush().await.unwrap();
         }
+        if fence_old {
+            gate.closed.store(true, Ordering::SeqCst);
+            let high = gate.high.load(Ordering::SeqCst);
+            assert!(high > 0);
+            let plan = std::collections::BTreeMap::from([("base".to_string(), high)]);
+            crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+                .await
+                .unwrap();
+            // Recovery must progress while the old storage call is still alive.
+            assert!(!drain.is_finished());
+            let mut next = store.lock().await;
+            next.base.refresh_latest().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 0);
+            next.cleanup_own_shard().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&next).await, 0);
+        }
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(30), drain)
             .await
             .unwrap()
             .unwrap();
         let mut store = store.lock().await;
-        assert!(flushed_generation_count(&store).await > 0);
+        if !fence_old {
+            assert!(flushed_generation_count(&store).await > 0);
+        }
         store.base.refresh_latest().await.unwrap();
         assert_eq!(
             store.base.dataset.count_rows(None).await.unwrap(),
-            1,
-            "cancelled caller's leaf append must have committed before retry"
+            if fence_old { 2 } else { 1 },
+            "late old append must be rejected after a storage barrier"
         );
         store.cleanup_own_shard().await.unwrap();
         assert_eq!(flushed_generation_count(&store).await, 0);
@@ -2527,6 +2578,52 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_manifest_barrier_rejects_a_late_drain_and_preserves_new_wal() {
+        use lance::dataset::mem_wal::ShardManifestStore;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        store.add(&[assistant_record("before")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.add(&[assistant_record("during")]).await.unwrap();
+        store.flush().await.unwrap();
+        let manifests = ShardManifestStore::new(
+            store.base.dataset.object_store(None).await.unwrap(),
+            &store.base.dataset.branch_location().path,
+            store.base.write_shard,
+            16,
+        );
+        let before = manifests.read_latest().await.unwrap().unwrap();
+        let mut late_drain = before.clone();
+        late_drain.version += 1;
+        late_drain.flushed_generations.clear();
+        let plan = std::collections::BTreeMap::from([(
+            format!("shard:{}", store.base.write_shard),
+            late_drain.version,
+        )]);
+        crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+            .await
+            .unwrap();
+        assert!(manifests
+            .write(&late_drain)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        let after = manifests.read_latest().await.unwrap().unwrap();
+        assert!(after.version > late_drain.version);
+        assert_eq!(
+            after.writer_epoch, before.writer_epoch,
+            "recovery must not fence live ingest"
+        );
+        assert_eq!(after.flushed_generations, before.flushed_generations);
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
         store.close().await.unwrap();
     }
 

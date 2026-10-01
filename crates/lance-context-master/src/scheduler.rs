@@ -1207,7 +1207,7 @@ mod tests {
             .route(
                 "/api/v1/internal/merge-executor",
                 get(|| async {
-                    Json(serde_json::json!({"protocol":1,"instance":"stub","timeout_secs":600}))
+                    Json(serde_json::json!({"protocol":2,"instance":"stub","timeout_secs":600}))
                 }),
             )
             .route(

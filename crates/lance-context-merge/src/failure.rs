@@ -74,7 +74,9 @@ impl ShardFailure {
             );
         // First task gets three attempts. Later tasks get one half-open probe,
         // never a fresh budget of three. Cap probing at once per hour.
-        let delay_secs = if needs_attention {
+        let delay_secs = if class == FailureClass::OwnershipUnresolved {
+            (30u64.saturating_mul(1 << attempts.saturating_sub(1).min(4))).min(300)
+        } else if needs_attention {
             3600
         } else if attempts < 3 {
             2
