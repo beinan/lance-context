@@ -97,6 +97,9 @@ pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 /// takes them.
 pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
 
+/// Merged generation directories removed in parallel after a merge commits.
+const DELETE_GENERATION_CONCURRENCY: usize = 16;
+
 /// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
 pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -1065,33 +1068,54 @@ impl StorageBase {
     /// Best-effort: a delete failure must NOT fail the merge — the merge has
     /// logically succeeded (data appended, manifest drained). A failed delete
     /// only leaks one directory.
+    /// Remove the directories of generations that the manifest no longer
+    /// lists. Runs on a spawned task, off the merge's critical path: once the
+    /// manifest drain has committed the generations are unreachable, and the
+    /// 64 to 512 `remove_dir_all` round trips (10 s per 64 on ADLS) were the
+    /// single largest phase of every merge. Directories are independent, so
+    /// they are removed concurrently. Best-effort by contract: a failure is
+    /// logged and the directory stays until reclaimed.
     async fn delete_merged_generation_dirs(&self, merged_paths: &[String]) -> LanceResult<()> {
-        let phase = timer_start!();
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
-        for path in merged_paths {
-            let gen_dir = branch_path
-                .clone()
-                .join("_mem_wal")
-                .join(self.write_shard.to_string().as_str())
-                .join(path.as_str());
-            if let Err(err) = object_store.remove_dir_all(gen_dir.clone()).await {
-                warn!(
-                    shard = %self.write_shard,
-                    generation_path = %path,
-                    error = %err,
-                    "failed to delete merged MemWAL generation directory; \
-                     it will remain until reclaimed"
-                );
-            }
-        }
-        // Best-effort by contract: a delete failure is logged above and does not
-        // fail the merge, so there is no error counter for this phase.
-        observe_duration!(
-            crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
-            timer_elapsed!(phase),
-            "phase" => "delete",
-        );
+        let shard = self.write_shard;
+        let dirs: Vec<_> = merged_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    branch_path
+                        .clone()
+                        .join("_mem_wal")
+                        .join(shard.to_string().as_str())
+                        .join(path.as_str()),
+                )
+            })
+            .collect();
+        tokio::spawn(async move {
+            let phase = timer_start!();
+            stream::iter(dirs)
+                .for_each_concurrent(DELETE_GENERATION_CONCURRENCY, |(path, gen_dir)| {
+                    let object_store = object_store.clone();
+                    async move {
+                        if let Err(err) = object_store.remove_dir_all(gen_dir).await {
+                            warn!(
+                                shard = %shard,
+                                generation_path = %path,
+                                error = %err,
+                                "failed to delete merged MemWAL generation directory; \
+                                 it will remain until reclaimed"
+                            );
+                        }
+                    }
+                })
+                .await;
+            observe_duration!(
+                crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                timer_elapsed!(phase),
+                "phase" => "delete",
+            );
+        });
         Ok(())
     }
 
