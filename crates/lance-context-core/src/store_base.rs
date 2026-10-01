@@ -1232,13 +1232,26 @@ impl StorageBase {
         // that tried to merge it; building the BTree first took 19 s. The
         // master builds it before fan-out (#277), but a worker's own timer
         // or a manual merge must not depend on the master having been here.
-        if self.dataset.count_fragments() > 0 && !self.has_key_btree_index().await? {
-            metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
-            info!(
-                uri = %self.dataset.uri(),
-                "base table has no key BTree; building it before the merge"
-            );
-            self.create_key_btree_index().await?;
+        if self.dataset.count_fragments() > 0 {
+            if !self.has_key_btree_index().await? {
+                metrics::counter!("rollout_merge_index_built_on_demand_total").increment(1);
+                info!(
+                    uri = %self.dataset.uri(),
+                    "base table has no key BTree; building it before the merge"
+                );
+                self.create_key_btree_index().await?;
+            } else {
+                // Present is not enough: every merge and compaction appends
+                // fragments the index does not cover, and the delete-only
+                // merge_insert hash-joins exactly those. A 2.2 GB store whose
+                // BTree covered 1 of 65 fragments took a worker from 5 to
+                // 32 GiB on a 37 MB merge and OOMKilled 19 of them at once;
+                // after one `optimize_indices` the same merge peaked at 3 GiB.
+                let covered = self.extend_key_btree_index().await?;
+                if covered > 0 {
+                    metrics::counter!("rollout_merge_index_extended_on_demand_total").increment(1);
+                }
+            }
         }
         let key_index = merge_schema.index_of(&self.key_column)?;
         let key_schema = Arc::new(merge_schema.project(&[key_index])?);

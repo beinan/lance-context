@@ -4103,6 +4103,45 @@ mod tests {
     /// Observable shape: an overwritten key leaves the old fragment in
     /// place with a deletion vector, and the new row lands in a fresh
     /// fragment; last-write-wins still holds.
+    /// A BTree that exists but covers only some fragments leaves the rest to
+    /// a full scan in the delete-only merge_insert. Each merge extends it
+    /// over whatever the previous merges and compactions appended, so no
+    /// fragment is ever scanned twice.
+    #[test]
+    fn merge_extends_a_stale_id_btree_over_new_fragments() {
+        use lance::index::DatasetIndexInternalExt as _;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            // Three more merges, each appending a fragment the index (built by
+            // the first merge) does not cover.
+            for id in ["a-1", "a-2", "a-3"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let unindexed = store
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .len();
+            // The merge that appended the last fragment extended the index
+            // before its own write, so at most that one fragment is uncovered.
+            assert!(
+                unindexed <= 1,
+                "unindexed fragments after merges: {unindexed}"
+            );
+            assert_eq!(store.list(None, None).await.unwrap().len(), 4);
+        });
+    }
+
     #[test]
     fn merge_deletes_old_rows_and_appends_instead_of_rewriting_fragments() {
         let dir = TempDir::new().unwrap();
@@ -4398,7 +4437,9 @@ mod tests {
             store.create_id_btree_index().await.unwrap();
             assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
 
-            // Two merges land two fragments the index knows nothing about.
+            // Two merges land two fragments. Each merge extends the index over
+            // what was uncovered *before* its own append, so only the last
+            // appended fragment is left for the explicit call here.
             for id in ["a-1", "a-2"] {
                 store.add(&[assistant_record(id)]).await.unwrap();
                 store.flush().await.unwrap();
@@ -4414,9 +4455,9 @@ mod tests {
                         .len()
                 }
             };
-            assert_eq!(unindexed(&store).await, 2);
+            assert_eq!(unindexed(&store).await, 1);
 
-            assert_eq!(store.extend_id_btree_index().await.unwrap(), 2);
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 1);
             assert_eq!(unindexed(&store).await, 0);
             assert!(store.has_id_btree_index().await.unwrap());
             assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
