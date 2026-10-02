@@ -130,9 +130,7 @@ pub struct RegistryConfig {
     #[arg(long, env = "REGISTRY_BACKEND", value_enum, default_value_t = RegistryBackend::Lance)]
     pub registry_backend: RegistryBackend,
 
-    /// Optional second backend that also receives every write, best-effort.
-    /// Used during a migration so the backend being moved to (or kept as a
-    /// fallback) stays current. Must differ from `registry_backend`.
+    /// Versioned etcd mirror for a Lance primary. Reverse mirroring is unsupported.
     #[arg(long, env = "REGISTRY_MIRROR", value_enum)]
     pub registry_mirror: Option<RegistryBackend>,
 }
@@ -172,7 +170,16 @@ pub async fn open_registry(
         })
     }
 
+    if config.registry_mirror.is_some()
+        && (config.registry_backend != RegistryBackend::Lance
+            || config.registry_mirror != Some(RegistryBackend::Etcd))
+    {
+        return Err(LanceError::io("REGISTRY_MIRROR supports only Lance primary -> etcd mirror; reverse mirroring/rolling rollback is unsupported"));
+    }
     let primary = build(config.registry_backend, kind, lance_uri, etcd).await?;
+    if let Some(etcd) = primary.as_any().downcast_ref::<EtcdRegistry>() {
+        etcd.activate_after_validation(lance_uri).await?;
+    }
     let Some(mirror) = config.registry_mirror else {
         return Ok(primary);
     };

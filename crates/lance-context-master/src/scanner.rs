@@ -236,6 +236,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
         for (label, registry) in [
             ("rollout", &state.registry),
             ("generic", &state.generic_registry),
+            ("datagen", &state.datagen_registry),
         ] {
             if let Err(e) = maintain_registry(state, label, registry).await {
                 tracing::warn!(registry = label, error = %e, "registry maintenance failed");

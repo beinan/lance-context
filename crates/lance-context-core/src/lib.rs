@@ -67,8 +67,8 @@ pub use record::{
     LIFECYCLE_CONTRADICTED,
 };
 pub use registry::{
-    backfill_registry, diff_registries, LanceRegistry, MirroredRegistry, RegistryEntry,
-    RolloutRegistry, StoreRegistry,
+    backfill_registry, diff_registries, LanceRegistry, MirroredRegistry, RegistryDiff,
+    RegistryEntry, RegistryMismatch, RolloutRegistry, StoreRegistry,
 };
 pub use registry_etcd::EtcdRegistry;
 pub use rollout::{RolloutRecord, ROLE_ARTIFACT, ROLE_ASSISTANT, ROLE_GRADE, ROLE_TOOL};

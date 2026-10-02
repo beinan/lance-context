@@ -71,6 +71,8 @@ pub struct MasterState {
     /// while the master -- whose etcd-locked MergeWal task exists to serialize
     /// exactly that -- never heard of them.
     pub generic_registry: Arc<dyn StoreRegistry>,
+    /// Datagen participates in the same registry migration as the worker.
+    pub datagen_registry: Arc<dyn StoreRegistry>,
     /// Periodically-refreshed per-experiment metrics (master-owned).
     pub stats: Mutex<StatsStore>,
     /// Last snapshot written to the stats table, kept in memory so
@@ -141,6 +143,13 @@ impl MasterState {
         let registry = open_registry("rollout", &registry_uri, etcd, &config.registry).await?;
         let generic_registry =
             open_registry("generic", &generic_registry_uri, etcd, &config.registry).await?;
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await?;
         let backfilled = discovery::backfill_registry(&config.data_dir, &*registry).await?;
         if backfilled > 0 {
             tracing::info!(
@@ -151,7 +160,11 @@ impl MasterState {
         // With a mirror configured, seed it from the primary so a backend
         // switch finds every store already there. Repeated on every
         // maintenance round; this covers the very first start.
-        for (label, reg) in [("rollout", &registry), ("generic", &generic_registry)] {
+        for (label, reg) in [
+            ("rollout", &registry),
+            ("generic", &generic_registry),
+            ("datagen", &datagen_registry),
+        ] {
             if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
                 match backfill_registry(&*m.primary, &*m.mirror).await {
                     Ok(copied) if copied > 0 => {
@@ -169,6 +182,7 @@ impl MasterState {
         let state = Arc::new(Self {
             registry,
             generic_registry,
+            datagen_registry,
             stats: Mutex::new(stats),
             stats_cache: RwLock::new(Arc::new(Vec::new())),
             record_stores: Mutex::new(LruCache::new(
@@ -338,6 +352,55 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "legacy");
         assert_eq!(entries[0].uri, uri.to_string_lossy().to_string());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn startup_and_migration_routes_include_datagen() {
+        use lance_context_core::{etcd::RegistryBackend, RolloutRegistry};
+        let dir = TempDir::new().unwrap();
+        for kind in ["rollout", "generic", "datagen"] {
+            let uri = dir.path().join(format!("_registry.{kind}.lance"));
+            let mut registry = RolloutRegistry::open_or_create(uri.to_str().unwrap(), None)
+                .await
+                .unwrap();
+            registry
+                .upsert("existing", &format!("/data/{kind}"))
+                .await
+                .unwrap();
+        }
+        let mut config = test_config(&dir);
+        config.registry.registry_mirror = Some(RegistryBackend::Etcd);
+        let state = MasterState::new(config).await.unwrap();
+        for kind in ["rollout", "generic", "datagen"] {
+            let axum::Json(diff) = crate::routes::registry_diff(
+                axum::extract::State(state.clone()),
+                axum::extract::Query(crate::routes::RegistryParams {
+                    kind: Some(kind.into()),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(diff["only_in_primary"], serde_json::json!([]));
+            assert_eq!(diff["only_in_mirror"], serde_json::json!([]));
+            assert_eq!(diff["mismatched"], serde_json::json!([]));
+        }
+        let m = state
+            .datagen_registry
+            .as_any()
+            .downcast_ref::<MirroredRegistry>()
+            .unwrap();
+        m.primary.remove("existing").await.unwrap();
+        let axum::Json(result) = crate::routes::registry_backfill(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::routes::RegistryParams {
+                kind: Some("datagen".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["copied"], 1);
+        assert!(m.mirror.get("existing").await.unwrap().is_none());
     }
 
     /// A master that dies mid-task leaves the record in `Running`. Once its

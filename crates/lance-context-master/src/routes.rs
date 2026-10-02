@@ -588,7 +588,7 @@ pub async fn list_repairs(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct RegistryParams {
-    /// `rollout` (default) or `generic`.
+    /// `rollout` (default), `generic`, or `datagen`.
     #[serde(default)]
     pub kind: Option<String>,
 }
@@ -600,16 +600,16 @@ fn registry_pair<'a>(
     match kind.unwrap_or("rollout") {
         "rollout" => Ok((&state.registry, "rollout")),
         "generic" => Ok((&state.generic_registry, "generic")),
+        "datagen" => Ok((&state.datagen_registry, "datagen")),
         other => Err(MasterError::InvalidRequest(format!(
-            "unknown registry kind '{other}' (rollout|generic)"
+            "unknown registry kind '{other}' (rollout|generic|datagen)"
         ))),
     }
 }
 
-/// `GET /api/v1/registry/diff?kind=` — names present in the primary backend
-/// but not the mirror, and vice versa. Empty on both sides means the two
-/// backends agree and a migration step can proceed. 400 when no mirror is
-/// configured, because then there is nothing to compare.
+/// Compare names, URIs and creation timestamps. A live comparison is only an
+/// observation; freeze all registry writers and reconcile all three kinds
+/// before cutover. An empty diff is not permission for a rolling backend flip.
 pub async fn registry_diff(
     State(state): State<Arc<MasterState>>,
     Query(params): Query<RegistryParams>,
@@ -623,19 +623,20 @@ pub async fn registry_diff(
             "REGISTRY_MIRROR is not configured; nothing to diff".to_string(),
         ));
     };
-    let (only_primary, only_mirror) =
-        lance_context_core::diff_registries(&*mirrored.primary, &*mirrored.mirror)
-            .await
-            .map_err(MasterError::from_lance)?;
+    let diff = lance_context_core::diff_registries(&*mirrored.primary, &*mirrored.mirror)
+        .await
+        .map_err(MasterError::from_lance)?;
     Ok(Json(serde_json::json!({
         "kind": kind,
-        "only_in_primary": only_primary,
-        "only_in_mirror": only_mirror,
+        "only_in_primary": diff.only_in_primary,
+        "only_in_mirror": diff.only_in_mirror,
+        "mismatched": diff.mismatched,
+        "cutover_requires_quiescence": true,
     })))
 }
 
-/// `POST /api/v1/registry/backfill?kind=` — copy every primary entry the
-/// mirror lacks into the mirror. Idempotent. The master also does this on
+/// `POST /api/v1/registry/backfill?kind=` — reconcile the complete primary
+/// snapshot, including changed values and deletions. The master also does this on
 /// startup and every maintenance round; this is for forcing it.
 pub async fn registry_backfill(
     State(state): State<Arc<MasterState>>,
