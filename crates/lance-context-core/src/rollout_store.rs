@@ -4066,9 +4066,10 @@ mod tests {
 
     #[test]
     fn compact_composes_with_concurrent_wal_merge() {
-        // A base-table compaction (Rewrite) and a WAL merge (Append) are
-        // non-conflicting in Lance's commit matrix: running them concurrently
-        // must not fail, and no rows are lost. Instance A compacts while
+        // Append and Rewrite compose, but preparing the WAL merge can also
+        // CreateIndex. Lance may ask that transaction to retry after Rewrite.
+        // One explicit retry once compaction completes must retain every row.
+        // Instance A compacts while
         // instance B (a different shard) merges its own generations into the
         // same base table.
         use tokio::sync::RwLock;
@@ -4136,12 +4137,27 @@ mod tests {
                 },
             );
             ca.expect("compaction should not fail against a concurrent append");
+            let mb = match mb {
+                Err(LanceError::RetryableCommitConflict { .. }) => {
+                    // The concurrent compactor has completed above. Retry only
+                    // this typed conflict, never arbitrary storage/data errors.
+                    b.write().await.cleanup_own_shard().await
+                }
+                result => result,
+            };
             assert_eq!(mb.expect("wal merge should not fail"), 3);
 
             // A fresh reader sees all 8 rows exactly once.
             let reader = RolloutStore::open(&uri).await.unwrap();
             let listed = reader.list(None, None).await.unwrap();
             assert_eq!(listed.len(), 8);
+            assert_eq!(reader.base.dataset.count_rows(None).await.unwrap(), 8);
+            let ids: std::collections::HashSet<_> = listed.iter().map(|r| r.id.clone()).collect();
+            let expected = (0..5)
+                .map(|i| format!("a-{i}"))
+                .chain((0..3).map(|i| format!("b-{i}")))
+                .collect();
+            assert_eq!(ids, expected);
         });
     }
 

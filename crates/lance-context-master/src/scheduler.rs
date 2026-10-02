@@ -573,6 +573,31 @@ async fn sweep_merge_wal_inner(state: &Arc<MasterState>) -> lance::Result<usize>
     Ok(queued)
 }
 
+// A draining target still needs metadata recovery while ownership is unresolved.
+// Once released, its old failure ledger must not enqueue fresh merge tasks.
+async fn should_probe_failure(
+    state: &Arc<MasterState>,
+    failure: &lance_context_merge::failure::ShardFailure,
+) -> bool {
+    if state.config.merge_rollout.owned(&failure.target) {
+        return true;
+    }
+    if state.config.merge_rollout.draining(&failure.target) {
+        match state
+            .task_store
+            .merge_coordinator()
+            .get(&failure.target)
+            .await
+        {
+            Ok(execution) => return execution.is_some(),
+            Err(error) => {
+                tracing::warn!(target = %failure.target, %error, "cannot inspect draining merge ownership")
+            }
+        }
+    }
+    false
+}
+
 /// Spawn the scheduler pollers plus the optional periodic auto-sweep.
 ///
 /// Returns the handle of the *general* poller only. When a separate WAL-merge
@@ -615,13 +640,13 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                     cursor = next;
                     let mut targets = std::collections::HashSet::new();
                     for failure in rows {
-                        if retry_state.config.merge_rollout.owned(&failure.target)
-                            && failure.next_retry_ms <= lance_context_merge::failure::now_ms()
+                        if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
                             && retry_state
                                 .config
                                 .worker_endpoints
                                 .contains(&failure.endpoint)
                             && targets.insert(failure.target.clone())
+                            && should_probe_failure(&retry_state, &failure).await
                         {
                             if let Err(error) =
                                 enqueue(&retry_state, TaskKind::MergeWal, &failure.target).await
@@ -871,14 +896,21 @@ mod tests {
             .unwrap();
         let coordinator = state.task_store.merge_coordinator();
         let proof = state.task_store.merge_claim(&claim);
+        let failure = coordinator
+            .record_failure(&proof, "exp", "http://127.0.0.1:1", "storage timeout")
+            .await
+            .unwrap();
+        assert!(!should_probe_failure(&state, &failure).await);
         let execution =
             lance_context_merge::Execution::new("exp", "http://127.0.0.1:1", "boot", 30);
         assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        assert!(should_probe_failure(&state, &failure).await);
         let running = coordinator.start(&execution).await.unwrap().unwrap();
         assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
         let outcome = crate::merge_execution::run_merge_wal(&state, &claim).await;
         assert!(outcome.as_ref().unwrap_err().contains("draining"));
         assert!(coordinator.get("exp").await.unwrap().is_none());
+        assert!(!should_probe_failure(&state, &failure).await);
         state.task_store.finish(claim, outcome).await.unwrap();
 
         let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();

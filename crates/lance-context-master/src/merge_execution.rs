@@ -33,6 +33,7 @@ pub(crate) async fn run_merge_wal(
         // A drain stops new work, but must still resolve an already-owned
         // execution. Otherwise rollback would strand its persistent lock.
         if let Some(old) = coordinator.get(target).await? {
+            ensure_recovery_due(&coordinator, &old).await?;
             if reconcile(&state.http, &coordinator, &proof, old, false)
                 .await
                 .is_err()
@@ -54,18 +55,7 @@ pub(crate) async fn run_merge_wal(
     // after a completed barrier lets healthy shards progress in this task.
     for recovery_round in 0..2 {
         if let Some(old) = coordinator.get(&claim.task.target).await? {
-            if old.phase == Phase::Recovering {
-                if let Some(failure) = coordinator.failure(&old.target, &old.endpoint).await? {
-                    if failure.last_error.contains("recovery barrier failed")
-                        && failure.next_retry_ms > lance_context_merge::failure::now_ms()
-                    {
-                        return Err(format!(
-                            "{}; recovery probe at {}",
-                            failure.last_error, failure.next_retry_ms
-                        ));
-                    }
-                }
-            }
+            ensure_recovery_due(&coordinator, &old).await?;
             if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
                 recover_execution(state, &coordinator, &proof, old).await?;
             } else if let Err(error) = reconcile(&state.http, &coordinator, &proof, old, true).await
@@ -176,6 +166,22 @@ impl Deadlines {
             }
         }
     }
+}
+
+async fn ensure_recovery_due(coordinator: &Coordinator, old: &Execution) -> Result<(), String> {
+    if old.phase == Phase::Recovering {
+        if let Some(failure) = coordinator.failure(&old.target, &old.endpoint).await? {
+            if failure.last_error.contains("recovery barrier failed")
+                && failure.next_retry_ms > lance_context_merge::failure::now_ms()
+            {
+                return Err(format!(
+                    "{}; recovery probe at {}",
+                    failure.last_error, failure.next_retry_ms
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn recover_execution(
