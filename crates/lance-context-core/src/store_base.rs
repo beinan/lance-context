@@ -2039,8 +2039,9 @@ impl StorageBase {
             ..Default::default()
         });
         let handler = lance_table::io::commit::commit_handler_from_url(uri, &store_params).await?;
-        let mut builder = DatasetBuilder::from_uri(uri)
-            .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
+        let mut builder = DatasetBuilder::from_uri(uri).with_commit_handler(Arc::new(
+            crate::merge_write_scope::GuardedCommit::new(handler),
+        ));
         if let Some(options) = storage_options {
             builder = builder.with_storage_options(options);
         }
@@ -2078,7 +2079,9 @@ impl StorageBase {
         params.session = session;
         let handler =
             lance_table::io::commit::commit_handler_from_url(uri, &params.store_params).await?;
-        params.commit_handler = Some(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
+        params.commit_handler = Some(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+            handler,
+        )));
 
         Dataset::write(batches, uri, Some(params)).await
     }

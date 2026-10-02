@@ -43,6 +43,7 @@ pub struct MergeWriteScope {
     progress: Mutex<Progress>,
     changed: Notify,
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
+    pin_opened_handles: bool,
     leaves: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
@@ -57,6 +58,17 @@ impl MergeWriteScope {
     pub fn with_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
         Arc::new(Self {
             authorizer: Some(authorizer),
+            ..Self::default()
+        })
+    }
+
+    /// Bind newly opened dataset handles to this execution, including commits
+    /// from child tasks. Use only for ephemeral maintenance handles: worker
+    /// caches must keep resolving the current execution at each call instead.
+    pub fn with_pinned_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
+        Arc::new(Self {
+            authorizer: Some(authorizer),
+            pin_opened_handles: true,
             ..Self::default()
         })
     }
@@ -336,7 +348,21 @@ pub async fn fence_manifest_versions(
 }
 
 #[derive(Debug)]
-pub(crate) struct GuardedCommit(pub Arc<dyn CommitHandler>);
+pub(crate) struct GuardedCommit {
+    inner: Arc<dyn CommitHandler>,
+    scope: Option<Arc<MergeWriteScope>>,
+}
+impl GuardedCommit {
+    pub(crate) fn new(inner: Arc<dyn CommitHandler>) -> Self {
+        Self {
+            inner,
+            scope: CURRENT
+                .try_with(Arc::clone)
+                .ok()
+                .filter(|scope| scope.pin_opened_handles),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
@@ -351,37 +377,43 @@ impl CommitHandler for GuardedCommit {
         naming_scheme: ManifestNamingScheme,
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        authorize("base", manifest.version).await?;
-        let inner = self.0.clone();
-        let mut owned_manifest = manifest.clone();
-        let path = base_path.clone();
-        let store = object_store.clone();
-        let scope = CURRENT.try_with(Arc::clone).ok();
-        let (location, committed) = shield(async move {
-            let location = inner
-                .commit(
-                    &mut owned_manifest,
-                    indices,
-                    &path,
-                    &store,
-                    manifest_writer,
-                    naming_scheme,
-                    transaction,
-                )
-                .await;
-            // Only a definite conflict proves this conditional commit did
-            // not happen. A transport/storage error can arrive after the
-            // remote service accepted it, even though the Rust future ended.
-            if matches!(&location, Err(CommitError::OtherError(_))) {
-                if let Some(scope) = scope {
-                    scope.mark_uncertain();
+        let work = async {
+            authorize("base", manifest.version).await?;
+            let inner = self.inner.clone();
+            let mut owned_manifest = manifest.clone();
+            let path = base_path.clone();
+            let store = object_store.clone();
+            let scope = CURRENT.try_with(Arc::clone).ok();
+            let (location, committed) = shield(async move {
+                let location = inner
+                    .commit(
+                        &mut owned_manifest,
+                        indices,
+                        &path,
+                        &store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await;
+                // Only a definite conflict proves this conditional commit did
+                // not happen. A transport/storage error can arrive after the
+                // remote service accepted it, even though the Rust future ended.
+                if matches!(&location, Err(CommitError::OtherError(_))) {
+                    if let Some(scope) = scope {
+                        scope.mark_uncertain();
+                    }
                 }
-            }
-            Ok::<_, CommitError>((location, owned_manifest))
-        })
-        .await?;
-        *manifest = committed;
-        location
+                Ok::<_, CommitError>((location, owned_manifest))
+            })
+            .await?;
+            *manifest = committed;
+            location
+        };
+        match &self.scope {
+            Some(scope) => scope.run(work).await,
+            None => work.await,
+        }
     }
 
     async fn resolve_latest_location(
@@ -389,7 +421,7 @@ impl CommitHandler for GuardedCommit {
         base_path: &Path,
         object_store: &ObjectStore,
     ) -> Result<ManifestLocation> {
-        self.0
+        self.inner
             .resolve_latest_location(base_path, object_store)
             .await
     }
@@ -399,7 +431,7 @@ impl CommitHandler for GuardedCommit {
         version: u64,
         object_store: &dyn object_store::ObjectStore,
     ) -> Result<ManifestLocation> {
-        self.0
+        self.inner
             .resolve_version_location(base_path, version, object_store)
             .await
     }
@@ -410,7 +442,7 @@ impl CommitHandler for GuardedCommit {
         object_store: &dyn object_store::ObjectStore,
         naming: ManifestNamingScheme,
     ) -> Result<bool> {
-        self.0
+        self.inner
             .version_exists(base_path, version, object_store, naming)
             .await
     }
@@ -419,7 +451,7 @@ impl CommitHandler for GuardedCommit {
         base_path: &Path,
         object_store: &'a ObjectStore,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        self.0
+        self.inner
             .list_detached_manifest_locations(base_path, object_store)
     }
     fn list_manifest_locations<'a>(
@@ -428,7 +460,7 @@ impl CommitHandler for GuardedCommit {
         object_store: &'a ObjectStore,
         sorted: bool,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        self.0
+        self.inner
             .list_manifest_locations(base_path, object_store, sorted)
     }
     fn list_manifest_locations_since<'a>(
@@ -437,11 +469,11 @@ impl CommitHandler for GuardedCommit {
         object_store: &'a ObjectStore,
         since: u64,
     ) -> BoxStream<'a, Result<ManifestLocation>> {
-        self.0
+        self.inner
             .list_manifest_locations_since(base_path, object_store, since)
     }
     async fn delete(&self, base_path: &Path) -> Result<()> {
-        self.0.delete(base_path).await
+        self.inner.delete(base_path).await
     }
 }
 

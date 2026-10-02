@@ -147,17 +147,29 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
     .record(timing.permit_wait.as_secs_f64());
 
     let started = std::time::Instant::now();
-    let outcome =
-        if state.config.merge_rollout.draining(&task.target) && task.kind != TaskKind::MergeWal {
+    let outcome = match crate::maintenance_execution::reconcile_previous(state, &claim).await {
+        Err(error) => Err(error),
+        Ok(())
+            if state.config.merge_rollout.draining(&task.target)
+                && task.kind != TaskKind::MergeWal =>
+        {
             Err("target draining legacy writers for merge protocol transition".into())
-        } else {
-            match task.kind {
-                TaskKind::Compact => run_compaction(state, &task).await,
-                TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
-                TaskKind::IndexId => run_index_id(state, &task.target).await,
-                TaskKind::Repair => run_repair(state, &task).await,
+        }
+        Ok(()) => match task.kind {
+            TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
+            _ => {
+                crate::maintenance_execution::run(state, &claim, async {
+                    match task.kind {
+                        TaskKind::Compact => run_compaction(state, &task).await,
+                        TaskKind::IndexId => run_index_id(state, &task.target).await,
+                        TaskKind::Repair => run_repair(state, &task).await,
+                        TaskKind::MergeWal => unreachable!(),
+                    }
+                })
+                .await
             }
-        };
+        },
+    };
     let work_elapsed = started.elapsed();
     let result = if outcome.is_ok() { "success" } else { "failed" };
 
@@ -674,6 +686,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
         let coordinator = retry_state.task_store.merge_coordinator();
         let mut cursor = None;
         let mut request_cursor = None;
+        let mut execution_cursor = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         loop {
             ticker.tick().await;
@@ -695,23 +708,53 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 }
                 Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
             }
+            match coordinator
+                .execution_page(execution_cursor.as_deref())
+                .await
+            {
+                Ok((executions, next)) => {
+                    execution_cursor = next;
+                    for execution in executions {
+                        if execution.maintenance.is_none() {
+                            continue;
+                        }
+                        if let Err(error) = crate::maintenance_execution::enqueue_recovery(
+                            &retry_state,
+                            &coordinator,
+                            &execution,
+                        )
+                        .await
+                        {
+                            tracing::warn!(target = %execution.target, %error, "local execution recovery enqueue failed");
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "local execution recovery scan failed"),
+            }
             match coordinator.failure_page(cursor.as_deref(), 256).await {
                 Ok((rows, next)) => {
                     cursor = next;
                     let mut targets = std::collections::HashSet::new();
                     for failure in rows {
+                        let task_kind = crate::maintenance_execution::retry_kind(&failure.endpoint)
+                            .or_else(|| {
+                                retry_state
+                                    .config
+                                    .worker_endpoints
+                                    .contains(&failure.endpoint)
+                                    .then_some(TaskKind::MergeWal)
+                            });
+                        let Some(task_kind) = task_kind else {
+                            continue;
+                        };
                         if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
-                            && retry_state
-                                .config
-                                .worker_endpoints
-                                .contains(&failure.endpoint)
-                            && targets.insert(failure.target.clone())
+                            && targets.insert((failure.target.clone(), kind_label(task_kind)))
                             && should_probe_failure(&retry_state, &failure).await
                         {
                             if let Err(error) =
-                                enqueue(&retry_state, TaskKind::MergeWal, &failure.target).await
+                                enqueue(&retry_state, task_kind, &failure.target).await
                             {
-                                tracing::warn!(target = %failure.target, %error, "merge recovery enqueue failed");
+                                tracing::warn!(target = %failure.target, %error, "maintenance recovery enqueue failed");
                             }
                         }
                     }
@@ -871,6 +914,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {
                 owned_targets: ["exp", "generic:gs", "broken"]
                     .into_iter()

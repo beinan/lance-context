@@ -8,6 +8,8 @@ use clap::Parser;
 pub struct MasterConfig {
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
+    #[command(flatten)]
+    pub maintenance: MaintenanceConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,
@@ -306,5 +308,28 @@ mod tests {
         assert_eq!(config.compaction_batch_size, 8);
         assert_eq!(config.compaction_max_source_fragments, 32);
         assert_eq!(config.compaction_max_bytes_per_file, 1024 * 1024 * 1024);
+    }
+}
+
+/// Deadlines for local table mutations on explicitly owned targets.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MaintenanceConfig {
+    /// Maximum local index/compact/repair execution time on owned targets.
+    #[arg(long, env = "MAINTENANCE_TIMEOUT_SECS", default_value_t = 3600)]
+    pub maintenance_timeout_secs: u64,
+    /// Maximum time without a completed storage/processing step.
+    #[arg(long, env = "MAINTENANCE_IDLE_TIMEOUT_SECS", default_value_t = 600)]
+    pub maintenance_idle_timeout_secs: u64,
+    /// Grace for in-flight manifest commits before storage fencing.
+    #[arg(long, env = "MAINTENANCE_DRAIN_TIMEOUT_SECS", default_value_t = 30)]
+    pub maintenance_drain_timeout_secs: u64,
+}
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            maintenance_timeout_secs: 3600,
+            maintenance_idle_timeout_secs: 600,
+            maintenance_drain_timeout_secs: 30,
+        }
     }
 }

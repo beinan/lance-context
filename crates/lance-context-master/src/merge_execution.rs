@@ -168,7 +168,10 @@ impl Deadlines {
     }
 }
 
-async fn ensure_recovery_due(coordinator: &Coordinator, old: &Execution) -> Result<(), String> {
+pub(crate) async fn ensure_recovery_due(
+    coordinator: &Coordinator,
+    old: &Execution,
+) -> Result<(), String> {
     if old.phase == Phase::Recovering {
         if let Some(failure) = coordinator.failure(&old.target, &old.endpoint).await? {
             if failure.last_error.contains("recovery barrier failed")
@@ -184,7 +187,7 @@ async fn ensure_recovery_due(coordinator: &Coordinator, old: &Execution) -> Resu
     Ok(())
 }
 
-async fn recover_execution(
+pub(crate) async fn recover_execution(
     state: &Arc<MasterState>,
     coordinator: &Coordinator,
     proof: &ClaimProof,

@@ -2372,6 +2372,94 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn owned_store_commit_guard_survives_transfer_to_a_child_task() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct Deny;
+        impl CommitAuthorizer for Deny {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(lance::Error::io("old execution fenced")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let version = store.version();
+        let scope = MergeWriteScope::with_pinned_authorizer(Arc::new(Deny));
+        let mut dataset = scope
+            .run(StorageBase::load_with_options(uri, None, None))
+            .await
+            .unwrap();
+        let error =
+            tokio::spawn(async move { dataset.update_metadata([("attempt", "late-child")]).await })
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("old execution fenced"));
+        scope.drain().await;
+        assert_eq!(
+            RolloutStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap()
+                .version(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_store_commit_guard_uses_each_new_execution() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct Deny;
+        impl CommitAuthorizer for Deny {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(lance::Error::io("current execution fenced")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        RolloutStore::open(uri).await.unwrap();
+        let old = MergeWriteScope::with_authorizer(Arc::new(Deny));
+        let mut dataset = old
+            .run(StorageBase::load_with_options(uri, None, None))
+            .await
+            .unwrap();
+        old.drain().await;
+        // A cached handle must not retain the old, now closed execution.
+        let next = MergeWriteScope::new();
+        next.run(async {
+            dataset
+                .update_metadata([("attempt", "next-execution")])
+                .await
+        })
+        .await
+        .unwrap();
+        next.drain().await;
+        // The same handle must still enforce a later execution's authorization.
+        let denied = MergeWriteScope::with_authorizer(Arc::new(Deny));
+        let error = denied
+            .run(async {
+                dataset
+                    .update_metadata([("attempt", "denied-execution")])
+                    .await
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("current execution fenced"));
+        denied.drain().await;
+    }
+
     #[test]
     fn rollout_filters_parse_supported_fields() {
         let filters = RolloutFilters::from_json_value(json!({
@@ -2509,7 +2597,7 @@ mod tests {
         store.flush().await.unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let handler = Arc::new(GuardedCommit(Arc::new(PausedCommit {
+        let handler = Arc::new(GuardedCommit::new(Arc::new(PausedCommit {
             inner: lance_table::io::commit::commit_handler_from_url(uri, &None)
                 .await
                 .unwrap(),

@@ -121,6 +121,14 @@ impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
+        if config.maintenance.maintenance_timeout_secs == 0
+            || config.maintenance.maintenance_idle_timeout_secs == 0
+            || config.maintenance.maintenance_drain_timeout_secs == 0
+        {
+            return Err(lance::Error::invalid_input(
+                "maintenance deadlines must be positive",
+            ));
+        }
         let task_store = TaskStore::open(&config).await?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
@@ -240,6 +248,7 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
             host: "127.0.0.1".to_string(),

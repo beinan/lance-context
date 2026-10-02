@@ -153,6 +153,7 @@ pub async fn start(
 ) -> Result<StatusCode, AppError> {
     let coordinator = state.merge_executions.coordinator().await?;
     if !state.merge_executions.owned(&execution.target)
+        || execution.maintenance.is_some()
         || execution.protocol != 2
         || execution.instance != state.merge_executions.instance
         || execution.phase != Phase::Reserved

@@ -679,14 +679,21 @@ impl EtcdTaskStore {
                     }
                 }
 
-                let merge_execution = if task.kind == TaskKind::MergeWal {
+                let merge_execution =
                     lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
                         .get(&task.target)
                         .await
-                        .map_err(lance::Error::io)?
-                } else {
-                    None
-                };
+                        .map_err(lance::Error::io)?;
+                // Only MergeWal reconciles a worker execution. A local fenced
+                // mutation may be recovered by any table writer after the
+                // exclusive reconciler lease has expired.
+                if task.kind != TaskKind::MergeWal
+                    && merge_execution
+                        .as_ref()
+                        .is_some_and(|e| e.maintenance.is_none())
+                {
+                    continue;
+                }
                 let token = generate_id();
                 let lease_id = self.grant_lease().await?;
                 let claim_key = self.claim_key(&task.id);
@@ -714,22 +721,13 @@ impl EtcdTaskStore {
                         compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
                     }
                 }
-                // A lost scheduler lease does not terminate remote storage work.
-                // MergeWal may claim to reconcile it; every other writer waits.
-                if task.kind != TaskKind::MergeWal && target_key.is_some() {
-                    compares.push(Compare::version(
-                        lance_context_merge::execution_key(&self.prefix, &task.target),
-                        CompareOp::Equal,
-                        0,
-                    ));
-                }
                 // Remote execution ownership persists, but its reconciler is
                 // still exclusive and leased. Dependency-chain merge tasks
                 // must not cancel another live scheduler's execution.
                 let merge_claim_key =
                     lance_context_merge::execution_key(&self.prefix, &task.target)
                         .replace("/merge-executions/", "/merge-claims/");
-                if task.kind == TaskKind::MergeWal {
+                if requires_target_lock(task.kind) {
                     compares.push(Compare::version(
                         merge_claim_key.as_str(),
                         CompareOp::Equal,
@@ -743,7 +741,7 @@ impl EtcdTaskStore {
                     TxnOp::put(running_key, running_value, None),
                     TxnOp::put(claim_key.as_str(), token.as_bytes(), lease_options.clone()),
                 ];
-                if task.kind == TaskKind::MergeWal {
+                if requires_target_lock(task.kind) {
                     operations.push(TxnOp::put(
                         merge_claim_key,
                         token.as_bytes(),
@@ -803,7 +801,7 @@ impl EtcdTaskStore {
             keepalive,
         } = claim.backend;
         let mut task = claim.task;
-        let unresolved = if task.kind == TaskKind::MergeWal && outcome.is_err() {
+        let unresolved = if requires_target_lock(task.kind) {
             lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
                 .get(&task.target)
                 .await
@@ -817,7 +815,7 @@ impl EtcdTaskStore {
             TxnOp::delete(claim_key.as_str(), None),
             TxnOp::delete(self.running_key(&task.id), None),
         ];
-        if task.kind == TaskKind::MergeWal {
+        if requires_target_lock(task.kind) {
             operations.push(TxnOp::delete(
                 lance_context_merge::execution_key(&self.prefix, &task.target)
                     .replace("/merge-executions/", "/merge-claims/"),
@@ -1516,6 +1514,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
             host: "127.0.0.1".to_string(),

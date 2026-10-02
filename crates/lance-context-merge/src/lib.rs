@@ -32,8 +32,38 @@ pub enum Phase {
     Finished,
 }
 
+/// Local master mutations use the same storage fence as WAL merging. Older
+/// readers cannot CAS these records because they do not preserve this field.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceKind {
+    Compact,
+    IndexId,
+    Repair,
+}
+
+impl MaintenanceKind {
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::Compact => "master:compact",
+            Self::IndexId => "master:index_id",
+            Self::Repair => "master:repair",
+        }
+    }
+    pub fn from_endpoint(endpoint: &str) -> Option<Self> {
+        match endpoint {
+            "master:compact" => Some(Self::Compact),
+            "master:index_id" => Some(Self::IndexId),
+            "master:repair" => Some(Self::Repair),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Execution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<MaintenanceKind>,
     pub id: String,
     pub target: String,
     pub endpoint: String,
@@ -61,6 +91,7 @@ fn default_queue_timeout() -> u64 {
 impl Execution {
     pub fn new(target: &str, endpoint: &str, instance: &str, timeout_secs: u64) -> Self {
         Self {
+            maintenance: None,
             id: uuid::Uuid::new_v4().to_string(),
             target: target.into(),
             endpoint: endpoint.into(),
@@ -138,6 +169,48 @@ impl Coordinator {
             .first()
             .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
             .transpose()
+    }
+
+    /// Bounded recovery inventory; execution records themselves are durable
+    /// demand even if a process died before writing its failure ledger.
+    pub async fn execution_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<Execution>, Option<String>)> {
+        let prefix = format!("{}/merge-executions/", self.prefix.trim_end_matches('/'));
+        let (start, options) = match after {
+            None => (prefix.clone(), etcd_client::GetOptions::new().with_prefix()),
+            Some(key) if key.starts_with(&prefix) => {
+                let mut end = prefix.as_bytes().to_vec();
+                *end.last_mut().unwrap() += 1;
+                (
+                    format!("{key}\0"),
+                    etcd_client::GetOptions::new().with_range(end),
+                )
+            }
+            Some(_) => return Err("invalid execution cursor".into()),
+        };
+        let response = self
+            .client
+            .clone()
+            .get(start, Some(options.with_limit(256)))
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows = response
+            .kvs()
+            .iter()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<Execution>>>()?;
+        let next = response
+            .more()
+            .then(|| {
+                response
+                    .kvs()
+                    .last()
+                    .map(|kv| String::from_utf8_lossy(kv.key()).into_owned())
+            })
+            .flatten();
+        Ok((rows, next))
     }
 
     /// Atomic claim check and admission close the delayed-request/lease-loss race.
@@ -446,6 +519,65 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn maintenance_records_preserve_legacy_worker_encoding_and_require_new_readers() {
+        let legacy = Execution::new("table", "http://worker", "instance", 600);
+        let encoded = encode(&legacy);
+        assert!(!String::from_utf8_lossy(&encoded).contains("maintenance"));
+        assert_eq!(
+            serde_json::from_slice::<Execution>(&encoded).unwrap(),
+            legacy
+        );
+        for kind in [
+            MaintenanceKind::Compact,
+            MaintenanceKind::IndexId,
+            MaintenanceKind::Repair,
+        ] {
+            let mut local = legacy.clone();
+            local.maintenance = Some(kind);
+            local.endpoint = kind.endpoint().into();
+            let encoded = encode(&local);
+            assert_eq!(
+                serde_json::from_slice::<Execution>(&encoded).unwrap(),
+                local
+            );
+            assert_eq!(MaintenanceKind::from_endpoint(&local.endpoint), Some(kind));
+            // An old reader omits the new field on re-encoding: its value CAS
+            // cannot start, finish, freeze or release this local execution.
+            let mut old_reader = local.clone();
+            old_reader.maintenance = None;
+            assert_ne!(encode(&old_reader), encoded);
+        }
+        assert_eq!(MaintenanceKind::from_endpoint("http://worker"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_inventory_pages_without_crossing_namespace() {
+        let (coordinator, mut client, _, _) = fixture().await;
+        for n in 0..257 {
+            let execution = Execution::new(&format!("table-{n:03}"), "master:repair", "lost", 60);
+            client
+                .put(
+                    execution_key(&coordinator.prefix, &execution.target),
+                    encode(&execution),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let (first, cursor) = coordinator.execution_page(None).await.unwrap();
+        assert_eq!(first.len(), 256);
+        let (last, done) = coordinator.execution_page(cursor.as_deref()).await.unwrap();
+        assert_eq!(last.len(), 1);
+        assert!(done.is_none());
+        assert!(!first.iter().any(|e| e.id == last[0].id));
+        assert!(coordinator
+            .execution_page(Some("/another-prefix/key"))
+            .await
+            .is_err());
     }
 
     // Isolated prefix on a LOCAL test etcd. These tests never use production.
