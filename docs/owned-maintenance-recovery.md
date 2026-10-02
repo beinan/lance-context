@@ -36,7 +36,10 @@ in pages of 256 every 15 seconds independently of stats sweeps.
 
 Failures use the existing `/merge-failures` API and durable per-target ledger,
 with endpoints `master:compact`, `master:index_id`, and `master:repair`. A new
-task or process does not reset the attempt count. Retryable failures back off;
+task or process does not reset the attempt count. A repair that actually commits
+a changed manifest clears the corresponding missing-file failures so dependent
+work can resume; no-op repairs and unrelated failures keep their budget.
+Retryable failures back off;
 persistent failures get `needs_attention` and hourly probes. An unresolved
 storage barrier retains ownership and probes at up to five-minute intervals.
 An unavailable dataset, bad configuration or repeatable corruption requires

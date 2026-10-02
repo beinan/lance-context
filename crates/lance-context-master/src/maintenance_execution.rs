@@ -166,8 +166,8 @@ where
     {
         if failure.next_retry_ms > lance_context_merge::failure::now_ms() {
             return Err(format!(
-                "maintenance retry at {}: {}",
-                failure.next_retry_ms, failure.last_error
+                "maintenance retry at {} after {:?} failure",
+                failure.next_retry_ms, failure.class
             ));
         }
     }
@@ -369,6 +369,37 @@ mod tests {
             assert_eq!(failure.consecutive_attempts, 1);
             assert!(failure.next_retry_ms > failure.last_failure_ms);
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn a_new_task_cannot_bypass_local_failure_backoff() {
+        let (_dir, state) = fixture().await;
+        let first = claim(&state, TaskKind::IndexId).await;
+        let outcome = run(&state, &first, async { Err("invalid index schema".into()) }).await;
+        state.task_store.finish(first, outcome).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let before = coordinator
+            .failure("table", "master:index_id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.needs_attention);
+        let fresh = claim(&state, TaskKind::IndexId).await;
+        let result = run(&state, &fresh, async {
+            panic!("backoff must prevent new payload work")
+        })
+        .await;
+        assert!(result.as_ref().unwrap_err().contains("retry at"));
+        state.task_store.finish(fresh, result).await.unwrap();
+        let after = coordinator
+            .failure("table", "master:index_id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.consecutive_attempts, after.consecutive_attempts);
+        assert_eq!(before.next_retry_ms, after.next_retry_ms);
+        assert!(coordinator.get("table").await.unwrap().is_none());
     }
 
     #[tokio::test]

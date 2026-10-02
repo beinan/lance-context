@@ -162,7 +162,7 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
                     match task.kind {
                         TaskKind::Compact => run_compaction(state, &task).await,
                         TaskKind::IndexId => run_index_id(state, &task.target).await,
-                        TaskKind::Repair => run_repair(state, &task).await,
+                        TaskKind::Repair => run_repair(state, &claim).await,
                         TaskKind::MergeWal => unreachable!(),
                     }
                 })
@@ -238,7 +238,8 @@ async fn schedule_repair(state: &Arc<MasterState>, failed: &TaskRecord) {
 
 /// Drop base-table fragments whose files are missing (see
 /// `StorageBase::repair_missing_fragments`) and record what was dropped.
-async fn run_repair(state: &Arc<MasterState>, task: &TaskRecord) -> Result<String, String> {
+async fn run_repair(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<String, String> {
+    let task = &claim.task;
     let (kind, name) = parse_target(&task.target);
     if kind != StoreKind::Rollout {
         return Err(format!("repair is not implemented for {kind:?} stores"));
@@ -254,6 +255,21 @@ async fn run_repair(state: &Arc<MasterState>, task: &TaskRecord) -> Result<Strin
     let Some(committed_version) = report.committed_version else {
         return Ok("nothing missing; no repair needed".to_string());
     };
+    // A committed repair changed the data that caused these failures. Permit
+    // the dependent retry immediately; a new task or a no-op repair must never
+    // clear a budget. Other error classes (schema, timeout, ownership) survive.
+    let coordinator = state.task_store.merge_coordinator();
+    for endpoint in ["master:compact", "master:index_id"] {
+        if coordinator
+            .failure(&task.target, endpoint)
+            .await?
+            .is_some_and(|failure| is_missing_fragment_error(&failure.last_error))
+        {
+            coordinator
+                .clear_failure(&state.task_store.merge_claim(claim), &task.target, endpoint)
+                .await?;
+        }
+    }
     let rows: usize = report
         .dropped
         .iter()
@@ -1371,6 +1387,24 @@ mod tests {
     async fn missing_fragment_failure_triggers_repair_and_rerun() {
         let dir = TempDir::new().unwrap();
         let state = MasterState::new(config(&dir)).await.unwrap();
+        // Repairing a missing fragment must not erase an unrelated failure.
+        enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+        let index_claim = state.task_store.claim_next().await.unwrap().unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let unrelated = coordinator
+            .record_failure(
+                &state.task_store.merge_claim(&index_claim),
+                "exp",
+                "master:index_id",
+                "invalid index schema",
+            )
+            .await
+            .unwrap();
+        state
+            .task_store
+            .finish(index_claim, Err("invalid index schema".into()))
+            .await
+            .unwrap();
         let worker = spawn_scheduler(&state);
 
         let name = "exp";
@@ -1431,6 +1465,22 @@ mod tests {
             .starts_with("dropped 1 fragments (1 rows)"));
         let rerun = await_terminal(&state, &rerun.id).await;
         assert_eq!(rerun.state, TaskState::Done, "got {rerun:?}");
+
+        let retained = coordinator
+            .failure(name, "master:index_id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.next_retry_ms, unrelated.next_retry_ms);
+        assert_eq!(
+            retained.consecutive_attempts,
+            unrelated.consecutive_attempts
+        );
+        assert!(coordinator
+            .failure(name, "master:compact")
+            .await
+            .unwrap()
+            .is_none());
 
         let repairs = state.task_store.list_repairs().await.unwrap();
         assert_eq!(repairs.len(), 1);
