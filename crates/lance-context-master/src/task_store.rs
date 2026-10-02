@@ -1434,12 +1434,12 @@ mod tests {
     async fn compact_noop_lease_expiry_allows_bounded_recheck() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
-        cfg.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
             .unwrap()
             .split(',')
             .map(str::to_owned)
             .collect();
-        cfg.etcd_prefix = format!("/test/{}", generate_id());
+        cfg.etcd.etcd_prefix = format!("/test/{}", generate_id());
         let store = TaskStore::open(&cfg).await.unwrap();
         store
             .record_compact_noop("table", "/table", 10, "options")
@@ -1457,7 +1457,7 @@ mod tests {
             .compact_is_unchanged("table", "/table", -1, "options")
             .await
             .unwrap());
-        let key = lance_context_merge::execution_key(&cfg.etcd_prefix, "table")
+        let key = lance_context_merge::execution_key(&cfg.etcd.etcd_prefix, "table")
             .replace("/merge-executions/", "/compact-noops/");
         let mut client = store.inner.client.clone();
         let kv = client.get(key, None).await.unwrap();

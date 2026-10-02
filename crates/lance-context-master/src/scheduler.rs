@@ -933,13 +933,7 @@ mod tests {
         let mut store = RolloutStore::open(&uri).await.unwrap();
         store.add(&[rollout_record("a")]).await.unwrap();
         store.cleanup_own_shard().await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert("exp", &uri)
-            .await
-            .unwrap();
+        state.registry.upsert("exp", &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
         let metrics = compact_inner(&state, "exp").await.unwrap();
         assert_eq!(metrics.fragments_removed, 0);
