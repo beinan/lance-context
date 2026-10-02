@@ -369,12 +369,50 @@ async fn compact_inner(
     let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
         .map_err(|e| e.to_string())?;
+    let options = compact_options_key(&config);
+    let before = store.version();
     let metrics = store
         .compact(Some(config))
         .await
         .map_err(|e| e.to_string())?;
+    if metrics.fragments_removed == 0 && metrics.fragments_added == 0 && before == store.version() {
+        // Optimization only: an etcd failure must not turn a completed compact
+        // into a failed task or retain its write lock indefinitely.
+        if !matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                state
+                    .task_store
+                    .record_compact_noop(name, &uri, before, &options)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            tracing::warn!(
+                store = name,
+                "could not persist compact no-op; future sweep may retry"
+            );
+        }
+    }
     update_stats_after_compaction(state, name, &store).await;
     Ok(metrics)
+}
+
+// Include every effective rewrite option. Scheduling intervals/quiet hours do
+// not affect the plan. JSON keeps the encoding stable across master restarts.
+fn compact_options_key(config: &CompactionConfig) -> String {
+    serde_json::json!({
+        "target_rows": config.target_rows_per_fragment,
+        "row_group": config.max_rows_per_group,
+        "deletions": config.materialize_deletions,
+        "deletion_threshold": config.materialize_deletions_threshold,
+        "threads": config.num_threads,
+        "max_bytes": config.max_bytes_per_file,
+        "batch_size": config.batch_size,
+        "max_sources": config.max_source_fragments,
+        "binary_copy": config.try_binary_copy,
+    })
+    .to_string()
 }
 
 /// Refresh the stats row for `name` after a successful compaction: re-observe
@@ -464,18 +502,21 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
     if in_quiet_hours(&config) {
         return Ok(0);
     }
-    // Threshold pushed into the scan and capped, rather than reading the whole
-    // stats table and filtering in this loop. At tens of thousands of
-    // experiments the full read dominated every sweep, and the enqueue count
-    // was unbounded.
+    // The stats implementation already materializes all above-threshold metadata
+    // to rank candidates. Keep the tail so suppressed/active leaders cannot
+    // starve useful work below the enqueue cap; never load table payloads here.
     let rows = state
         .stats
         .lock()
         .await
-        .list_above_fragment_count(config.min_fragments, MAX_SWEEP_ENQUEUE)
+        .list_above_fragment_count(config.min_fragments, usize::MAX)
         .await?;
+    let options = compact_options_key(&config);
     let mut queued = 0;
     for row in rows {
+        if queued >= MAX_SWEEP_ENQUEUE {
+            break;
+        }
         // Generic rows share the stats table (their name carries the
         // `generic:` prefix) so the WAL-merge sweep sees them; compaction of
         // generic stores is not master-scheduled, so they are skipped here.
@@ -489,8 +530,27 @@ async fn sweep_candidates_inner(state: &Arc<MasterState>) -> lance::Result<usize
         {
             continue;
         }
-        enqueue(state, TaskKind::Compact, &row.name).await?;
-        queued += 1;
+        if state
+            .task_store
+            .compact_is_unchanged(
+                &row.name,
+                &state.rollout_uri(&row.name),
+                row.version,
+                &options,
+            )
+            .await?
+        {
+            metrics::counter!("master_compact_noop_suppressed_total").increment(1);
+            continue;
+        }
+        let before = state
+            .task_store
+            .get_active_id(TaskKind::Compact, &row.name)
+            .await?;
+        let task = enqueue(state, TaskKind::Compact, &row.name).await?;
+        if before.as_deref() != Some(task.id.as_str()) {
+            queued += 1;
+        }
     }
     Ok(queued)
 }
@@ -861,6 +921,109 @@ mod tests {
             task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_noop_survives_restart_and_changes_invalidate_it() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.min_fragments = 1;
+        let state = MasterState::new(cfg.clone()).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        let mut store = RolloutStore::open(&uri).await.unwrap();
+        store.add(&[rollout_record("a")]).await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        state
+            .registry
+            .write()
+            .await
+            .upsert("exp", &uri)
+            .await
+            .unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+        let metrics = compact_inner(&state, "exp").await.unwrap();
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(sweep_candidates(&state).await.unwrap(), 0);
+        drop(state);
+        let restarted = MasterState::new(cfg.clone()).await.unwrap();
+        assert_eq!(sweep_candidates(&restarted).await.unwrap(), 0);
+        // Explicit operator requests are still admitted.
+        let manual = enqueue(&restarted, TaskKind::Compact, "exp").await.unwrap();
+        assert_eq!(manual.state, TaskState::Queued);
+        // A version change (including index/deletion commits) invalidates it.
+        let key = compact_options_key(&restarted.compaction_config());
+        assert!(!restarted
+            .task_store
+            .compact_is_unchanged("exp", &uri, store.version() as i64 + 1, &key)
+            .await
+            .unwrap());
+        cfg.target_rows_per_fragment += 1;
+        let changed = MasterState::new(cfg).await.unwrap();
+        assert!(!changed
+            .task_store
+            .compact_is_unchanged(
+                "exp",
+                &uri,
+                store.version() as i64,
+                &compact_options_key(&changed.compaction_config())
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_sweep_reaches_useful_tail_after_suppressed_leaders() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let options = compact_options_key(&state.compaction_config());
+        let mut rows = Vec::new();
+        for i in 0..=MAX_SWEEP_ENQUEUE {
+            let name = format!("noop-{i}");
+            let uri = state.rollout_uri(&name);
+            state
+                .task_store
+                .record_compact_noop(&name, &uri, 1, &options)
+                .await
+                .unwrap();
+            rows.push(StatRow {
+                name,
+                uri,
+                version: 1,
+                fragment_count: 100,
+                row_count: 0,
+                last_updated: 0,
+                pending_wal_generations: 0,
+                last_compaction: 0,
+                total_compactions: 1,
+                scanned_at: 0,
+            });
+        }
+        let mut useful = rows[0].clone();
+        useful.name = "useful".into();
+        useful.uri = state.rollout_uri("useful");
+        useful.fragment_count = 20;
+        rows.push(useful);
+        state
+            .stats
+            .lock()
+            .await
+            .replace_snapshot(&rows)
+            .await
+            .unwrap();
+        assert_eq!(sweep_candidates(&state).await.unwrap(), 1);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::Compact, "useful")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            sweep_candidates(&state).await.unwrap(),
+            0,
+            "deduped tasks do not spend the budget"
+        );
     }
 
     /// Wait until the task reaches a terminal state, returning its final record.

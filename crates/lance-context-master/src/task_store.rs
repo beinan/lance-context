@@ -162,6 +162,70 @@ impl TaskStore {
         }
     }
 
+    /// A successful no-op is tied to the exact observed version and options.
+    /// Expiry also bounds suppression when stats are stale or a URI is reused.
+    pub(crate) async fn record_compact_noop(
+        &self,
+        target: &str,
+        uri: &str,
+        version: u64,
+        options: &str,
+    ) -> lance::Result<()> {
+        let key = lance_context_merge::execution_key(&self.inner.prefix, target)
+            .replace("/merge-executions/", "/compact-noops/");
+        let lease = self
+            .inner
+            .client
+            .clone()
+            .lease_grant(900, None)
+            .await
+            .map_err(etcd_error("compact no-op lease"))?
+            .id();
+        let value = serde_json::json!({"uri": uri, "version": version, "options": options});
+        self.inner
+            .client
+            .clone()
+            .put(
+                key,
+                value.to_string(),
+                Some(PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .map_err(etcd_error("compact no-op record"))?;
+        Ok(())
+    }
+
+    pub(crate) async fn compact_is_unchanged(
+        &self,
+        target: &str,
+        uri: &str,
+        version: i64,
+        options: &str,
+    ) -> lance::Result<bool> {
+        if version < 0 {
+            return Ok(false);
+        }
+        let key = lance_context_merge::execution_key(&self.inner.prefix, target)
+            .replace("/merge-executions/", "/compact-noops/");
+        let response = self
+            .inner
+            .client
+            .clone()
+            .get(key, None)
+            .await
+            .map_err(etcd_error("compact no-op read"))?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(false);
+        };
+        let value: serde_json::Value = serde_json::from_slice(kv.value())
+            .map_err(|e| lance::Error::io(format!("invalid compact no-op record: {e}")))?;
+        Ok(
+            value["uri"] == uri
+                && value["version"] == version as u64
+                && value["options"] == options,
+        )
+    }
+
     pub async fn open(config: &MasterConfig) -> lance::Result<Self> {
         let store = Self {
             inner: Arc::new(EtcdTaskStore::connect(config).await?),
@@ -1407,6 +1471,48 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_noop_lease_expiry_allows_bounded_recheck() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd_prefix = format!("/test/{}", generate_id());
+        let store = TaskStore::open(&cfg).await.unwrap();
+        store
+            .record_compact_noop("table", "/table", 10, "options")
+            .await
+            .unwrap();
+        assert!(store
+            .compact_is_unchanged("table", "/table", 10, "options")
+            .await
+            .unwrap());
+        assert!(!store
+            .compact_is_unchanged("table", "/elsewhere", 10, "options")
+            .await
+            .unwrap());
+        assert!(!store
+            .compact_is_unchanged("table", "/table", -1, "options")
+            .await
+            .unwrap());
+        let key = lance_context_merge::execution_key(&cfg.etcd_prefix, "table")
+            .replace("/merge-executions/", "/compact-noops/");
+        let mut client = store.inner.client.clone();
+        let kv = client.get(key, None).await.unwrap();
+        let lease = kv.kvs()[0].lease();
+        let ttl = client.lease_time_to_live(lease, None).await.unwrap().ttl();
+        assert!((1..=900).contains(&ttl));
+        client.lease_revoke(lease).await.unwrap();
+        assert!(!store
+            .compact_is_unchanged("table", "/table", 10, "options")
+            .await
+            .unwrap());
+    }
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
