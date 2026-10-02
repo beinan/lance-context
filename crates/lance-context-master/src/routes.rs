@@ -573,26 +573,6 @@ pub async fn enqueue_task(
 /// lapses, and the last error. A store in this list is broken in a way that
 /// retrying will not fix (a manifest naming a missing fragment, for example);
 /// a manual `POST /tasks` still enqueues it.
-#[derive(Debug, Deserialize)]
-pub struct MergeFailureParams {
-    pub after: Option<String>,
-}
-
-pub async fn list_merge_failures(
-    State(state): State<Arc<MasterState>>,
-    Query(params): Query<MergeFailureParams>,
-) -> Result<Json<serde_json::Value>, MasterError> {
-    let (failures, next) = state
-        .task_store
-        .merge_coordinator()
-        .failure_page(params.after.as_deref(), 256)
-        .await
-        .map_err(MasterError::Internal)?;
-    Ok(Json(
-        serde_json::json!({"failures": failures, "next": next}),
-    ))
-}
-
 pub async fn list_cooldowns(
     State(state): State<Arc<MasterState>>,
 ) -> Result<Json<Vec<TaskCooldown>>, MasterError> {
@@ -672,7 +652,6 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/experiments/{name}/rescan", post(rescan_experiment))
         .route("/tasks", post(enqueue_task).get(list_tasks))
         .route("/scheduler/cooldowns", get(list_cooldowns))
-        .route("/scheduler/merge-failures", get(list_merge_failures))
         .route("/scheduler/repairs", get(list_repairs))
         .route("/tasks/{id}", get(get_task))
         .route("/rescan", post(rescan))
@@ -736,6 +715,7 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
             host: "127.0.0.1".to_string(),
             port: 0,

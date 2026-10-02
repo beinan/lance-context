@@ -4,14 +4,25 @@ use clap::Parser;
 #[command(name = "lance-context-server")]
 #[command(about = "REST API server for lance-context")]
 pub struct ServerConfig {
-    /// Configure etcd to enable the owned merge execution protocol.
+    /// Connection used lazily by explicitly enabled owned merge targets.
     #[command(flatten)]
     pub merge_etcd: lance_context_merge::EtcdConfig,
 
-    /// Deadline for scoped merge work, including slot acquisition. Already
+    #[command(flatten)]
+    pub merge_rollout: lance_context_merge::rollout::MergeRollout,
+
+    /// Maximum execution time AFTER slot acquisition. Already
     /// started manifest writes must drain before ownership can be released.
-    #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 600)]
+    #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
     pub merge_execution_timeout_secs: u64,
+
+    /// Maximum wait for a merge slot, separate from execution time.
+    #[arg(long, env = "MERGE_QUEUE_TIMEOUT_SECS", default_value_t = 600)]
+    pub merge_queue_timeout_secs: u64,
+
+    /// Maximum interval without an observed completed merge step.
+    #[arg(long, env = "MERGE_IDLE_TIMEOUT_SECS", default_value_t = 600)]
+    pub merge_idle_timeout_secs: u64,
 
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,

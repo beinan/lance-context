@@ -13,6 +13,10 @@ struct Capabilities {
     protocol: u32,
     instance: String,
     timeout_secs: u64,
+    queue_timeout_secs: u64,
+    idle_timeout_secs: u64,
+    progress_protocol: u32,
+    owned_targets: Vec<String>,
 }
 
 pub(crate) async fn run_merge_wal(
@@ -24,6 +28,28 @@ pub(crate) async fn run_merge_wal(
     }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
+    let target = &claim.task.target;
+    if state.config.merge_rollout.draining(target) {
+        // A drain stops new work, but must still resolve an already-owned
+        // execution. Otherwise rollback would strand its persistent lock.
+        if let Some(old) = coordinator.get(target).await? {
+            if reconcile(&state.http, &coordinator, &proof, old, false)
+                .await
+                .is_err()
+            {
+                if let Some(current) = coordinator.get(target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                }
+            }
+        }
+        return Err("merge target draining for protocol transition".into());
+    }
+    if !state.config.merge_rollout.owned(target) {
+        if coordinator.get(target).await?.is_some() {
+            return Err("owned execution still present; refusing legacy downgrade".into());
+        }
+        return run_legacy(state, target).await;
+    }
     // Reconcile/fence before any other table mutation. One retry of the fan-out
     // after a completed barrier lets healthy shards progress in this task.
     for recovery_round in 0..2 {
@@ -67,6 +93,89 @@ pub(crate) async fn run_merge_wal(
         }
     }
     unreachable!("bounded merge recovery loop returns on last iteration")
+}
+
+// Compatibility path is chosen only by explicit configuration, never after a
+// failed owned RPC. It retains legacy limitations until that table is drained.
+async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    let mut reclaimed = 0u64;
+    for endpoint in &state.config.worker_endpoints {
+        let endpoint = endpoint.trim_end_matches('/');
+        let url = match target.strip_prefix("generic:") {
+            Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
+            None => format!("{endpoint}/api/v1/internal/merge-wal/{target}"),
+        };
+        let started = std::time::Instant::now();
+        let result = async {
+            let response = state
+                .http
+                .post(url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(0);
+            }
+            let reply: serde_json::Value = response
+                .error_for_status()
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            reply["reclaimed"]
+                .as_u64()
+                .ok_or_else(|| "invalid legacy merge response".to_string())
+        }
+        .await;
+        metrics::histogram!("master_merge_wal_worker_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        metrics::counter!("master_merge_wal_workers_total", "result" => if result.is_ok() { "ok" } else { "failed" }).increment(1);
+        reclaimed += result?;
+    }
+    metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(reclaimed);
+    Ok(format!(
+        "merged {reclaimed} generations across {}/{} workers (legacy)",
+        state.config.worker_endpoints.len(),
+        state.config.worker_endpoints.len()
+    ))
+}
+
+struct Deadlines {
+    queue: tokio::time::Instant,
+    execution_timeout: Duration,
+    idle_timeout: Duration,
+    running: Option<tokio::time::Instant>,
+    last_progress: tokio::time::Instant,
+    sequence: Option<u64>,
+}
+
+impl Deadlines {
+    fn new(execution: &Execution, now: tokio::time::Instant) -> Self {
+        Self {
+            queue: now + Duration::from_secs(execution.queue_timeout_secs) + RPC_TIMEOUT,
+            execution_timeout: Duration::from_secs(execution.timeout_secs),
+            idle_timeout: Duration::from_secs(execution.idle_timeout_secs) + RPC_TIMEOUT,
+            running: None,
+            last_progress: now,
+            sequence: None,
+        }
+    }
+    fn observe(&mut self, sequence: u64, now: tokio::time::Instant) {
+        self.running.get_or_insert(now);
+        if self.sequence.is_none_or(|previous| sequence > previous) {
+            self.sequence = Some(sequence);
+            self.last_progress = now;
+        }
+    }
+    fn expired(&self, now: tokio::time::Instant) -> bool {
+        match self.running {
+            None => now >= self.queue,
+            Some(started) => {
+                now.duration_since(started) >= self.execution_timeout + RPC_TIMEOUT
+                    || now.duration_since(self.last_progress) >= self.idle_timeout
+            }
+        }
+    }
 }
 
 async fn recover_execution(
@@ -225,15 +334,23 @@ async fn one(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    if capabilities.protocol != 2 || capabilities.timeout_secs == 0 {
+    if capabilities.protocol != 2
+        || capabilities.progress_protocol != 1
+        || !capabilities.owned_targets.iter().any(|t| t == target)
+        || capabilities.timeout_secs == 0
+        || capabilities.queue_timeout_secs == 0
+        || capabilities.idle_timeout_secs == 0
+    {
         return Err("worker lacks bounded owned-merge protocol".into());
     }
-    let execution = Execution::new(
+    let mut execution = Execution::new(
         target,
         endpoint,
         &capabilities.instance,
-        capabilities.timeout_secs.min(600),
+        capabilities.timeout_secs,
     );
+    execution.queue_timeout_secs = capabilities.queue_timeout_secs;
+    execution.idle_timeout_secs = capabilities.idle_timeout_secs;
     // Even a lost reserve response is ambiguous. Recover the fence before
     // issuing any other storage operation; never infer absence from an error.
     let admission = coordinator.reserve(proof, &execution).await;
@@ -286,16 +403,16 @@ async fn reconcile_with_grace(
     cancel_immediately: bool,
     grace: Duration,
 ) -> Result<usize, String> {
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(initial.timeout_secs) + RPC_TIMEOUT;
-    let handoff_deadline = if cancel_immediately {
-        tokio::time::Instant::now()
-    } else {
-        deadline
-    } + grace;
+    let mut deadlines = Deadlines::new(&initial, tokio::time::Instant::now());
+    let mut cancel_started = cancel_immediately.then(tokio::time::Instant::now);
     let mut next_cancel = tokio::time::Instant::now();
     loop {
-        if tokio::time::Instant::now() >= handoff_deadline {
+        // Losing etcd responses must not turn this into an unbounded scheduler
+        // wait. Ownership remains durable when the reconciliation slot exits.
+        if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
+            cancel_started = Some(tokio::time::Instant::now());
+        }
+        if cancel_started.is_some_and(|at| at.elapsed() >= grace) {
             let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained pending storage version recovery";
             coordinator
                 .record_failure(proof, &initial.target, &initial.endpoint, error)
@@ -326,9 +443,15 @@ async fn reconcile_with_grace(
             }
             return current.error.map_or(Ok(current.reclaimed), Err);
         }
-        if (cancel_immediately || tokio::time::Instant::now() >= deadline)
-            && tokio::time::Instant::now() >= next_cancel
-        {
+        if cancel_started.is_none() {
+            if let Ok(Some(progress)) = coordinator.progress(&current).await {
+                deadlines.observe(progress.sequence, tokio::time::Instant::now());
+            }
+            if deadlines.expired(tokio::time::Instant::now()) {
+                cancel_started = Some(tokio::time::Instant::now());
+            }
+        }
+        if cancel_started.is_some() && tokio::time::Instant::now() >= next_cancel {
             next_cancel = tokio::time::Instant::now() + RETRY_DELAY;
             // CAS reserved work to terminal, or ask its owner to cancel the
             // actual storage future. HTTP success alone is not acknowledgement.
@@ -351,6 +474,41 @@ async fn reconcile_with_grace(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_execution_and_real_progress_have_independent_deadlines() {
+        use super::*;
+        let mut execution = Execution::new("hot", "worker", "boot", 1800);
+        execution.queue_timeout_secs = 600;
+        execution.idle_timeout_secs = 120;
+        let now = tokio::time::Instant::now();
+        let mut deadlines = Deadlines::new(&execution, now);
+        assert!(!deadlines.expired(now + Duration::from_secs(599)));
+        // A long queue wait consumes none of the running budget.
+        let started = now + Duration::from_secs(599);
+        deadlines.observe(0, started);
+        for step in 1..=10 {
+            let current = started + Duration::from_secs(step * 100);
+            deadlines.observe(step, current);
+            assert!(!deadlines.expired(current));
+        }
+        // Receiving the same progress repeatedly is only a heartbeat.
+        let stalled = started + Duration::from_secs(1131);
+        deadlines.observe(10, stalled);
+        assert!(deadlines.expired(stalled));
+        // Even actual progress cannot extend the configured total ceiling.
+        deadlines.observe(11, started + Duration::from_secs(1811));
+        assert!(deadlines.expired(started + Duration::from_secs(1811)));
+    }
+
+    #[test]
+    fn a_worker_that_never_acquires_a_slot_has_a_bounded_queue_wait() {
+        use super::*;
+        let mut execution = Execution::new("hot", "worker", "boot", 3600);
+        execution.queue_timeout_secs = 10;
+        let now = tokio::time::Instant::now();
+        let deadlines = Deadlines::new(&execution, now);
+        assert!(deadlines.expired(now + Duration::from_secs(21)));
+    }
     use super::*;
     use axum::{
         extract::State,
@@ -378,7 +536,7 @@ mod tests {
             .route(
                 "/api/v1/internal/merge-executor",
                 get(|| async {
-                    Json(serde_json::json!({"protocol":2,"instance":"test","timeout_secs":1}))
+                    Json(serde_json::json!({"protocol":2,"instance":"test","timeout_secs":1,"queue_timeout_secs":1,"idle_timeout_secs":1,"progress_protocol":1,"owned_targets":["table"]}))
                 }),
             )
             .route(
@@ -473,6 +631,8 @@ mod tests {
             &endpoints,
             "--etcd-prefix",
             &prefix,
+            "--merge-owned-targets",
+            "table",
         ]);
         let mut state = MasterState::new(cfg).await.unwrap();
         let uri = state.rollout_uri("table");
@@ -611,6 +771,41 @@ mod tests {
             .unwrap());
         let terminal = coordinator.get("table").await.unwrap().unwrap();
         assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn missing_owned_capability_never_falls_back_to_legacy_post() {
+        let (coordinator, proof) = fixture().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/table",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"reclaimed": 9}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(one(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            &endpoint
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.get("table").await.unwrap().is_none());
         server.abort();
     }
 

@@ -864,6 +864,23 @@ impl StorageBase {
             .await
     }
 
+    /// Metadata-only count trigger for a coordinated sweeper. Never prepares
+    /// batches or takes a merge-memory reservation just to enqueue work.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        if self.merge_after_generations == 0 || self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        Ok(manifest_store.read_latest().await?.is_some_and(|manifest| {
+            manifest.flushed_generations.len() >= self.merge_after_generations
+        }))
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
     /// consulting the manifest — the time-triggered (`threshold = 1`) behavior
     /// of [`Self::cleanup_own_shard`]. See that method for why the ordering is
@@ -1192,6 +1209,7 @@ impl StorageBase {
             let mut current_batches = Vec::new();
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
+                crate::merge_write_scope::checkpoint();
                 if batch.num_rows() > 0 {
                     let batch = align_batch_to_schema(batch, merge_schema.clone())?;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());

@@ -6,6 +6,8 @@
 
 pub mod failure;
 pub mod fencing;
+pub mod progress;
+pub mod rollout;
 
 use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,10 @@ pub struct Execution {
     pub endpoint: String,
     pub instance: String,
     pub timeout_secs: u64,
+    #[serde(default = "default_queue_timeout")]
+    pub queue_timeout_secs: u64,
+    #[serde(default = "default_queue_timeout")]
+    pub idle_timeout_secs: u64,
     pub phase: Phase,
     pub reclaimed: usize,
     pub error: Option<String>,
@@ -48,6 +54,10 @@ fn protocol_absent(protocol: &u32) -> bool {
     *protocol == 0
 }
 
+fn default_queue_timeout() -> u64 {
+    600
+}
+
 impl Execution {
     pub fn new(target: &str, endpoint: &str, instance: &str, timeout_secs: u64) -> Self {
         Self {
@@ -56,6 +66,8 @@ impl Execution {
             endpoint: endpoint.into(),
             instance: instance.into(),
             timeout_secs,
+            queue_timeout_secs: default_queue_timeout(),
+            idle_timeout_secs: default_queue_timeout(),
             phase: Phase::Reserved,
             reclaimed: 0,
             error: None,
@@ -217,6 +229,7 @@ impl Coordinator {
         ]);
         operations.extend([
             self.remove_permits(execution),
+            self.remove_progress(execution),
             TxnOp::delete(key, None),
             TxnOp::put(
                 target_lock_key(&self.prefix, &execution.target),
@@ -249,13 +262,13 @@ impl Coordinator {
 /// The executor owns this future independently of the request handler. On
 /// cancellation, drop its scoped storage future *before* publishing Finished.
 /// Callers must not pass a detached JoinHandle: dropping one does not stop it.
-pub async fn execute_scoped<F>(
+pub async fn execute_scoped<F, T>(
     work: F,
     timeout: std::time::Duration,
     mut cancel: tokio::sync::watch::Receiver<bool>,
-) -> Result<usize>
+) -> Result<T>
 where
-    F: std::future::Future<Output = Result<usize>>,
+    F: std::future::Future<Output = Result<T>>,
 {
     // Keep the work in this inner scope: select! only drops branch borrows when
     // the future was pinned outside it, which would publish completion too soon.
@@ -426,7 +439,7 @@ mod tests {
     async fn pre_cancelled_request_never_polls_storage() {
         let (cancel, rx) = watch::channel(false);
         cancel.send(true).unwrap();
-        let result = execute_scoped(
+        let result: Result<usize> = execute_scoped(
             async { panic!("must not execute storage") },
             Duration::from_secs(1),
             rx,
@@ -469,6 +482,66 @@ mod tests {
             proof,
             lease,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_demand_coalesces_without_resetting_failure_backoff() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let mut last = None;
+        for _ in 0..4 {
+            last = Some(
+                coordinator
+                    .record_failure(&proof, "table", "worker", "storage timeout")
+                    .await
+                    .unwrap(),
+            );
+        }
+        for _ in 0..10 {
+            coordinator.request_merge("table").await.unwrap();
+        }
+        let (rows, next) = coordinator.request_page(None).await.unwrap();
+        assert_eq!(rows, ["table"]);
+        assert!(next.is_none());
+        let after = coordinator
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = last.unwrap();
+        assert_eq!(after.consecutive_attempts, 4);
+        assert_eq!(after.next_retry_ms, before.next_retry_ms);
+        coordinator.acknowledge_request("table").await.unwrap();
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        coordinator.request_merge("table").await.unwrap();
+        assert_eq!(coordinator.request_page(None).await.unwrap().0, ["table"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn progress_cannot_resurrect_a_frozen_or_released_execution() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 4).await.unwrap());
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            4
+        );
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        assert!(!coordinator.publish_progress(&running, 5).await.unwrap());
+        // Empty watermarks: this test did not authorize any storage writes.
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(coordinator.progress(&running).await.unwrap().is_none());
+        assert!(!coordinator.publish_progress(&running, 6).await.unwrap());
     }
 
     #[tokio::test]

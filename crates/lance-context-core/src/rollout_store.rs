@@ -655,6 +655,11 @@ impl RolloutStore {
         self.base.prepare_count_merge().await
     }
 
+    /// Check the configured count trigger using only this shard's manifest.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        self.base.count_merge_due().await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
     /// the time-triggered behavior of [`Self::cleanup_own_shard`].
     pub async fn prepare_cleanup_merge(

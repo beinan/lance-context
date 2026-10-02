@@ -1410,6 +1410,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
             host: "127.0.0.1".to_string(),
             port: 0,

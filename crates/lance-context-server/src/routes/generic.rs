@@ -273,11 +273,9 @@ pub async fn merge_generic_wal(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if state.merge_executions.enabled() {
-        return Err(AppError::Overloaded(
-            "use the owned merge executor protocol".into(),
-        ));
-    }
+    state
+        .merge_executions
+        .legacy_allowed(&format!("generic:{name}"))?;
     let _slot = state.acquire_merge_slot().await;
     merge_generic_wal_owned(State(state), Path(name)).await
 }

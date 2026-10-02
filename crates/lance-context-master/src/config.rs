@@ -6,6 +6,8 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "lance-context-master", version)]
 pub struct MasterConfig {
+    #[command(flatten)]
+    pub merge_rollout: lance_context_merge::rollout::MergeRollout,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,

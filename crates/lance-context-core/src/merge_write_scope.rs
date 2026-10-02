@@ -13,7 +13,10 @@ use object_store::path::Path;
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::sync::{oneshot, Notify};
 
@@ -36,6 +39,7 @@ pub trait CommitAuthorizer: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 pub struct MergeWriteScope {
+    completed_steps: AtomicU64,
     progress: Mutex<Progress>,
     changed: Notify,
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
@@ -43,6 +47,9 @@ pub struct MergeWriteScope {
 }
 
 impl MergeWriteScope {
+    pub fn completed_steps(&self) -> u64 {
+        self.completed_steps.load(Ordering::Relaxed)
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -93,6 +100,12 @@ impl MergeWriteScope {
     }
 }
 
+/// Count completed work, never timer ticks or admission attempts. This is a
+/// stall diagnostic, not evidence that WAL has been durably reclaimed.
+pub(crate) fn checkpoint() {
+    let _ = CURRENT.try_with(|scope| scope.completed_steps.fetch_add(1, Ordering::Relaxed));
+}
+
 pub(crate) async fn authorize(resource: &str, version: u64) -> Result<()> {
     if let Ok(scope) = CURRENT.try_with(Arc::clone) {
         if let Some(authorizer) = &scope.authorizer {
@@ -141,6 +154,9 @@ where
     let leaf = tokio::spawn(async move {
         let mut active = active;
         let result = write.await;
+        if result.is_ok() {
+            active.scope.completed_steps.fetch_add(1, Ordering::Relaxed);
+        }
         if result.is_err() {
             active.scope.mark_uncertain();
         }

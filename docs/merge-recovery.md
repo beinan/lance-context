@@ -58,6 +58,49 @@ The base handle refreshes before retrying, and WAL drain remains a relative edit
 that preserves generations flushed during recovery. Graceful worker shutdown
 cancels/drains owned actors before closing resident stores.
 
+## Queue, execution, and no-progress limits
+
+Admission and slot acquisition have a separate `MERGE_QUEUE_TIMEOUT_SECS`
+(default 600). The execution clock starts only after a merge slot is acquired.
+`MERGE_EXECUTION_TIMEOUT_SECS` is a configurable total ceiling (default 3600),
+not a hard-coded 600-second cap. `MERGE_IDLE_TIMEOUT_SECS` (default 600) limits
+the interval without observed completed work. All three must be positive.
+
+The worker counts completed batch reads, merge phases, and shielded storage
+operations. It publishes a changed sequence at most once a second, guarded by
+execution ownership. The master tracks the same sequence with bounded RPC
+allowance. Repeated heartbeats do not extend the idle limit, and progressing
+work cannot extend the total ceiling. A missing progress record means the
+executor has not reported acquiring its slot. Readiness and these intermediate
+checkpoints are NOT proof of WAL reclamation; only committed shard drains are.
+
+Progress observation is coarse inside opaque Lance index/build/storage calls.
+A single such operation exceeding the idle threshold can still be cancelled.
+Measure its p99 on realistic blobs and tune the idle/total limits before enabling
+a large target. These defaults are not production throughput measurements.
+Cancellation retains the slot until leaf commits drain or a barrier proves them
+fenced. It does not restart the pod. An etcd outage cannot indefinitely occupy a
+master reconciliation slot; unresolved ownership remains durable for recovery.
+
+## Count- and time-triggered merge compatibility
+
+`ROLLOUT_MERGE_AFTER_GENERATIONS` and `ROLLOUT_CLEANUP_INTERVAL_SECS` remain
+valid with owned merging. For enabled rollout/generic targets, the flush
+sweeper checks its own shard's count using manifest metadata only. At the
+threshold it writes a coalesced merge request; the cleanup timer uses the same
+request path. The master consumes requests every 15 seconds in pages of at most
+256 through normal task dedupe, and executes the table's workers serially under
+owned commit protection and their existing merge slots/byte budgets.
+
+This preserves #289's pending trigger, but changes execution for opted-in tables:
+it is scheduled by the master, rather than performed inline by the flush
+sweeper. Queue latency therefore remains relevant; 15 seconds is a polling
+interval, not a completion SLA. A later flush tick reasserts demand if the active
+task has already passed that shard. Requests never clear failure backoff. A busy
+merge slot does not block flushing or require preparing any payload to request
+work. Unselected targets retain #289's direct, slot-bounded count merge. Datagen
+is not a scheduler-owned target and retains its existing sweeper path.
+
 ## Repeated failures
 
 Per-target/endpoint records survive task recreation and master restart. They
@@ -88,48 +131,91 @@ enqueues due targets through existing dedupe. It does not wait for the
 600-second stats sweep. Large ledgers add page traversal latency; removed worker
 endpoints are not automatically probed.
 
-`GET /api/v1/scheduler/merge-failures?after=<cursor>` returns up to 256 records
-and a `next` cursor. `needs_attention`, `last_error`, and `next_retry_ms` expose
-the circuit state. `master_merge_storage_recoveries_total{result}` records
-barrier outcomes alongside existing task and reclaimed-generation metrics. This
-is an observable circuit state, not an external notification integration.
+`needs_attention`, `last_error`, and `next_retry_ms` are persisted in the failure
+ledger. `master_merge_storage_recoveries_total{result}` records barrier outcomes
+alongside existing task and reclaimed-generation metrics. The read-only failure
+inspection HTTP API is a separate follow-up; no external notification integration
+is included here.
 
 Merge errors do **not** enqueue destructive fragment repair. Missing/corrupt
 files require diagnosis and restoration or an explicitly reviewed repair.
 Other maintenance tasks retain their existing repair policy.
 
-## Storage and rollout requirements
+## Storage requirements
 
-- Masters/workers must use the same physical storage namespace and etcd prefix,
-  with consistent storage configuration/credentials. URI mismatch fails closed.
-- Version fencing supports Lance's immutable conditional manifest handlers:
-  local files, S3, GCS, Azure, memory, OSS, COS, TOS, and shared memory. Fallback
-  unsafe handlers and external catalogues such as `s3+ddb` are rejected for
-  owned merging/recovery. Existing manifest immutability/retention guarantees
-  must be preserved; never manually remove fencing/version files to unblock a
-  live writer.
-- Workers need `ETCD_ENDPOINTS` and the same `ETCD_PREFIX` as masters.
-  `MERGE_EXECUTION_TIMEOUT_SECS` defaults to 600 and the master caps the requested
-  deadline at 600. Zero is rejected. Cancellation reconciliation has a 60-second
-  allowance; a metadata recovery attempt has a 120-second deadline.
-- Enable protocol 2 on both sides. There is no fallback to unbounded legacy
-  merge HTTP calls. Old executions without version admission cannot be
-  automatically fenced using an empty watermark set; they remain protected.
-- With the coordinator enabled, legacy merge routes reject admission. Disable
-  worker self-merge thresholds and cleanup timers; startup checks enforce this.
-- `INDEX_BEFORE_MERGE` remains accepted for compatibility; workers prepare their
-  key indexes inside owned execution. Keep ordinary workers at six merge slots
-  and 20 GiB; this change increases neither limit.
-- Drain/reconcile legacy in-flight merges before enabling protocol 2. Masters
-  must continue other jobs; recovery helpers must retain target locks. Do not
-  clear a keeper's pause while its delegate is alive.
+- Masters/workers use the same physical storage namespace, etcd prefix, and
+  storage configuration/credentials. URI mismatch fails closed.
+- Version fencing requires Lance's immutable conditional manifest handlers:
+  local files, S3, GCS, Azure, memory, OSS, COS, TOS, and shared memory. Unsafe
+  fallback handlers and external catalogues such as `s3+ddb` are rejected.
+  Preserve manifest immutability and retention; never delete fencing files to
+  unblock a live writer.
+- Workers with owned targets need `ETCD_ENDPOINTS`. Connection is lazy and
+  retried on demand: etcd unavailability does not fail worker startup, flush, or
+  ingestion. New owned admission and commit authorization fail closed when etcd
+  is unavailable. Already authorized storage writes may still finish.
+- Cancellation reconciliation has a 60-second allowance; each metadata barrier
+  attempt has a 120-second deadline. These never authorize an unsafe handoff.
+- `INDEX_BEFORE_MERGE` remains accepted; owned workers prepare their key indexes
+  inside execution. Keep ordinary workers at six merge slots / 20 GiB. Neither
+  limit is increased by this patch.
+
+## Default-off, per-table rollout
+
+`MERGE_OWNED_TARGETS` and `MERGE_DRAIN_TARGETS` are comma-separated **exact**
+scheduler targets (`name` for rollout, `generic:name` for generic). Both default
+to empty; wildcards and overlapping lists are rejected. Merely configuring
+etcd or deploying the binaries does not enable the protocol. Unselected tables
+use the legacy serial path, including its inability to safely recover a stuck
+untracked write. An owned RPC failure never falls back to that path.
+
+This is an explicit operator-controlled migration, not automatic discovery or
+a proof that old writes have drained. All replicas and helpers must follow the
+sequence; mixed admission policies for the same table are unsupported.
+
+1. Deploy capability-aware binaries with both lists empty. Keep self-merge
+   thresholds/timers and unrelated master jobs running. No worker etcd
+   connection is opened merely to advertise capabilities.
+2. Select one table. Put it in `MERGE_DRAIN_TARGETS` on all masters and workers;
+   prevent legacy helper admission for that table as well. Workers reject new
+   legacy merge requests and skip its self-merge; masters reject new maintenance
+   mutations for that table while still reconciling any already-owned merge. Other tables, ingestion, and master job pools continue.
+3. Verify that previously admitted legacy worker/helper writes have actually
+   completed, including ambiguous remote storage operations. Ready pods, lease
+   expiry, elapsed time, or a completed HTTP request alone are insufficient.
+   An untracked legacy write has no admitted-version watermark and cannot be
+   automatically fenced by this protocol. If it is unresolved, keep **that
+   table** draining until storage completion is established; do not clear its
+   ownership or pretend an empty watermark permits recovery.
+4. Move the target from draining to owned on every worker. Inspect
+   `GET /api/v1/internal/merge-executor`: check the exact target lists,
+   incarnation, progress protocol, and all three timeout values. Keep masters
+   draining while workers transition. Worker triggers can queue durable demand
+   but cannot start an unowned merge. Once all writers are ready, move the
+   target to owned on all masters and update helpers to use owned admission.
+5. Soak that table under sustained writes, worker death, delayed storage, and
+   etcd disruption. Measure committed generations, memory/OOM, commit conflicts,
+   etcd overhead, queue time, longest opaque phase, and p95/p99 task latency.
+   Expand one table at a time only after the results justify it.
+
+Rollback also goes through draining: stop new admission, finish or storage-fence
+all owned executions with the capable binaries, then return the selected table
+to legacy configuration. Do not simply remove an owned target or roll back a
+worker while its execution is unresolved. The master explicitly refuses a
+legacy path while a durable execution record exists. Do not clear a helper's
+pause while its delegate is alive. There is no fleet-wide stop requirement.
+
+## Review and deployment boundary
+
+Timeout, cancellation, commit authorization, storage fencing, and ownership
+handoff are one correctness unit. Shipping an HTTP timeout alone would leave
+old writes alive and permit conflicting retries. Persistent retry budgets also
+remain in the runtime so newly triggered tasks cannot repeatedly reset attempts;
+the read-only failure inspection API can be reviewed separately.
 
 The fence covers scheduler-coordinated maintenance and helpers that honor target
-locks. It does not retrofit lease-loss protection onto the master's own local
+locks. It does not retrofit lease-loss protection onto master's local
 compaction/index jobs or arbitrary manual writers. It cannot repair missing data
-or guarantee a WAL pending ceiling while storage remains unavailable.
-
-Before production rollout, staging must exercise realistic blobs, sustained
-writes, forced worker death and delayed storage responses. Measure pending and
-reclaimed generations, memory/OOM counts, commit conflicts, etcd overhead, and
-p95/p99 task latency. Local fault tests do not replace that soak.
+or guarantee a pending ceiling while storage is unavailable. Local fault tests
+and CI do not replace the realistic staging soak. This change is not a production
+deployment, and its default-off rollout is deliberate.

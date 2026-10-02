@@ -9,7 +9,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use futures::FutureExt;
 use lance_context_merge::{execute_scoped, Coordinator, Execution, Phase};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, OnceCell};
 
 struct OwnedCommitGuard {
     coordinator: Coordinator,
@@ -45,23 +45,68 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
 }
 
 pub struct Executions {
-    coordinator: Option<Coordinator>,
+    coordinator: OnceCell<Coordinator>,
+    etcd: Option<lance_context_merge::EtcdConfig>,
+    pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
+    queue_timeout_secs: u64,
+    idle_timeout_secs: u64,
     instance: String,
     timeout_secs: u64,
     running: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 
 impl Executions {
+    #[cfg(test)]
     pub fn new(coordinator: Option<Coordinator>, timeout_secs: u64) -> Self {
         Self {
-            coordinator,
+            coordinator: OnceCell::new_with(coordinator),
+            etcd: None,
+            rollout: Default::default(),
+            queue_timeout_secs: 600,
+            idle_timeout_secs: 600,
             instance: uuid::Uuid::new_v4().to_string(),
             timeout_secs,
             running: Mutex::new(HashMap::new()),
         }
     }
-    pub(crate) fn enabled(&self) -> bool {
-        self.coordinator.is_some()
+    pub fn configured(
+        etcd: lance_context_merge::EtcdConfig,
+        rollout: lance_context_merge::rollout::MergeRollout,
+        timeout_secs: u64,
+        queue_timeout_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            coordinator: OnceCell::new(),
+            etcd: Some(etcd),
+            rollout,
+            timeout_secs,
+            queue_timeout_secs,
+            idle_timeout_secs,
+            instance: uuid::Uuid::new_v4().to_string(),
+            running: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn owned(&self, target: &str) -> bool {
+        self.rollout.owned(target)
+    }
+
+    pub(crate) fn legacy_allowed(&self, target: &str) -> Result<(), AppError> {
+        if self.owned(target) || self.rollout.draining(target) {
+            return Err(AppError::Overloaded(
+                "table is draining or requires owned merge protocol".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn request_merge(&self, target: &str) -> Result<(), String> {
+        self.coordinator()
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .request_merge(target)
+            .await
     }
 
     /// Invoked after HTTP admission has stopped. Detached executors are not
@@ -75,20 +120,30 @@ impl Executions {
         }
     }
 
-    fn coordinator(&self) -> Result<Coordinator, AppError> {
-        self.coordinator.clone().ok_or_else(|| {
-            AppError::Overloaded("owned merge execution requires ETCD_ENDPOINTS".into())
-        })
+    async fn coordinator(&self) -> Result<Coordinator, AppError> {
+        self.coordinator
+            .get_or_try_init(|| async {
+                let config = self.etcd.as_ref().ok_or_else(|| {
+                    AppError::Overloaded("owned merge execution requires ETCD_ENDPOINTS".into())
+                })?;
+                config.connect().await.map_err(AppError::Internal)
+            })
+            .await
+            .cloned()
     }
 }
 
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    state.merge_executions.coordinator()?;
     Ok(Json(
         serde_json::json!({"protocol": 2, "instance": state.merge_executions.instance,
-        "timeout_secs": state.merge_executions.timeout_secs}),
+        "timeout_secs": state.merge_executions.timeout_secs,
+        "queue_timeout_secs": state.merge_executions.queue_timeout_secs,
+        "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
+        "progress_protocol": 1,
+        "owned_targets": state.merge_executions.rollout.owned_targets,
+        "drain_targets": state.merge_executions.rollout.drain_targets}),
     ))
 }
 
@@ -96,12 +151,17 @@ pub async fn start(
     State(state): State<Arc<AppState>>,
     Json(execution): Json<Execution>,
 ) -> Result<StatusCode, AppError> {
-    let coordinator = state.merge_executions.coordinator()?;
-    if execution.protocol != 2
+    let coordinator = state.merge_executions.coordinator().await?;
+    if !state.merge_executions.owned(&execution.target)
+        || execution.protocol != 2
         || execution.instance != state.merge_executions.instance
         || execution.phase != Phase::Reserved
         || execution.timeout_secs == 0
         || execution.timeout_secs > state.merge_executions.timeout_secs
+        || execution.queue_timeout_secs == 0
+        || execution.queue_timeout_secs > state.merge_executions.queue_timeout_secs
+        || execution.idle_timeout_secs == 0
+        || execution.idle_timeout_secs > state.merge_executions.idle_timeout_secs
     {
         return Err(AppError::InvalidRequest(
             "merge executor incarnation or deadline mismatch".into(),
@@ -172,7 +232,6 @@ async fn run(
         if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
             return Err("invalid storage backend for owned merge fencing".into());
         }
-        slot = state.acquire_merge_slot().await;
         let result = if let Some(name) = target.strip_prefix("generic:") {
             generic::merge_generic_wal_owned(
                 State(state.clone()),
@@ -207,11 +266,30 @@ async fn run(
             dataset_uri: uri.clone(),
         }),
     );
-    let outcome = std::panic::AssertUnwindSafe(execute_scoped(
-        write_scope.run(work),
-        Duration::from_secs(execution.timeout_secs),
-        cancelled,
-    ))
+    let outcome = std::panic::AssertUnwindSafe(async {
+        // No payload work starts before admission to the process-wide slot.
+        slot = execute_scoped(
+            async { Ok(state.acquire_merge_slot().await) },
+            Duration::from_secs(execution.queue_timeout_secs),
+            cancelled.clone(),
+        )
+        .await
+        .map_err(|e| format!("merge queue wait: {e}"))?;
+        if !coordinator.publish_progress(&running, 0).await? {
+            return Err("merge ownership revoked before execution".into());
+        }
+        execute_scoped(
+            async {
+                tokio::select! {
+                    result = write_scope.run(work) => result,
+                    error = watch_progress(&coordinator, &running, &write_scope) => Err(error),
+                }
+            },
+            Duration::from_secs(execution.timeout_secs),
+            cancelled,
+        )
+        .await
+    })
     .catch_unwind()
     .await
     .unwrap_or_else(|_| Err("merge executor panicked".into()));
@@ -286,11 +364,41 @@ async fn run(
     Ok(())
 }
 
+async fn watch_progress(
+    coordinator: &Coordinator,
+    execution: &Execution,
+    scope: &lance_context_core::merge_write_scope::MergeWriteScope,
+) -> String {
+    let mut sequence = 0;
+    let mut changed = tokio::time::Instant::now();
+    let mut published = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let current = scope.completed_steps();
+        if current != sequence {
+            sequence = current;
+            changed = tokio::time::Instant::now();
+        }
+        if changed.elapsed() >= Duration::from_secs(execution.idle_timeout_secs) {
+            return "merge no-progress deadline exceeded".into();
+        }
+        if current != published {
+            match coordinator.publish_progress(execution, current).await {
+                Ok(true) => published = current,
+                Ok(false) => return "merge ownership revoked during execution".into(),
+                Err(error) => {
+                    tracing::warn!(id = %execution.id, %error, "merge progress publication failed")
+                }
+            }
+        }
+    }
+}
+
 pub async fn cancel(
     State(state): State<Arc<AppState>>,
     Json(execution): Json<Execution>,
 ) -> Result<StatusCode, AppError> {
-    let coordinator = state.merge_executions.coordinator()?;
+    let coordinator = state.merge_executions.coordinator().await?;
     if coordinator
         .cancel_reserved(&execution)
         .await
@@ -321,6 +429,136 @@ mod tests {
     use super::*;
     use lance_context_merge::{ClaimProof, EtcdConfig};
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn unavailable_etcd_does_not_block_startup_or_disable_legacy_self_merge() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ServerConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--etcd-endpoints",
+            "http://127.0.0.1:1",
+            "--merge-owned-targets",
+            "hot",
+            "--rollout-merge-after-generations",
+            "3",
+            "--rollout-cleanup-interval-secs",
+            "30",
+        ]);
+        let state = Arc::new(AppState::new(config).await.unwrap());
+        assert!(state.merge_executions.coordinator.get().is_none());
+        assert_eq!(state.rollout_merge_after_generations, 3);
+        assert_eq!(state.rollout_cleanup_interval_secs, 30);
+        assert!(state.merge_executions.legacy_allowed("other").is_ok());
+        assert!(state.merge_executions.legacy_allowed("hot").is_err());
+        let Json(reply) = capabilities(State(state.clone())).await.unwrap();
+        assert_eq!(reply["owned_targets"][0], "hot");
+        assert!(state.merge_executions.coordinator.get().is_none());
+    }
+
+    async fn deadline_fixture() -> (Arc<AppState>, Coordinator, ClaimProof, tempfile::TempDir) {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/server-deadlines/{}", uuid::Uuid::new_v4());
+        let proof = ClaimProof {
+            key: format!("{prefix}/claim"),
+            token: "owner".into(),
+            lease_id: 0,
+        };
+        client
+            .put(proof.key.as_str(), proof.token.as_str(), None)
+            .await
+            .unwrap();
+        client
+            .put(
+                lance_context_merge::target_lock_key(&prefix, "hot"),
+                proof.token.as_str(),
+                None,
+            )
+            .await
+            .unwrap();
+        let coordinator = Coordinator::new(client, prefix);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.merge_slots = Some(Arc::new(tokio::sync::Semaphore::new(1)));
+        state.merge_executions = Executions::new(Some(coordinator.clone()), 3600);
+        state
+            .merge_executions
+            .rollout
+            .owned_targets
+            .push("hot".into());
+        let state = Arc::new(state);
+        let _ = rollouts::create_rollout_store(
+            State(state.clone()),
+            Json(lance_context_api::CreateRolloutStoreRequest {
+                name: "hot".into(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        (state, coordinator, proof, dir)
+    }
+
+    async fn terminal(coordinator: &Coordinator) -> Execution {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = coordinator.get("hot").await.unwrap().unwrap();
+                if current.phase == Phase::Finished {
+                    return current;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn queue_wait_longer_than_execution_budget_still_runs_after_slot_release() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let held = state.acquire_merge_slot().await;
+        let mut execution = Execution::new("hot", "worker", &state.merge_executions.instance, 1);
+        execution.queue_timeout_secs = 10;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        start(State(state.clone()), Json(execution.clone()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            coordinator.get("hot").await.unwrap().unwrap().phase,
+            Phase::Running
+        );
+        assert!(coordinator.progress(&execution).await.unwrap().is_none());
+        drop(held);
+        let finished = terminal(&coordinator).await;
+        assert!(finished.error.is_none(), "{finished:?}");
+        assert!(coordinator.release(&proof, &finished).await.unwrap());
+        state.merge_executions.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn no_progress_cancels_a_blocked_merge_before_the_total_deadline() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let store = state.get_or_open_rollout_store("hot").await.unwrap();
+        let held = store.write().await;
+        let mut execution = Execution::new("hot", "worker", &state.merge_executions.instance, 3600);
+        execution.idle_timeout_secs = 1;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        start(State(state.clone()), Json(execution)).await.unwrap();
+        let finished = terminal(&coordinator).await;
+        assert!(finished.error.as_ref().unwrap().contains("no-progress"));
+        assert!(coordinator.release(&proof, &finished).await.unwrap());
+        assert_eq!(state.merge_slots.as_ref().unwrap().available_permits(), 1);
+        drop(held);
+        state.merge_executions.shutdown().await;
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
@@ -364,6 +602,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
         state.merge_executions = Executions::new(Some(coordinator.clone()), 600);
+        state
+            .merge_executions
+            .rollout
+            .owned_targets
+            .push("blocked".into());
         let state = Arc::new(state);
         let name = "blocked";
         // Create via the real API so registry and resident handle agree.

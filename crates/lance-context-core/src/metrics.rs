@@ -162,6 +162,9 @@ macro_rules! observe_phase {
     ($phase:expr, $body:expr) => {{
         let __start = $crate::metrics::timer_start!();
         let __result = $body;
+        if __result.is_ok() {
+            $crate::merge_write_scope::checkpoint();
+        }
         match &__result {
             Ok(_) => $crate::metrics::observe_duration!(
                 $crate::metrics::ROLLOUT_WAL_MERGE_DURATION,

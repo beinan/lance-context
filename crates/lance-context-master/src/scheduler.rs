@@ -147,12 +147,17 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
     .record(timing.permit_wait.as_secs_f64());
 
     let started = std::time::Instant::now();
-    let outcome = match task.kind {
-        TaskKind::Compact => run_compaction(state, &task).await,
-        TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
-        TaskKind::IndexId => run_index_id(state, &task.target).await,
-        TaskKind::Repair => run_repair(state, &task).await,
-    };
+    let outcome =
+        if state.config.merge_rollout.draining(&task.target) && task.kind != TaskKind::MergeWal {
+            Err("target draining legacy writers for merge protocol transition".into())
+        } else {
+            match task.kind {
+                TaskKind::Compact => run_compaction(state, &task).await,
+                TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
+                TaskKind::IndexId => run_index_id(state, &task.target).await,
+                TaskKind::Repair => run_repair(state, &task).await,
+            }
+        };
     let work_elapsed = started.elapsed();
     let result = if outcome.is_ok() { "success" } else { "failed" };
 
@@ -583,15 +588,35 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let coordinator = retry_state.task_store.merge_coordinator();
         let mut cursor = None;
+        let mut request_cursor = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         loop {
             ticker.tick().await;
+            match coordinator.request_page(request_cursor.as_deref()).await {
+                Ok((targets, next)) => {
+                    request_cursor = next;
+                    for target in targets {
+                        if retry_state.config.merge_rollout.owned(&target) {
+                            match enqueue(&retry_state, TaskKind::MergeWal, &target).await {
+                                Ok(_) => {
+                                    let _ = coordinator.acknowledge_request(&target).await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%target, %error, "worker merge demand enqueue failed")
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "worker merge demand scan failed"),
+            }
             match coordinator.failure_page(cursor.as_deref(), 256).await {
                 Ok((rows, next)) => {
                     cursor = next;
                     let mut targets = std::collections::HashSet::new();
                     for failure in rows {
-                        if failure.next_retry_ms <= lance_context_merge::failure::now_ms()
+                        if retry_state.config.merge_rollout.owned(&failure.target)
+                            && failure.next_retry_ms <= lance_context_merge::failure::now_ms()
                             && retry_state
                                 .config
                                 .worker_endpoints
@@ -761,6 +786,14 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            merge_rollout: lance_context_merge::rollout::MergeRollout {
+                owned_targets: ["exp", "generic:gs", "broken"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .chain((0..20).map(|i| format!("exp-{i}")))
+                    .collect(),
+                drain_targets: vec![],
+            },
             data_dir: dir.path().to_string_lossy().to_string(),
             host: "127.0.0.1".to_string(),
             port: 0,
@@ -820,6 +853,54 @@ mod tests {
 
     /// Manual enqueue -> dispatcher compacts -> task reaches Done and the stats
     /// table records a compaction.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn draining_resolves_existing_owned_merge_and_blocks_new_target_mutations() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.retain(|t| t != "exp");
+        cfg.merge_rollout.drain_targets.push("exp".into());
+        cfg.worker_endpoints = vec!["http://127.0.0.1:1".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let proof = state.task_store.merge_claim(&claim);
+        let execution =
+            lance_context_merge::Execution::new("exp", "http://127.0.0.1:1", "boot", 30);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
+        let outcome = crate::merge_execution::run_merge_wal(&state, &claim).await;
+        assert!(outcome.as_ref().unwrap_err().contains("draining"));
+        assert!(coordinator.get("exp").await.unwrap().is_none());
+        state.task_store.finish(claim, outcome).await.unwrap();
+
+        let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::GENERAL)
+            .await
+            .unwrap()
+            .unwrap();
+        run_task(
+            &state,
+            claim,
+            TaskClaimTiming {
+                claim: Duration::ZERO,
+                permit_wait: Duration::ZERO,
+            },
+        )
+        .await;
+        let result = state.task_store.get(&compact.id).await.unwrap().unwrap();
+        assert!(result.error.as_deref().unwrap().contains("draining"));
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn manual_compaction_runs_and_updates_stats() {
@@ -1203,11 +1284,13 @@ mod tests {
             .await
             .unwrap();
         let coordinator = Coordinator::new(client, cfg.etcd_prefix.clone());
+        let owned_targets = cfg.merge_rollout.owned_targets.clone();
         axum::Router::new()
             .route(
                 "/api/v1/internal/merge-executor",
-                get(|| async {
-                    Json(serde_json::json!({"protocol":2,"instance":"stub","timeout_secs":600}))
+                get(move || {
+                    let owned_targets = owned_targets.clone();
+                    async move { Json(serde_json::json!({"protocol":2,"instance":"stub","timeout_secs":600,"queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,"owned_targets":owned_targets})) }
                 }),
             )
             .route(

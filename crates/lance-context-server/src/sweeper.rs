@@ -45,6 +45,11 @@ pub(crate) trait Sweepable: Send + Sync + 'static {
         async { Ok(0) }
     }
 
+    /// Cheap metadata-only predicate used when the master owns execution.
+    fn count_merge_due(&self) -> impl std::future::Future<Output = Result<bool, String>> + Send {
+        async { Ok(false) }
+    }
+
     /// Fold **every** pending flushed generation into the base table; returns
     /// how many were reclaimed.
     fn merge_wal(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send;
@@ -59,6 +64,14 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         // Read lock: `flush` is `&self`, so concurrent appends are not blocked.
         let guard = self.read().await;
         guard.flush().await.map_err(|e| e.to_string())
+    }
+
+    async fn count_merge_due(&self) -> Result<bool, String> {
+        self.read()
+            .await
+            .count_merge_due()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn merge_if_due(&self) -> Result<usize, String> {
@@ -128,6 +141,14 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
         guard.flush().await.map_err(|e| e.to_string())
     }
 
+    async fn count_merge_due(&self) -> Result<bool, String> {
+        self.read()
+            .await
+            .count_merge_due()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn merge_if_due(&self) -> Result<usize, String> {
         // Generic stores default to a deferred seal and take the same
         // one-row-per-append traffic as rollout, so the count trigger rides
@@ -189,10 +210,11 @@ pub(crate) async fn resident<S: Clone>(cache: &Mutex<LruCache<String, S>>) -> Ve
 /// and alerts keep working; the new `kind` label is what distinguishes the
 /// store types. Renaming them would be a silent breakage for anyone graphing
 /// these today.
-pub(crate) async fn flush_pass<S: Sweepable>(
+pub(crate) async fn flush_pass_coordinated<S: Sweepable>(
     stores: Vec<(String, S)>,
     pass_timeout: Duration,
     merge_slots: Option<Arc<Semaphore>>,
+    state: Option<Arc<crate::state::AppState>>,
 ) {
     let kind = S::kind();
     for (name, store) in stores {
@@ -211,6 +233,21 @@ pub(crate) async fn flush_pass<S: Sweepable>(
                 // hold up the flush of every store behind this one. When the
                 // slots are full the merge is skipped; the next pass (30 s)
                 // tries again, and the master's sweep covers the store anyway.
+                if let Some(state) = &state {
+                    match tokio::time::timeout(
+                        pass_timeout,
+                        route_merge(state, &name, &store, true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(false)) => {}
+                        Ok(Ok(true)) => continue,
+                        outcome => {
+                            tracing::warn!(store = %name, ?outcome, "coordinated count merge request failed");
+                            continue;
+                        }
+                    }
+                }
                 let slot = match &merge_slots {
                     Some(slots) => match slots.clone().try_acquire_owned() {
                         Ok(permit) => Some(permit),
@@ -250,15 +287,78 @@ pub(crate) async fn flush_pass<S: Sweepable>(
 }
 
 /// Merge every resident store's pending generations, same timeout discipline.
-pub(crate) async fn merge_pass<S: Sweepable>(stores: Vec<(String, S)>, pass_timeout: Duration) {
+pub(crate) async fn merge_pass_coordinated<S: Sweepable>(
+    stores: Vec<(String, S)>,
+    pass_timeout: Duration,
+    state: Option<Arc<crate::state::AppState>>,
+) {
     let kind = S::kind();
     for (name, store) in stores {
+        if let Some(state) = &state {
+            match tokio::time::timeout(pass_timeout, route_merge(state, &name, &store, false)).await
+            {
+                Ok(Ok(false)) => {}
+                Ok(Ok(true)) => continue,
+                outcome => {
+                    tracing::warn!(store = %name, ?outcome, "coordinated cleanup request failed");
+                    continue;
+                }
+            }
+        }
+        let slot = match state.as_ref().and_then(|s| s.merge_slots.clone()) {
+            Some(slots) => match slots.try_acquire_owned() {
+                Ok(slot) => Some(slot),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        let _slot = slot;
         report_merge(
             &name,
             kind,
             tokio::time::timeout(pass_timeout, store.merge_wal()).await,
         );
     }
+}
+
+/// Return true when routing handled the target (including drain/no-op).
+async fn route_merge<S: Sweepable>(
+    state: &Arc<crate::state::AppState>,
+    name: &str,
+    store: &S,
+    count_trigger: bool,
+) -> Result<bool, String> {
+    let target = match S::kind() {
+        "rollout" => name.to_string(),
+        "generic" => format!("generic:{name}"),
+        _ => return Ok(false),
+    };
+    if state.merge_executions.rollout.draining(&target) {
+        return Ok(true);
+    }
+    if !state.merge_executions.owned(&target) {
+        return Ok(false);
+    }
+    if !count_trigger || store.count_merge_due().await? {
+        state.merge_executions.request_merge(&target).await?;
+        metrics::counter!("rollout_wal_coordinated_merge_requests_total", "kind" => S::kind())
+            .increment(1);
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) async fn flush_pass<S: Sweepable>(
+    stores: Vec<(String, S)>,
+    timeout: Duration,
+    slots: Option<Arc<Semaphore>>,
+) {
+    flush_pass_coordinated(stores, timeout, slots, None).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn merge_pass<S: Sweepable>(stores: Vec<(String, S)>, timeout: Duration) {
+    merge_pass_coordinated(stores, timeout, None).await;
 }
 
 /// Record one merge attempt's outcome on the cleanup counters and log.
@@ -300,6 +400,49 @@ mod tests {
     use lance_context_core::GenericStoreOptions;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn owned_count_trigger_enqueues_without_bypassing_slots_or_preparing_payloads() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let coordinator = lance_context_merge::Coordinator::new(
+            client,
+            format!("/owned-sweeper/{}", uuid::Uuid::new_v4()),
+        );
+        let state_dir = TempDir::new().unwrap();
+        let mut state = crate::state::AppState::new_for_test(state_dir.path().to_path_buf()).await;
+        state.merge_executions =
+            crate::merge_execution::Executions::new(Some(coordinator.clone()), 3600);
+        state
+            .merge_executions
+            .rollout
+            .owned_targets
+            .push("generic:s".into());
+        let state = Arc::new(state);
+        let dir = TempDir::new().unwrap();
+        let store = generic_with_pending(&dir, 2, 2).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.clone().acquire_owned().await.unwrap();
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(5),
+            Some(slots),
+            Some(state),
+        )
+        .await;
+        assert_eq!(
+            coordinator.request_page(None).await.unwrap().0,
+            ["generic:s"]
+        );
+        assert_eq!(
+            store.read().await.pending_wal_generations().await.unwrap(),
+            2
+        );
+        assert_eq!(store.read().await.count_base_rows().await.unwrap(), 0);
+    }
 
     fn spec() -> SchemaSpec {
         SchemaSpec::new(vec![(

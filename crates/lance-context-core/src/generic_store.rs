@@ -406,6 +406,11 @@ impl GenericStore {
         self.base.prepare_count_merge().await
     }
 
+    /// Check the configured count trigger using only this shard's manifest.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        self.base.count_merge_due().await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock
