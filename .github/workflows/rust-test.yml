@@ -135,7 +135,7 @@ jobs:
           cargo llvm-cov --no-report --all-features \
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
           cargo llvm-cov --no-report --all-features \
-            -p lance-context-core --lib registry -- --ignored
+            -p lance-context-core --lib -- registry --ignored
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
