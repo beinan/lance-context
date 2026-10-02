@@ -658,6 +658,23 @@ async fn should_probe_failure(
     false
 }
 
+async fn enqueue_merge_request(
+    state: &Arc<MasterState>,
+    coordinator: &lance_context_merge::Coordinator,
+    request: &lance_context_merge::rollout::MergeRequest,
+) -> Result<(), String> {
+    if !state.config.merge_rollout.owned(&request.target) {
+        return Ok(());
+    }
+    let task = enqueue(state, TaskKind::MergeWal, &request.target)
+        .await
+        .map_err(|e| e.to_string())?;
+    if task.state == lance_context_api::TaskState::Queued {
+        coordinator.acknowledge_request(request).await?;
+    }
+    Ok(())
+}
+
 /// Spawn the scheduler pollers plus the optional periodic auto-sweep.
 ///
 /// Returns the handle of the *general* poller only. When a separate WAL-merge
@@ -680,16 +697,11 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
             match coordinator.request_page(request_cursor.as_deref()).await {
                 Ok((targets, next)) => {
                     request_cursor = next;
-                    for target in targets {
-                        if retry_state.config.merge_rollout.owned(&target) {
-                            match enqueue(&retry_state, TaskKind::MergeWal, &target).await {
-                                Ok(_) => {
-                                    let _ = coordinator.acknowledge_request(&target).await;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(%target, %error, "worker merge demand enqueue failed")
-                                }
-                            }
+                    for request in targets {
+                        if let Err(error) =
+                            enqueue_merge_request(&retry_state, &coordinator, &request).await
+                        {
+                            tracing::warn!(target = %request.target, %error, "worker merge demand enqueue failed");
                         }
                     }
                 }
@@ -1024,6 +1036,41 @@ mod tests {
             0,
             "deduped tasks do not spend the budget"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn demand_during_running_merge_retains_a_followup_without_stats_sweep() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let first = enqueue(&state, TaskKind::MergeWal, "hot").await.unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, first.id);
+        coordinator.request_merge("hot").await.unwrap();
+        let request = coordinator.request_page(None).await.unwrap().0.remove(0);
+        enqueue_merge_request(&state, &coordinator, &request)
+            .await
+            .unwrap();
+        assert_eq!(coordinator.request_page(None).await.unwrap().0.len(), 1);
+        state
+            .task_store
+            .finish(claim, Ok("old pass complete".into()))
+            .await
+            .unwrap();
+        enqueue_merge_request(&state, &coordinator, &request)
+            .await
+            .unwrap();
+        let next = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "hot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.id, next);
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
     }
 
     /// Wait until the task reaches a terminal state, returning its final record.

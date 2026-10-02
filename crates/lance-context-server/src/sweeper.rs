@@ -434,7 +434,14 @@ mod tests {
         )
         .await;
         assert_eq!(
-            coordinator.request_page(None).await.unwrap().0,
+            coordinator
+                .request_page(None)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|r| r.target)
+                .collect::<Vec<_>>(),
             ["generic:s"]
         );
         assert_eq!(

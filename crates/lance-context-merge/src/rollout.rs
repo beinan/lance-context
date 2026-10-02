@@ -47,6 +47,14 @@ impl MergeRollout {
     }
 }
 
+/// One coalesced demand snapshot. Its revision identifies exactly what a
+/// scheduler may acknowledge; later flushes must survive an older enqueue.
+#[derive(Clone, Debug)]
+pub struct MergeRequest {
+    pub target: String,
+    pub revision: i64,
+}
+
 impl Coordinator {
     fn request_key(&self, target: &str) -> String {
         execution_key(&self.prefix, target).replace("/merge-executions/", "/merge-requests/")
@@ -55,15 +63,18 @@ impl Coordinator {
     /// Coalesce worker count/timer triggers without resetting failure budgets.
     pub async fn request_merge(&self, target: &str) -> Result<()> {
         let key = self.request_key(target);
-        self.transact(
-            vec![Compare::version(key.as_str(), CompareOp::Equal, 0)],
-            vec![TxnOp::put(key, target, None)],
-        )
-        .await?;
+        self.client
+            .clone()
+            .put(key, target, None)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub async fn request_page(&self, after: Option<&str>) -> Result<(Vec<String>, Option<String>)> {
+    pub async fn request_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<MergeRequest>, Option<String>)> {
         let prefix = format!("{}/merge-requests/", self.prefix.trim_end_matches('/'));
         let (start, options) = match after {
             None => (prefix.clone(), GetOptions::new().with_prefix()),
@@ -83,7 +94,10 @@ impl Coordinator {
         let rows = response
             .kvs()
             .iter()
-            .map(|kv| String::from_utf8_lossy(kv.value()).into_owned())
+            .map(|kv| MergeRequest {
+                target: String::from_utf8_lossy(kv.value()).into_owned(),
+                revision: kv.mod_revision(),
+            })
             .collect();
         let next = response
             .more()
@@ -97,15 +111,20 @@ impl Coordinator {
         Ok((rows, next))
     }
 
-    /// Called only after a durable enqueue. A subsequent flush tick reasserts
-    /// demand if the active task already passed this worker's shard.
-    pub async fn acknowledge_request(&self, target: &str) -> Result<()> {
-        self.client
-            .clone()
-            .delete(self.request_key(target), None)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+    /// Only acknowledge a queued task, never an already-running pass that may
+    /// have visited this shard. A concurrent flush advances the revision and
+    /// survives this compare-and-delete even if enqueue/start raced it.
+    pub async fn acknowledge_request(&self, request: &MergeRequest) -> Result<bool> {
+        let key = self.request_key(&request.target);
+        self.transact(
+            vec![Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                request.revision,
+            )],
+            vec![TxnOp::delete(key, None)],
+        )
+        .await
     }
 }
 

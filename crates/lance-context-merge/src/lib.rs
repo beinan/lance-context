@@ -501,7 +501,8 @@ mod tests {
             coordinator.request_merge("table").await.unwrap();
         }
         let (rows, next) = coordinator.request_page(None).await.unwrap();
-        assert_eq!(rows, ["table"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, "table");
         assert!(next.is_none());
         let after = coordinator
             .failure("table", "worker")
@@ -511,10 +512,17 @@ mod tests {
         let before = last.unwrap();
         assert_eq!(after.consecutive_attempts, 4);
         assert_eq!(after.next_retry_ms, before.next_retry_ms);
-        coordinator.acknowledge_request("table").await.unwrap();
+        // A later flush must survive the old demand acknowledgement.
+        coordinator.request_merge("table").await.unwrap();
+        assert!(!coordinator.acknowledge_request(&rows[0]).await.unwrap());
+        let newer = coordinator.request_page(None).await.unwrap().0;
+        assert!(coordinator.acknowledge_request(&newer[0]).await.unwrap());
         assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
         coordinator.request_merge("table").await.unwrap();
-        assert_eq!(coordinator.request_page(None).await.unwrap().0, ["table"]);
+        assert_eq!(
+            coordinator.request_page(None).await.unwrap().0[0].target,
+            "table"
+        );
     }
 
     #[tokio::test]
