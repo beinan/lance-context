@@ -6,11 +6,19 @@ use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
 pub struct MergeRollout {
     /// Exact scheduler targets using owned merges (generic stores: generic:name).
     /// Empty by default. Enable only after the target's legacy writers drain.
-    #[arg(long, env = "MERGE_OWNED_TARGETS", value_delimiter = ',')]
+    #[arg(
+        long = "merge-owned-targets",
+        env = "MERGE_OWNED_TARGETS",
+        value_delimiter = ','
+    )]
     pub owned_targets: Vec<String>,
     /// Drain maintenance for these targets during migration; ingestion and
     /// maintenance of other tables continue. Coordinate all replicas and helpers.
-    #[arg(long, env = "MERGE_DRAIN_TARGETS", value_delimiter = ',')]
+    #[arg(
+        long = "merge-drain-targets",
+        env = "MERGE_DRAIN_TARGETS",
+        value_delimiter = ','
+    )]
     pub drain_targets: Vec<String>,
 }
 
