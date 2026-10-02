@@ -293,14 +293,17 @@ mod tests {
 
     async fn fixture() -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
-        let mut config =
-            MasterConfig::parse_from(["master", "--data-dir", dir.path().to_str().unwrap()]);
-        config.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
-            .unwrap()
-            .split(',')
-            .map(str::to_owned)
-            .collect();
-        config.etcd_prefix = format!("/maintenance-test/{}", lance_context_core::generate_id());
+        let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let prefix = format!("/maintenance-test/{}", lance_context_core::generate_id());
+        let mut config = MasterConfig::parse_from([
+            "master",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--etcd-endpoints",
+            &endpoints,
+            "--etcd-prefix",
+            &prefix,
+        ]);
         config.merge_rollout.owned_targets = vec!["table".into()];
         config.stats_scan_interval_secs = 0;
         config.compaction_interval_secs = 0;
