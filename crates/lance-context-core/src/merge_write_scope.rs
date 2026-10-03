@@ -141,11 +141,22 @@ impl Drop for Active {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn shield<F, T, E>(write: F) -> std::result::Result<T, E>
 where
     F: Future<Output = std::result::Result<T, E>> + Send + 'static,
     T: Send + 'static,
     E: From<Error> + Send + 'static,
+{
+    shield_observed(write, |result| result.is_ok()).await
+}
+
+async fn shield_observed<F, T, E, P>(write: F, progressed: P) -> std::result::Result<T, E>
+where
+    F: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: From<Error> + Send + 'static,
+    P: FnOnce(&std::result::Result<T, E>) -> bool + Send + 'static,
 {
     let Ok(scope) = CURRENT.try_with(Arc::clone) else {
         return write.await;
@@ -166,7 +177,7 @@ where
     let leaf = tokio::spawn(async move {
         let mut active = active;
         let result = write.await;
-        if result.is_ok() {
+        if progressed(&result) {
             active.scope.completed_steps.fetch_add(1, Ordering::Relaxed);
         }
         if result.is_err() {
@@ -209,18 +220,21 @@ pub(crate) async fn drain_generations(
         authorize(&resource, next.version).await?;
         let writer = store.clone();
         let scope = CURRENT.try_with(Arc::clone).ok();
-        let (next, written) = shield(async move {
-            let written = writer.write(&next).await;
-            if written
-                .as_ref()
-                .is_err_and(|e| !e.to_string().contains("already exists"))
-            {
-                if let Some(scope) = scope {
-                    scope.mark_uncertain();
+        let (next, written) = shield_observed(
+            async move {
+                let written = writer.write(&next).await;
+                if written
+                    .as_ref()
+                    .is_err_and(|e| !e.to_string().contains("already exists"))
+                {
+                    if let Some(scope) = scope {
+                        scope.mark_uncertain();
+                    }
                 }
-            }
-            Ok::<_, Error>((next, written))
-        })
+                Ok::<_, Error>((next, written))
+            },
+            |result| result.as_ref().is_ok_and(|(_, written)| written.is_ok()),
+        )
         .await?;
         match written {
             Ok(_) => return Ok(next),
@@ -384,28 +398,31 @@ impl CommitHandler for GuardedCommit {
             let path = base_path.clone();
             let store = object_store.clone();
             let scope = CURRENT.try_with(Arc::clone).ok();
-            let (location, committed) = shield(async move {
-                let location = inner
-                    .commit(
-                        &mut owned_manifest,
-                        indices,
-                        &path,
-                        &store,
-                        manifest_writer,
-                        naming_scheme,
-                        transaction,
-                    )
-                    .await;
-                // Only a definite conflict proves this conditional commit did
-                // not happen. A transport/storage error can arrive after the
-                // remote service accepted it, even though the Rust future ended.
-                if matches!(&location, Err(CommitError::OtherError(_))) {
-                    if let Some(scope) = scope {
-                        scope.mark_uncertain();
+            let (location, committed) = shield_observed(
+                async move {
+                    let location = inner
+                        .commit(
+                            &mut owned_manifest,
+                            indices,
+                            &path,
+                            &store,
+                            manifest_writer,
+                            naming_scheme,
+                            transaction,
+                        )
+                        .await;
+                    // Only a definite conflict proves this conditional commit did
+                    // not happen. A transport/storage error can arrive after the
+                    // remote service accepted it, even though the Rust future ended.
+                    if matches!(&location, Err(CommitError::OtherError(_))) {
+                        if let Some(scope) = scope {
+                            scope.mark_uncertain();
+                        }
                     }
-                }
-                Ok::<_, CommitError>((location, owned_manifest))
-            })
+                    Ok::<_, CommitError>((location, owned_manifest))
+                },
+                |result| result.as_ref().is_ok_and(|(location, _)| location.is_ok()),
+            )
             .await?;
             *manifest = committed;
             location
@@ -501,6 +518,21 @@ mod tests {
         ] {
             assert!(supports_version_fencing(uri), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn conditional_conflicts_and_errors_do_not_count_as_progress() {
+        let scope = MergeWriteScope::new();
+        for committed in [false, false, true] {
+            scope
+                .run(shield_observed(
+                    async move { Ok::<_, Error>(committed) },
+                    |result| matches!(result, Ok(true)),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(scope.completed_steps(), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! Master-owned, bounded Kubernetes catch-up jobs. No payload reads in admission.
 mod executor;
 mod kubernetes;
+mod progress;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
@@ -36,8 +37,11 @@ pub struct CatchupConfig {
     pub stats_max_age_secs: u64,
     #[arg(long, env = "CATCHUP_INTERVAL_SECS", default_value_t = 30)]
     pub interval_secs: u64,
-    #[arg(long, env = "CATCHUP_JOB_DEADLINE_SECS", default_value_t = 1800)]
-    pub job_deadline_secs: u64,
+    #[arg(long, env = "CATCHUP_SLICE_SECS", default_value_t = 1800)]
+    pub slice_secs: u64,
+    /// Maximum time without an execution starting, separate from merge progress.
+    #[arg(long, env = "CATCHUP_STARTUP_TIMEOUT_SECS", default_value_t = 1800)]
+    pub startup_timeout_secs: u64,
     /// Stable writer identities, not Pod IPs. Only sealed generations are merged.
     #[arg(long, env = "CATCHUP_SHARDS", value_delimiter = ',')]
     pub shards: Vec<String>,
@@ -65,7 +69,8 @@ impl Default for CatchupConfig {
             min_pending: 256,
             stats_max_age_secs: 900,
             interval_secs: 30,
-            job_deadline_secs: 1800,
+            slice_secs: 1800,
+            startup_timeout_secs: 1800,
             shards: Vec::new(),
             merge_max_bytes: 67_108_864,
             merge_memory_bytes: 1_073_741_824,
@@ -84,8 +89,10 @@ impl CatchupConfig {
             || self.min_pending < 1
             || self.interval_secs == 0
             || self.stats_max_age_secs == 0
-            || self.job_deadline_secs < 120
-            || self.job_deadline_secs > 86_400
+            || self.startup_timeout_secs < 120
+            || self.startup_timeout_secs > 86_400
+            || self.slice_secs < 120
+            || self.slice_secs > 86_400
             || self.merge_max_bytes == 0
             || self.merge_memory_bytes < self.merge_max_bytes
             || self.shards.is_empty()
@@ -274,7 +281,7 @@ async fn admit(
     if request.dry_run {
         return Ok(Decision::new(target, "eligible_dry_run"));
     }
-    inventory.ensure_policy(&state.config.catchup).await?;
+    inventory.ensure_policy(&state.config).await?;
     let result = inventory
         .reserve(
             target,
@@ -313,7 +320,7 @@ pub fn spawn(state: &Arc<MasterState>) -> Option<tokio::task::JoinHandle<()>> {
 }
 async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
     let inventory = Inventory::new(state);
-    inventory.ensure_policy(&state.config.catchup).await?;
+    inventory.ensure_policy(&state.config).await?;
     let kube = Kubernetes::in_cluster(&state.config.catchup)?;
     // The lease reduces duplicate Kubernetes traffic; CAS inventory updates
     // remain correct even if a delayed replica outlives this coordination lease.
@@ -329,9 +336,48 @@ async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
                 let inventory = &inventory;
                 let kube = &kube;
                 async move {
-                    match kube.reconcile(&state.config, &record).await {
-                        Ok(Some(success)) => inventory.complete(&record, success, chrono::Utc::now().timestamp_millis()).await?,
-                        Ok(None) => {},
+                    let mut record = record;
+                    let mut stop = record.termination_requested;
+                    if !stop {
+                    match progress::sample(state, &record).await {
+                        Ok(sample) => {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let observed = progress::observe(record.progress.as_ref(), sample.clone(), now,
+                                &state.config.catchup, state.config.maintenance.maintenance_idle_timeout_secs);
+                            let mut updated = record.clone();
+                            updated.progress = Some(observed);
+                            if !inventory.update(&record, &updated).await? { return Ok(()); }
+                            record = updated;
+                            // Recheck immediately before acting: a stale sample is not
+                            // permission to terminate a now-progressing execution.
+                            if record.progress.as_ref().is_some_and(|p| p.stalled) {
+                                stop = progress::revoke(state, &record, &sample).await?;
+                                if stop {
+                                    let mut updated = record.clone();
+                                    updated.termination_requested = true;
+                                    if !inventory.update(&record, &updated).await? { return Ok(()); }
+                                    record = updated;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            inventory.note_error(&record, &error).await?;
+                            return Ok(());
+                        }
+                    }
+                    }
+                    match kube.reconcile(&state.config, &record, stop).await {
+                        Ok((uid, terminal)) => {
+                            if record.job_uid.is_none() && uid.is_some() {
+                                let mut updated = record.clone();
+                                updated.job_uid = uid;
+                                if !inventory.update(&record, &updated).await? { return Ok(()); }
+                                record = updated;
+                            }
+                            if let Some(success) = terminal {
+                                inventory.complete(&record, success, chrono::Utc::now().timestamp_millis()).await?;
+                            }
+                        },
                         Err(error) => {
                             tracing::warn!(target = %record.target, job = %record.job, %error, "catch-up job unresolved; reservation retained");
                             metrics::counter!("master_catchup_job_errors_total").increment(1);

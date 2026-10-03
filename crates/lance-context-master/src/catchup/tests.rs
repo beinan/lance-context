@@ -56,9 +56,11 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let r = Record {
         target: "hot".into(),
         job: "lc-catchup-test".into(),
+        job_uid: None,
         slot: 0,
         attempt: 1,
         active: true,
+        termination_requested: false,
         reason: "test".into(),
         pending_at_admission: 1000,
         created_at_ms: 0,
@@ -67,10 +69,16 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
         needs_attention: false,
         next_retry_ms: 0,
         outcome: None,
+        progress: None,
     };
     let mut pod = template();
     pod["containers"][0]["env"] = json!([{"name":"CATCHUP_ENABLED","value":"true"}]);
+    pod["activeDeadlineSeconds"] = json!(1);
     let job = kubernetes::render_job(&c, &r, pod);
+    assert!(job["spec"].get("activeDeadlineSeconds").is_none());
+    assert!(job["spec"]["template"]["spec"]
+        .get("activeDeadlineSeconds")
+        .is_none());
     assert_eq!(job["spec"]["parallelism"], 1);
     assert_eq!(job["spec"]["backoffLimit"], 0);
     assert_eq!(job["spec"]["template"]["spec"]["restartPolicy"], "Never");
@@ -240,12 +248,9 @@ async fn policy_disagreement_cannot_expand_the_cluster_budget() {
         return;
     };
     let inventory = Inventory::new(&state);
-    inventory
-        .ensure_policy(&state.config.catchup)
-        .await
-        .unwrap();
-    let mut other = state.config.catchup.clone();
-    other.max_jobs += 1;
+    inventory.ensure_policy(&state.config).await.unwrap();
+    let mut other = state.config.clone();
+    other.catchup.max_jobs += 1;
     assert!(inventory.ensure_policy(&other).await.is_err());
 }
 
@@ -373,4 +378,106 @@ async fn repeated_failed_jobs_keep_backoff_across_controller_restarts() {
         assert!(persisted.next_retry_ms > now + 60_000);
         now = persisted.next_retry_ms;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn catchup_runtime_ceiling_does_not_cancel_work_within_idle_window() {
+    let (_dir, state) = fixture().await.unwrap();
+    let mut cfg = state.config.clone();
+    cfg.catchup.enabled = false;
+    cfg.catchup.target = Some("hot".into());
+    let inventory = Inventory::new(&state);
+    let admitted = inventory
+        .reserve("hot", "runtime test", 1000, 0)
+        .await
+        .unwrap();
+    cfg.catchup.job_name = admitted.job.clone();
+    cfg.maintenance.maintenance_timeout_secs = 1;
+    cfg.maintenance.maintenance_idle_timeout_secs = 10;
+    let dedicated = MasterState::new(cfg).await.unwrap();
+    dedicated
+        .task_store
+        .enqueue(TaskKind::MergeWal, "hot", vec![])
+        .await
+        .unwrap();
+    let claim = dedicated
+        .task_store
+        .claim_merge_target("hot", admitted.job.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let result = crate::maintenance_execution::run_as(
+        &dedicated,
+        &claim,
+        lance_context_merge::MaintenanceKind::Catchup,
+        async {
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            Ok("operation completed beyond old ceiling".into())
+        },
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    dedicated.task_store.finish(claim, result).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn stale_progress_revoke_cannot_cancel_advancing_or_replaced_execution() {
+    let (_dir, state) = fixture().await.unwrap();
+    let inventory = Inventory::new(&state);
+    let admitted = inventory
+        .reserve("hot", "stall test", 1000, 0)
+        .await
+        .unwrap();
+    state
+        .task_store
+        .enqueue(TaskKind::MergeWal, "hot", vec![])
+        .await
+        .unwrap();
+    let claim = state
+        .task_store
+        .claim_merge_target("hot", admitted.job.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let coordinator = state.task_store.merge_coordinator();
+    let mut execution = lance_context_merge::Execution::new(
+        "hot",
+        "master:catchup",
+        admitted.job.as_ref().unwrap(),
+        1,
+    );
+    execution.maintenance = Some(lance_context_merge::MaintenanceKind::Catchup);
+    let proof = state.task_store.merge_claim(&claim);
+    assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+    let running = coordinator.start(&execution).await.unwrap().unwrap();
+    assert!(coordinator.publish_progress(&running, 1).await.unwrap());
+    let record = inventory.get("hot").await.unwrap().unwrap();
+    let old = progress::sample(&state, &record).await.unwrap();
+    assert!(coordinator.publish_progress(&running, 2).await.unwrap());
+    assert!(!progress::revoke(&state, &record, &old).await.unwrap());
+    let fresh = progress::sample(&state, &record).await.unwrap();
+    assert!(progress::revoke(&state, &record, &fresh).await.unwrap());
+    assert!(!coordinator.publish_progress(&running, 3).await.unwrap());
+    assert!(coordinator
+        .authorize_commit(&running, "/hot", "base", 2)
+        .await
+        .is_err());
+    let uncertain = coordinator.get("hot").await.unwrap().unwrap();
+    assert_eq!(uncertain.phase, lance_context_merge::Phase::Uncertain);
+    assert!(coordinator.release(&proof, &uncertain).await.is_err());
+    let frozen = coordinator
+        .freeze(&proof, &uncertain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+    let recovered = coordinator.get("hot").await.unwrap().unwrap();
+    assert!(coordinator.release(&proof, &recovered).await.unwrap());
+    state
+        .task_store
+        .finish(claim, Err("injected stall".into()))
+        .await
+        .unwrap();
 }

@@ -7,7 +7,7 @@ use crate::{
 };
 use axum::{extract::State, http::StatusCode, Json};
 use futures::FutureExt;
-use lance_context_merge::{execute_scoped, Coordinator, Execution, Phase};
+use lance_context_merge::{execute_scoped, execute_until_cancelled, Coordinator, Execution, Phase};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{watch, Mutex, OnceCell};
 
@@ -281,14 +281,13 @@ async fn run(
         if !coordinator.publish_progress(&running, 0).await? {
             return Err("merge ownership revoked before execution".into());
         }
-        execute_scoped(
+        execute_until_cancelled(
             async {
                 tokio::select! {
                     result = write_scope.run(work) => result,
                     error = watch_progress(&coordinator, &running, &write_scope) => Err(error),
                 }
             },
-            Duration::from_secs(execution.timeout_secs),
             cancelled,
         )
         .await
@@ -385,7 +384,7 @@ async fn watch_ownership(coordinator: &Coordinator, execution: &Execution) -> St
             Ok(Ok(Some(current))) if current == *execution => {}
             Ok(Ok(_)) => return "merge ownership revoked during execution".into(),
             // An unavailable coordinator is not evidence of a completed fence.
-            // Queue, idle and total execution deadlines remain independent.
+            // Queue and real-progress idle deadlines remain independent.
             _ => {}
         }
     }
@@ -584,6 +583,30 @@ mod tests {
         assert!(coordinator.release(&proof, &finished).await.unwrap());
         assert_eq!(state.merge_slots.as_ref().unwrap().available_permits(), 1);
         drop(held);
+        state.merge_executions.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn running_work_is_not_cancelled_by_legacy_total_timeout() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let store = state.get_or_open_rollout_store("hot").await.unwrap();
+        let held = store.write().await;
+        let mut execution = Execution::new("hot", "worker", &state.merge_executions.instance, 1);
+        execution.idle_timeout_secs = 10;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        start(State(state.clone()), Json(execution.clone()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert_eq!(
+            coordinator.get("hot").await.unwrap().unwrap().phase,
+            Phase::Running
+        );
+        drop(held);
+        let finished = terminal(&coordinator).await;
+        assert!(finished.error.is_none(), "{finished:?}");
+        assert!(coordinator.release(&proof, &finished).await.unwrap());
         state.merge_executions.shutdown().await;
     }
 

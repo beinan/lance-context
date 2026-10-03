@@ -1,4 +1,4 @@
-use super::{CatchupConfig, Decision, Result};
+use super::{Decision, Result};
 use crate::state::MasterState;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,13 @@ use serde::{Deserialize, Serialize};
 pub struct Record {
     pub target: String,
     pub job: String,
+    #[serde(default)]
+    pub job_uid: Option<String>,
     pub slot: usize,
     pub attempt: u64,
     pub active: bool,
+    #[serde(default)]
+    pub termination_requested: bool,
     pub reason: String,
     pub pending_at_admission: i64,
     pub created_at_ms: i64,
@@ -18,6 +22,8 @@ pub struct Record {
     pub needs_attention: bool,
     pub next_retry_ms: i64,
     pub outcome: Option<String>,
+    #[serde(default)]
+    pub progress: Option<super::progress::Observation>,
 }
 pub(super) struct Inventory {
     pub client: Client,
@@ -56,10 +62,11 @@ impl Inventory {
             .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
             .transpose()
     }
-    pub async fn ensure_policy(&self, config: &CatchupConfig) -> Result<()> {
+    pub async fn ensure_policy(&self, master: &crate::config::MasterConfig) -> Result<()> {
+        let config = &master.catchup;
         let template = super::kubernetes::read_template(config)?;
         let policy = serde_json::json!({"namespace":config.namespace,"max_jobs":config.max_jobs,"template":template,
-            "shards":config.shards,"merge_max_bytes":config.merge_max_bytes,"merge_memory_bytes":config.merge_memory_bytes,"deadline":config.job_deadline_secs}).to_string();
+            "shards":config.shards,"merge_max_bytes":config.merge_max_bytes,"merge_memory_bytes":config.merge_memory_bytes,"slice":config.slice_secs,"startup_timeout":config.startup_timeout_secs,"idle_timeout":master.maintenance.maintenance_idle_timeout_secs}).to_string();
         let key = format!("{}/catchup-policy", self.prefix);
         let mut client = self.client.clone();
         client
@@ -124,9 +131,15 @@ impl Inventory {
         let mut updated = record.clone();
         updated.outcome = Some(error.chars().take(1024).collect());
         updated.needs_attention = true;
+        updated.progress = None;
+        self.update(record, &updated).await?;
+        Ok(())
+    }
+    pub async fn update(&self, record: &Record, updated: &Record) -> Result<bool> {
         let old = serde_json::to_vec(record).map_err(|e| e.to_string())?;
         let new = serde_json::to_vec(&updated).map_err(|e| e.to_string())?;
-        self.client
+        Ok(self
+            .client
             .clone()
             .txn(
                 Txn::new()
@@ -144,8 +157,8 @@ impl Inventory {
                     ]),
             )
             .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+            .map_err(|e| e.to_string())?
+            .succeeded())
     }
     pub async fn reserve(
         &self,
@@ -174,9 +187,11 @@ impl Inventory {
             let record = Record {
                 target: target.into(),
                 job: job.clone(),
+                job_uid: None,
                 slot,
                 attempt: old.as_ref().map_or(1, |r| r.attempt.saturating_add(1)),
                 active: true,
+                termination_requested: false,
                 reason: reason.into(),
                 pending_at_admission: pending,
                 created_at_ms: now,
@@ -185,6 +200,7 @@ impl Inventory {
                 needs_attention: false,
                 next_retry_ms: 0,
                 outcome: None,
+                progress: None,
             };
             let value = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
             let prior = match &old {

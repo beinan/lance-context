@@ -1209,7 +1209,6 @@ impl StorageBase {
             let mut current_batches = Vec::new();
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
-                crate::merge_write_scope::checkpoint();
                 if batch.num_rows() > 0 {
                     let batch = align_batch_to_schema(batch, merge_schema.clone())?;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
@@ -1229,6 +1228,7 @@ impl StorageBase {
                         }
                     }
                     current_batches.push(batch);
+                    crate::merge_write_scope::checkpoint();
                 }
             }
             generation_batches.push((flushed.generation, current_batches));

@@ -62,12 +62,14 @@ cancels/drains owned actors before closing resident stores.
 
 Admission and slot acquisition have a separate `MERGE_QUEUE_TIMEOUT_SECS`
 (default 600). The execution clock starts only after a merge slot is acquired.
-`MERGE_EXECUTION_TIMEOUT_SECS` is a configurable total ceiling (default 3600),
-not a hard-coded 600-second cap. `MERGE_IDLE_TIMEOUT_SECS` (default 600) limits
-the interval without observed completed work. All three must be positive.
+`MERGE_IDLE_TIMEOUT_SECS` (default 600) limits the interval without observed
+completed work. Progressing owned merges have no total runtime ceiling.
+`MERGE_EXECUTION_TIMEOUT_SECS` remains a positive legacy wire field for rolling
+compatibility; older masters/workers can still enforce it until upgraded. Queue
+and idle limits must also be positive.
 
-The worker counts completed batch reads, merge phases, and shielded storage
-operations. It publishes a changed sequence at most once a second, guarded by
+The worker counts completed nonempty batch reads and successful manifest commits,
+excluding conditional-write conflicts and failed storage operations. It publishes a changed sequence at most once a second, guarded by
 execution ownership. The master tracks the same sequence with bounded RPC
 allowance. Repeated heartbeats do not extend the idle limit, and progressing
 work cannot extend the total ceiling. A missing progress record means the

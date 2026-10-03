@@ -24,7 +24,7 @@ still apply. It does not enable owned targets or restart production workers.
    override the target, data URI, etcd endpoints/prefix and execution budgets.
    Image, command, credentials and resources never come from API callers.
 2. Bind the namespace-scoped Role in `deploy/catchup/rbac.yaml` to the masters'
-   ServiceAccount. It permits creating/getting Jobs and listing Pods; it grants
+   ServiceAccount. It permits creating/getting/patching Jobs and listing Pods; it grants
    no Pod deletion, exec, or deployment modification. The executor Pod does not
    receive the Kubernetes service account token.
 3. Set `CATCHUP_POD_TEMPLATE` to the mounted JSON path,
@@ -40,7 +40,7 @@ still apply. It does not enable owned targets or restart production workers.
 
 Defaults: four Jobs cluster-wide, 256 pending generations, a 30-second scan
 interval, and stats no older than 900 seconds. A Job has one container, one table,
-serial shard visits, no Kubernetes retries, a 1800-second hard deadline, a
+serial shard visits, no Kubernetes retries, a 1800-second soft admission slice, a
 30-second termination grace period, and a 24-hour terminal retention period.
 The Job cannot preempt other Pods. CPU/memory requests must equal explicit
 limits. The sample reserves 2 CPUs and 8 GiB per Job (8 CPUs/32 GiB total at the
@@ -52,8 +52,9 @@ are buffering bounds, not a total RSS guarantee: one indivisible generation and
 Lance working memory can exceed the buffer bound. Kubernetes limits provide the
 final process bound. Validate real large generations before increasing concurrency.
 A slice visits configured shards up to 16 times, stopping early when a
-whole pass reclaims nothing or the admission time budget ends. It reserves time
-for the last admitted operation and commit drain before the hard deadline. Each
+whole pass reclaims nothing or `CATCHUP_SLICE_SECS` ends. An already admitted
+operation may finish beyond that slice while making progress. No Job or Pod
+runtime deadline is installed at creation. Each
 Job rotates the starting shard using a durable attempt number, including after
 failures, so a slow first shard cannot always hide the rest. Further fresh
 pressure can request another slice.
@@ -89,7 +90,8 @@ GET /api/v1/catchup?target=hot_table
 
 Status exposes the current/latest Job, admission pending count and reason, active
 reservation, start/finish timestamps, outcome, consecutive failures, next retry
-and `needs_attention`. A missing target record returns JSON `null`. For failures,
+and `needs_attention`, the last observed execution/sequence and observation times,
+plus whether termination was requested. A missing target record returns JSON `null`. For failures,
 inspect this status and the referenced Job logs; do not clear ownership keys or
 blindly recreate Pods.
 
@@ -121,8 +123,31 @@ progress timeout and storage version barrier as other owned maintenance. Losing
 a task lease or terminating its Pod is not enough to authorize new storage writes;
 unresolved execution fencing must still succeed. The native executor times out a
 busy initial task claim after 30 seconds. No-progress work uses the existing
-`MAINTENANCE_IDLE_TIMEOUT_SECS` (600 by default), and Kubernetes enforces the
-outer Job deadline even if the process cannot cooperate.
+`MAINTENANCE_IDLE_TIMEOUT_SECS` (600 by default). The master independently
+observes completed work, not heartbeats. Continuous no progress for that interval
+plus a separate 60-second confirmation triggers recovery; the startup window
+before an execution appears is `CATCHUP_STARTUP_TIMEOUT_SECS` (1800 by default).
+A new execution receives a fresh observation window. Failed samples or a gap
+longer than three controller intervals (at least 60 seconds) invalidate the old
+window; an observation outage does not prove a stall.
+
+For a running execution, a final etcd transaction compares both ownership and the
+observed progress sequence before revoking commit admission. A concurrent advance
+wins over cancellation. Only then does the master patch the exact Job's deadline
+to terminate a non-cooperative process, with UID/resource-version preconditions.
+It persists the termination request for retry across master/API failures. This
+is a reaction to confirmed lack of progress, not a runtime limit on healthy work.
+The existing storage barrier must still fence previously admitted commits before
+replacement writes; Job termination alone is insufficient. Confirmed Job UIDs
+cannot be silently replaced or recreated after disappearance.
+
+Completed nonempty WAL batches and successful manifest commits count as progress;
+conditional commit conflicts and unchanged publications do not. A pending count
+may rise under ingestion despite useful merge work, so it is not the stall signal.
+Some Lance-internal phases, including a single index build or long storage call,
+do not yet expose intermediate checkpoints. Validate the idle threshold against
+these phases on real large tables; completed-step telemetry cannot establish
+whether an opaque call is still advancing internally.
 
 Failure counts survive master and Job replacement. Failed Jobs back off from
 120 seconds to one hour, with `needs_attention` after three failures; the existing
@@ -141,7 +166,7 @@ reservations and is not the shutdown procedure.
 
 This is a catch-up controller, not a replacement for every external watchdog rule.
 It does not evict ordinary workers or diagnose arbitrary OS-level deadlocks. Its
-Job deadlines terminate dedicated processes; ordinary owned-task recovery still
+progress-based termination handles dedicated processes; ordinary owned-task recovery still
 uses the existing worker identity/progress detection and cancellation protocol.
 
 ## Validation before production activation
@@ -149,12 +174,20 @@ uses the existing worker identity/progress detection and cancellation protocol.
 The tests cover multi-master CAS admission, global capacity, wrong-Job claims,
 ordinary-table progress, durable backoff, policy disagreement, an ambiguous Job
 creation response, delayed Pod termination, and a native multi-shard merge with
-live ingestion handles. Run the etcd-backed tests with `ETCD_TEST_ENDPOINTS` and
+live ingestion handles, progress beyond the old runtime ceiling, repeated unchanged
+heartbeats, sampling gaps, stale-progress revocation races, and Job identity checks. Run the etcd-backed tests with `ETCD_TEST_ENDPOINTS` and
 `--include-ignored`; the repository CI runs ignored etcd tests separately.
 
 In staging, use isolated storage and an etcd prefix. Verify real large-generation
-RSS and throughput, continuous writes with result conservation, Job deadline
-termination, master replacement after reservation/creation, storage failure during
+RSS and throughput, continuous writes with result conservation, survival beyond
+the slice while advancing, confirmed no-progress termination, master replacement after reservation/creation, storage failure during
 a commit, and complete fencing before retry. Merely seeing a Pod become Ready
 is not a throughput or recovery test. These changes do not themselves deploy or
 activate the production controller.
+
+Owned worker merges and local owned maintenance also stop using a total execution
+time ceiling in this change. Their existing idle watchdogs, ownership checks,
+queue limits, cancellation and manifest-drain barriers remain. The legacy timeout
+configuration/wire fields remain for compatibility; older master/worker binaries
+may still enforce them during a mixed-version rollout. Deploy compatible versions
+throughout before relying on the absence of a total execution ceiling.

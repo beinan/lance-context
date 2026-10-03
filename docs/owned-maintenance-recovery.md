@@ -8,9 +8,11 @@ compaction concurrency and all merge memory/byte budgets are unchanged.
 
 ## Cancellation and takeover
 
-The default total deadline is 3600 seconds (`MAINTENANCE_TIMEOUT_SECS`), with a
+Owned maintenance has no total runtime ceiling while making progress. It uses a
 600-second no-progress deadline (`MAINTENANCE_IDLE_TIMEOUT_SECS`) and 30-second
-commit drain grace (`MAINTENANCE_DRAIN_TIMEOUT_SECS`). All must be positive.
+commit drain grace (`MAINTENANCE_DRAIN_TIMEOUT_SECS`). `MAINTENANCE_TIMEOUT_SECS`
+remains a positive legacy wire field; older binaries may still enforce it during
+a rolling upgrade. All timeout configuration fields must remain positive.
 Progress counts completed scoped processing steps or manifest commits, never
 heartbeats. Lance index building and individual compaction rewrites do not
 expose fine-grained scan progress here: a healthy long operation can reach the

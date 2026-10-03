@@ -191,7 +191,16 @@ where
     let mut reserved = Execution::new(
         &claim.task.target,
         maintenance.endpoint(),
-        &claim.task.id,
+        if maintenance == MaintenanceKind::Catchup {
+            state
+                .config
+                .catchup
+                .job_name
+                .as_deref()
+                .ok_or("missing catch-up Job identity")?
+        } else {
+            &claim.task.id
+        },
         config.maintenance_timeout_secs,
     );
     reserved.maintenance = Some(maintenance);
@@ -209,14 +218,13 @@ where
         uri,
     }));
     let outcome = std::panic::AssertUnwindSafe(async {
-        tokio::time::timeout(Duration::from_secs(running.timeout_secs), async {
+        let watched = async {
             tokio::select! {
                 result = scope.run(work) => result,
                 error = watch(&coordinator, &running, &scope) => Err(error),
             }
-        })
-        .await
-        .unwrap_or_else(|_| Err("maintenance execution deadline exceeded".into()))
+        };
+        watched.await
     })
     .catch_unwind()
     .await

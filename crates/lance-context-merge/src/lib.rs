@@ -341,13 +341,31 @@ impl Coordinator {
 pub async fn execute_scoped<F, T>(
     work: F,
     timeout: std::time::Duration,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    execute_until_cancelled(
+        async {
+            tokio::time::timeout(timeout, work)
+                .await
+                .unwrap_or_else(|_| Err("merge execution deadline exceeded".into()))
+        },
+        cancel,
+    )
+    .await
+}
+
+/// The caller supplies a real-progress watchdog. Cancellation drops the storage
+/// future before returning, without a total runtime ceiling on useful work.
+pub async fn execute_until_cancelled<F, T>(
+    work: F,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    // Keep the work in this inner scope: select! only drops branch borrows when
-    // the future was pinned outside it, which would publish completion too soon.
     tokio::select! {
         biased;
         _ = async {
@@ -356,8 +374,7 @@ where
                 if cancel.changed().await.is_err() { std::future::pending::<()>().await; }
             }
         } => Err("merge execution cancelled".into()),
-        result = tokio::time::timeout(timeout, work) =>
-            result.unwrap_or_else(|_| Err("merge execution deadline exceeded".into())),
+        result = work => result,
     }
 }
 

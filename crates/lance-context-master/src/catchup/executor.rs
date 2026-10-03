@@ -83,19 +83,9 @@ async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> 
     let budget = MergeMemoryBudget::new(config.merge_memory_bytes);
     let mut total = 0usize;
     let started = tokio::time::Instant::now();
-    // Leave time for the last admitted operation and commit draining. A long
-    // table should finish a useful slice, not repeatedly hit the hard deadline.
-    let maintenance = &state.config.maintenance;
-    let reserve = maintenance
-        .maintenance_idle_timeout_secs
-        .min(maintenance.maintenance_timeout_secs / 2)
-        .saturating_add(maintenance.maintenance_drain_timeout_secs);
-    let admit_for = Duration::from_secs(
-        maintenance
-            .maintenance_timeout_secs
-            .saturating_sub(reserve)
-            .max(1),
-    );
+    // This is only an admission time slice. A progressing operation already
+    // admitted may run beyond it; cancellation is based on lack of progress.
+    let admit_for = Duration::from_secs(config.slice_secs);
     // Bound each slice even under continuous ingestion; later fresh stats may
     // request another Job. Visit every shard before repeating any hot shard.
     for _ in 0..16 {

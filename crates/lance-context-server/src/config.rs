@@ -7,8 +7,7 @@ pub struct ServerConfig {
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
 
-    /// Maximum execution time AFTER slot acquisition. Already
-    /// started manifest writes must drain before ownership can be released.
+    /// Legacy wire field; owned merges now use the real-progress idle timeout.
     #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
     pub merge_execution_timeout_secs: u64,
 
