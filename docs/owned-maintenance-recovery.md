@@ -72,10 +72,12 @@ still use their durable retry budgets; successful work on another shard cannot
 reset those budgets. This also drains historical batches when no new writes or
 stats sweeps arrive.
 
-Workers use `OWNED_MERGE_AFTER_GENERATIONS` (default 32, 0 disables) to request work
+Workers use `OWNED_MERGE_AFTER_GENERATIONS` (0 disables) to request work
 for explicitly selected owned targets from the existing flush timer. The check
 reads only this worker's shard manifest, without loading WAL payloads or taking a
-merge slot. This threshold is independent of `ROLLOUT_MERGE_AFTER_GENERATIONS`,
+merge slot. Unset, it inherits a positive `ROLLOUT_MERGE_AFTER_GENERATIONS` or
+uses 32 when legacy count-triggered merging is disabled. An explicit threshold
+is independent of `ROLLOUT_MERGE_AFTER_GENERATIONS`,
 which can remain 0 for legacy targets during a per-table rollout. The flush timer
 must be enabled. Draining targets request no new work. Count thresholds bound
 triggering per shard, not total table pending or merge memory.
