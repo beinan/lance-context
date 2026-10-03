@@ -7,6 +7,14 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_DELAY: Duration = Duration::from_millis(250);
 const RETRY_DELAY: Duration = Duration::from_secs(2);
 const ATTEMPTS: usize = 3;
+const OWNER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const OWNER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNER_PROBE_FAILURES: u8 = 3;
+
+#[derive(serde::Deserialize)]
+struct ExecutorIdentity {
+    instance: String,
+}
 
 #[derive(serde::Deserialize)]
 struct Capabilities {
@@ -415,6 +423,8 @@ async fn reconcile_with_grace(
     let mut deadlines = Deadlines::new(&initial, tokio::time::Instant::now());
     let mut cancel_started = cancel_immediately.then(tokio::time::Instant::now);
     let mut next_cancel = tokio::time::Instant::now();
+    let mut next_probe = tokio::time::Instant::now() + OWNER_PROBE_INTERVAL;
+    let mut failed_probes = 0;
     loop {
         // Losing etcd responses must not turn this into an unbounded scheduler
         // wait. Ownership remains durable when the reconciliation slot exits.
@@ -454,10 +464,62 @@ async fn reconcile_with_grace(
         }
         if cancel_started.is_none() {
             if let Ok(Some(progress)) = coordinator.progress(&current).await {
+                if deadlines
+                    .sequence
+                    .is_none_or(|previous| progress.sequence > previous)
+                {
+                    // Completed work outweighs an unavailable HTTP endpoint.
+                    failed_probes = 0;
+                }
                 deadlines.observe(progress.sequence, tokio::time::Instant::now());
             }
             if deadlines.expired(tokio::time::Instant::now()) {
                 cancel_started = Some(tokio::time::Instant::now());
+            }
+        }
+        if tokio::time::Instant::now() >= next_probe {
+            let probe = async {
+                http.get(format!(
+                    "{}/api/v1/internal/merge-executor",
+                    current.endpoint.trim_end_matches('/')
+                ))
+                .timeout(OWNER_PROBE_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ExecutorIdentity>()
+                .await
+            }
+            .await;
+            next_probe = tokio::time::Instant::now() + OWNER_PROBE_INTERVAL;
+            let reason = match probe {
+                Ok(identity) if identity.instance == current.instance => {
+                    failed_probes = 0;
+                    None
+                }
+                Ok(_) => Some("merge executor incarnation changed"),
+                Err(_) => {
+                    failed_probes += 1;
+                    (failed_probes >= OWNER_PROBE_FAILURES)
+                        .then_some("merge executor unreachable without progress")
+                }
+            };
+            if let Some(reason) = reason {
+                if current.phase == Phase::Reserved {
+                    // No execution has started. CAS cancellation either wins
+                    // admission or the next observation sees the running owner.
+                    let _ = coordinator.cancel_reserved(&current).await;
+                    continue;
+                }
+                // This is a reason to revoke admission and run the storage
+                // barrier, never permission to release ownership directly.
+                let error = format!("merge ownership unresolved: {reason}; recovery required");
+                coordinator
+                    .record_failure(proof, &current.target, &current.endpoint, &error)
+                    .await?;
+                tracing::warn!(target = %current.target, endpoint = %current.endpoint,
+                    id = %current.id, %reason, "recovering lost merge executor before execution deadline");
+                return Err(error);
             }
         }
         if cancel_started.is_some() && tokio::time::Instant::now() >= next_cancel {
@@ -729,6 +791,106 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn verify_lost_executor(restarted: bool) {
+        let (coordinator, proof) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = if restarted {
+            Router::new().route(
+                "/api/v1/internal/merge-executor",
+                get(|| async { Json(serde_json::json!({"instance": "new-process"})) }),
+            )
+        } else {
+            Router::new()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let execution = Execution::new("table", &endpoint, "old-process", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let error = tokio::time::timeout(
+            Duration::from_secs(if restarted { 15 } else { 40 }),
+            reconcile(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                running.clone(),
+                false,
+            ),
+        )
+        .await
+        .expect("lost executor must be detected before the 600-second idle timeout")
+        .unwrap_err();
+        assert!(
+            error.contains(if restarted {
+                "incarnation changed"
+            } else {
+                "unreachable"
+            }),
+            "{error}"
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
+        assert!(!coordinator
+            .reserve(&proof, &Execution::new("table", "other", "new", 3600))
+            .await
+            .unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn restarted_executor_is_detected_before_idle_deadline() {
+        verify_lost_executor(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn unreachable_executor_is_detected_before_idle_deadline() {
+        verify_lost_executor(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn real_progress_prevents_takeover_when_http_probes_fail() {
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "worker", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let publisher = coordinator.clone();
+        let working = running.clone();
+        let work = tokio::spawn(async move {
+            for step in 1..=35 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(publisher.publish_progress(&working, step).await.unwrap());
+            }
+            assert!(publisher.finish(&working, Ok(7)).await.unwrap());
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                reconcile(
+                    &reqwest::Client::new(),
+                    &coordinator,
+                    &proof,
+                    running,
+                    false
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            7
+        );
+        work.await.unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert!(coordinator
+            .failure("table", &execution.endpoint)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

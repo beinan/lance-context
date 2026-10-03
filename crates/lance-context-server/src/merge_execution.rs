@@ -267,7 +267,7 @@ async fn run(
             dataset_uri: uri.clone(),
         }),
     );
-    let outcome = std::panic::AssertUnwindSafe(async {
+    let execute = async {
         // No payload work starts before admission to the process-wide slot.
         slot = execute_scoped(
             async { Ok(state.acquire_merge_slot().await) },
@@ -290,6 +290,12 @@ async fn run(
             cancelled,
         )
         .await
+    };
+    let outcome = std::panic::AssertUnwindSafe(async {
+        tokio::select! {
+            result = execute => result,
+            error = watch_ownership(&coordinator, &running) => Err(error),
+        }
     })
     .catch_unwind()
     .await
@@ -363,6 +369,24 @@ async fn run(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(())
+}
+
+// Check independently of progress and slot admission. A revoked executor may
+// be stuck before its first checkpoint, and the HTTP cancel may never arrive.
+// This only cancels preparation; the caller still drains or fences admitted
+// storage writes before releasing the merge slot and publishing a terminal state.
+async fn watch_ownership(coordinator: &Coordinator, execution: &Execution) -> String {
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match tokio::time::timeout(Duration::from_secs(2), coordinator.get(&execution.target)).await
+        {
+            Ok(Ok(Some(current))) if current == *execution => {}
+            Ok(Ok(_)) => return "merge ownership revoked during execution".into(),
+            // An unavailable coordinator is not evidence of a completed fence.
+            // Queue, idle and total execution deadlines remain independent.
+            _ => {}
+        }
+    }
 }
 
 async fn watch_progress(
@@ -559,6 +583,82 @@ mod tests {
         assert_eq!(state.merge_slots.as_ref().unwrap().available_permits(), 1);
         drop(held);
         state.merge_executions.shutdown().await;
+    }
+
+    // No cancel HTTP request is sent in either case. Revocation must interrupt
+    // both slot wait and a merge that cannot reach even its first checkpoint.
+    async fn revoked_executor_exits(queue_blocked: bool) {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let store = state.get_or_open_rollout_store("hot").await.unwrap();
+        let held_store = store.write().await;
+        let held_slot = if queue_blocked {
+            state.acquire_merge_slot().await
+        } else {
+            None
+        };
+        let execution = Execution::new("hot", "worker", &state.merge_executions.instance, 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        start(State(state.clone()), Json(execution.clone()))
+            .await
+            .unwrap();
+        let running = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = coordinator.get("hot").await.unwrap().unwrap();
+                if current.phase == Phase::Running
+                    && (queue_blocked || coordinator.progress(&current).await.unwrap().is_some())
+                {
+                    break current;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while !state.merge_executions.running.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("revoked executor must stop without waiting for idle/queue timeout");
+        assert_eq!(
+            state.merge_slots.as_ref().unwrap().available_permits(),
+            usize::from(!queue_blocked)
+        );
+        // Local task exit alone does not unlock the table or acknowledge the
+        // storage barrier. An attempted replacement is still rejected.
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(frozen.clone()));
+        let replacement = Execution::new("hot", "worker", &state.merge_executions.instance, 3600);
+        assert!(!coordinator.reserve(&proof, &replacement).await.unwrap());
+        let watermarks = coordinator.watermarks(&frozen).await.unwrap();
+        assert!(watermarks.versions.is_empty());
+        // There were no admitted writes, so the storage barrier is empty.
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("hot").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        drop(held_slot);
+        drop(held_store);
+        assert!(coordinator.reserve(&proof, &replacement).await.unwrap());
+        start(State(state.clone()), Json(replacement))
+            .await
+            .unwrap();
+        let finished = terminal(&coordinator).await;
+        assert!(finished.error.is_none(), "{finished:?}");
+        assert!(coordinator.release(&proof, &finished).await.unwrap());
+        state.merge_executions.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn revoked_executor_stops_while_waiting_for_a_slot() {
+        revoked_executor_exits(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn revoked_executor_stops_without_any_progress() {
+        revoked_executor_exits(false).await;
     }
 
     #[tokio::test]

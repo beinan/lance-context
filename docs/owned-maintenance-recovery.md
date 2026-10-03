@@ -59,3 +59,28 @@ this change cannot retroactively fence an old unguarded write. It does not enabl
 owned targets, alter production pods, or complete registry migration. Recovery
 continues on draining targets while an owned execution remains. Validate large
 table timings and fault recovery before selecting tighter deadlines.
+
+## Prompt worker loss detection
+
+For owned WAL merges, the master probes the executor identity every 10 seconds
+with a two-second request timeout. A changed process incarnation triggers storage
+recovery on the next probe. Three consecutive failed probes without observed
+merge progress also trigger recovery (normally about 30–36 seconds). A successful
+probe or a newly completed merge step clears the failed-probe count. These are
+recovery triggers, not evidence that a remote storage commit has stopped: the
+existing version barrier must still succeed before a replacement can write.
+
+Workers independently check execution ownership every two seconds, including
+while waiting for a merge slot and before the first processing checkpoint. A
+revoked execution cancels its work even when its cancel HTTP request was lost.
+The merge slot remains held until admitted storage writes drain or the durable
+storage barrier permits their cancellation. This terminates the individual merge
+execution, not the worker process or other tables' work.
+
+A live worker with no completed processing steps still uses
+`MERGE_IDLE_TIMEOUT_SECS` (default 600). Identity probes are not merge progress
+and cannot extend this deadline. Reduce that setting only after measuring the
+longest individual generation read or base-table write for the target workload;
+there is no sub-operation progress for a single long storage call. These changes
+do not activate ownership fencing for legacy tables, launch replacement pods, or
+provide an OS-level watchdog for a completely wedged worker process.
