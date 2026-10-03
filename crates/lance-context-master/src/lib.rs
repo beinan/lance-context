@@ -1,5 +1,6 @@
 //! Control-plane (master) library surface.
 
+pub mod catchup;
 pub mod config;
 pub mod discovery;
 pub mod error;

@@ -20,6 +20,7 @@ pub(crate) fn retry_kind(endpoint: &str) -> Option<TaskKind> {
         MaintenanceKind::Compact => Some(TaskKind::Compact),
         MaintenanceKind::IndexId => Some(TaskKind::IndexId),
         MaintenanceKind::Repair => Some(TaskKind::Repair),
+        MaintenanceKind::Catchup => Some(TaskKind::MergeWal),
     }
 }
 
@@ -154,7 +155,22 @@ where
         return work.await;
     }
     let maintenance = kind(claim.task.kind).ok_or("invalid local maintenance kind")?;
-    let uri = state.rollout_uri(&claim.task.target);
+    run_as(state, claim, maintenance, work).await
+}
+
+pub(crate) async fn run_as<F>(
+    state: &Arc<MasterState>,
+    claim: &TaskClaim,
+    maintenance: MaintenanceKind,
+    work: F,
+) -> Result<String, String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let uri = match claim.task.target.strip_prefix("generic:") {
+        Some(name) => state.generic_uri(name),
+        None => state.rollout_uri(&claim.task.target),
+    };
     if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
         return Err("invalid storage backend for maintenance fencing".into());
     }

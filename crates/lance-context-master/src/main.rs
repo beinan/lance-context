@@ -34,6 +34,14 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Some(target) = config.catchup.target.clone() {
+        if let Err(error) = lance_context_master::catchup::execute(config, &target).await {
+            tracing::error!(%target, %error, "dedicated catch-up failed");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let ui_dir = config.ui_dir.clone();
 
     let state = match MasterState::new(config).await {
@@ -49,6 +57,7 @@ async fn main() {
 
     // Durable scheduler poller (+ optional coordinated auto-sweep).
     let _scheduler = scheduler::spawn_scheduler(&state);
+    let _catchup = lance_context_master::catchup::spawn(&state);
 
     let mut app = Router::new().nest("/api/v1", routes::api_router());
 

@@ -1,0 +1,15 @@
+{
+  "containers": [
+    {
+      "name": "executor",
+      "image": "YOUR_REGISTRY/lance-context@sha256:REPLACE_WITH_TESTED_IMAGE_DIGEST",
+      "command": ["/usr/local/bin/lance-context-master"],
+      "envFrom": [{"secretRef": {"name": "lance-storage-credentials"}}],
+      "resources": {
+        "requests": {"cpu": "2", "memory": "8Gi"},
+        "limits": {"cpu": "2", "memory": "8Gi"}
+      },
+      "securityContext": {"allowPrivilegeEscalation": false}
+    }
+  ]
+}

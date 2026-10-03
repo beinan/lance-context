@@ -291,13 +291,30 @@ impl TaskStore {
     /// saturated one.
     pub async fn claim_next_of_kinds(&self, kinds: TaskKinds) -> lance::Result<Option<TaskClaim>> {
         self.inner.recover_orphaned().await?;
-        let (claim, dependency_failed) = self.inner.claim_next(kinds).await?;
+        let (claim, dependency_failed) = self.inner.claim_next(kinds, None).await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
             }
         }
         Ok(claim)
+    }
+
+    /// Claim exactly this target, never consuming another table's queue entry.
+    pub(crate) async fn claim_merge_target(
+        &self,
+        target: &str,
+        job: &str,
+    ) -> lance::Result<Option<TaskClaim>> {
+        self.inner.recover_orphaned().await?;
+        let Some(id) = self.get_active_id(TaskKind::MergeWal, target).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .inner
+            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)))
+            .await?
+            .0)
     }
 
     /// Finish a claimed task and release its claim/target lock.
@@ -587,9 +604,19 @@ impl EtcdTaskStore {
             .map_err(|_| lance::Error::io("etcd returned an invalid queue count"))
     }
 
-    async fn claim_next(&self, kinds: TaskKinds) -> lance::Result<(Option<TaskClaim>, bool)> {
-        let prefix = self.queue_prefix();
-        let range_end = prefix_range_end(prefix.as_bytes());
+    async fn claim_next(
+        &self,
+        kinds: TaskKinds,
+        only_id: Option<(&str, &str)>,
+    ) -> lance::Result<(Option<TaskClaim>, bool)> {
+        let prefix = only_id.map_or_else(|| self.queue_prefix(), |(id, _)| self.queue_key(id));
+        let range_end = if only_id.is_some() {
+            let mut end = prefix.as_bytes().to_vec();
+            end.push(0);
+            end
+        } else {
+            prefix_range_end(prefix.as_bytes())
+        };
         let mut start_key = prefix.into_bytes();
         let mut dependency_failed = false;
 
@@ -667,6 +694,13 @@ impl EtcdTaskStore {
                     Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
                     Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
                 ];
+                let catchup_key = crate::catchup::store::active_key(&self.prefix, &task.target);
+                if requires_target_lock(task.kind) {
+                    compares.push(match only_id {
+                        Some((_, job)) => Compare::value(catchup_key, CompareOp::Equal, job),
+                        None => Compare::version(catchup_key, CompareOp::Equal, 0),
+                    });
+                }
                 if let Some(key) = &target_key {
                     if let Some(execution) = &merge_execution {
                         compares.push(Compare::value(
@@ -1471,6 +1505,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            catchup: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),

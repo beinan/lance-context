@@ -10,6 +10,8 @@ pub struct MasterConfig {
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
     #[command(flatten)]
     pub maintenance: MaintenanceConfig,
+    #[command(flatten)]
+    pub catchup: crate::catchup::CatchupConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,

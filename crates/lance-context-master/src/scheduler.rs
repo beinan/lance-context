@@ -942,6 +942,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            catchup: Default::default(),
             maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {
                 owned_targets: ["exp", "generic:gs", "broken"]

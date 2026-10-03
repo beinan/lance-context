@@ -124,6 +124,7 @@ impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
     pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
+        config.catchup.validate().map_err(lance::Error::io)?;
         if config.maintenance.maintenance_timeout_secs == 0
             || config.maintenance.maintenance_idle_timeout_secs == 0
             || config.maintenance.maintenance_drain_timeout_secs == 0
@@ -281,6 +282,7 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            catchup: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),

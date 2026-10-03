@@ -40,6 +40,7 @@ pub enum MaintenanceKind {
     Compact,
     IndexId,
     Repair,
+    Catchup,
 }
 
 impl MaintenanceKind {
@@ -48,6 +49,7 @@ impl MaintenanceKind {
             Self::Compact => "master:compact",
             Self::IndexId => "master:index_id",
             Self::Repair => "master:repair",
+            Self::Catchup => "master:catchup",
         }
     }
     pub fn from_endpoint(endpoint: &str) -> Option<Self> {
@@ -55,6 +57,7 @@ impl MaintenanceKind {
             "master:compact" => Some(Self::Compact),
             "master:index_id" => Some(Self::IndexId),
             "master:repair" => Some(Self::Repair),
+            "master:catchup" => Some(Self::Catchup),
             _ => None,
         }
     }
@@ -534,6 +537,7 @@ mod tests {
             MaintenanceKind::Compact,
             MaintenanceKind::IndexId,
             MaintenanceKind::Repair,
+            MaintenanceKind::Catchup,
         ] {
             let mut local = legacy.clone();
             local.maintenance = Some(kind);

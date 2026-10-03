@@ -710,6 +710,10 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/experiments/{name}/compact/status", get(compact_status))
         .route("/experiments/{name}/rescan", post(rescan_experiment))
         .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route(
+            "/catchup",
+            post(crate::catchup::trigger).get(crate::catchup::status),
+        )
         .route("/scheduler/cooldowns", get(list_cooldowns))
         .route("/scheduler/repairs", get(list_repairs))
         .route("/registry/diff", get(registry_diff))
@@ -774,6 +778,7 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            catchup: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
