@@ -451,7 +451,12 @@ async fn stale_progress_revoke_cannot_cancel_advancing_or_replaced_execution() {
     execution.maintenance = Some(lance_context_merge::MaintenanceKind::Catchup);
     let proof = state.task_store.merge_claim(&claim);
     assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+    let record = inventory.get("hot").await.unwrap().unwrap();
+    let queued = progress::sample(&state, &record).await.unwrap();
     let running = coordinator.start(&execution).await.unwrap().unwrap();
+    // Starting the same execution changes its phase before its first progress
+    // publication. The old queued sample must not cancel this fresh executor.
+    assert!(!progress::revoke(&state, &record, &queued).await.unwrap());
     assert!(coordinator.publish_progress(&running, 1).await.unwrap());
     let record = inventory.get("hot").await.unwrap().unwrap();
     let old = progress::sample(&state, &record).await.unwrap();

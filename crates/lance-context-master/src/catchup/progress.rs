@@ -52,7 +52,8 @@ pub(super) async fn revoke(
     match current {
         Some(execution)
             if observed.execution.as_deref() == Some(&execution.id)
-                && execution.instance == record.job =>
+                && execution.instance == record.job
+                && format!("{:?}", execution.phase) == observed.phase =>
         {
             if execution.phase == lance_context_merge::Phase::Running {
                 coordinator
