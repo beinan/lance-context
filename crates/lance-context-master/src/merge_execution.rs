@@ -429,9 +429,6 @@ async fn reconcile_with_grace(
     loop {
         // Losing etcd responses must not turn this into an unbounded scheduler
         // wait. Ownership remains durable when the reconciliation slot exits.
-        if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
-            cancel_started = Some(tokio::time::Instant::now());
-        }
         if cancel_started.is_some_and(|at| at.elapsed() >= grace) {
             let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained pending storage version recovery";
             coordinator
@@ -443,6 +440,11 @@ async fn reconcile_with_grace(
             Ok(Some(current)) if current.id == initial.id => current,
             Ok(_) => return Err("merge execution ownership changed during reconciliation".into()),
             Err(error) => {
+                // Bound an unavailable coordinator independently. On successful
+                // reads, sample progress before evaluating the idle deadline.
+                if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
+                    cancel_started = Some(tokio::time::Instant::now());
+                }
                 tracing::warn!(target = %initial.target, %error, "cannot confirm merge completion; retaining execution fence");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;

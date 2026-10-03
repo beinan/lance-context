@@ -71,14 +71,14 @@ and idle limits must also be positive.
 The worker counts completed nonempty batch reads and successful manifest commits,
 excluding conditional-write conflicts and failed storage operations. It publishes a changed sequence at most once a second, guarded by
 execution ownership. The master tracks the same sequence with bounded RPC
-allowance. Repeated heartbeats do not extend the idle limit, and progressing
-work cannot extend the total ceiling. A missing progress record means the
+allowance. Repeated heartbeats do not extend the idle limit. Progressing work
+may continue beyond the legacy total ceiling. A missing progress record means the
 executor has not reported acquiring its slot. Readiness and these intermediate
 checkpoints are NOT proof of WAL reclamation; only committed shard drains are.
 
 Progress observation is coarse inside opaque Lance index/build/storage calls.
 A single such operation exceeding the idle threshold can still be cancelled.
-Measure its p99 on realistic blobs and tune the idle/total limits before enabling
+Measure its p99 on realistic blobs and tune the idle limit before enabling
 a large target. These defaults are not production throughput measurements.
 Cancellation retains the slot until leaf commits drain or a barrier proves them
 fenced. It does not restart the pod. An etcd outage cannot indefinitely occupy a
