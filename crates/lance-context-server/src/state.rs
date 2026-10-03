@@ -370,6 +370,7 @@ impl AppState {
                 config.merge_execution_timeout_secs,
                 config.merge_queue_timeout_secs,
                 config.merge_idle_timeout_secs,
+                config.owned_merge_after_generations,
             ),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
