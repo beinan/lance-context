@@ -51,8 +51,12 @@ eight generations and 64 MiB per batch, and a 1 GiB merge-buffer budget. These
 are buffering bounds, not a total RSS guarantee: one indivisible generation and
 Lance working memory can exceed the buffer bound. Kubernetes limits provide the
 final process bound. Validate real large generations before increasing concurrency.
-A slice visits every configured shard up to 16 times, stopping early when a
-whole pass reclaims nothing. Further fresh pressure can request another slice.
+A slice visits configured shards up to 16 times, stopping early when a
+whole pass reclaims nothing or the admission time budget ends. It reserves time
+for the last admitted operation and commit drain before the hard deadline. Each
+Job rotates the starting shard using a durable attempt number, including after
+failures, so a slow first shard cannot always hide the rest. Further fresh
+pressure can request another slice.
 
 ## Agent/API contract
 

@@ -136,11 +136,16 @@ impl MasterState {
         let task_store = TaskStore::open(&config).await?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
-        let init_guard = loop {
-            if let Some(guard) = task_store.try_coordination_lock("state-init").await? {
-                break guard;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let dedicated = config.catchup.target.is_some();
+        let init_guard = if dedicated {
+            None
+        } else {
+            Some(loop {
+                if let Some(guard) = task_store.try_coordination_lock("state-init").await? {
+                    break guard;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            })
         };
         let base_uri = config.data_dir.clone();
         let rollout_session = build_rollout_session(config.rollout_cache_bytes);
@@ -159,35 +164,41 @@ impl MasterState {
             &config.registry,
         )
         .await?;
-        let backfilled = discovery::backfill_registry(&config.data_dir, &*registry).await?;
-        if backfilled > 0 {
-            tracing::info!(
-                experiments = backfilled,
-                "backfilled rollout registry from data directory"
-            );
-        }
-        // With a mirror configured, seed it from the primary so a backend
-        // switch finds every store already there. Repeated on every
-        // maintenance round; this covers the very first start.
-        for (label, reg) in [
-            ("rollout", &registry),
-            ("generic", &generic_registry),
-            ("datagen", &datagen_registry),
-        ] {
-            if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
-                match backfill_registry(&*m.primary, &*m.mirror).await {
-                    Ok(copied) if copied > 0 => {
-                        tracing::info!(registry = label, copied, "seeded registry mirror")
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(registry = label, %error, "registry mirror seed failed")
+        // A dedicated one-table executor must not scan/backfill the whole
+        // registry or delay ordinary master startup behind its initialization.
+        if !dedicated {
+            let backfilled = discovery::backfill_registry(&config.data_dir, &*registry).await?;
+            if backfilled > 0 {
+                tracing::info!(
+                    experiments = backfilled,
+                    "backfilled rollout registry from data directory"
+                );
+            }
+            // With a mirror configured, seed it from the primary so a backend
+            // switch finds every store already there. Repeated on every
+            // maintenance round; this covers the very first start.
+            for (label, reg) in [
+                ("rollout", &registry),
+                ("generic", &generic_registry),
+                ("datagen", &datagen_registry),
+            ] {
+                if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
+                    match backfill_registry(&*m.primary, &*m.mirror).await {
+                        Ok(copied) if copied > 0 => {
+                            tracing::info!(registry = label, copied, "seeded registry mirror")
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(registry = label, %error, "registry mirror seed failed")
+                        }
                     }
                 }
             }
         }
         let stats = StatsStore::open_or_create(&stats_uri, None).await?;
-        task_store.release_coordination_lock(init_guard).await?;
+        if let Some(guard) = init_guard {
+            task_store.release_coordination_lock(guard).await?;
+        }
         let state = Arc::new(Self {
             registry,
             generic_registry,

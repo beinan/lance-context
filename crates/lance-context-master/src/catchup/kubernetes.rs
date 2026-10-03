@@ -178,6 +178,11 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let mut shards = config.catchup.shards.clone();
+    if !shards.is_empty() {
+        let start = record.attempt.saturating_sub(1) as usize % shards.len();
+        shards.rotate_left(start);
+    }
     let overrides = [
         ("DATA_DIR", config.data_dir.clone()),
         ("ETCD_ENDPOINTS", config.etcd.etcd_endpoints.join(",")),
@@ -185,7 +190,7 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
         ("CATCHUP_ENABLED", "false".into()),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
-        ("CATCHUP_SHARDS", config.catchup.shards.join(",")),
+        ("CATCHUP_SHARDS", shards.join(",")),
         (
             "CATCHUP_MERGE_MAX_BYTES",
             config.catchup.merge_max_bytes.to_string(),
@@ -300,6 +305,7 @@ mod tests {
             target: "hot".into(),
             job: "lc-catchup-test".into(),
             slot: 0,
+            attempt: 1,
             active: true,
             reason: "test".into(),
             pending_at_admission: 1000,

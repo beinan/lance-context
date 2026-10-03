@@ -57,6 +57,7 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
         target: "hot".into(),
         job: "lc-catchup-test".into(),
         slot: 0,
+        attempt: 1,
         active: true,
         reason: "test".into(),
         pending_at_admission: 1000,
@@ -89,6 +90,16 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     assert_eq!(
         env.iter().find(|e| e["name"] == "CATCHUP_ENABLED").unwrap()["value"],
         "false"
+    );
+    let mut next = r.clone();
+    next.attempt = 2;
+    let next_job = kubernetes::render_job(&c, &next, template());
+    let env = next_job["spec"]["template"]["spec"]["containers"][0]["env"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        env.iter().find(|e| e["name"] == "CATCHUP_SHARDS").unwrap()["value"],
+        "worker-1,worker-0"
     );
 }
 async fn fixture() -> Option<(tempfile::TempDir, Arc<MasterState>)> {
@@ -354,6 +365,7 @@ async fn repeated_failed_jobs_keep_backoff_across_controller_restarts() {
             "reserved"
         );
         let record = inventory.get("hot").await.unwrap().unwrap();
+        assert_eq!(record.attempt, u64::from(attempt));
         inventory.complete(&record, false, now + 1).await.unwrap();
         let persisted = Inventory::new(&state).get("hot").await.unwrap().unwrap();
         assert_eq!(persisted.consecutive_failures, attempt);

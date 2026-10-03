@@ -82,11 +82,30 @@ async fn merge_passes(state: &Arc<MasterState>, target: &str) -> Result<String> 
     let session = RolloutStore::build_session(96 * 1024 * 1024, 32 * 1024 * 1024);
     let budget = MergeMemoryBudget::new(config.merge_memory_bytes);
     let mut total = 0usize;
+    let started = tokio::time::Instant::now();
+    // Leave time for the last admitted operation and commit draining. A long
+    // table should finish a useful slice, not repeatedly hit the hard deadline.
+    let maintenance = &state.config.maintenance;
+    let reserve = maintenance
+        .maintenance_idle_timeout_secs
+        .min(maintenance.maintenance_timeout_secs / 2)
+        .saturating_add(maintenance.maintenance_drain_timeout_secs);
+    let admit_for = Duration::from_secs(
+        maintenance
+            .maintenance_timeout_secs
+            .saturating_sub(reserve)
+            .max(1),
+    );
     // Bound each slice even under continuous ingestion; later fresh stats may
     // request another Job. Visit every shard before repeating any hot shard.
     for _ in 0..16 {
         let before = total;
         for shard in &config.shards {
+            if started.elapsed() >= admit_for {
+                return Ok(format!(
+                    "dedicated catch-up slice merged {total} generations"
+                ));
+            }
             let reclaimed = if let Some(name) = target.strip_prefix("generic:") {
                 let options = GenericStoreOptions {
                     shard_id: Some(shard.clone()),
