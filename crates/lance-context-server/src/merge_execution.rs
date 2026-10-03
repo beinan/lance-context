@@ -267,7 +267,9 @@ async fn run(
             dataset_uri: uri.clone(),
         }),
     );
-    let execute = async {
+    // Erase the nested merge future so adding the independent watchdog does
+    // not exceed the compiler's async layout recursion limit.
+    let execute: futures::future::BoxFuture<'_, Result<usize, String>> = Box::pin(async {
         // No payload work starts before admission to the process-wide slot.
         slot = execute_scoped(
             async { Ok(state.acquire_merge_slot().await) },
@@ -290,7 +292,7 @@ async fn run(
             cancelled,
         )
         .await
-    };
+    });
     let outcome = std::panic::AssertUnwindSafe(async {
         tokio::select! {
             result = execute => result,
