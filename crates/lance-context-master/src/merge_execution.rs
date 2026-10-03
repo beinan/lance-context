@@ -202,6 +202,12 @@ pub(crate) async fn recover_execution(
     old: Execution,
 ) -> Result<(), String> {
     let result = async {
+        // Completion can race a failed identity probe or the end of cancel
+        // grace. A terminal executor needs release, not a new storage barrier.
+        if matches!(old.phase, Phase::Finished | Phase::Recovered) {
+            return coordinator.release(proof, &old).await?.then_some(())
+                .ok_or_else(|| "claim lost before releasing terminal merge execution".to_string());
+        }
         let frozen = coordinator.freeze(proof, &old).await?
             .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
         let watermarks = coordinator.watermarks(&frozen).await?;
@@ -760,6 +766,18 @@ mod tests {
             .authorize_commit(&running, &uri, "base", initial_version + 4)
             .await
             .is_err());
+
+        // A probe may decide to recover just as the executor publishes its
+        // terminal result. Release that result without trying to freeze it.
+        let completed = Execution::new("table", &lost, "late-completion", 1);
+        assert!(coordinator.reserve(&proof, &completed).await.unwrap());
+        let completed = coordinator.start(&completed).await.unwrap().unwrap();
+        assert!(coordinator.finish(&completed, Ok(0)).await.unwrap());
+        let completed = coordinator.get("table").await.unwrap().unwrap();
+        recover_execution(&state, &coordinator, &proof, completed)
+            .await
+            .unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
 
         // A mismatched worker namespace must remain fenced, never recover by
         // committing a barrier to an unrelated same-named table.
