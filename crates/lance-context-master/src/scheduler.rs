@@ -365,6 +365,39 @@ async fn watch_compaction_preparation(
     }
 }
 
+async fn wait_for_compaction_commit(
+    state: &Arc<MasterState>,
+    claim: &mut TaskClaim,
+) -> Result<(), String> {
+    let waiting = std::time::Instant::now();
+    loop {
+        if !state
+            .task_store
+            .preparation_owned(claim)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("compaction preparation claim lost before commit".into());
+        }
+        if state
+            .task_store
+            .promote_compaction(claim)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        // Check only after promotion has definitively declined. Never cancel
+        // an in-flight acquisition and mistake an accepted claim for a timeout.
+        if waiting.elapsed()
+            >= Duration::from_secs(state.config.maintenance.compaction_commit_wait_secs)
+        {
+            return Err("compaction commit ownership wait budget exhausted; reprepare".into());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn run_prepared_compaction(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
@@ -410,25 +443,7 @@ async fn run_prepared_compaction(
     }
     let waiting = std::time::Instant::now();
     tracing::info!(task = %claim.task.id, target = %claim.task.target, seconds = began.elapsed().as_secs_f64(), "compaction files ready; waiting for commit ownership");
-    loop {
-        if !state
-            .task_store
-            .preparation_owned(claim)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            return Err("compaction preparation claim lost before commit".into());
-        }
-        if state
-            .task_store
-            .promote_compaction(claim)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    wait_for_compaction_commit(state, claim).await?;
     metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit_wait")
         .record(waiting.elapsed().as_secs_f64());
     // No preparation handle is reused: only this scope may authorize metadata
@@ -1137,6 +1152,75 @@ mod tests {
             task_history_ttl_secs: 86_400,
             ui_dir: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_compact_yields_capacity_without_cancelling_busy_writer() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.compaction_prepare_targets = vec!["exp".into()];
+        cfg.maintenance.compaction_commit_wait_secs = 0;
+        let state = MasterState::new(cfg).await.unwrap();
+        enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let mut prep = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let merge = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let merge_id = merge.task.id.clone();
+        let error = wait_for_compaction_commit(&state, &mut prep)
+            .await
+            .unwrap_err();
+        assert!(error.contains("wait budget exhausted"));
+        state.task_store.finish(prep, Err(error)).await.unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get(&merge_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
+        // The other writer still owns its exact claim and can finish normally.
+        state
+            .task_store
+            .finish(merge, Ok("writer kept progressing".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get(&merge_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Done
+        );
+        enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let mut next = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_compaction_commit(&state, &mut next).await.unwrap();
+        state
+            .task_store
+            .finish(next, Ok("retry acquired free writer".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

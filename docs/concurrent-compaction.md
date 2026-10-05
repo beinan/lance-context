@@ -44,6 +44,11 @@ process lost before commit may leave unreferenced immutable files and its task
 is requeued after lease expiry. Files are never considered committed because
 encoding completed. A newly selected dedicated owner still excludes compaction
 publication. Preparation does not override maintenance dependencies or guards.
+`COMPACTION_COMMIT_WAIT_SECS` (default 120) bounds how long ready output retains
+local capacity while waiting for a writer. Exhaustion fails only this compact
+attempt, releases its preparation claim, and leaves the progressing writer
+untouched. A later compact replans; no prepared output is treated as committed.
+This admission budget is separate from the progress-based execution watchdog.
 
 Deployment can mix old and new masters: queue/task records retain their schema,
 and an expired preparation claim can be safely retried through either path.

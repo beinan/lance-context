@@ -325,6 +325,10 @@ pub struct MaintenanceConfig {
     /// source fragments invalidate preparation instead of being overwritten.
     #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
     pub compaction_prepare_targets: Vec<String>,
+    /// Yield prepared output after this long waiting for another table writer.
+    /// This limits local capacity retention; it never cancels the current writer.
+    #[arg(long, env = "COMPACTION_COMMIT_WAIT_SECS", default_value_t = 120)]
+    pub compaction_commit_wait_secs: u64,
     /// Legacy wire field; owned work now uses the real-progress idle timeout.
     #[arg(long, env = "MAINTENANCE_TIMEOUT_SECS", default_value_t = 3600)]
     pub maintenance_timeout_secs: u64,
@@ -339,6 +343,7 @@ impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
             compaction_prepare_targets: Vec::new(),
+            compaction_commit_wait_secs: 120,
             maintenance_timeout_secs: 3600,
             maintenance_idle_timeout_secs: 600,
             maintenance_drain_timeout_secs: 30,
