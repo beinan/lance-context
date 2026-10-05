@@ -1294,9 +1294,22 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn prepared_compact_runs_through_owned_commit_and_releases_both_claims() {
+        prepared_compact_commit_and_release(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_compact_runs_through_legacy_commit_and_releases_both_claims() {
+        prepared_compact_commit_and_release(false).await;
+    }
+
+    async fn prepared_compact_commit_and_release(owned: bool) {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.maintenance.compaction_prepare_targets = vec!["exp".into()];
+        if !owned {
+            cfg.merge_rollout.owned_targets.clear();
+        }
         let state = MasterState::new(cfg).await.unwrap();
         let uri = state.rollout_uri("exp");
         let mut store = RolloutStore::open(&uri).await.unwrap();
