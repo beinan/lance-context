@@ -320,6 +320,11 @@ mod tests {
 /// Deadlines for local table mutations on explicitly owned targets.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
+    /// Prepare rollout compaction files without holding the table write lock.
+    /// Explicit rollout targets or '*'; empty keeps legacy behavior. Updates to
+    /// source fragments invalidate preparation instead of being overwritten.
+    #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
+    pub compaction_prepare_targets: Vec<String>,
     /// Legacy wire field; owned work now uses the real-progress idle timeout.
     #[arg(long, env = "MAINTENANCE_TIMEOUT_SECS", default_value_t = 3600)]
     pub maintenance_timeout_secs: u64,
@@ -333,6 +338,7 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
+            compaction_prepare_targets: Vec::new(),
             maintenance_timeout_secs: 3600,
             maintenance_idle_timeout_secs: 600,
             maintenance_drain_timeout_secs: 30,

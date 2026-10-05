@@ -51,7 +51,7 @@ use lance::dataset::mem_wal::{
 };
 use lance::dataset::optimize::{
     commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionMode,
-    CompactionOptions,
+    CompactionOptions, RewriteResult,
 };
 use lance::dataset::{
     builder::DatasetBuilder, Dataset, MergeInsertBuilder, NewColumnTransform, WhenMatched,
@@ -111,17 +111,38 @@ pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// read unaffordable: at ~1,500 per shard, reads exhausted a 32 GiB worker.
 pub(crate) const DEFAULT_PENDING_GENERATIONS_WARN: usize = 256;
 
+/// Unpublished rewrite files. No dataset handle or commit authorization escapes
+/// preparation. A fresh, fenced handle must publish this result.
+#[derive(Debug)]
+pub struct PreparedCompaction {
+    read_version: u64,
+    uri: String,
+    schema: Schema,
+    options: CompactionOptions,
+    tasks: Vec<RewriteResult>,
+}
+
+impl PreparedCompaction {
+    pub fn read_version(&self) -> u64 {
+        self.read_version
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+}
+
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
 ///
 /// Lance's built-in `max_source_fragments` stops before a whole planned task
 /// that exceeds the budget. A long run of tiny fragments can therefore produce
 /// one oversized task and compact nothing. Truncating the public task data
 /// keeps the rewrite contiguous while guaranteeing incremental progress.
-async fn compact_files_incremental(
-    dataset: &mut Dataset,
+async fn prepare_compaction_files(
+    dataset: &Dataset,
     mut options: CompactionOptions,
     max_source_fragments: usize,
-) -> LanceResult<CompactionMetrics> {
+) -> LanceResult<Vec<RewriteResult>> {
     options.max_source_fragments = None;
     let plan = plan_compaction(dataset, &options).await?;
     let mut remaining = max_source_fragments;
@@ -137,7 +158,7 @@ async fn compact_files_incremental(
         }
     }
     if tasks.is_empty() {
-        return Ok(CompactionMetrics::default());
+        return Ok(Vec::new());
     }
 
     let concurrency = options.num_threads.unwrap_or(1).max(1);
@@ -151,6 +172,16 @@ async fn compact_files_incremental(
         .try_collect()
         .await?;
 
+    Ok(completed)
+}
+
+async fn compact_files_incremental(
+    dataset: &mut Dataset,
+    options: CompactionOptions,
+    max_source_fragments: usize,
+) -> LanceResult<CompactionMetrics> {
+    let completed =
+        prepare_compaction_files(dataset, options.clone(), max_source_fragments).await?;
     commit_compaction(
         dataset,
         completed,
@@ -1527,6 +1558,97 @@ impl StorageBase {
 
     // ------------------------------------------------- compaction & indexing
 
+    fn compaction_options(config: &CompactionConfig) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: config.target_rows_per_fragment,
+            max_rows_per_group: config.max_rows_per_group,
+            materialize_deletions: config.materialize_deletions,
+            materialize_deletions_threshold: config.materialize_deletions_threshold,
+            num_threads: config.num_threads,
+            max_bytes_per_file: config.max_bytes_per_file,
+            batch_size: config.batch_size,
+            max_source_fragments: config.max_source_fragments,
+            compaction_mode: config
+                .try_binary_copy
+                .then_some(CompactionMode::TryBinaryCopy),
+            // Every base table here carries a MemWAL index, which is fieldless
+            // (it tracks shard/generation bookkeeping, not a data column).
+            // Lance's inline index remap panics on a fieldless index ("An index
+            // existed with no fields"), so defer remapping: compaction records a
+            // fragment-reuse index and remaps lazily instead of touching the
+            // MemWAL index during the rewrite.
+            defer_index_remap: true,
+            ..Default::default()
+        }
+    }
+
+    /// Read a fixed snapshot and write new immutable files, without publishing.
+    /// Callers must forbid manifest commits while this future runs.
+    pub async fn prepare_compaction(
+        &self,
+        config: CompactionConfig,
+    ) -> LanceResult<PreparedCompaction> {
+        self.ensure_writable()?;
+        let options = Self::compaction_options(&config);
+        let tasks = prepare_compaction_files(
+            &self.dataset,
+            options.clone(),
+            config.max_source_fragments.unwrap_or(usize::MAX).max(1),
+        )
+        .await?;
+        Ok(PreparedCompaction {
+            read_version: self.dataset.version().version,
+            uri: self.dataset.uri().to_owned(),
+            schema: Schema::from(self.dataset.schema()),
+            options,
+            tasks,
+        })
+    }
+
+    /// Publish prepared files under a fresh owner. Preserve the original
+    /// RewriteResult read versions so Lance checks every intervening write.
+    pub async fn commit_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+    ) -> LanceResult<CompactionMetrics> {
+        self.ensure_writable()?;
+        self.dataset.checkout_latest().await?;
+        if prepared.uri != self.dataset.uri()
+            || prepared.schema != Schema::from(self.dataset.schema())
+        {
+            return Err(LanceError::invalid_input(
+                "compaction dataset or schema changed; reprepare",
+            ));
+        }
+        // Reject a stale rewrite before any ReserveFragments/index commit.
+        // Append-only merges leave these source fragments unchanged.
+        let sources: HashMap<_, _> = self
+            .dataset
+            .manifest()
+            .fragments
+            .iter()
+            .map(|f| (f.id, f))
+            .collect();
+        for task in &prepared.tasks {
+            for old in &task.original_fragments {
+                if sources.get(&old.id).copied() != Some(old) {
+                    return Err(LanceError::invalid_input(
+                        "compaction source fragment changed; reprepare",
+                    ));
+                }
+            }
+        }
+        let metrics = commit_compaction(
+            &mut self.dataset,
+            prepared.tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &prepared.options,
+        )
+        .await?;
+        self.reload().await?;
+        Ok(metrics)
+    }
+
     /// Compact the base table's small fragments into larger ones.
     ///
     /// Every WAL merge `append`s a new fragment to the base table, so a
@@ -1548,27 +1670,7 @@ impl StorageBase {
         self.ensure_writable()?;
         let config = options.unwrap_or_default();
 
-        let lance_options = CompactionOptions {
-            target_rows_per_fragment: config.target_rows_per_fragment,
-            max_rows_per_group: config.max_rows_per_group,
-            materialize_deletions: config.materialize_deletions,
-            materialize_deletions_threshold: config.materialize_deletions_threshold,
-            num_threads: config.num_threads,
-            max_bytes_per_file: config.max_bytes_per_file,
-            batch_size: config.batch_size,
-            max_source_fragments: config.max_source_fragments,
-            compaction_mode: config
-                .try_binary_copy
-                .then_some(CompactionMode::TryBinaryCopy),
-            // Every base table here carries a MemWAL index, which is fieldless
-            // (it tracks shard/generation bookkeeping, not a data column).
-            // Lance's inline index remap panics on a fieldless index ("An index
-            // existed with no fields"), so defer remapping: compaction records a
-            // fragment-reuse index and remaps lazily instead of touching the
-            // MemWAL index during the rewrite.
-            defer_index_remap: true,
-            ..Default::default()
-        };
+        let lance_options = Self::compaction_options(&config);
 
         let result = match config.max_source_fragments {
             Some(max_source_fragments) => {

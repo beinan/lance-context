@@ -54,6 +54,17 @@ impl TaskKinds {
         index_id: true,
     };
 
+    pub const COMPACT: Self = Self {
+        compact: true,
+        merge_wal: false,
+        index_id: false,
+    };
+
+    pub fn without_compact(mut self) -> Self {
+        self.compact = false;
+        self
+    }
+
     #[must_use]
     pub fn contains(self, kind: TaskKind) -> bool {
         match kind {
@@ -107,6 +118,8 @@ struct EtcdTaskStore {
     client: Client,
     prefix: String,
     lease_ttl: i64,
+    prepare_targets: Vec<String>,
+    rollout: lance_context_merge::rollout::MergeRollout,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -116,11 +129,18 @@ pub struct TaskClaim {
     backend: ClaimBackend,
 }
 
+impl TaskClaim {
+    pub(crate) fn preparing_compaction(&self) -> bool {
+        self.backend.preparation_key.is_some() && self.backend.target_key.is_none()
+    }
+}
+
 struct ClaimBackend {
     token: String,
     lease_id: i64,
     claim_key: String,
     target_key: Option<String>,
+    preparation_key: Option<String>,
     keepalive: LeaseKeepalive,
 }
 
@@ -148,6 +168,111 @@ impl Drop for LeaseKeepalive {
 }
 
 impl TaskStore {
+    pub(crate) async fn preparation_owned(&self, claim: &TaskClaim) -> lance::Result<bool> {
+        let Some(key) = &claim.backend.preparation_key else {
+            return Ok(false);
+        };
+        let values = self
+            .inner
+            .read_values(&[claim.backend.claim_key.clone(), key.clone()])
+            .await?;
+        Ok(values
+            .iter()
+            .all(|v| v.as_deref() == Some(claim.backend.token.as_bytes())))
+    }
+
+    /// Acquire the existing table writer protocol only after immutable files
+    /// are ready. An ambiguous response can adopt only this claim's own token.
+    pub(crate) async fn promote_compaction(&self, claim: &mut TaskClaim) -> lance::Result<bool> {
+        assert!(claim.preparing_compaction());
+        let b = &claim.backend;
+        let target = &claim.task.target;
+        let execution_key = lance_context_merge::execution_key(&self.inner.prefix, target);
+        let target_key = self.inner.target_lock_key(target);
+        let merge_key = execution_key.replace("/merge-executions/", "/merge-claims/");
+        let active_key = crate::catchup::store::active_key(&self.inner.prefix, target);
+        let values = self
+            .inner
+            .read_values(&[
+                execution_key.clone(),
+                target_key.clone(),
+                merge_key.clone(),
+                active_key.clone(),
+            ])
+            .await?;
+        let old: Option<lance_context_merge::Execution> = values[0]
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()
+            .map_err(|e| lance::Error::io(e.to_string()))?;
+        if values[2].is_some()
+            || values[3].is_some()
+            || old.as_ref().is_some_and(|e| e.maintenance.is_none())
+        {
+            return Ok(false);
+        }
+        let expected_owner = old.as_ref().map(lance_context_merge::execution_owner);
+        if values[1].as_deref() != expected_owner.as_deref().map(str::as_bytes) {
+            return Ok(false);
+        }
+        let mut compares = vec![
+            Compare::value(b.claim_key.as_str(), CompareOp::Equal, b.token.as_bytes()),
+            Compare::value(
+                b.preparation_key.as_ref().unwrap().as_str(),
+                CompareOp::Equal,
+                b.token.as_bytes(),
+            ),
+            Compare::version(merge_key.as_str(), CompareOp::Equal, 0),
+            Compare::version(active_key, CompareOp::Equal, 0),
+        ];
+        for (key, value) in [
+            (execution_key, &values[0]),
+            (target_key.clone(), &values[1]),
+        ] {
+            compares.push(match value {
+                Some(v) => Compare::value(key, CompareOp::Equal, v.clone()),
+                None => Compare::version(key, CompareOp::Equal, 0),
+            });
+        }
+        let opts = Some(PutOptions::new().with_lease(b.lease_id));
+        let mut writes = vec![TxnOp::put(
+            merge_key.clone(),
+            b.token.as_bytes(),
+            opts.clone(),
+        )];
+        if old.is_none() {
+            writes.push(TxnOp::put(target_key.clone(), b.token.as_bytes(), opts));
+        }
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(Txn::new().when(compares).and_then(writes))
+            .await;
+        let accepted = match response {
+            Ok(r) => r.succeeded(),
+            Err(error) => {
+                let values = self
+                    .inner
+                    .read_values(&[b.claim_key.clone(), merge_key, target_key.clone()])
+                    .await?;
+                if values[0].as_deref() == Some(b.token.as_bytes())
+                    && values[1].as_deref() == Some(b.token.as_bytes())
+                    && values[2].as_deref()
+                        == Some(expected_owner.as_deref().unwrap_or(&b.token).as_bytes())
+                {
+                    true
+                } else {
+                    return Err(etcd_error("promote compaction")(error));
+                }
+            }
+        };
+        if accepted {
+            claim.backend.target_key = Some(target_key);
+        }
+        Ok(accepted)
+    }
+
     pub(crate) fn merge_coordinator(&self) -> lance_context_merge::Coordinator {
         lance_context_merge::Coordinator::new(self.inner.client.clone(), self.inner.prefix.clone())
     }
@@ -525,6 +650,8 @@ impl EtcdTaskStore {
             client,
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
+            prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
+            rollout: config.merge_rollout.clone(),
         })
     }
 
@@ -677,6 +804,21 @@ impl EtcdTaskStore {
                     }
                 }
 
+                let preparing = task.kind == TaskKind::Compact
+                    && !task.target.starts_with("generic:")
+                    && !self.rollout.draining(&task.target)
+                    && self
+                        .prepare_targets
+                        .iter()
+                        .any(|t| t == "*" || t == &task.target);
+                let write_claim = requires_target_lock(task.kind) && !preparing;
+                let preparation_key = preparing.then(|| {
+                    format!(
+                        "{}/compact-preparations/{}",
+                        self.prefix,
+                        encode_segment(&task.target)
+                    )
+                });
                 let execution_key = lance_context_merge::execution_key(&self.prefix, &task.target);
                 let snapshot = self
                     .read_values(&[
@@ -685,6 +827,13 @@ impl EtcdTaskStore {
                         crate::catchup::store::active_key(&self.prefix, &task.target),
                         execution_key.replace("/merge-executions/", "/merge-claims/"),
                         self.claim_key(&task.id),
+                        preparation_key.clone().unwrap_or_else(|| {
+                            format!(
+                                "{}/compact-preparations/{}",
+                                self.prefix,
+                                encode_segment(&task.target)
+                            )
+                        }),
                     ])
                     .await?;
                 let merge_execution: Option<lance_context_merge::Execution> = snapshot[0]
@@ -699,7 +848,8 @@ impl EtcdTaskStore {
                     .map(lance_context_merge::execution_owner);
                 let expected_job = only_id.map(|(_, job)| job.as_bytes());
                 if snapshot[4].is_some()
-                    || (requires_target_lock(task.kind)
+                    || (preparing && (snapshot[5].is_some() || snapshot[2].is_some()))
+                    || (write_claim
                         && (snapshot[2].as_deref() != expected_job
                             || snapshot[3].is_some()
                             || snapshot[1].as_deref()
@@ -711,7 +861,8 @@ impl EtcdTaskStore {
                 // Only MergeWal reconciles a worker execution. A local fenced
                 // mutation may be recovered by any table writer after the
                 // exclusive reconciler lease has expired.
-                if task.kind != TaskKind::MergeWal
+                if !preparing
+                    && task.kind != TaskKind::MergeWal
                     && merge_execution
                         .as_ref()
                         .is_some_and(|e| e.maintenance.is_none())
@@ -730,8 +881,7 @@ impl EtcdTaskStore {
                     }
                 };
                 let claim_key = self.claim_key(&task.id);
-                let target_key =
-                    requires_target_lock(task.kind).then(|| self.target_lock_key(&task.target));
+                let target_key = write_claim.then(|| self.target_lock_key(&task.target));
                 let queue_key = self.queue_key(&task.id);
                 let running_key = self.running_key(&task.id);
                 let queued_value = encode_task(&task)?;
@@ -743,8 +893,16 @@ impl EtcdTaskStore {
                     Compare::version(claim_key.as_str(), CompareOp::Equal, 0),
                     Compare::version(queue_key.as_str(), CompareOp::Greater, 0),
                 ];
+                if let Some(key) = &preparation_key {
+                    compares.push(Compare::version(key.as_str(), CompareOp::Equal, 0));
+                    compares.push(Compare::version(
+                        crate::catchup::store::active_key(&self.prefix, &task.target),
+                        CompareOp::Equal,
+                        0,
+                    ));
+                }
                 let catchup_key = crate::catchup::store::active_key(&self.prefix, &task.target);
-                if requires_target_lock(task.kind) {
+                if write_claim {
                     compares.push(match only_id {
                         Some((_, job)) => Compare::value(catchup_key, CompareOp::Equal, job),
                         None => Compare::version(catchup_key, CompareOp::Equal, 0),
@@ -767,7 +925,7 @@ impl EtcdTaskStore {
                 let merge_claim_key =
                     lance_context_merge::execution_key(&self.prefix, &task.target)
                         .replace("/merge-executions/", "/merge-claims/");
-                if requires_target_lock(task.kind) {
+                if write_claim {
                     compares.push(Compare::version(
                         merge_claim_key.as_str(),
                         CompareOp::Equal,
@@ -781,7 +939,14 @@ impl EtcdTaskStore {
                     TxnOp::put(running_key, running_value, None),
                     TxnOp::put(claim_key.as_str(), token.as_bytes(), lease_options.clone()),
                 ];
-                if requires_target_lock(task.kind) {
+                if let Some(key) = &preparation_key {
+                    operations.push(TxnOp::put(
+                        key.as_str(),
+                        token.as_bytes(),
+                        lease_options.clone(),
+                    ));
+                }
+                if write_claim {
                     operations.push(TxnOp::put(
                         merge_claim_key,
                         token.as_bytes(),
@@ -821,6 +986,7 @@ impl EtcdTaskStore {
                                 lease_id,
                                 claim_key,
                                 target_key,
+                                preparation_key,
                                 keepalive,
                             },
                         }),
@@ -847,10 +1013,12 @@ impl EtcdTaskStore {
             lease_id,
             claim_key,
             target_key,
+            preparation_key,
             keepalive,
         } = claim.backend;
         let mut task = claim.task;
-        let unresolved = if requires_target_lock(task.kind) {
+        let owns_table = target_key.is_some();
+        let unresolved = if owns_table {
             lance_context_merge::Coordinator::new(self.client.clone(), self.prefix.clone())
                 .get(&task.target)
                 .await
@@ -864,12 +1032,15 @@ impl EtcdTaskStore {
             TxnOp::delete(claim_key.as_str(), None),
             TxnOp::delete(self.running_key(&task.id), None),
         ];
-        if requires_target_lock(task.kind) {
+        if owns_table {
             operations.push(TxnOp::delete(
                 lance_context_merge::execution_key(&self.prefix, &task.target)
                     .replace("/merge-executions/", "/merge-claims/"),
                 None,
             ));
+        }
+        if let Some(key) = preparation_key {
+            operations.push(TxnOp::delete(key, None));
         }
         if unresolved.is_none() {
             if let Some(key) = &target_key {
@@ -879,28 +1050,28 @@ impl EtcdTaskStore {
         if let Some(key) = self.dedupe_key(task.kind, &task.target, &task.depends_on) {
             operations.push(TxnOp::delete(key, None));
         }
+        let mut compares = vec![Compare::value(
+            claim_key.as_str(),
+            CompareOp::Equal,
+            token.as_bytes(),
+        )];
+        if owns_table {
+            compares.push(match &unresolved {
+                Some(execution) => Compare::value(
+                    lance_context_merge::execution_key(&self.prefix, &task.target),
+                    CompareOp::Equal,
+                    serde_json::to_vec(execution).map_err(|e| lance::Error::io(e.to_string()))?,
+                ),
+                None => Compare::version(
+                    lance_context_merge::execution_key(&self.prefix, &task.target),
+                    CompareOp::Equal,
+                    0,
+                ),
+            });
+        }
         let mut client = self.client.clone();
         let completed = client
-            .txn(
-                Txn::new()
-                    .when([
-                        Compare::value(claim_key.as_str(), CompareOp::Equal, token.as_bytes()),
-                        match &unresolved {
-                            Some(execution) => Compare::value(
-                                lance_context_merge::execution_key(&self.prefix, &task.target),
-                                CompareOp::Equal,
-                                serde_json::to_vec(execution)
-                                    .map_err(|e| lance::Error::io(e.to_string()))?,
-                            ),
-                            None => Compare::version(
-                                lance_context_merge::execution_key(&self.prefix, &task.target),
-                                CompareOp::Equal,
-                                0,
-                            ),
-                        },
-                    ])
-                    .and_then(operations),
-            )
+            .txn(Txn::new().when(compares).and_then(operations))
             .await
             .map_err(etcd_error("complete task"))?
             .succeeded();
@@ -2096,6 +2267,209 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn preparation_test_store() -> (TempDir, MasterConfig, TaskStore) {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/lance-context/test/{}", generate_id());
+        cfg.maintenance.compaction_prepare_targets = vec!["*".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        (dir, cfg, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compaction_preparation_allows_merge_but_commit_is_exclusive() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prep.preparing_compaction());
+        assert!(store
+            .inner
+            .get_text(&store.inner.target_lock_key("hot"))
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        store
+            .finish(merge, Ok("append while rewriting".into()))
+            .await
+            .unwrap();
+        assert!(store.promote_compaction(&mut prep).await.unwrap());
+        assert!(!prep.preparing_compaction());
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .finish(prep, Ok("compact published".into()))
+            .await
+            .unwrap();
+        let next = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store.finish(next, Ok("continued".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn preparation_and_promotion_respect_dedicated_owner() {
+        let (_dir, cfg, store) = preparation_test_store().await;
+        store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "dedicated", None)
+            .await
+            .unwrap();
+        assert!(store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .inner
+            .client
+            .clone()
+            .delete(active.clone(), None)
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .inner
+            .client
+            .clone()
+            .put(active.clone(), "new-dedicated", None)
+            .await
+            .unwrap();
+        assert!(!store.promote_compaction(&mut prep).await.unwrap());
+        store.finish(prep, Err("superseded".into())).await.unwrap();
+        assert_eq!(
+            store.inner.get_text(&active).await.unwrap().as_deref(),
+            Some("new-dedicated")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn failed_preparation_cannot_release_an_active_merge() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", Vec::new())
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let execution = lance_context_merge::Execution::new("hot", "worker", &merge.task.id, 600);
+        assert!(coordinator
+            .reserve(&store.merge_claim(&merge), &execution)
+            .await
+            .unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        store
+            .finish(prep, Err("preparation failed".into()))
+            .await
+            .unwrap();
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(running.clone()));
+        assert_eq!(
+            store
+                .inner
+                .get_text(&store.inner.target_lock_key("hot"))
+                .await
+                .unwrap(),
+            Some(lance_context_merge::execution_owner(&running))
+        );
+        assert!(coordinator.finish(&running, Ok(1)).await.unwrap());
+        let terminal = coordinator.get("hot").await.unwrap().unwrap();
+        assert!(coordinator
+            .release(&store.merge_claim(&merge), &terminal)
+            .await
+            .unwrap());
+        store.finish(merge, Ok("done".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn expired_preparation_cannot_promote_or_finish_replacement() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        let task = store
+            .enqueue(TaskKind::Compact, "hot", Vec::new())
+            .await
+            .unwrap();
+        let mut old = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .inner
+            .revoke_lease(old.backend.lease_id)
+            .await
+            .unwrap();
+        store.recover_orphaned().await.unwrap();
+        let mut replacement = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.task.id, task.id);
+        assert!(!store.preparation_owned(&old).await.unwrap());
+        assert!(!store.promote_compaction(&mut old).await.unwrap());
+        assert!(store.finish(old, Ok("stale".into())).await.is_err());
+        assert!(store.preparation_owned(&replacement).await.unwrap());
+        assert!(store.promote_compaction(&mut replacement).await.unwrap());
+        store.finish(replacement, Ok("valid".into())).await.unwrap();
     }
 
     #[tokio::test]

@@ -706,6 +706,22 @@ impl RolloutStore {
         self.base.compact(options).await
     }
 
+    /// Prepare immutable compaction output without a base-table commit.
+    pub async fn prepare_compaction(
+        &self,
+        options: CompactionConfig,
+    ) -> LanceResult<crate::PreparedCompaction> {
+        self.base.prepare_compaction(options).await
+    }
+
+    /// Publish prepared output using this freshly opened, fenced handle.
+    pub async fn commit_prepared_compaction(
+        &mut self,
+        prepared: crate::PreparedCompaction,
+    ) -> LanceResult<CompactionMetrics> {
+        self.base.commit_prepared_compaction(prepared).await
+    }
+
     /// See `StorageBase::base_data_files`.
     pub fn base_data_files(&self) -> Vec<String> {
         self.base.base_data_files()

@@ -133,7 +133,7 @@ struct TaskClaimTiming {
 /// `timing` carries how long the dispatch loop spent claiming this task and
 /// waiting for a concurrency permit, so every phase of the task's life lands on
 /// one metric rather than only the work window.
-async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimTiming) {
+async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskClaimTiming) {
     let task = claim.task.clone();
     let kind = kind_label(task.kind);
 
@@ -147,28 +147,32 @@ async fn run_task(state: &Arc<MasterState>, claim: TaskClaim, timing: TaskClaimT
     .record(timing.permit_wait.as_secs_f64());
 
     let started = std::time::Instant::now();
-    let outcome = match crate::maintenance_execution::reconcile_previous(state, &claim).await {
-        Err(error) => Err(error),
-        Ok(())
-            if state.config.merge_rollout.draining(&task.target)
-                && task.kind != TaskKind::MergeWal =>
-        {
-            Err("target draining legacy writers for merge protocol transition".into())
-        }
-        Ok(()) => match task.kind {
-            TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
-            _ => {
-                crate::maintenance_execution::run(state, &claim, async {
-                    match task.kind {
-                        TaskKind::Compact => run_compaction(state, &task).await,
-                        TaskKind::IndexId => run_index_id(state, &task.target).await,
-                        TaskKind::Repair => run_repair(state, &claim).await,
-                        TaskKind::MergeWal => unreachable!(),
-                    }
-                })
-                .await
+    let outcome = if claim.preparing_compaction() {
+        run_prepared_compaction(state, &mut claim).await
+    } else {
+        match crate::maintenance_execution::reconcile_previous(state, &claim).await {
+            Err(error) => Err(error),
+            Ok(())
+                if state.config.merge_rollout.draining(&task.target)
+                    && task.kind != TaskKind::MergeWal =>
+            {
+                Err("target draining legacy writers for merge protocol transition".into())
             }
-        },
+            Ok(()) => match task.kind {
+                TaskKind::MergeWal => crate::merge_execution::run_merge_wal(state, &claim).await,
+                _ => {
+                    crate::maintenance_execution::run(state, &claim, async {
+                        match task.kind {
+                            TaskKind::Compact => run_compaction(state, &task).await,
+                            TaskKind::IndexId => run_index_id(state, &task.target).await,
+                            TaskKind::Repair => run_repair(state, &claim).await,
+                            TaskKind::MergeWal => unreachable!(),
+                        }
+                    })
+                    .await
+                }
+            },
+        }
     };
     let work_elapsed = started.elapsed();
     let result = if outcome.is_ok() { "success" } else { "failed" };
@@ -320,6 +324,135 @@ async fn run_repair(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<Strin
     ))
 }
 
+/// Preparation must never publish a manifest, even if a future Lance version
+/// adds a hidden metadata write. Handles opened here capture this rejection.
+#[derive(Debug)]
+struct PreparationOnly;
+impl lance_context_core::merge_write_scope::CommitAuthorizer for PreparationOnly {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(lance::Error::io("compaction preparation cannot commit")) })
+    }
+}
+
+async fn watch_compaction_preparation(
+    state: &Arc<MasterState>,
+    claim: &TaskClaim,
+    scope: &lance_context_core::merge_write_scope::MergeWriteScope,
+) -> String {
+    let mut sequence = scope.completed_steps();
+    let mut changed = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match state.task_store.preparation_owned(claim).await {
+            Ok(true) => {}
+            Ok(false) => return "compaction preparation claim lost".into(),
+            Err(error) => return error.to_string(),
+        }
+        let current = scope.completed_steps();
+        if current != sequence {
+            changed = std::time::Instant::now();
+            sequence = current;
+        }
+        if changed.elapsed()
+            >= Duration::from_secs(state.config.maintenance.maintenance_idle_timeout_secs)
+        {
+            return "compaction preparation made no progress".into();
+        }
+    }
+}
+
+async fn run_prepared_compaction(
+    state: &Arc<MasterState>,
+    claim: &mut TaskClaim,
+) -> Result<String, String> {
+    let target = claim.task.target.clone();
+    let (_, name) = parse_target(&target);
+    let uri = state.rollout_uri(name);
+    let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_pinned_authorizer(
+        Arc::new(PreparationOnly),
+    );
+    let began = std::time::Instant::now();
+    tracing::info!(task = %claim.task.id, target = %claim.task.target, "compaction file preparation started without table ownership");
+    let prepared = {
+        let work = scope.run(async {
+            let store =
+                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            store
+                .prepare_compaction(state.compaction_config())
+                .await
+                .map_err(|e| e.to_string())
+        });
+        tokio::select! {
+            result = work => result?,
+            error = watch_compaction_preparation(state, claim, &scope) => return Err(error),
+        }
+    };
+    metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "prepare")
+        .record(began.elapsed().as_secs_f64());
+    if prepared.is_empty() {
+        // Suppress only the observed snapshot; any concurrent append changes
+        // the version and makes this hint inapplicable.
+        let options = compact_options_key(&state.compaction_config());
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            state
+                .task_store
+                .record_compact_noop(name, &uri, prepared.read_version(), &options),
+        )
+        .await;
+        return Ok("compaction snapshot needs no rewrite".into());
+    }
+    let waiting = std::time::Instant::now();
+    tracing::info!(task = %claim.task.id, target = %claim.task.target, seconds = began.elapsed().as_secs_f64(), "compaction files ready; waiting for commit ownership");
+    loop {
+        if !state
+            .task_store
+            .preparation_owned(claim)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("compaction preparation claim lost before commit".into());
+        }
+        if state
+            .task_store
+            .promote_compaction(claim)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit_wait")
+        .record(waiting.elapsed().as_secs_f64());
+    // No preparation handle is reused: only this scope may authorize metadata
+    // commits, including Lance's fragment-ID reservation and index remap.
+    crate::maintenance_execution::reconcile_previous(state, claim).await?;
+    let started = std::time::Instant::now();
+    let outcome = crate::maintenance_execution::run(state, claim, async {
+        let mut store =
+            RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+                .await
+                .map_err(|e| e.to_string())?;
+        let metrics = store
+            .commit_prepared_compaction(prepared)
+            .await
+            .map_err(|e| e.to_string())?;
+        update_stats_after_compaction(state, name, &store).await;
+        finish_compaction(state, &claim.task, metrics).await
+    })
+    .await;
+    metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "commit")
+        .record(started.elapsed().as_secs_f64());
+    outcome
+}
+
 /// Compact one experiment. The task-store claim owns the per-experiment write
 /// lock for the full execution.
 ///
@@ -337,6 +470,14 @@ async fn run_compaction(state: &Arc<MasterState>, task: &TaskRecord) -> Result<S
         return Err(format!("compaction is not scheduled for {kind:?} stores"));
     }
     let metrics = compact_inner(state, name).await?;
+    finish_compaction(state, task, metrics).await
+}
+
+async fn finish_compaction(
+    state: &Arc<MasterState>,
+    task: &TaskRecord,
+    metrics: lance::dataset::optimize::CompactionMetrics,
+) -> Result<String, String> {
     if state.config.index_after_compaction && metrics.fragments_added > 0 {
         // Best-effort: the compaction itself is done; the next compaction of
         // this target re-enqueues the index anyway.
@@ -390,12 +531,6 @@ async fn compact_inner(
 ) -> Result<lance::dataset::optimize::CompactionMetrics, String> {
     let uri = state.rollout_uri(name);
     let config = state.compaction_config();
-    let _permit = state
-        .compaction_permits
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| "compaction semaphore closed".to_string())?;
 
     let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
         .await
@@ -862,16 +997,17 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // FIFO order within a kind is unchanged.
     let general = spawn_pool_poller(
         state.clone(),
-        sem,
+        sem.clone(),
         if merge_sem.is_some() {
-            TaskKinds::GENERAL
+            TaskKinds::GENERAL.without_compact()
         } else {
             // No separate merge budget: the general pool runs everything, so it
             // must still be allowed to claim MergeWal.
-            TaskKinds::ANY
+            TaskKinds::ANY.without_compact()
         },
         true,
     );
+    spawn_pool_poller(state.clone(), sem, TaskKinds::COMPACT, false);
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
@@ -897,30 +1033,33 @@ fn spawn_pool_poller(
                 }
             }
             while pool.available_permits() > 0 {
+                // Reserve both budgets before taking durable table ownership.
+                let compact_permit = if kinds == TaskKinds::COMPACT {
+                    match state.compaction_permits.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => break,
+                    }
+                } else {
+                    None
+                };
+                let Ok(permit) = pool.clone().try_acquire_owned() else {
+                    break;
+                };
                 let claim_start = std::time::Instant::now();
                 match state.task_store.claim_next_of_kinds(kinds).await {
                     Ok(Some(claim)) => {
                         let claim_elapsed = claim_start.elapsed();
-                        // The task is already claimed at this point (queue key
-                        // deleted, lease granted, target lock held), so time
-                        // spent here is a claimed-but-idle task holding its
-                        // per-experiment lock — worth seeing separately. This
-                        // loop only claims kinds its own pool runs, so the wait
-                        // is now bounded by that pool's own occupancy.
-                        let permit_start = std::time::Instant::now();
-                        let permit = pool
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .expect("semaphore never closed");
+                        // Local capacity was reserved before the claim. No
+                        // claimed table waits on a compaction semaphore.
                         let timing = TaskClaimTiming {
                             claim: claim_elapsed,
-                            permit_wait: permit_start.elapsed(),
+                            permit_wait: Duration::ZERO,
                         };
                         let st = state.clone();
                         tokio::spawn(async move {
                             run_task(&st, claim, timing).await;
                             drop(permit);
+                            drop(compact_permit);
                         });
                     }
                     Ok(None) => break,
@@ -997,6 +1136,133 @@ mod tests {
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
             ui_dir: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn compact_capacity_is_reserved_before_claim_without_blocking_other_kinds() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        RolloutStore::open(&state.rollout_uri("exp")).await.unwrap();
+        let occupied = state
+            .compaction_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+        let pool = Arc::new(Semaphore::new(2));
+        let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::COMPACT, false);
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert_eq!(
+            state
+                .task_store
+                .get(&compact.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        assert_eq!(pool.available_permits(), 2);
+        let merge = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let index = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.task.kind, TaskKind::IndexId);
+        state
+            .task_store
+            .finish(merge, Ok("merge is not pinned by idle compact".into()))
+            .await
+            .unwrap();
+        state
+            .task_store
+            .finish(index, Ok("index remains dispatchable".into()))
+            .await
+            .unwrap();
+        drop(occupied);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let task = state.task_store.get(&compact.id).await.unwrap().unwrap();
+                if task.state == TaskState::Done {
+                    break;
+                }
+                assert_ne!(task.state, TaskState::Failed, "{:?}", task.error);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        poller.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn prepared_compact_runs_through_owned_commit_and_releases_both_claims() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.compaction_prepare_targets = vec!["exp".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        let mut store = RolloutStore::open(&uri).await.unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store.add(&[rollout_record(id)]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+        }
+        let task = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(claim.preparing_compaction());
+        run_task(
+            &state,
+            claim,
+            TaskClaimTiming {
+                claim: Duration::ZERO,
+                permit_wait: Duration::ZERO,
+            },
+        )
+        .await;
+        let finished = state.task_store.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(finished.state, TaskState::Done, "{:?}", finished.error);
+        assert!(state
+            .task_store
+            .merge_coordinator()
+            .get("exp")
+            .await
+            .unwrap()
+            .is_none());
+        enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let merge = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .task_store
+            .finish(merge, Ok("resumed".into()))
+            .await
+            .unwrap();
+        let reader = RolloutStore::open_existing_with_options(&uri, Default::default())
+            .await
+            .unwrap();
+        for id in ["a", "b", "c", "d"] {
+            assert!(reader.get_by_id(id).await.unwrap().is_some());
         }
     }
 

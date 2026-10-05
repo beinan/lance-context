@@ -102,3 +102,5 @@ pub use lance::Error as LanceError;
 // Re-export the Lance session type so the server can build one shared,
 // capacity-bounded cache session across all resident rollout stores.
 pub use lance::session::Session;
+
+pub use store_base::PreparedCompaction;

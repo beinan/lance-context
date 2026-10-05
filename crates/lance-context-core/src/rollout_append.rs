@@ -934,6 +934,166 @@ mod tests {
         MergeMemoryBudget::new(8 * 1024 * 1024)
     }
 
+    #[derive(Debug)]
+    struct NoPreparationCommit;
+    impl crate::merge_write_scope::CommitAuthorizer for NoPreparationCommit {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { Err(Error::io("unexpected preparation manifest commit")) })
+        }
+    }
+
+    async fn prepared_compaction_fixture(uri: &str) -> (RolloutStore, AppendCoordinator) {
+        let a = writer(uri, "a").await;
+        let mut coordinator = AppendCoordinator::open(uri, None).await.unwrap();
+        for i in 0..4 {
+            put(&a, &format!("seed-{i}"), 4096).await;
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let part = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            coordinator.commit(vec![part]).await.unwrap();
+        }
+        (a, coordinator)
+    }
+
+    async fn prepare_without_commit(uri: &str) -> crate::PreparedCompaction {
+        crate::merge_write_scope::MergeWriteScope::with_pinned_authorizer(Arc::new(
+            NoPreparationCommit,
+        ))
+        .run(async {
+            let store =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            store
+                .prepare_compaction(crate::CompactionConfig {
+                    target_rows_per_fragment: 1024,
+                    max_source_fragments: Some(128),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_preserves_append_and_watermarks_in_both_orders() {
+        for merge_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let (a, mut coordinator) = prepared_compaction_fixture(uri).await;
+            let before = Dataset::open(uri).await.unwrap().version().version;
+            let prepared = prepare_without_commit(uri).await;
+            assert!(!prepared.is_empty());
+            assert_eq!(
+                Dataset::open(uri).await.unwrap().version().version,
+                before,
+                "preparation must not publish even a reservation"
+            );
+            put(&a, "during-compact", 8192).await;
+            let (plans, _) = coordinator
+                .plan(&["a".into()], 64, 1024 * 1024)
+                .await
+                .unwrap();
+            let staged = stage(uri, plans[0].clone(), budget(), None).await.unwrap();
+            let high = staged.plan.generations.last().unwrap().number;
+            let shard = staged.plan.shard;
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            if merge_first {
+                coordinator.commit(vec![staged.clone()]).await.unwrap();
+            }
+            let metrics = publisher
+                .commit_prepared_compaction(prepared)
+                .await
+                .unwrap();
+            assert_eq!(metrics.fragments_removed, 4);
+            if !merge_first {
+                coordinator.commit(vec![staged.clone()]).await.unwrap();
+            }
+            assert_eq!(
+                coordinator.commit(vec![staged]).await.unwrap(),
+                0,
+                "replay after rewrite must not duplicate rows"
+            );
+            assert_eq!(rows(uri).await, 5);
+            let current = Dataset::open(uri).await.unwrap();
+            assert_eq!(watermarks(&current).await.unwrap().get(&shard), Some(&high));
+            let reader =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            for i in 0..4 {
+                assert_eq!(
+                    reader.get_blob(&format!("seed-{i}")).await.unwrap(),
+                    Some(vec![42; 4096])
+                );
+            }
+            assert_eq!(
+                reader.get_blob("during-compact").await.unwrap(),
+                Some(vec![42; 8192])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_cannot_publish_with_revoked_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_writer, _) = prepared_compaction_fixture(uri).await;
+        let prepared = prepare_without_commit(uri).await;
+        let before = Dataset::open(uri).await.unwrap().version().version;
+        let result = crate::merge_write_scope::MergeWriteScope::with_pinned_authorizer(Arc::new(
+            NoPreparationCommit,
+        ))
+        .run(async {
+            let mut publisher =
+                RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            publisher.commit_prepared_compaction(prepared).await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, before);
+        assert_eq!(rows(uri).await, 4);
+    }
+
+    #[tokio::test]
+    async fn prepared_compaction_rejects_deleted_sources_without_resurrection() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let (_a, _) = prepared_compaction_fixture(uri).await;
+        let prepared = prepare_without_commit(uri).await;
+        let mut latest = Dataset::open(uri).await.unwrap();
+        latest.delete("id = 'seed-0'").await.unwrap();
+        let version = latest.version().version;
+        let mut publisher =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        let error = publisher
+            .commit_prepared_compaction(prepared)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("source fragment changed"),
+            "{error}"
+        );
+        assert_eq!(Dataset::open(uri).await.unwrap().version().version, version);
+        assert_eq!(rows(uri).await, 3);
+        assert!(publisher.get_blob("seed-0").await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn parallel_files_publish_once_and_preserve_new_writes() {
         let dir = tempfile::tempdir().unwrap();
