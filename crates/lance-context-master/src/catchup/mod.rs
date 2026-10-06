@@ -34,6 +34,10 @@ pub struct CatchupConfig {
     pub max_jobs: usize,
     #[arg(long, env = "CATCHUP_MIN_PENDING", default_value_t = 256)]
     pub min_pending: i64,
+    /// Keep servicing any positive WAL count on these explicitly owned targets.
+    /// Existing external publishers require a separate qualified ownership handoff.
+    #[arg(long, env = "CATCHUP_CONTINUOUS_TARGETS", value_delimiter = ',')]
+    pub continuous_targets: Vec<String>,
     #[arg(long, env = "CATCHUP_STATS_MAX_AGE_SECS", default_value_t = 900)]
     pub stats_max_age_secs: u64,
     #[arg(long, env = "CATCHUP_INTERVAL_SECS", default_value_t = 30)]
@@ -81,6 +85,7 @@ impl Default for CatchupConfig {
             namespace: "default".into(),
             max_jobs: 4,
             min_pending: 256,
+            continuous_targets: Vec::new(),
             stats_max_age_secs: 900,
             interval_secs: 30,
             slice_secs: 1800,
@@ -106,6 +111,11 @@ impl CatchupConfig {
         if self.max_jobs == 0
             || self.max_jobs > 256
             || self.min_pending < 1
+            || self.continuous_targets.len() > 256
+            || self
+                .continuous_targets
+                .iter()
+                .any(|t| t.is_empty() || t.len() > 512)
             || self.interval_secs == 0
             || self.stats_max_age_secs == 0
             || self.startup_timeout_secs < 120
@@ -236,7 +246,17 @@ fn eligibility(
     {
         return Some("stale_stats");
     }
-    if row.pending_wal_generations < config.catchup.min_pending {
+    let threshold = if config
+        .catchup
+        .continuous_targets
+        .iter()
+        .any(|t| t == target)
+    {
+        1
+    } else {
+        config.catchup.min_pending
+    };
+    if row.pending_wal_generations < threshold {
         return Some("below_threshold");
     }
     None

@@ -120,7 +120,22 @@ impl Kubernetes {
             .request(Method::GET, &format!("{}/{}", self.base, record.job), None)
             .await?;
         if status == StatusCode::NOT_FOUND {
-            if stop || record.job_uid.is_some() {
+            if let Some(uid) = &record.job_uid {
+                // Deletion/preemption can remove the Job before its terminal
+                // status is collected. Only exact, stopped child Pods establish
+                // resource retirement; absence alone proves nothing about an
+                // old process on a partitioned node. Storage recovery is still
+                // required by normal admission before any successor can write.
+                let pods = self.job_pods(uid).await?;
+                if confirmed_retired_children(record, uid, &pods) {
+                    return Ok((Some(uid.clone()), Some(JobOutcome::Failed)));
+                }
+                return Err(
+                    "catch-up Job missing; no exact terminal Pod evidence; reservation retained"
+                        .into(),
+                );
+            }
+            if stop {
                 return Err(
                     "catch-up Job missing after confirmation or startup stall; reservation retained"
                         .into(),
@@ -201,7 +216,21 @@ impl Kubernetes {
         };
         // Older Kubernetes versions publish Failed while Pods still terminate.
         // Check Job UID and every Pod phase before giving the resource slot back.
-        if !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        let items = self.job_pods(&uid).await?;
+        if items
+            .iter()
+            .any(|p| !matches!(p["status"]["phase"].as_str(), Some("Succeeded" | "Failed")))
+        {
+            return Ok((Some(uid), None));
+        }
+        Ok((
+            Some(uid),
+            Some(outcome::terminal_outcome(record, &job, &items, success)?),
+        ))
+    }
+
+    async fn job_pods(&self, uid: &str) -> Result<Vec<Value>> {
+        if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
             return Err("invalid Job UID".into());
         }
         let url = format!(
@@ -216,18 +245,51 @@ impl Kubernetes {
         {
             return Err("cannot confirm catch-up Pods terminated".into());
         }
-        let items = pods["items"].as_array().ok_or("invalid Pod list")?;
-        if items
-            .iter()
-            .any(|p| !matches!(p["status"]["phase"].as_str(), Some("Succeeded" | "Failed")))
-        {
-            return Ok((Some(uid), None));
-        }
-        Ok((
-            Some(uid),
-            Some(outcome::terminal_outcome(record, &job, items, success)?),
-        ))
+        pods["items"]
+            .as_array()
+            .cloned()
+            .ok_or("invalid Pod list".into())
     }
+}
+
+fn confirmed_retired_children(record: &Record, uid: &str, pods: &[Value]) -> bool {
+    !pods.is_empty()
+        && pods.iter().all(|pod| {
+            pod["metadata"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty())
+                && pod["metadata"]["ownerReferences"]
+                    .as_array()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|o| {
+                            o["uid"] == uid
+                                && o["name"] == record.job
+                                && o["kind"] == "Job"
+                                && o["controller"] == true
+                        })
+                    })
+                && matches!(
+                    pod["status"]["phase"].as_str(),
+                    Some("Failed" | "Succeeded")
+                )
+                && pod["spec"]["restartPolicy"] == "Never"
+                && pod["spec"]["containers"]
+                    .as_array()
+                    .is_some_and(|c| c.len() == 1)
+                && pod["status"]["containerStatuses"]
+                    .as_array()
+                    .is_some_and(|statuses| {
+                        statuses.len() == 1
+                            && statuses[0]["restartCount"] == 0
+                            && statuses[0]["state"]["terminated"]["finishedAt"]
+                                .as_str()
+                                .is_some_and(|s| !s.is_empty())
+                            && statuses[0]["state"]["terminated"]["exitCode"]
+                                .as_i64()
+                                .is_some()
+                            && statuses[0]["name"] == pod["spec"]["containers"][0]["name"]
+                    })
+        })
 }
 
 pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value) -> Value {
@@ -466,6 +528,25 @@ mod tests {
             client.reconcile(&config, &record, false).await.unwrap().1,
             Some(JobOutcome::Failed)
         );
+        // Simulate Job deletion before the controller collected terminal status.
+        *mock.job.lock().unwrap() = None;
+        assert!(client.reconcile(&config, &record, false).await.is_err());
+        *mock.pod_override.lock().unwrap() = Some(json!({"items":[{
+            "metadata":{"uid":"pod-uid","ownerReferences":[{"uid":"test-uid",
+                "name":record.job,"kind":"Job","controller":true}]},
+            "spec":{"restartPolicy":"Never","containers":[{"name":"executor"}]},
+            "status":{"phase":"Failed","containerStatuses":[{"name":"executor","restartCount":0,
+                "state":{"terminated":{"exitCode":137,"finishedAt":"2026-10-06T00:00:00Z"}}}]}
+        }]}));
+        assert_eq!(
+            client.reconcile(&config, &record, false).await.unwrap().1,
+            Some(JobOutcome::Failed)
+        );
+        assert_eq!(
+            mock.creates.load(Ordering::SeqCst),
+            1,
+            "must not recreate a missing confirmed Job under the old name"
+        );
         server.abort();
     }
     #[tokio::test]
@@ -560,6 +641,43 @@ mod tests {
         assert_eq!(mock.patches.load(Ordering::SeqCst), 0);
         assert_eq!(mock.creates.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+
+    #[test]
+    fn missing_job_requires_exact_terminal_children_not_absence_or_pod_phase_alone() {
+        let record: Record = serde_json::from_value(json!({
+            "target":"hot", "job":"job", "job_uid":"job-uid", "slot":0,
+            "attempt":1, "active":true, "reason":"test", "pending_at_admission":1000,
+            "created_at_ms":0, "finished_at_ms":null, "consecutive_failures":0,
+            "needs_attention":false, "next_retry_ms":0, "outcome":null
+        }))
+        .unwrap();
+        let pod = json!({"metadata":{"uid":"pod", "ownerReferences":[{
+            "uid":"job-uid", "name":"job", "kind":"Job", "controller":true}]},
+            "spec":{"restartPolicy":"Never", "containers":[{"name":"executor"}]},
+            "status":{"phase":"Failed", "containerStatuses":[{"name":"executor", "restartCount":0,
+                "state":{"terminated":{"exitCode":137,"finishedAt":"2026-10-06T00:00:00Z"}}}]}});
+        assert!(confirmed_retired_children(
+            &record,
+            "job-uid",
+            std::slice::from_ref(&pod)
+        ));
+        assert!(!confirmed_retired_children(&record, "job-uid", &[]));
+        for (pointer, value) in [
+            ("/metadata/uid", json!("")),
+            ("/metadata/ownerReferences/0/uid", json!("other")),
+            ("/status/phase", json!("Running")),
+            ("/status/containerStatuses/0/restartCount", json!(1)),
+            ("/status/containerStatuses/0/state/terminated", json!(null)),
+            ("/spec/restartPolicy", json!("Always")),
+        ] {
+            let mut changed = pod.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !confirmed_retired_children(&record, "job-uid", &[changed]),
+                "{pointer}"
+            );
+        }
     }
 
     #[test]

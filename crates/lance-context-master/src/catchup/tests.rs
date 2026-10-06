@@ -51,6 +51,96 @@ fn admission_requires_fresh_owned_pressure_even_for_manual_requests() {
     c.catchup.enabled = false;
     assert_eq!(eligibility(&c, Some(&r), "hot", now), Some("disabled"));
 }
+
+#[test]
+fn continuous_coverage_services_small_tails_without_relaxing_ownership_or_freshness() {
+    let mut c = config();
+    c.catchup.continuous_targets = vec!["hot".into(), "legacy".into()];
+    let now = 10_000_000;
+    let mut r = row(now);
+    r.pending_wal_generations = 1;
+    assert!(eligibility(&c, Some(&r), "hot", now).is_none());
+    assert_eq!(
+        eligibility(&c, Some(&r), "other", now),
+        Some("below_threshold")
+    );
+    assert_eq!(
+        eligibility(&c, Some(&r), "legacy", now),
+        Some("requires_owned_target")
+    );
+    r.pending_wal_generations = 0;
+    assert_eq!(
+        eligibility(&c, Some(&r), "hot", now),
+        Some("below_threshold")
+    );
+    r.pending_wal_generations = 1;
+    r.scanned_at = now - 901_000;
+    assert_eq!(eligibility(&c, Some(&r), "hot", now), Some("stale_stats"));
+    r.scanned_at = now;
+    c.merge_rollout.drain_targets.push("hot".into());
+    assert_eq!(
+        eligibility(&c, Some(&r), "hot", now),
+        Some("requires_owned_target")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn continuous_coverage_is_durable_and_resumes_only_after_fresh_success_stats() {
+    let (_dir, state) = fixture().await.unwrap();
+    let mut config = state.config.clone();
+    config.catchup.continuous_targets = vec!["hot".into()];
+    let first = MasterState::new(config.clone()).await.unwrap();
+    let inventory = Inventory::new(&first);
+    inventory.ensure_policy(&config).await.unwrap();
+    // A restarted master must declare the same desired coverage.
+    assert!(Inventory::new(&state)
+        .ensure_policy(&state.config)
+        .await
+        .is_err());
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut r = row(now);
+    r.pending_wal_generations = 1;
+    let request = Trigger {
+        target: "hot".into(),
+        reason: "continuous".into(),
+        dry_run: false,
+    };
+    assert_eq!(
+        admit(&first, Some(&r), &request).await.unwrap().decision,
+        "reserved"
+    );
+    let active = inventory.get("hot").await.unwrap().unwrap();
+    // An older successful pass with expired cooldown, but no newer stats yet.
+    inventory
+        .complete(&active, JobOutcome::Succeeded, now - 120_000)
+        .await
+        .unwrap();
+    r.scanned_at = now - 120_001;
+    let successor = MasterState::new(config).await.unwrap();
+    assert_eq!(
+        admit(&successor, Some(&r), &request)
+            .await
+            .unwrap()
+            .decision,
+        "awaiting_fresh_stats"
+    );
+    r.scanned_at = now;
+    assert_eq!(
+        admit(&successor, Some(&r), &request)
+            .await
+            .unwrap()
+            .decision,
+        "reserved"
+    );
+    let next = Inventory::new(&successor)
+        .get("hot")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.attempt, active.attempt + 1);
+    assert_ne!(next.job, active.job);
+}
 #[test]
 fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     let mut c = config();

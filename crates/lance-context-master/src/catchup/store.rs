@@ -65,8 +65,16 @@ impl Inventory {
     pub async fn ensure_policy(&self, master: &crate::config::MasterConfig) -> Result<()> {
         let config = &master.catchup;
         let template = super::kubernetes::read_template(config)?;
-        let policy = serde_json::json!({"namespace":config.namespace,"max_jobs":config.max_jobs,"template":template,
-            "shards":config.shards,"merge_max_bytes":config.merge_max_bytes,"merge_memory_bytes":config.merge_memory_bytes,"slice":config.slice_secs,"startup_timeout":config.startup_timeout_secs,"idle_timeout":master.maintenance.maintenance_idle_timeout_secs}).to_string();
+        let mut policy = serde_json::json!({"namespace":config.namespace,"max_jobs":config.max_jobs,"template":template,
+            "shards":config.shards,"merge_max_bytes":config.merge_max_bytes,"merge_memory_bytes":config.merge_memory_bytes,"slice":config.slice_secs,"startup_timeout":config.startup_timeout_secs,"idle_timeout":master.maintenance.maintenance_idle_timeout_secs});
+        // Preserve the existing policy bytes when continuous service is off.
+        if !config.continuous_targets.is_empty() {
+            let mut targets = config.continuous_targets.clone();
+            targets.sort();
+            targets.dedup();
+            policy["continuous_targets"] = serde_json::json!(targets);
+        }
+        let policy = policy.to_string();
         let key = format!("{}/catchup-policy", self.prefix);
         let mut client = self.client.clone();
         client

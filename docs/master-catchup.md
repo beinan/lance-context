@@ -238,3 +238,37 @@ controller. Existing successful/ordinary failed Jobs retain their handling;
 older executors returning 75 without the receipt require reconciliation rather
 than a guessed success or cleared failure history. This change does not adopt
 externally managed publishers or enable production catchup automatically.
+
+
+## Continuous coverage for selected tables
+
+`CATCHUP_CONTINUOUS_TARGETS=table_a,table_b` makes the existing controller service
+any positive fresh WAL count for these tables, including small tails after a
+successful slice. Other tables retain `CATCHUP_MIN_PENDING`. Zero pending does
+not create an idle Job. Continuous targets must still be explicitly owned and
+non-draining, with the same storage fences, failure deadlines, global capacity
+and fresh-after-success stats requirement as ordinary catchup.
+
+The continuous target set is stored in the shared catchup policy, canonicalized
+across replicas. A master with a different set refuses autonomous reconciliation
+instead of silently abandoning desired coverage after failover. Use the existing
+policy-change procedure to change it. Empty configuration preserves existing
+policy compatibility. The existing GET/POST catchup API observes/triggers the
+same admission, so manual requests cannot bypass the ownership or memory bounds.
+
+If a confirmed Job disappears, the controller now checks children belonging to
+that exact Job UID. It only releases the inventory slot when nonempty child
+inventory proves terminal containers with restartPolicy Never and matching owner
+references. This records a failure, preserving retry policy. It does not clear
+execution, claim or target-lock keys: the normal fenced recovery path must resolve
+any old storage operation before successor work. Missing children, running Pods,
+restarts, paginated/incomplete listings and identity mismatches retain the
+reservation and report an actionable unresolved state. Job absence is never a
+proof that a process on a partitioned node stopped.
+
+This provides continuous lifecycle coverage for controller-managed Jobs. It does
+not adopt external persistent native publishers merely by listing their names.
+Migrate one external owner at a time after qualified join/fence evidence, preserving
+its attempt/failure debt and legacy admission exclusion. Until that handoff is
+implemented and verified for the actual old runtime, keep the external owner
+active. Do not delete its catchup-active or operator keys to make admission pass.
