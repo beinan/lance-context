@@ -395,6 +395,14 @@ async fn wait_for_compaction_commit(
     claim: &mut TaskClaim,
 ) -> Result<(), String> {
     let waiting = std::time::Instant::now();
+    if !state
+        .task_store
+        .request_compaction_commit(claim)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err("compaction preparation claim lost before requesting commit".into());
+    }
     loop {
         if !state
             .task_store

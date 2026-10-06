@@ -183,6 +183,34 @@ impl TaskStore {
             .all(|v| v.as_deref() == Some(claim.backend.token.as_bytes())))
     }
 
+    /// Ask subsequent merge admissions to yield after files are ready. This
+    /// marker shares the preparation lease: crash/finish removes the request.
+    /// It grants no write ownership and never cancels an admitted merge.
+    pub(crate) async fn request_compaction_commit(&self, claim: &TaskClaim) -> lance::Result<bool> {
+        let Some(preparation) = &claim.backend.preparation_key else {
+            return Ok(false);
+        };
+        let b = &claim.backend;
+        self.inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([
+                        Compare::value(b.claim_key.as_str(), CompareOp::Equal, b.token.as_bytes()),
+                        Compare::value(preparation.as_str(), CompareOp::Equal, b.token.as_bytes()),
+                    ])
+                    .and_then([TxnOp::put(
+                        self.inner.compaction_commit_key(&claim.task.target),
+                        b.token.as_bytes(),
+                        Some(PutOptions::new().with_lease(b.lease_id)),
+                    )]),
+            )
+            .await
+            .map(|r| r.succeeded())
+            .map_err(etcd_error("request compaction commit turn"))
+    }
+
     /// Acquire the existing table writer protocol only after immutable files
     /// are ready. An ambiguous response can adopt only this claim's own token.
     pub(crate) async fn promote_compaction(&self, claim: &mut TaskClaim) -> lance::Result<bool> {
@@ -842,6 +870,7 @@ impl EtcdTaskStore {
                                 encode_segment(&task.target)
                             )
                         }),
+                        self.compaction_commit_key(&task.target),
                     ])
                     .await?;
                 let merge_execution: Option<lance_context_merge::Execution> = snapshot[0]
@@ -849,6 +878,18 @@ impl EtcdTaskStore {
                     .map(serde_json::from_slice)
                     .transpose()
                     .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
+                // Preparation itself stays concurrent. Once its output is
+                // ready, yield the next merge turn so the short commit can win.
+                // An unresolved execution still needs merge recovery; never
+                // let a scheduling hint block that storage safety path.
+                if task.kind == TaskKind::MergeWal
+                    && merge_execution.is_none()
+                    && snapshot[6].is_some()
+                    && snapshot[6] == snapshot[5]
+                {
+                    metrics::counter!("master_merge_yield_to_compaction_total").increment(1);
+                    continue;
+                }
                 // Avoid lease grant/revoke for a clearly blocked candidate.
                 // The final transaction still checks every ownership predicate.
                 let expected_owner = merge_execution
@@ -918,6 +959,22 @@ impl EtcdTaskStore {
                     compares.push(match &snapshot[2] {
                         Some(owner) => Compare::value(active_key, CompareOp::Equal, owner.clone()),
                         None => Compare::version(active_key, CompareOp::Equal, 0),
+                    });
+                }
+                if task.kind == TaskKind::MergeWal && merge_execution.is_none() {
+                    // A commit request arriving between the read and claim
+                    // must win over this stale merge admission attempt.
+                    compares.push(match &snapshot[6] {
+                        Some(value) => Compare::value(
+                            self.compaction_commit_key(&task.target),
+                            CompareOp::Equal,
+                            value.clone(),
+                        ),
+                        None => Compare::version(
+                            self.compaction_commit_key(&task.target),
+                            CompareOp::Equal,
+                            0,
+                        ),
                     });
                 }
                 let catchup_key = crate::catchup::store::active_key(&self.prefix, &task.target);
@@ -1440,6 +1497,14 @@ impl EtcdTaskStore {
 
     fn claim_key(&self, id: &str) -> String {
         format!("{}/claims/{id}", self.prefix)
+    }
+
+    fn compaction_commit_key(&self, target: &str) -> String {
+        format!(
+            "{}/compact-commit-ready/{}",
+            self.prefix,
+            encode_segment(target)
+        )
     }
 
     fn target_lock_key(&self, target: &str) -> String {
@@ -2474,6 +2539,177 @@ mod tests {
             .unwrap()
             .unwrap();
         store.finish(next, Ok("continued".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn ready_compaction_gets_the_next_native_merge_turn_without_blocking_preparation() {
+        let (_dir, mut cfg, _) = preparation_test_store().await;
+        cfg.maintenance.maintenance_catchup_targets = vec!["hot".into()];
+        cfg.merge_rollout.owned_targets = vec!["hot".into()];
+        let store = TaskStore::open(&cfg).await.unwrap();
+        let active = crate::catchup::store::active_key(&cfg.etcd.etcd_prefix, "hot");
+        store
+            .inner
+            .client
+            .clone()
+            .put(active, "native", None)
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        let mut prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let native = store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            prep.preparing_compaction(),
+            "preparation must not block native merge admission"
+        );
+        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        assert!(
+            !store.promote_compaction(&mut prep).await.unwrap(),
+            "running merge must finish cooperatively"
+        );
+        store
+            .finish(native, Ok("joined pass".into()))
+            .await
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_merge_target("hot", "native")
+                .await
+                .unwrap()
+                .is_none(),
+            "new pass must yield to ready compact"
+        );
+        assert!(store.promote_compaction(&mut prep).await.unwrap());
+        store
+            .finish(prep, Ok("compact committed".into()))
+            .await
+            .unwrap();
+        assert!(store
+            .inner
+            .get_text(&store.inner.compaction_commit_key("hot"))
+            .await
+            .unwrap()
+            .is_none());
+        let next = store
+            .claim_merge_target("hot", "native")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(next, Ok("merge resumes".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn ready_compaction_lease_loss_unblocks_merges_and_cannot_publish_a_stale_request() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        let prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        store
+            .inner
+            .revoke_lease(prep.backend.lease_id)
+            .await
+            .unwrap();
+        assert!(!store.request_compaction_commit(&prep).await.unwrap());
+        assert!(store
+            .inner
+            .get_text(&store.inner.compaction_commit_key("hot"))
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish(merge, Ok("merge remains available".into()))
+            .await
+            .unwrap();
+        drop(prep);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn ready_compaction_never_blocks_recovery_of_an_unresolved_merge_execution() {
+        let (_dir, _cfg, store) = preparation_test_store().await;
+        store
+            .enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        let prep = store
+            .claim_next_of_kinds(TaskKinds::COMPACT)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let merge = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let execution = lance_context_merge::Execution::new("hot", "worker", "boot", 600);
+        assert!(coordinator
+            .reserve(&store.merge_claim(&merge), &execution)
+            .await
+            .unwrap());
+        assert!(store.request_compaction_commit(&prep).await.unwrap());
+        store.abandon_claim_for_test(merge).await.unwrap();
+        let recovery = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        store
+            .finish(
+                recovery,
+                Err("fixture retains unresolved storage ownership".into()),
+            )
+            .await
+            .unwrap();
+        store
+            .finish(prep, Err("fixture preparation ends".into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
