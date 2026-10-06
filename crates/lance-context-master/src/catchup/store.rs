@@ -311,8 +311,8 @@ impl Inventory {
             .map_err(|e| e.to_string())?
             .succeeded();
         if changed {
-            tracing::info!(target = %record.target, job = %record.job, success, failures = terminal.consecutive_failures, "catch-up job terminal; capacity released");
-            metrics::counter!("master_catchup_jobs_finished_total", "result" => if success { "ok" } else { "failed" }).increment(1);
+            tracing::info!(target = %record.target, job = %record.job, ?outcome, failures = terminal.consecutive_failures, "catch-up job terminal; capacity released");
+            metrics::counter!("master_catchup_jobs_finished_total", "result" => match outcome { JobOutcome::Succeeded => "ok", JobOutcome::Deferred => "deferred", JobOutcome::Failed => "failed" }).increment(1);
         }
         Ok(())
     }
