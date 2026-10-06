@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import pathlib
+import random
 import re
 import signal
 import subprocess
@@ -31,6 +32,30 @@ def authorized(operator, job, pod_name, pod_uid):
         and operator.get("native_job") == job
         and operator.get("native_pod") == pod_name
         and operator.get("native_pod_uid") == pod_uid
+    )
+
+
+def confirmed_busy(code, markers, attempt_id, target, claimed, reclaimed, errors):
+    """Only the new binary's joined, attempt-bound pre-claim outcome can defer.
+
+    An old binary's error text, an arbitrary exit75, or any claim/payload evidence
+    retains the ordinary failure path. The caller must have joined the child.
+    """
+    return (
+        code == 75
+        and not claimed
+        and reclaimed == 0
+        and errors == 0
+        and len(markers) == 1
+        and type(markers[0].get("version")) is int
+        and markers[0]
+        == {
+            "event": "catchup_admission_deferred",
+            "version": 1,
+            "reason": "busy_before_claim",
+            "target": target,
+            "attempt_id": attempt_id,
+        }
     )
 
 
@@ -177,18 +202,36 @@ def main():
             started = time.monotonic()
             reclaimed = 0
             pass_errors = 0
+            claimed = False
+            markers = []
             proc = subprocess.Popen(
                 [NATIVE_BINARY],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env={**os.environ, "CATCHUP_ATTEMPT_ID": attempt["id"]},
             )
             log("native_pass_started", pid=proc.pid)
             for line in proc.stdout:
                 print(line.rstrip(), flush=True)
                 clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                if (
+                    "catch-up task claimed" in clean
+                    or "dedicated catch-up committed" in clean
+                ):
+                    claimed = True
+                try:
+                    event = json.loads(clean)
+                except ValueError:
+                    event = None
+                if (
+                    isinstance(event, dict)
+                    and event.get("event") == "catchup_admission_deferred"
+                ):
+                    markers.append(event)
                 if "parallel rollout append completed" in clean:
+                    claimed = True
                     n = re.search(r"\breclaimed=(\d+)", clean)
                     if n:
                         reclaimed += int(n.group(1))
@@ -206,7 +249,30 @@ def main():
                 reclaimed=reclaimed,
                 seconds=seconds,
             )
-            if code == 0:
+            busy = confirmed_busy(
+                code, markers, attempt["id"], T, claimed, reclaimed, pass_errors
+            )
+            if busy:
+                # Read again after joining: do not shorten existing earned debt,
+                # including debt recorded concurrently by another executor.
+                failure = json.loads(
+                    read("merge-failures/" + H + "/" + b"master:catchup".hex()) or "{}"
+                )
+                terminal.update(
+                    state="deferred",
+                    deferred_admission={"class": "busy_before_claim"},
+                    consecutive_failures=previous.get("consecutive_failures", 0),
+                    needs_attention=bool(
+                        previous.get("needs_attention")
+                        or failure.get("needs_attention")
+                    ),
+                    next_retry_ms=max(
+                        previous.get("next_retry_ms", 0),
+                        failure.get("next_retry_ms", 0),
+                        int((time.time() + random.uniform(2, 5)) * 1000),
+                    ),
+                )
+            elif code == 0:
                 terminal.update(
                     consecutive_failures=0,
                     needs_attention=False,
@@ -220,7 +286,8 @@ def main():
                     )
                     * 1000
                 )
-            if cas_attempt(admitted, terminal, operator) is None:
+            recorded = cas_attempt(admitted, terminal, operator) is not None
+            if not recorded:
                 log("attempt_record_changed_ownership_untouched")
             log(
                 "native_pass_finished",
@@ -229,9 +296,16 @@ def main():
                 seconds=seconds,
                 generations_per_second=reclaimed / seconds,
                 failed_shards=pass_errors,
+                outcome=terminal["state"],
+                attempt_recorded=recorded,
             )
             # Let ordinary flushes proceed; zero-work passes must not hammer etcd/catalogs.
-            stop.wait(2 if code == 0 and reclaimed > 0 else 30)
+            if busy and recorded:
+                stop.wait(
+                    max(0, min(60, terminal["next_retry_ms"] / 1000 - time.time()))
+                )
+            else:
+                stop.wait(2 if code == 0 and reclaimed > 0 else 30)
         except Exception as e:  # noqa: BLE001 - preserve native child join on any supervisor error
             log("supervisor_error_ownership_untouched", error=repr(e))
             if proc is not None:

@@ -276,6 +276,136 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.read("failure"), failure)
         self.assertFalse((self.folder / "started").exists())
 
+    def configure_outcome(self, *, code=75, marker=True, extra="", foreign=False):
+        # The child cannot report its terminal outcome until explicitly released.
+        text = self.stub.read_text()
+        text = text[: text.index('print("parallel rollout')]
+        text += "import json,sys\n"
+        if extra:
+            text += "print(" + repr(extra) + ",flush=True)\n"
+        if marker:
+            text += (
+                'print(json.dumps({"event":"catchup_admission_deferred","version":1,'
+                '"reason":"busy_before_claim","target":"table","attempt_id":'
+                + (
+                    '"foreign-attempt"'
+                    if foreign
+                    else 'os.environ["CATCHUP_ATTEMPT_ID"]'
+                )
+                + "}),flush=True)\n"
+            )
+        text += "sys.exit(" + str(code) + ")\n"
+        self.stub.write_text(text)
+
+    def release_terminal(self):
+        self.wait_for(lambda: (self.folder / "started").exists())
+        (self.folder / "release").touch()
+        self.wait_for(lambda: json.loads(self.read("attempt"))["state"] != "admitted")
+        return json.loads(self.read("attempt"))
+
+    def test_confirmed_busy_defers_without_earning_failure_and_retries(self):
+        self.configure_outcome()
+        previous = {
+            "job": "persistent-job",
+            "consecutive_failures": 2,
+            "needs_attention": True,
+            "next_retry_ms": 1,
+            "state": "failed",
+        }
+        self.put("attempt", json.dumps(previous))
+        failure = json.dumps(
+            {"next_retry_ms": 1, "last_error": "earned-storage-failure"}
+        )
+        self.put("failure", failure)
+        self.start()
+        terminal = self.release_terminal()
+        self.assertEqual(terminal["state"], "deferred")
+        self.assertEqual(terminal["consecutive_failures"], 2)
+        self.assertTrue(terminal["needs_attention"])
+        self.assertGreaterEqual(
+            terminal["next_retry_ms"], terminal["finished_at"] * 1000 + 1900
+        )
+        self.assertLessEqual(terminal["next_retry_ms"], time.time() * 1000 + 5100)
+        self.assertEqual(self.read("failure"), failure)
+        self.wait_for(
+            lambda: len((self.folder / "started").read_text().splitlines()) >= 2,
+            seconds=7,
+        )
+        self.assertEqual(self.read("owner"), "persistent-job")
+
+    def test_unproven_or_partial_outcomes_keep_failure_backoff(self):
+        # Each case runs a fresh child+real-etcd prefix in a separate test fixture.
+        # Pure marker variants are additionally covered by the classifier tests.
+        self.configure_outcome(
+            extra="parallel rollout append completed reclaimed=41 failed=0"
+        )
+        self.start()
+        terminal = self.release_terminal()
+        self.assertEqual(terminal["state"], "failed")
+        self.assertEqual(terminal["reclaimed"], 41)
+        self.assertGreater(terminal["next_retry_ms"], time.time() * 1000 + 110000)
+
+    def test_exit75_without_marker_is_failure(self):
+        self.configure_outcome(marker=False)
+        self.start()
+        self.assertEqual(self.release_terminal()["state"], "failed")
+
+    def test_foreign_attempt_marker_is_failure(self):
+        self.configure_outcome(foreign=True)
+        self.start()
+        self.assertEqual(self.release_terminal()["state"], "failed")
+
+    def test_claimed_zero_work_is_not_preclaim_busy(self):
+        self.configure_outcome(extra="catch-up task claimed target=table")
+        self.start()
+        self.assertEqual(self.release_terminal()["state"], "failed")
+
+    def test_old_error_text_does_not_shorten_failure_backoff(self):
+        self.configure_outcome(
+            code=1,
+            marker=False,
+            extra="dedicated catch-up failed target=table error=catch-up admission remained busy for 30 seconds",
+        )
+        self.start()
+        self.assertEqual(self.release_terminal()["state"], "failed")
+
+    def test_concurrent_native_failure_deadline_is_preserved_after_busy(self):
+        self.configure_outcome()
+        self.start()
+        self.wait_for(lambda: (self.folder / "started").exists())
+        deadline = int((time.time() + 600) * 1000)
+        failure = json.dumps(
+            {
+                "next_retry_ms": deadline,
+                "needs_attention": True,
+                "last_error": "unknown storage outcome",
+            }
+        )
+        self.put("failure", failure)
+        terminal = self.release_terminal()
+        self.assertEqual(terminal["state"], "deferred")
+        self.assertEqual(terminal["next_retry_ms"], deadline)
+        self.assertTrue(terminal["needs_attention"])
+        self.assertEqual(self.read("failure"), failure)
+        time.sleep(0.2)
+        self.assertEqual(len((self.folder / "started").read_text().splitlines()), 1)
+
+    def test_terminal_operator_race_leaves_admitted_debt_intact(self):
+        self.configure_outcome()
+        self.start()
+        self.wait_for(lambda: (self.folder / "started").exists())
+        admitted = self.read("attempt")
+        self.operator["native_pod_uid"] = "replacement"
+        self.put("operator", json.dumps(self.operator))
+        (self.folder / "release").touch()
+        self.wait_for(
+            lambda: (
+                "attempt_record_changed" in (self.folder / "supervisor.log").read_text()
+            )
+        )
+        self.assertEqual(self.read("attempt"), admitted)
+        self.assertEqual(self.read("owner"), "persistent-job")
+
     def test_operator_change_after_uid_check_is_rejected_by_full_cas(self):
         fixture = self
         raced = threading.Event()
@@ -309,6 +439,48 @@ class SupervisorTests(unittest.TestCase):
         time.sleep(0.3)
         self.assert_no_attempt()
         self.assertEqual(self.read("owner"), "persistent-job")
+
+
+class BusyContractTests(unittest.TestCase):
+    def test_requires_exact_terminal_contract(self):
+        from native_supervisor import confirmed_busy
+
+        event = {
+            "event": "catchup_admission_deferred",
+            "version": 1,
+            "reason": "busy_before_claim",
+            "target": "table",
+            "attempt_id": "id",
+        }
+        baseline = [75, [event], "id", "table", False, 0, 0]
+        self.assertTrue(confirmed_busy(*baseline))
+        variants = [
+            (0, 1),
+            (0, 0),
+            (0, -9),
+            (1, []),
+            (1, [event, event]),
+            (2, "other"),
+            (3, "other"),
+            (4, True),
+            (5, 1),
+            (6, 1),
+        ]
+        for index, value in variants:
+            with self.subTest(index=index, value=value):
+                args = list(baseline)
+                args[index] = value
+                self.assertFalse(confirmed_busy(*args))
+        for field, value in [
+            ("version", True),
+            ("version", 2),
+            ("reason", "unknown"),
+            ("attempt_id", None),
+            ("extra", "unexpected"),
+        ]:
+            with self.subTest(field=field, value=value):
+                bad = {**event, field: value}
+                self.assertFalse(confirmed_busy(75, [bad], "id", "table", False, 0, 0))
 
 
 if __name__ == "__main__":

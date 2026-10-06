@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install disposable etcd fixture dependency
         run: sudo apt-get update && sudo apt-get install -y etcd-server
-      - name: Verify supervisor identity, CAS, backoff and join behavior
+      - name: Verify supervisor identity, busy deferral, CAS, backoff and join behavior
         env:
           ETCD_BIN: /usr/bin/etcd
         run: python3 -m unittest discover -s deploy/catchup -p 'test_native_supervisor.py' -v

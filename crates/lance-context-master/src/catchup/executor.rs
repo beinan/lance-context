@@ -8,9 +8,17 @@ use lance_context_core::{
 use lance_context_merge::MaintenanceKind;
 use std::{future::Future, sync::Arc, time::Duration};
 
+/// A busy admission never acquired a task or entered recovery/payload work.
+/// Transport errors, including an unknown claim outcome, remain errors.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExecuteOutcome {
+    Completed,
+    AdmissionBusy,
+}
+
 /// One dedicated process, one table, ordered commits, bounded passes. No server,
 /// scanner, ingestion writer, or fleet task consumer starts in this mode.
-pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
+pub async fn execute(mut config: MasterConfig, target: &str) -> Result<ExecuteOutcome> {
     config.catchup.enabled = false;
     config.catchup.validate()?;
     if !config.merge_rollout.owned(target) || config.merge_rollout.draining(target) {
@@ -31,7 +39,7 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
         .await
         .map_err(|e| e.to_string())?;
     let admission_started = tokio::time::Instant::now();
-    let claim = claim_before_deadline(
+    let Some(claim) = claim_before_deadline(
         || async {
             state
                 .task_store
@@ -41,7 +49,10 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
         },
         admission_started + Duration::from_secs(30),
     )
-    .await?;
+    .await?
+    else {
+        return Ok(ExecuteOutcome::AdmissionBusy);
+    };
     tracing::info!(%target, admission_seconds = admission_started.elapsed().as_secs_f64(),
         "catch-up task claimed");
     let result = async {
@@ -76,13 +87,13 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<()> {
     if let Some(error) = error {
         return Err(error);
     }
-    Ok(())
+    Ok(ExecuteOutcome::Completed)
 }
 
 async fn claim_before_deadline<T, F, Fut>(
     mut attempt: F,
     deadline: tokio::time::Instant,
-) -> Result<T>
+) -> Result<Option<T>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Option<T>>>,
@@ -92,10 +103,10 @@ where
         // mutating claim RPC. Individual etcd RPCs have their own timeout;
         // an accepted claim must be delivered even at the retry deadline.
         if tokio::time::Instant::now() >= deadline {
-            return Err("catch-up admission remained busy for 30 seconds".into());
+            return Ok(None);
         }
         if let Some(claim) = attempt().await? {
-            return Ok(claim);
+            return Ok(Some(claim));
         }
         tokio::time::sleep_until(
             deadline.min(tokio::time::Instant::now() + Duration::from_secs(1)),
@@ -317,7 +328,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result, "accepted claim");
+        assert_eq!(result, Some("accepted claim"));
     }
 
     #[tokio::test]
@@ -332,8 +343,25 @@ mod tests {
             deadline,
         )
         .await;
-        assert!(result.unwrap_err().contains("admission remained busy"));
+        assert_eq!(result.unwrap(), None);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_unknown_claim_outcome_is_not_busy_even_after_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = claim_before_deadline(
+            || async {
+                tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+                Err::<Option<()>, _>("claim response lost after accepted transaction".into())
+            },
+            deadline,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "claim response lost after accepted transaction"
+        );
     }
 
     #[tokio::test]

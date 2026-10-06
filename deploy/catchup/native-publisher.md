@@ -61,6 +61,29 @@ responsible for claims, cancellation, memory reservations, storage barriers and
 watermarks. This script has no general automatic recreation loop. Migration to
 the native Job controller remains separate work.
 
+## Busy before task claim
+
+When every completed claim attempt returns no claim for 30 seconds, the native
+executor returns the typed `AdmissionBusy` outcome. It has not entered execution
+recovery or payload work. The CLI exits 75 and emits one JSON record with event
+`catchup_admission_deferred`, version 1, reason `busy_before_claim`, target, and
+`CATCHUP_ATTEMPT_ID`. A claim accepted across the deadline is still delivered;
+an RPC error or lost claim response remains a failure, even after the deadline.
+
+The supervisor supplies a fresh attempt ID to each child, joins it, and requires
+both exit 75 and that exact record with no observed claim or payload work. Only
+then does it record `state=deferred` and retry after 2–5 seconds of jitter rather
+than charging another 120-second-or-longer failure penalty. It preserves previous
+failure counts, attention flags, and earned deadlines, rereads the native failure
+ledger after joining, and never changes that ledger. The next admission always
+checks the latest durable failure deadline again. A failed terminal CAS retains
+the pessimistic admitted attempt; it does not authorize a short retry.
+
+This requires both the updated native binary and supervisor. An old binary's
+busy error text, exit 75 alone, a mismatched/duplicate marker, partial work,
+transport errors and unknown outcomes retain normal failure handling. The
+separate native Kubernetes Job controller does not consume this wrapper protocol.
+
 ## Tests
 
 ```sh

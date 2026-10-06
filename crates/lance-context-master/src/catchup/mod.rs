@@ -11,7 +11,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-pub use executor::execute;
+pub use executor::{execute, ExecuteOutcome};
 use kubernetes::Kubernetes;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};

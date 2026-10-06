@@ -542,6 +542,102 @@ async fn stale_progress_revoke_cannot_cancel_advancing_or_replaced_execution() {
 /// Full native executor comparison; setup and verification are outside timing.
 /// Opt in explicitly so CI's ignored etcd suite does not run a benchmark.
 #[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS; exercises the real 30-second claim boundary"]
+async fn busy_executor_preserves_live_claim_then_merges_after_release() {
+    use lance_context_core::{
+        ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, SchemaSpec,
+    };
+    let (_dir, state) = fixture().await.unwrap();
+    let target = "generic:hot";
+    let uri = state.generic_uri("hot");
+    let schema = SchemaSpec::new(vec![
+        (
+            "id".into(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        ),
+        (
+            "text".into(),
+            ColumnSpec::new(ColumnType::String { large: true }),
+        ),
+    ]);
+    let writer = GenericStore::open(
+        &uri,
+        schema,
+        GenericStoreOptions {
+            shard_id: Some("worker-0".into()),
+            merge_after_generations: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for generation in 0..4 {
+        writer
+            .add(&[
+                json!({"id": format!("row-{generation}"), "text": format!("payload-{generation}")})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    }
+    assert_eq!(writer.pending_wal_generations().await.unwrap(), 4);
+    let mut cfg = state.config.clone();
+    cfg.catchup.enabled = false;
+    cfg.catchup.shards = vec!["worker-0".into()];
+    cfg.merge_rollout.owned_targets.push(target.into());
+    cfg.catchup.target = Some(target.into());
+    cfg.catchup.job_name = Inventory::new(&state)
+        .reserve(target, "busy-test", 4, 100)
+        .await
+        .unwrap()
+        .job;
+    let task = state
+        .task_store
+        .enqueue(TaskKind::MergeWal, target, vec![])
+        .await
+        .unwrap();
+    let held = state
+        .task_store
+        .claim_merge_target(target, cfg.catchup.job_name.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        execute(cfg.clone(), target).await.unwrap(),
+        ExecuteOutcome::AdmissionBusy
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+    assert_eq!(
+        state.task_store.get(&task.id).await.unwrap().unwrap().state,
+        lance_context_api::TaskState::Running
+    );
+    assert_eq!(writer.pending_wal_generations().await.unwrap(), 4);
+    state
+        .task_store
+        .finish(held, Ok("release fixture claim".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        execute(cfg, target).await.unwrap(),
+        ExecuteOutcome::Completed
+    );
+    let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(reader.pending_wal_generations().await.unwrap(), 0);
+    let rows = reader.list(None, None).await.unwrap();
+    assert_eq!(rows.len(), 4);
+    for row in rows {
+        let index = row["id"].as_str().unwrap().strip_prefix("row-").unwrap();
+        assert_eq!(row["text"], format!("payload-{index}"));
+    }
+}
+
+#[tokio::test]
 #[ignore = "manual benchmark: CATCHUP_BENCH=1 ETCD_TEST_ENDPOINTS required"]
 async fn benchmark_native_catchup_pipeline() {
     if std::env::var("CATCHUP_BENCH").as_deref() != Ok("1") {

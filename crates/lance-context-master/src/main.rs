@@ -35,9 +35,28 @@ async fn main() {
     }
 
     if let Some(target) = config.catchup.target.clone() {
-        if let Err(error) = lance_context_master::catchup::execute(config, &target).await {
-            tracing::error!(%target, %error, "dedicated catch-up failed");
-            std::process::exit(1);
+        use lance_context_master::catchup::ExecuteOutcome;
+        match lance_context_master::catchup::execute(config, &target).await {
+            Ok(ExecuteOutcome::Completed) => {}
+            Ok(ExecuteOutcome::AdmissionBusy) => {
+                // Machine-readable, attempt-bound contract with the supervisor.
+                // Emitted only before a task claim; never infer this from error text.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "catchup_admission_deferred",
+                        "version": 1,
+                        "reason": "busy_before_claim",
+                        "target": target,
+                        "attempt_id": std::env::var("CATCHUP_ATTEMPT_ID").ok(),
+                    })
+                );
+                std::process::exit(75);
+            }
+            Err(error) => {
+                tracing::error!(%target, %error, "dedicated catch-up failed");
+                std::process::exit(1);
+            }
         }
         return;
     }
