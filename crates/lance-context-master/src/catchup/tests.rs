@@ -1,3 +1,4 @@
+use super::outcome::JobOutcome;
 use super::*;
 use clap::Parser;
 use lance_context_api::TaskKind;
@@ -100,6 +101,8 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
     for (name, expected) in [
         ("CATCHUP_PIPELINE_ENABLED", "false"),
         ("CATCHUP_MERGE_MAX_GENERATIONS", "32"),
+        ("CATCHUP_ATTEMPT_ID", "1"),
+        ("CATCHUP_OUTCOME_PATH", "/dev/termination-log"),
     ] {
         let matches: Vec<_> = env.iter().filter(|e| e["name"] == name).collect();
         assert_eq!(matches.len(), 1);
@@ -127,6 +130,15 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
         env.iter().find(|e| e["name"] == "CATCHUP_ENABLED").unwrap()["value"],
         "false"
     );
+    assert_eq!(
+        env.iter().find(|e| e["name"] == "CATCHUP_POD_UID").unwrap()["valueFrom"]["fieldRef"]
+            ["fieldPath"],
+        "metadata.uid"
+    );
+    assert_eq!(
+        job["spec"]["template"]["spec"]["containers"][0]["terminationMessagePolicy"],
+        "File"
+    );
     let mut next = r.clone();
     next.attempt = 2;
     let next_job = kubernetes::render_job(&c, &next, template());
@@ -138,7 +150,7 @@ fn job_is_native_and_bounded_and_overrides_unsafe_inherited_mode() {
         "worker-1,worker-0"
     );
 }
-async fn fixture() -> Option<(tempfile::TempDir, Arc<MasterState>)> {
+pub(super) async fn fixture() -> Option<(tempfile::TempDir, Arc<MasterState>)> {
     let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").expect("ETCD_TEST_ENDPOINTS is required");
     let dir = tempfile::tempdir().unwrap();
     let mut c = config();
@@ -179,7 +191,7 @@ async fn replicas_share_one_slot_and_dedupe_duplicate_requests() {
     );
     assert_eq!(a.active().await.unwrap().len(), 1);
     let record = a.get("hot").await.unwrap().unwrap();
-    b.complete(&record, false, 1000).await.unwrap();
+    b.complete(&record, JobOutcome::Failed, 1000).await.unwrap();
     let failed = a.get("hot").await.unwrap().unwrap();
     assert_eq!(failed.consecutive_failures, 1);
     assert!(!failed.active);
@@ -198,7 +210,9 @@ async fn replicas_share_one_slot_and_dedupe_duplicate_requests() {
         "reserved"
     );
     // Replaying an old completion cannot release the new table's slot.
-    b.complete(&record, true, 2000).await.unwrap();
+    b.complete(&record, JobOutcome::Succeeded, 2000)
+        .await
+        .unwrap();
     assert_eq!(a.active().await.unwrap()[0].target, "other");
 }
 #[tokio::test]
@@ -423,13 +437,83 @@ async fn repeated_failed_jobs_keep_backoff_across_controller_restarts() {
         );
         let record = inventory.get("hot").await.unwrap().unwrap();
         assert_eq!(record.attempt, u64::from(attempt));
-        inventory.complete(&record, false, now + 1).await.unwrap();
+        inventory
+            .complete(&record, JobOutcome::Failed, now + 1)
+            .await
+            .unwrap();
         let persisted = Inventory::new(&state).get("hot").await.unwrap().unwrap();
         assert_eq!(persisted.consecutive_failures, attempt);
         assert_eq!(persisted.needs_attention, attempt >= 3);
         assert!(persisted.next_retry_ms > now + 60_000);
         now = persisted.next_retry_ms;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires ETCD_TEST_ENDPOINTS"]
+async fn deferred_jobs_preserve_failure_debt_and_fence_stale_completion() {
+    let (_dir, state) = fixture().await.unwrap();
+    let inventory = Inventory::new(&state);
+    let mut now = 1000;
+    // Establish genuine failure debt, including the attention flag.
+    for _ in 0..3 {
+        inventory.reserve("hot", "test", 1000, now).await.unwrap();
+        let record = inventory.get("hot").await.unwrap().unwrap();
+        inventory
+            .complete(&record, JobOutcome::Failed, now + 1)
+            .await
+            .unwrap();
+        now = inventory.get("hot").await.unwrap().unwrap().next_retry_ms;
+    }
+    for _ in 0..3 {
+        let inventory = Inventory::new(&state); // Simulate a fresh controller.
+        inventory.reserve("hot", "test", 1000, now).await.unwrap();
+        let record = inventory.get("hot").await.unwrap().unwrap();
+        assert!(record.needs_attention);
+        inventory
+            .complete(&record, JobOutcome::Deferred, now + 1)
+            .await
+            .unwrap();
+        let deferred = inventory.get("hot").await.unwrap().unwrap();
+        assert_eq!(deferred.consecutive_failures, 3);
+        assert!(deferred.needs_attention);
+        assert_eq!(deferred.outcome.as_deref(), Some("deferred_before_claim"));
+        assert!((3000..=5000).contains(&(deferred.next_retry_ms - now - 1)));
+        assert!(!deferred.active);
+        assert!(inventory.active().await.unwrap().is_empty());
+        assert_ne!(
+            inventory
+                .reserve("hot", "too early", 1000, now + 2)
+                .await
+                .unwrap()
+                .decision,
+            "reserved"
+        );
+        // An old controller cannot turn this deferred attempt into a failure.
+        inventory
+            .complete(&record, JobOutcome::Failed, now + 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            inventory
+                .get("hot")
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_failures,
+            3
+        );
+        now = deferred.next_retry_ms;
+    }
+    inventory.reserve("hot", "test", 1000, now).await.unwrap();
+    let record = inventory.get("hot").await.unwrap().unwrap();
+    inventory
+        .complete(&record, JobOutcome::Succeeded, now + 1)
+        .await
+        .unwrap();
+    let recovered = inventory.get("hot").await.unwrap().unwrap();
+    assert_eq!(recovered.consecutive_failures, 0);
+    assert!(!recovered.needs_attention);
 }
 
 #[tokio::test]
@@ -605,12 +689,22 @@ async fn busy_executor_preserves_live_claim_then_merges_after_release() {
         .await
         .unwrap()
         .unwrap();
+    let receipt_path = _dir.path().join("termination");
+    cfg.catchup.outcome_path = Some(receipt_path.to_string_lossy().into());
+    cfg.catchup.attempt_id = Some("1".into());
+    cfg.catchup.pod_uid = Some("test-pod".into());
     let started = std::time::Instant::now();
     assert_eq!(
         execute(cfg.clone(), target).await.unwrap(),
         ExecuteOutcome::AdmissionBusy
     );
     assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["outcome"], "deferred_before_claim");
+    assert_eq!(receipt["target"], target);
+    assert_eq!(receipt["pod_uid"], "test-pod");
+    std::fs::remove_file(&receipt_path).unwrap();
     assert_eq!(
         state.task_store.get(&task.id).await.unwrap().unwrap().state,
         lance_context_api::TaskState::Running
@@ -624,6 +718,10 @@ async fn busy_executor_preserves_live_claim_then_merges_after_release() {
     assert_eq!(
         execute(cfg, target).await.unwrap(),
         ExecuteOutcome::Completed
+    );
+    assert!(
+        !receipt_path.exists(),
+        "claimed work must not emit a deferred receipt"
     );
     let reader = GenericStore::open_existing(&uri, GenericStoreOptions::default())
         .await

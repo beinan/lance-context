@@ -206,3 +206,35 @@ queue limits, cancellation and manifest-drain barriers remain. The legacy timeou
 configuration/wire fields remain for compatibility; older master/worker binaries
 may still enforce them during a mixed-version rollout. Deploy compatible versions
 throughout before relying on the absence of a total execution ceiling.
+
+
+## Busy admission and terminal evidence
+
+Controller-created Jobs set a downward-API Pod UID, attempt identity and a
+Kubernetes termination-message path. If every claim RPC definitively returned
+no claim, the executor writes a versioned `deferred_before_claim` receipt before
+exiting 75. Claim RPC errors (including accepted-but-lost responses), recovery,
+payload failures and partial work do not produce this receipt. The standalone
+native supervisor retains its separate stdout contract.
+
+The controller waits for terminal Job and Pod status, then checks the receipt
+against the target, Job, attempt, actual Pod UID, container and Job owner
+reference. Multiple Pods, container restarts, missing/truncated receipts or a
+termination already requested by the controller remain unresolved; their
+reservation is retained and `needs_attention` is exposed by the existing GET
+catchup API. Exit 75 alone never authorizes a fast retry.
+
+A verified deferred result releases only this inventory reservation and records
+`outcome=deferred_before_claim`. It preserves real failure counts, attention and
+earned retry deadlines, with 3–5 seconds of per-Job jitter. Actual readmission
+occurs on a subsequent configured controller tick (30 seconds by default), and
+still checks current execution, target locks and durable failure cooldowns.
+It is not a promise of a new Pod in 3–5 seconds. A completed Job is reconciled
+before progress sampling so an unrelated maintenance owner cannot hide its
+terminal outcome or be revoked by this controller.
+
+Deploy the updated executor image in the pinned Pod template together with the
+controller. Existing successful/ordinary failed Jobs retain their handling;
+older executors returning 75 without the receipt require reconciliation rather
+than a guessed success or cleared failure history. This change does not adopt
+externally managed publishers or enable production catchup automatically.

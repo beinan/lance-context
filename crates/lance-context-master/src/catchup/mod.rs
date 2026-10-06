@@ -1,6 +1,7 @@
 //! Master-owned, bounded Kubernetes catch-up jobs. No payload reads in admission.
 mod executor;
 mod kubernetes;
+mod outcome;
 mod progress;
 pub(crate) mod store;
 #[cfg(test)]
@@ -64,6 +65,13 @@ pub struct CatchupConfig {
     pub target: Option<String>,
     #[arg(long, env = "CATCHUP_JOB_NAME", hide = true)]
     pub job_name: Option<String>,
+    /// Controller Jobs opt in to identity-bound Kubernetes termination receipts.
+    #[arg(long, env = "CATCHUP_OUTCOME_PATH", hide = true)]
+    pub outcome_path: Option<String>,
+    #[arg(long, env = "CATCHUP_ATTEMPT_ID", hide = true)]
+    pub attempt_id: Option<String>,
+    #[arg(long, env = "CATCHUP_POD_UID", hide = true)]
+    pub pod_uid: Option<String>,
 }
 impl Default for CatchupConfig {
     fn default() -> Self {
@@ -84,6 +92,9 @@ impl Default for CatchupConfig {
             pipeline_enabled: true,
             target: None,
             job_name: None,
+            outcome_path: None,
+            attempt_id: None,
+            pod_uid: None,
         }
     }
 }
@@ -329,6 +340,80 @@ pub fn spawn(state: &Arc<MasterState>) -> Option<tokio::task::JoinHandle<()>> {
         }
     }))
 }
+async fn reconcile_record(
+    state: &Arc<MasterState>,
+    inventory: &Inventory,
+    kube: &Kubernetes,
+    mut record: Record,
+) -> Result<()> {
+    // A busy executor may already have exited while a different maintenance
+    // execution owns the table. Reconcile its terminal receipt BEFORE sampling
+    // progress, which correctly refuses to observe/revoke that other owner.
+    match kube
+        .reconcile(&state.config, &record, record.termination_requested)
+        .await
+    {
+        Ok((uid, terminal)) => {
+            if record.job_uid.is_none() && uid.is_some() {
+                let mut updated = record.clone();
+                updated.job_uid = uid;
+                if !inventory.update(&record, &updated).await? {
+                    return Ok(());
+                }
+                record = updated;
+            }
+            if let Some(outcome) = terminal {
+                return inventory
+                    .complete(&record, outcome, chrono::Utc::now().timestamp_millis())
+                    .await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target = %record.target, job = %record.job, %error,
+                "catch-up job unresolved; reservation retained");
+            metrics::counter!("master_catchup_job_errors_total").increment(1);
+            return inventory.note_error(&record, &error).await;
+        }
+    }
+    if record.termination_requested {
+        return Ok(());
+    }
+    let sample = match progress::sample(state, &record).await {
+        Ok(sample) => sample,
+        Err(error) => return inventory.note_error(&record, &error).await,
+    };
+    let observed = progress::observe(
+        record.progress.as_ref(),
+        sample.clone(),
+        chrono::Utc::now().timestamp_millis(),
+        &state.config.catchup,
+        state.config.maintenance.maintenance_idle_timeout_secs,
+    );
+    let mut updated = record.clone();
+    updated.progress = Some(observed);
+    if !inventory.update(&record, &updated).await? {
+        return Ok(());
+    }
+    record = updated;
+    // Recheck immediately before acting: an old observation cannot authorize
+    // termination of an execution that has since advanced or been replaced.
+    if record.progress.as_ref().is_some_and(|p| p.stalled)
+        && progress::revoke(state, &record, &sample).await?
+    {
+        let mut updated = record.clone();
+        updated.termination_requested = true;
+        if !inventory.update(&record, &updated).await? {
+            return Ok(());
+        }
+        if let Err(error) = kube.reconcile(&state.config, &updated, true).await {
+            inventory.note_error(&updated, &error).await?;
+        }
+        // Terminal results are collected on the next tick, retaining capacity
+        // until the Job and its Pods have all stopped.
+    }
+    Ok(())
+}
+
 async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
     let Some(_operation) = state.admission.try_admit() else {
         return Ok(());
@@ -346,63 +431,14 @@ async fn tick(state: &Arc<MasterState>, cursor: &mut usize) -> Result<()> {
     {
         use futures::{stream, StreamExt, TryStreamExt};
         let result = async {
-            stream::iter(inventory.active().await?).map(|record| {
-                let inventory = &inventory;
-                let kube = &kube;
-                async move {
-                    let mut record = record;
-                    let mut stop = record.termination_requested;
-                    if !stop {
-                    match progress::sample(state, &record).await {
-                        Ok(sample) => {
-                            let now = chrono::Utc::now().timestamp_millis();
-                            let observed = progress::observe(record.progress.as_ref(), sample.clone(), now,
-                                &state.config.catchup, state.config.maintenance.maintenance_idle_timeout_secs);
-                            let mut updated = record.clone();
-                            updated.progress = Some(observed);
-                            if !inventory.update(&record, &updated).await? { return Ok(()); }
-                            record = updated;
-                            // Recheck immediately before acting: a stale sample is not
-                            // permission to terminate a now-progressing execution.
-                            if record.progress.as_ref().is_some_and(|p| p.stalled) {
-                                stop = progress::revoke(state, &record, &sample).await?;
-                                if stop {
-                                    let mut updated = record.clone();
-                                    updated.termination_requested = true;
-                                    if !inventory.update(&record, &updated).await? { return Ok(()); }
-                                    record = updated;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            inventory.note_error(&record, &error).await?;
-                            return Ok(());
-                        }
-                    }
-                    }
-                    match kube.reconcile(&state.config, &record, stop).await {
-                        Ok((uid, terminal)) => {
-                            if record.job_uid.is_none() && uid.is_some() {
-                                let mut updated = record.clone();
-                                updated.job_uid = uid;
-                                if !inventory.update(&record, &updated).await? { return Ok(()); }
-                                record = updated;
-                            }
-                            if let Some(success) = terminal {
-                                inventory.complete(&record, success, chrono::Utc::now().timestamp_millis()).await?;
-                            }
-                        },
-                        Err(error) => {
-                            tracing::warn!(target = %record.target, job = %record.job, %error, "catch-up job unresolved; reservation retained");
-                            metrics::counter!("master_catchup_job_errors_total").increment(1);
-                            inventory.note_error(&record, &error).await?;
-                        }
-                    }
-                    Ok::<_,String>(())
-                }
-            }).buffer_unordered(8).try_collect::<Vec<_>>().await?;
-            Ok::<_,String>(())
-        }.await;
+            stream::iter(inventory.active().await?)
+                .map(|record| reconcile_record(state, &inventory, &kube, record))
+                .buffer_unordered(8)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok::<_, String>(())
+        }
+        .await;
         let released = state
             .task_store
             .release_coordination_lock(guard)

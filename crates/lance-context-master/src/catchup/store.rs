@@ -1,4 +1,4 @@
-use super::{Decision, Result};
+use super::{outcome::JobOutcome, Decision, Result};
 use crate::state::MasterState;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use serde::{Deserialize, Serialize};
@@ -197,8 +197,8 @@ impl Inventory {
                 created_at_ms: now,
                 finished_at_ms: None,
                 consecutive_failures: old.as_ref().map_or(0, |r| r.consecutive_failures),
-                needs_attention: false,
-                next_retry_ms: 0,
+                needs_attention: old.as_ref().is_some_and(|r| r.needs_attention),
+                next_retry_ms: old.as_ref().map_or(0, |r| r.next_retry_ms),
                 outcome: None,
                 progress: None,
             };
@@ -250,30 +250,40 @@ impl Inventory {
             },
         ))
     }
-    pub async fn complete(&self, record: &Record, success: bool, now: i64) -> Result<()> {
+    pub(super) async fn complete(
+        &self,
+        record: &Record,
+        outcome: JobOutcome,
+        now: i64,
+    ) -> Result<()> {
         let mut terminal = record.clone();
         terminal.active = false;
         terminal.finished_at_ms = Some(now);
-        terminal.consecutive_failures = if success {
-            0
-        } else {
-            record.consecutive_failures.saturating_add(1)
-        };
-        terminal.needs_attention = terminal.consecutive_failures >= 3;
-        let delay_secs = if success {
-            60
-        } else {
-            (60u64.saturating_mul(1u64 << terminal.consecutive_failures.min(6))).min(3600)
+        let delay_secs = match outcome {
+            JobOutcome::Succeeded => {
+                terminal.consecutive_failures = 0;
+                terminal.needs_attention = false;
+                terminal.outcome = Some("succeeded".into());
+                60
+            }
+            JobOutcome::Deferred => {
+                // Admission acquired no work. Keep earned failure debt and
+                // attention, including deadlines surviving a controller restart.
+                terminal.outcome = Some("deferred_before_claim".into());
+                // Stable per-Job jitter; no synchronized etcd retry burst.
+                3 + record.job.bytes().fold(0u64, |n, b| (n + u64::from(b)) % 3)
+            }
+            JobOutcome::Failed => {
+                terminal.consecutive_failures = record.consecutive_failures.saturating_add(1);
+                terminal.needs_attention = terminal.consecutive_failures >= 3;
+                terminal.outcome = Some("failed; inspect Job status and executor logs".into());
+                (60u64.saturating_mul(1u64 << terminal.consecutive_failures.min(6))).min(3600)
+            }
         };
         terminal.next_retry_ms = now.saturating_add(delay_secs as i64 * 1000);
-        terminal.outcome = Some(
-            if success {
-                "succeeded"
-            } else {
-                "failed; inspect Job status and executor logs"
-            }
-            .into(),
-        );
+        if outcome == JobOutcome::Deferred {
+            terminal.next_retry_ms = terminal.next_retry_ms.max(record.next_retry_ms);
+        }
         let old = serde_json::to_vec(record).map_err(|e| e.to_string())?;
         let new = serde_json::to_vec(&terminal).map_err(|e| e.to_string())?;
         let active = active_key(&self.prefix, &record.target);

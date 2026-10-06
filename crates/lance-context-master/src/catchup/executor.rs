@@ -51,6 +51,7 @@ pub async fn execute(mut config: MasterConfig, target: &str) -> Result<ExecuteOu
     )
     .await?
     else {
+        super::outcome::report_deferred(&state.config.catchup, target)?;
         return Ok(ExecuteOutcome::AdmissionBusy);
     };
     tracing::info!(%target, admission_seconds = admission_started.elapsed().as_secs_f64(),

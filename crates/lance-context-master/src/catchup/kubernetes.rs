@@ -1,4 +1,8 @@
-use super::{store::Record, CatchupConfig, Result};
+use super::{
+    outcome::{self, JobOutcome},
+    store::Record,
+    CatchupConfig, Result,
+};
 use crate::config::MasterConfig;
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Value};
@@ -111,7 +115,7 @@ impl Kubernetes {
         config: &MasterConfig,
         record: &Record,
         stop: bool,
-    ) -> Result<(Option<String>, Option<bool>)> {
+    ) -> Result<(Option<String>, Option<JobOutcome>)> {
         let (status, mut job) = self
             .request(Method::GET, &format!("{}/{}", self.base, record.job), None)
             .await?;
@@ -219,7 +223,10 @@ impl Kubernetes {
         {
             return Ok((Some(uid), None));
         }
-        Ok((Some(uid), Some(success)))
+        Ok((
+            Some(uid),
+            Some(outcome::terminal_outcome(record, &job, items, success)?),
+        ))
     }
 }
 
@@ -265,6 +272,8 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
         ),
         ("CATCHUP_TARGET", record.target.clone()),
         ("CATCHUP_JOB_NAME", record.job.clone()),
+        ("CATCHUP_ATTEMPT_ID", record.attempt.to_string()),
+        ("CATCHUP_OUTCOME_PATH", outcome::RECEIPT_PATH.into()),
         ("CATCHUP_SHARDS", shards.join(",")),
         (
             "CATCHUP_MERGE_MAX_GENERATIONS",
@@ -291,7 +300,13 @@ pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value
         env.retain(|e| e["name"] != name);
         env.push(json!({"name": name, "value": value}));
     }
+    env.retain(|e| e["name"] != "CATCHUP_POD_UID");
+    env.push(
+        json!({"name":"CATCHUP_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}),
+    );
     spec["containers"][0]["env"] = json!(env);
+    spec["containers"][0]["terminationMessagePath"] = json!(outcome::RECEIPT_PATH);
+    spec["containers"][0]["terminationMessagePolicy"] = json!("File");
     spec["containers"][0]["args"] = json!([]);
     spec["restartPolicy"] = json!("Never");
     spec["preemptionPolicy"] = json!("Never");
@@ -324,6 +339,7 @@ mod tests {
         patches: AtomicUsize,
         pods_stopped: AtomicBool,
         job: std::sync::Mutex<Option<Value>>,
+        pod_override: std::sync::Mutex<Option<Value>>,
     }
     async fn create(
         State(mock): State<Arc<Mock>>,
@@ -364,6 +380,9 @@ mod tests {
         (StatusCode::OK, Json(job.clone()))
     }
     async fn pods(State(mock): State<Arc<Mock>>) -> Json<Value> {
+        if let Some(pods) = mock.pod_override.lock().unwrap().clone() {
+            return Json(pods);
+        }
         Json(
             json!({"items":[{"status":{"phase":if mock.pods_stopped.load(Ordering::SeqCst) {"Failed"} else {"Running"}}}]}),
         )
@@ -376,6 +395,7 @@ mod tests {
             patches: AtomicUsize::new(0),
             pods_stopped: AtomicBool::new(false),
             job: std::sync::Mutex::new(None),
+            pod_override: std::sync::Mutex::new(None),
         });
         let app = Router::new()
             .route("/jobs", axum::routing::post(create))
@@ -444,10 +464,104 @@ mod tests {
         mock.pods_stopped.store(true, Ordering::SeqCst);
         assert_eq!(
             client.reconcile(&config, &record, false).await.unwrap().1,
-            Some(false)
+            Some(JobOutcome::Failed)
         );
         server.abort();
     }
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn terminal_deferred_job_releases_its_slot_without_touching_other_execution() {
+        use super::super::{reconcile_record, store::Inventory};
+        let (_dir, state) = super::super::tests::fixture().await.unwrap();
+        let inventory = Inventory::new(&state);
+        inventory.reserve("hot", "test", 1000, 0).await.unwrap();
+        let record = inventory.get("hot").await.unwrap().unwrap();
+        // A different operation arrived after admission but before our claim.
+        let coordinator = state.task_store.merge_coordinator();
+        let other = lance_context_merge::Execution::new("hot", "master:other", "other-owner", 1);
+        state
+            .task_store
+            .etcd_client()
+            .clone()
+            .put(
+                lance_context_merge::execution_key(&state.config.etcd.etcd_prefix, "hot"),
+                serde_json::to_vec(&other).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut job = render_job(
+            &state.config,
+            &record,
+            read_template(&state.config.catchup).unwrap(),
+        );
+        job["metadata"]["uid"] = json!("job-uid");
+        let message = json!({"version":1, "outcome":"deferred_before_claim",
+            "target":"hot", "job":record.job, "attempt":record.attempt.to_string(),
+            "pod_uid":"pod-uid"})
+        .to_string();
+        let pods = json!({"items":[{"metadata":{"uid":"pod-uid","ownerReferences":[{
+            "uid":"job-uid","name":record.job,"kind":"Job","controller":true}]},
+            "status":{"phase":"Failed","containerStatuses":[{"name":"catchup", "restartCount":0,
+                "state":{"terminated":{"exitCode":75,"message":message}}}]}}]});
+        let mock = Arc::new(Mock {
+            creates: AtomicUsize::new(0),
+            terminal: AtomicBool::new(true),
+            patches: AtomicUsize::new(0),
+            pods_stopped: AtomicBool::new(true),
+            job: std::sync::Mutex::new(Some(job)),
+            pod_override: std::sync::Mutex::new(Some(pods)),
+        });
+        let app = Router::new()
+            .route("/jobs/{name}", get(lookup).patch(patch))
+            .route("/pods", get(self::pods))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let token = _dir.path().join("kube-token");
+        std::fs::write(&token, "test").unwrap();
+        let kube = Kubernetes {
+            client: Client::new(),
+            base: format!("http://{addr}/jobs"),
+            pods_base: format!("http://{addr}/pods"),
+            token_file: token.to_string_lossy().into(),
+        };
+        // A code 75 with lost terminal evidence remains unresolved even if
+        // another execution is healthy. No failure debt or ownership is reset.
+        let valid_pods = mock.pod_override.lock().unwrap().clone().unwrap();
+        let mut missing_receipt = valid_pods.clone();
+        missing_receipt["items"][0]["status"]["containerStatuses"][0]["state"]["terminated"]
+            ["message"] = json!("");
+        *mock.pod_override.lock().unwrap() = Some(missing_receipt);
+        reconcile_record(&state, &inventory, &kube, record.clone())
+            .await
+            .unwrap();
+        let unresolved = inventory.get("hot").await.unwrap().unwrap();
+        assert!(unresolved.active);
+        assert!(unresolved.needs_attention);
+        assert_eq!(unresolved.consecutive_failures, 0);
+        assert_eq!(inventory.active().await.unwrap().len(), 1);
+        *mock.pod_override.lock().unwrap() = Some(valid_pods);
+        reconcile_record(&state, &Inventory::new(&state), &kube, unresolved)
+            .await
+            .unwrap();
+        let done = inventory.get("hot").await.unwrap().unwrap();
+        assert!(!done.active);
+        assert_eq!(done.outcome.as_deref(), Some("deferred_before_claim"));
+        assert_eq!(done.consecutive_failures, 0);
+        assert!(inventory.active().await.unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_value(coordinator.get("hot").await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(other).unwrap()
+        );
+        assert_eq!(mock.patches.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
     #[test]
     fn invalid_or_unbounded_templates_are_rejected() {
         assert!(validate_template(&json!({"containers":[]})).is_err());
