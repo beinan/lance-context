@@ -889,6 +889,7 @@ async fn enqueue_merge_request(
 /// not every scheduler task -- adequate for tests, which drop the whole
 /// `MasterState` immediately after.
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
+    crate::wal_tail::spawn(state);
     // Retry metadata independently of coarse stats sweeps. Every replica may
     // enqueue; the existing task dedupe/claim transaction elects one executor.
     let retry_state = state.clone();
@@ -1129,6 +1130,7 @@ mod tests {
         MasterConfig {
             append: Default::default(),
             catchup: Default::default(),
+            wal_tail: Default::default(),
             maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {
                 owned_targets: ["exp", "generic:gs", "broken"]

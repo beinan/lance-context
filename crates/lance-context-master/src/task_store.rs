@@ -2216,6 +2216,7 @@ mod tests {
         MasterConfig {
             append: Default::default(),
             catchup: Default::default(),
+            wal_tail: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
