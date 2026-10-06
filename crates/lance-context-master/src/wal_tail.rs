@@ -114,6 +114,20 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     // Existing in-memory scalar stats only: no datasets, payloads, WAL listing
     // or stats-writer lock. Followers without a fresh snapshot do no work.
     let snapshot = state.stats_cache.read().await.clone();
+    let max_age = state
+        .config
+        .wal_tail
+        .wal_tail_stats_max_age_secs
+        .min(86_400) as i64
+        * 1000;
+    // An uninitialized/stale follower must not consume or reset the shared
+    // cursor before a replica with a usable snapshot can finish the rotation.
+    if !snapshot
+        .iter()
+        .any(|row| row.scanned_at <= now && now.saturating_sub(row.scanned_at) <= max_age)
+    {
+        return Ok(0);
+    }
     let mut names = candidates(&state.config, &snapshot, cursor.after.as_deref(), now);
     if names.is_empty() && cursor.after.is_none() {
         return Ok(0);
@@ -291,6 +305,11 @@ mod tests {
             .unwrap()
             .is_none());
         let successor = MasterState::new(state.config.clone()).await.unwrap();
+        assert_eq!(
+            tick(&successor, now + 30_000).await.unwrap(),
+            0,
+            "empty follower must not advance the shared cursor"
+        );
         *successor.stats_cache.write().await = state.stats_cache.read().await.clone();
         assert_eq!(tick(&successor, now + 1000).await.unwrap(), 0);
         assert_eq!(tick(&successor, now + 30_000).await.unwrap(), 1);
