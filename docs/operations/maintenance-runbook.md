@@ -66,9 +66,11 @@ Use `GET /api/v1/merge-progress?target=<name>` and compare **two samples of the
 same `execution.id`** taken ≥ 60 s apart.
 
 * `progress.sequence` increased → **working**. Leave it alone, however long it
-  has run. Compaction and index builds on large tables take many minutes with
+  has run. A merge on a hot table can legitimately run for hours as a chain of
+  passes; compaction and index builds on large tables take many minutes with
   coarse progress; index trainers in Lance 9 report progress only through
-  completed data/index file IO.
+  completed data/index file IO. Long is normal. Long **and** progressing is
+  never a reason to act.
 * `progress.sequence` unchanged for less than `MAINTENANCE_IDLE_TIMEOUT_SECS`
   → **undetermined**. Wait. Heartbeats and phase changes in `work_report` do
   not advance the sequence by design.
@@ -127,14 +129,27 @@ Symptom: `master_commit_turn_requests_total{result="expired"}` rising;
 `INDEX_COMMIT_WAIT_SECS`/`COMPACTION_COMMIT_WAIT_SECS`; task errors
 `maintenance commit ownership wait budget exhausted; reprepare`.
 
+First: this is **not** a fault in the merger. A continuous merger on a hot table
+that keeps winning the write turn is doing its job and is making progress (§3
+tells you how to verify that). Never stop, drain or restart a progressing
+merge to let compaction in; that trades a bounded fairness problem for WAL
+backlog and a fenced recovery. The symptom is a scheduling‑fairness gap, and
+the remedies are scheduling remedies:
+
 * If `master_merge_yield_to_compaction_total` is **flat** while `expired` rises,
-  some contender for that table does not honour the commit-ready hint: a
-  master or catch-up executor older than #324, or a legacy worker self-merge.
-  Upgrade or stop that contender. The hint cannot interrupt a binary that
-  ignores it.
+  some contender for that table does not understand the commit‑ready hint: a
+  master or catch‑up executor older than #324, or a legacy worker self‑merge.
+  Upgrade that binary at the next rollout. Until then, the preparation will keep
+  expiring on that table; that is wasted IO, not data risk.
 * If yield is rising and `expired` still rises, the merger wins the race after
-  yielding once. Raise the commit wait for that kind as a stopgap; the design
-  fix is `max_consecutive_turns` (design §4.2).
+  yielding once. Raise `COMPACTION_COMMIT_WAIT_SECS` / `INDEX_COMMIT_WAIT_SECS`
+  for that kind as a stopgap so the preparer survives more than one turn; the
+  design fix is `max_consecutive_turns` (design §4.2).
+* If the table is hot enough that it never leaves the critical class, defer
+  compaction/index for it (`MERGE_DRAIN_TARGETS` is **not** the tool — that
+  stops merge too). Today the only per‑table lever is to remove it from
+  `COMPACTION_PREPARE_TARGETS` / `INDEX_PREPARE_TARGETS` so it is not
+  repeatedly prepared and discarded; schedule the build in a quiet window.
 * A preparation that expires is discarded and rebuilt from scratch. Repeated
   expiry on a large table is wasted IO, not a correctness problem.
 
