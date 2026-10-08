@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod catchup;
 pub mod config;
+pub mod demand;
 pub mod discovery;
 pub mod eligibility;
 pub mod error;
