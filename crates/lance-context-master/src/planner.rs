@@ -281,6 +281,7 @@ pub(crate) async fn reconcile_once(
     let mut ops = Vec::new();
     let mut written = 0usize;
     let mut total_pending = 0u64;
+    let folded: BTreeMap<String, TableDemand> = tables.clone();
     for (target, mut table) in tables {
         total_pending += table.pending_generations();
         let key = keys.demand(&target);
@@ -337,14 +338,27 @@ pub(crate) async fn reconcile_once(
             return Err("leadership lost during reconcile".into());
         }
     }
-    // Executor view: heartbeats plus reservations. Read every tick so the
-    // leader always has it warm; nothing is placed from it yet.
+    // Executor view: heartbeats plus reservations, then the shadow pass.
     let executors_keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
     match crate::executors::load_headroom(&client, &executors_keys).await {
         Ok(headroom) => {
             metrics::gauge!("planner_executors").set(headroom.len() as f64);
             let reserved: u64 = headroom.values().map(|h| h.bytes_reserved).sum();
             metrics::gauge!("planner_reserved_bytes_total").set(reserved as f64);
+            if let Err(error) = shadow_pass(
+                state,
+                keys,
+                &executors_keys,
+                leader_token,
+                &folded,
+                headroom,
+                now,
+            )
+            .await
+            {
+                tracing::warn!(%error, "planner shadow pass failed");
+                metrics::counter!("planner_shadow_errors_total").increment(1);
+            }
         }
         Err(error) => {
             tracing::warn!(%error, "planner could not load executor headroom");
@@ -361,6 +375,178 @@ pub(crate) async fn reconcile_once(
         "planner reconcile"
     );
     Ok(written)
+}
+
+/// Shadow placement: score every table, order per design §4.2, place
+/// against headroom, and record what *would* be dispatched as `Shadow`
+/// assignments that no executor reads. Then compare with reality: for each
+/// table the planner would place, is a MergeWal task already active or
+/// queued? For each table it would not, is one running anyway? Each
+/// mismatch is a disagreement; the counter has to approach zero before P2.
+///
+/// Shadow assignments are replaced wholesale every pass (they are a view,
+/// not a reservation anyone binds), guarded by the leader token.
+async fn shadow_pass(
+    state: &Arc<MasterState>,
+    keys: &Keys,
+    executors_keys: &crate::executors::Keys,
+    leader_token: &str,
+    tables: &BTreeMap<String, TableDemand>,
+    mut headroom: BTreeMap<String, crate::executors::Headroom>,
+    now: i64,
+) -> Result<(), String> {
+    use crate::executors::{Assignment, AssignmentState};
+    use crate::scoring::{planner_order, score_merge, Class, MergePolicy};
+    use lance_context_api::TaskKind;
+
+    let policy = MergePolicy {
+        min_generations: state.config.merge_wal_min_generations.max(1) as u64,
+        ..MergePolicy::default()
+    };
+    let mut scored: Vec<_> = tables
+        .iter()
+        .filter_map(|(target, demand)| score_merge(target, demand, &policy, now))
+        .collect();
+    scored.sort_by(planner_order);
+    for s in &scored {
+        metrics::gauge!("planner_merge_score", "target" => s.target.clone()).set(s.score);
+    }
+    let by_class = |c: Class| scored.iter().filter(|s| s.class == c).count();
+    metrics::gauge!("planner_units", "class" => "critical").set(by_class(Class::Critical) as f64);
+    metrics::gauge!("planner_units", "class" => "normal").set(by_class(Class::Normal) as f64);
+    metrics::gauge!("planner_units", "class" => "tail").set(by_class(Class::Tail) as f64);
+
+    // Only Shadow records from previous passes are replaced; nothing else
+    // under assignments/ is touched.
+    let mut client = state.task_store.etcd_client().clone();
+    let existing = client
+        .get(
+            executors_keys.assignments_prefix(),
+            Some(GetOptions::new().with_prefix()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut ops: Vec<TxnOp> = existing
+        .kvs()
+        .iter()
+        .filter(|kv| {
+            serde_json::from_slice::<Assignment>(kv.value())
+                .is_ok_and(|a| a.state == AssignmentState::Shadow)
+        })
+        .map(|kv| TxnOp::delete(kv.key().to_vec(), None))
+        .collect();
+    // Headroom already counts previous Shadow records; release them in the
+    // arithmetic too, since they are about to be replaced.
+    for h in headroom.values_mut() {
+        h.slots_reserved.clear();
+        h.bytes_reserved = 0;
+        h.assignments = 0;
+    }
+    for kv in existing.kvs() {
+        if let Ok(a) = serde_json::from_slice::<Assignment>(kv.value()) {
+            if a.state != AssignmentState::Shadow && a.holds_capacity() {
+                if let Some(h) = headroom.get_mut(&a.executor) {
+                    for (k, n) in &a.reserved_slots {
+                        *h.slots_reserved.entry(*k).or_insert(0) += n;
+                    }
+                    h.bytes_reserved += a.reserved_bytes;
+                    h.assignments += 1;
+                }
+            }
+        }
+    }
+
+    let mut would_place: Vec<(String, String)> = Vec::new();
+    let mut unplaceable = 0usize;
+    for s in &scored {
+        if s.class == Class::Tail {
+            continue; // the real sweeps do not touch tails either
+        }
+        // Estimated cost: staging buffers are ~2x decoded bytes, capped at
+        // the per-pass byte limit the append path enforces.
+        let expected_bytes = (s.pending_bytes.saturating_mul(2))
+            .min(state.config.append.rollout_append_max_bytes as u64 * 2)
+            .max(1);
+        let pick = headroom
+            .values_mut()
+            .filter(|h| h.fits(TaskKind::MergeWal, expected_bytes))
+            .max_by_key(|h| h.bytes_free());
+        let Some(h) = pick else {
+            unplaceable += 1;
+            continue;
+        };
+        *h.slots_reserved.entry(TaskKind::MergeWal).or_insert(0) += 1;
+        h.bytes_reserved += expected_bytes;
+        h.assignments += 1;
+        let unit_id = generate_id();
+        let a = Assignment {
+            v: crate::executors::SCHEMA_VERSION,
+            unit_id: unit_id.clone(),
+            kind: TaskKind::MergeWal,
+            target: s.target.clone(),
+            needs_write_turn: true,
+            executor: h.executor.clone(),
+            planner_token: leader_token.to_string(),
+            reserved_slots: [(TaskKind::MergeWal, 1)].into_iter().collect(),
+            reserved_bytes: expected_bytes,
+            state: AssignmentState::Shadow,
+            created_ms: now,
+            bind_deadline_ms: now + 30_000,
+        };
+        ops.push(TxnOp::put(
+            executors_keys.assignment(&s.target, &unit_id),
+            serde_json::to_vec(&a).unwrap(),
+            None,
+        ));
+        would_place.push((s.target.clone(), h.executor.clone()));
+    }
+    metrics::gauge!("planner_shadow_placements").set(would_place.len() as f64);
+    metrics::gauge!("planner_shadow_unplaceable").set(unplaceable as f64);
+
+    for chunk in ops.chunks(100) {
+        let response = client
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::value(
+                        keys.leader_token().as_str(),
+                        CompareOp::Equal,
+                        leader_token,
+                    )])
+                    .and_then(chunk.to_vec()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.succeeded() {
+            return Err("leadership lost during shadow pass".into());
+        }
+    }
+
+    // Disagreement: planner says place vs. reality has no task; or planner
+    // says nothing (no demand scored, or tail) vs. reality is running one.
+    let placed: std::collections::BTreeSet<&str> =
+        would_place.iter().map(|(t, _)| t.as_str()).collect();
+    let mut disagreements = 0u64;
+    for s in &scored {
+        let active = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, &s.target)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some();
+        let planner_wants = placed.contains(s.target.as_str());
+        if planner_wants != active {
+            disagreements += 1;
+            tracing::debug!(
+                target = %s.target, class = ?s.class, score = s.score,
+                planner_wants, reality_active = active,
+                "planner shadow disagreement"
+            );
+        }
+    }
+    metrics::counter!("scheduler_shadow_disagreements_total", "kind" => "merge_wal")
+        .increment(disagreements);
+    metrics::gauge!("planner_shadow_disagreements_last_pass").set(disagreements as f64);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -559,6 +745,71 @@ mod tests {
         assert_eq!(report.tables.len(), 1);
         assert_eq!(report.tables[0].pending_generations, 42);
         assert_eq!(report.tables[0].shards, 2);
+
+        // Shadow placement: with this master's heartbeat live, the hot table
+        // (42 pending >= 8) gets exactly one Shadow assignment against it;
+        // cold (0 pending) gets none. No real MergeWal task exists, so the
+        // pass records one disagreement for hot.
+        let hb_runner = tokio::spawn({
+            let first = first.clone();
+            async move { crate::executors::heartbeat_loop_for_test(&first).await }
+        });
+        let ekeys = crate::executors::Keys::new(&cfg.etcd.etcd_prefix);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let shadows: Vec<crate::executors::Assignment> = loop {
+            let got = client
+                .get(
+                    ekeys.assignments_prefix(),
+                    Some(GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap();
+            let v: Vec<crate::executors::Assignment> = got
+                .kvs()
+                .iter()
+                .filter_map(|kv| serde_json::from_slice(kv.value()).ok())
+                .collect();
+            if !v.is_empty() {
+                break v;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no shadow assignment written"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(shadows.len(), 1, "{shadows:?}");
+        assert_eq!(shadows[0].target, "hot");
+        assert_eq!(shadows[0].state, crate::executors::AssignmentState::Shadow);
+        assert_eq!(shadows[0].kind, lance_context_api::TaskKind::MergeWal);
+        assert_eq!(shadows[0].executor, first.admission.status().executor_id);
+        assert!(shadows[0].reserved_bytes > 0);
+        // Headroom reflects the shadow reservation.
+        let h = crate::executors::load_headroom(&client, &ekeys)
+            .await
+            .unwrap();
+        assert_eq!(h[&shadows[0].executor].assignments, 1);
+        // Enqueue a real MergeWal task for hot: on the next pass the planner
+        // and reality agree, and the shadow row is replaced, not duplicated.
+        first
+            .task_store
+            .enqueue(lance_context_api::TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let got = client
+            .get(
+                ekeys.assignments_prefix(),
+                Some(GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.kvs().len(),
+            1,
+            "shadow rows are replaced, never accumulated"
+        );
+        hb_runner.abort();
 
         // A deposed leader's reconcile is refused: forge a different token.
         let err = reconcile_once(&first, &keys, "not-the-leader")
