@@ -264,6 +264,11 @@ pub(crate) fn spawn(state: &Arc<MasterState>) {
     });
 }
 
+#[cfg(test)]
+pub(crate) async fn heartbeat_loop_for_test(state: &Arc<MasterState>) -> Result<(), String> {
+    heartbeat_loop(state).await
+}
+
 async fn heartbeat_loop(state: &Arc<MasterState>) -> Result<(), String> {
     let keys = Keys::new(&state.config.etcd.etcd_prefix);
     let mut client = state.task_store.etcd_client().clone();
@@ -578,5 +583,57 @@ mod tests {
         let h = load_headroom(&client, &keys).await.unwrap();
         assert_eq!(h[&id].assignments, 1);
         assert!(h[&id].draining);
+    }
+}
+
+#[cfg(test)]
+mod shadow_isolation {
+    /// Spec test 5: shadow assignments are written only by the planner and
+    /// read only by the planner, `load_headroom` and the operator route. No
+    /// scheduler, merge, catch-up or executor code path may consult them
+    /// until P2 deliberately introduces binding. This is a source-level
+    /// check so a stray read fails CI, not production.
+    #[test]
+    fn no_executor_code_path_reads_assignments() {
+        let allowed = ["planner.rs", "executors.rs", "routes.rs"];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".rs") || allowed.contains(&name) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            if text.contains("assignments_prefix")
+                || text.contains(".assignment(")
+                || text.contains("/assignments/")
+            {
+                offenders.push(name.to_string());
+            }
+        }
+        // The catchup/ subdirectory too.
+        for sub in ["catchup"] {
+            if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
+                for entry in rd.flatten() {
+                    let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                    if text.contains("assignments") {
+                        offenders.push(format!("{sub}/{}", entry.file_name().to_string_lossy()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "executor paths read assignments: {offenders:?}"
+        );
+        // routes.rs may only read through load_headroom.
+        let routes = std::fs::read_to_string(dir.join("routes.rs")).unwrap();
+        assert!(
+            !routes.contains("assignments_prefix"),
+            "routes must go through load_headroom"
+        );
     }
 }

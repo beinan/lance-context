@@ -160,9 +160,17 @@ Rules (review point 4):
 ### 2.3 P1 scope for executors
 
 P1 writes heartbeats from every master (all are executors regardless of
-leadership) and from catch-up Jobs. The planner computes placements and
-writes assignments **only in shadow mode**: state `shadow`, never read by any
-executor, garbage-collected after 10 min. No executor binds anything in P1.
+leadership). The planner scores `MergeWal` demand only (design §4.2: classes
+Critical / Normal / Tail; class 1 oldest‑first), places against headroom, and
+writes assignments **only in shadow mode**: state `shadow`, replaced wholesale
+every pass, never read by any executor (a source‑level test enforces this), no
+binding. Tails are not placed, matching the real sweeps. Each pass then
+compares its placements with whether a real `MergeWal` task is active per
+table and increments `scheduler_shadow_disagreements_total{kind}`; the
+per‑pass count is `planner_shadow_disagreements_last_pass`. Compaction and
+index scoring, commit‑ready class 2 and `max_consecutive_turns` come with P2's
+preparation integration; catch‑up Job heartbeats come when Jobs become an
+executor kind.
 
 ## 3. Leader
 
