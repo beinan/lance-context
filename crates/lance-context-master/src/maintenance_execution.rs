@@ -321,39 +321,23 @@ where
     {
         return Err("maintenance ownership changed before completion".into());
     }
-    // A successful WAL catch-up reclaimed generations: publish the merged
-    // watermark per shard in the release transaction so demand and ownership
-    // change together. Other maintenance kinds do not move WAL watermarks. A
-    // watermark read failure must not strand a completed merge; release
-    // without demand and let the next scan correct it.
-    let merged = if maintenance == MaintenanceKind::Catchup && outcome.is_ok() {
-        match lance_context_core::rollout_append::merged_watermarks(&uri).await {
-            Ok(marks) => marks
-                .into_iter()
-                .map(
-                    |(shard, generation)| lance_context_merge::demand::ShardMerged {
-                        shard: shard.to_string(),
-                        merged_through: generation,
-                    },
-                )
-                .collect(),
-            Err(error) => {
-                tracing::warn!(target = %running.target, %error,
-                    "merged watermarks unavailable; releasing without demand update");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    if !coordinator
-        .release_with_demand(&proof, &terminal, &merged)
-        .await?
-    {
+    if !coordinator.release(&proof, &terminal).await? {
         return Err("maintenance completion claim lost".into());
     }
-    if !merged.is_empty() {
-        metrics::counter!("master_demand_merged_watermarks_total").increment(merged.len() as u64);
+    // A successful WAL catch-up reclaimed generations. Publish the merged
+    // watermark per shard *after* release, detached and bounded, so the
+    // release path never waits on a storage read, never contends with
+    // writer flushes on the demand keys, and never exceeds the etcd
+    // transaction size for a table with many shards. Each shard is its own
+    // monotonic per-dimension join, so a lost or late publish cannot
+    // misstate demand; the next scan reconciles it. Other maintenance kinds
+    // do not move WAL watermarks.
+    if maintenance == MaintenanceKind::Catchup && outcome.is_ok() {
+        crate::demand_publish::spawn_merged_demand(
+            coordinator.clone(),
+            running.target.clone(),
+            uri.clone(),
+        );
     }
     outcome
 }
