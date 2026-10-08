@@ -218,25 +218,25 @@ pub struct ShardMerged {
 }
 
 impl Coordinator {
-    /// Compare/op pairs that publish `merged_through` for each shard, for
-    /// inclusion in a larger transaction. Reads current events first; a
-    /// shard with no stored event gets a fresh executor-sourced record with
-    /// `sealed_through = merged_through` (the writer's next flush raises it).
-    /// Skips shards whose stored `merged_through` is already ≥ the new one.
-    pub(crate) async fn demand_release_changes(
+    /// Publish one shard's merged watermark as its own monotonic put.
+    ///
+    /// Reads the stored record, advances only `merged_through` (never lowers
+    /// anything the writer set), and writes under a mod-revision compare. A
+    /// writer flush racing on the same key fails the compare; the put is
+    /// retried a bounded number of times against the fresh record so a
+    /// normal flush cannot make merged progress disappear. A shard with no
+    /// stored event gets a fresh executor-sourced record with
+    /// `sealed_through = merged_through` at epoch 0, which any real writer
+    /// epoch supersedes. Returns `Ok(false)` when the stored merged mark is
+    /// already at or past the new one.
+    pub async fn publish_merged_watermark(
         &self,
         target: &str,
-        merged: &[ShardMerged],
-    ) -> Result<(Vec<Compare>, Vec<TxnOp>)> {
-        let mut compares = Vec::new();
-        let mut operations = Vec::new();
-        if merged.is_empty() {
-            return Ok((compares, operations));
-        }
+        shard: &ShardMerged,
+    ) -> Result<bool> {
+        let key = self.demand_event_key(target, &shard.shard);
         let mut client = self.client.clone();
-        let now_ms = chrono_now_ms();
-        for shard in merged {
-            let key = self.demand_event_key(target, &shard.shard);
+        for _ in 0..5 {
             let current = client
                 .get(key.as_str(), None)
                 .await
@@ -245,42 +245,49 @@ impl Coordinator {
                 .kvs()
                 .first()
                 .and_then(|kv| serde_json::from_slice(kv.value()).ok());
-            let next = match &stored {
-                Some(stored) => {
-                    if stored
-                        .merged_through
-                        .is_some_and(|m| m >= shard.merged_through)
-                    {
-                        continue;
-                    }
-                    DemandEvent {
-                        merged_through: Some(shard.merged_through),
-                        sealed_through: stored.sealed_through.max(shard.merged_through),
-                        source: EventSource::Executor,
-                        ..stored.clone()
-                    }
-                }
-                None => DemandEvent {
-                    v: SCHEMA_VERSION,
-                    shard: shard.shard.clone(),
-                    sealed_through: shard.merged_through,
-                    sealed_bytes_through: 0,
-                    merged_through: Some(shard.merged_through),
-                    flushed_at_ms: now_ms,
-                    writer_epoch: 0,
-                    source: EventSource::Executor,
-                },
+            // The executor merged generations numbered under the stored
+            // writer's epoch, so report under that epoch.
+            let epoch = stored.as_ref().map_or(0, |s| s.writer_epoch);
+            let event = DemandEvent {
+                v: SCHEMA_VERSION,
+                shard: shard.shard.clone(),
+                sealed_through: stored
+                    .as_ref()
+                    .map_or(shard.merged_through, |s| s.sealed_through),
+                sealed_bytes_through: stored.as_ref().map_or(0, |s| s.sealed_bytes_through),
+                merged_through: Some(shard.merged_through),
+                flushed_at_ms: stored
+                    .as_ref()
+                    .map_or_else(chrono_now_ms, |s| s.flushed_at_ms),
+                writer_epoch: epoch,
+                source: EventSource::Executor,
+            };
+            let Some(next) = join_events(stored.as_ref(), &event) else {
+                return Ok(false);
             };
             let value = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
-            compares.push(match current.kvs().first() {
+            let compare = match current.kvs().first() {
                 Some(kv) => {
                     Compare::mod_revision(key.as_str(), CompareOp::Equal, kv.mod_revision())
                 }
                 None => Compare::version(key.as_str(), CompareOp::Equal, 0),
-            });
-            operations.push(TxnOp::put(key, value, None));
+            };
+            let response = client
+                .txn(
+                    etcd_client::Txn::new()
+                        .when(vec![compare])
+                        .and_then(vec![TxnOp::put(key.as_str(), value, None)]),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if response.succeeded() {
+                return Ok(true);
+            }
         }
-        Ok((compares, operations))
+        Err(format!(
+            "merged watermark for {target}/{} kept losing to concurrent writes",
+            shard.shard
+        ))
     }
 
     fn demand_event_key(&self, target: &str, shard: &str) -> String {
@@ -291,68 +298,100 @@ impl Coordinator {
         )
     }
 
-    /// Publish a shard watermark. Monotonic: if the stored event already has a
-    /// `(writer_epoch, sealed_through)` at least as new, nothing is written and
-    /// `Ok(false)` is returned. Never deletes. Safe to call on every flush.
+    /// Publish a shard watermark. The stored record is the per-dimension join
+    /// of everything published so far: `sealed` and `merged` are each the max
+    /// of `(writer_epoch, value)` across stored and new, independently, so a
+    /// writer event with `merged_through: None` keeps the executor's merged
+    /// mark and an executor event with an older sealed still advances merged.
+    /// Writes under a mod-revision compare and retries a bounded number of
+    /// times against the fresh record when a concurrent writer wins the race,
+    /// so no publisher's progress is lost to another's. Returns `Ok(false)`
+    /// when nothing advanced. Never deletes. Safe on every flush.
     pub async fn publish_demand_event(&self, target: &str, event: &DemandEvent) -> Result<bool> {
         let key = self.demand_event_key(target, &event.shard);
-        let value = serde_json::to_vec(event).map_err(|e| e.to_string())?;
         let mut client = self.client.clone();
-        let current = client
-            .get(key.as_str(), None)
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(kv) = current.kvs().first() else {
+        for _ in 0..5 {
+            let current = client
+                .get(key.as_str(), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let stored: Option<DemandEvent> = current
+                .kvs()
+                .first()
+                .and_then(|kv| serde_json::from_slice(kv.value()).ok());
+            let Some(next) = join_events(stored.as_ref(), event) else {
+                return Ok(false);
+            };
+            let value = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
+            let compare = match current.kvs().first() {
+                Some(kv) => {
+                    Compare::mod_revision(key.as_str(), CompareOp::Equal, kv.mod_revision())
+                }
+                None => Compare::version(key.as_str(), CompareOp::Equal, 0),
+            };
             let response = client
                 .txn(
                     etcd_client::Txn::new()
-                        .when(vec![Compare::version(key.as_str(), CompareOp::Equal, 0)])
+                        .when(vec![compare])
                         .and_then(vec![TxnOp::put(key.as_str(), value, None)]),
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            return Ok(response.succeeded());
-        };
-        let stored: DemandEvent = match serde_json::from_slice(kv.value()) {
-            Ok(stored) => stored,
-            // An unreadable record is replaced rather than left poisoning the key.
-            Err(_) => DemandEvent {
-                v: 0,
-                shard: event.shard.clone(),
-                sealed_through: 0,
-                sealed_bytes_through: 0,
-                merged_through: None,
-                flushed_at_ms: 0,
-                writer_epoch: 0,
-                source: event.source,
-            },
-        };
-        let newer = (
-            event.writer_epoch,
-            event.sealed_through,
-            event.merged_through,
-        ) > (
-            stored.writer_epoch,
-            stored.sealed_through,
-            stored.merged_through,
-        );
-        if !newer {
-            return Ok(false);
+            if response.succeeded() {
+                return Ok(true);
+            }
         }
-        let response = client
-            .txn(
-                etcd_client::Txn::new()
-                    .when(vec![Compare::mod_revision(
-                        key.as_str(),
-                        CompareOp::Equal,
-                        kv.mod_revision(),
-                    )])
-                    .and_then(vec![TxnOp::put(key.as_str(), value, None)]),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(response.succeeded())
+        Err(format!(
+            "demand event for {target}/{} kept losing to concurrent writes",
+            event.shard
+        ))
     }
+}
+
+/// Per-dimension join of a stored event with a new one. Returns `None` when
+/// the stored record already dominates on every dimension. `sealed` is
+/// ordered by `(writer_epoch, sealed_through)` then bytes; `merged` by
+/// `(writer_epoch, merged_through)`; each taken independently. The result
+/// keeps the stored record's writer fields unless the new event's sealed
+/// mark wins. A merged mark whose epoch differs from the resulting sealed
+/// epoch is dropped: the wire record stores merged as a bare value under the
+/// record's epoch, and a cross-epoch merged mark says nothing about this
+/// epoch's generations anyway.
+pub fn join_events(stored: Option<&DemandEvent>, event: &DemandEvent) -> Option<DemandEvent> {
+    let Some(stored) = stored else {
+        return Some(event.clone());
+    };
+    let stored_sealed = (stored.writer_epoch, stored.sealed_through);
+    let event_sealed = (event.writer_epoch, event.sealed_through);
+    let stored_merged = stored.merged_through.map(|v| (stored.writer_epoch, v));
+    let event_merged = event.merged_through.map(|v| (event.writer_epoch, v));
+    let sealed_wins = event_sealed > stored_sealed
+        || (event_sealed == stored_sealed
+            && event.sealed_bytes_through > stored.sealed_bytes_through);
+    let merged_wins = match (stored_merged, event_merged) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(s), Some(e)) => e > s,
+    };
+    if !sealed_wins && !merged_wins {
+        return None;
+    }
+    let best_merged = match (stored_merged, event_merged) {
+        (Some(s), Some(e)) => Some(s.max(e)),
+        (s, e) => s.or(e),
+    };
+    let mut next = if sealed_wins {
+        event.clone()
+    } else {
+        stored.clone()
+    };
+    next.merged_through = best_merged
+        .filter(|(epoch, _)| *epoch == next.writer_epoch)
+        .map(|(_, value)| value);
+    if merged_wins && !sealed_wins {
+        next.source = event.source;
+    }
+    Some(next)
 }
 
 #[cfg(test)]
@@ -555,76 +594,85 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
-    async fn release_changes_only_advance_merged_and_keep_writer_fields() {
+    async fn merged_publish_advances_only_merged_and_survives_writer_races() {
         let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
         let client = etcd_client::Client::connect([endpoint], None)
             .await
             .unwrap();
         let coordinator = Coordinator::new(
             client.clone(),
-            format!("/demand-release/{}", uuid::Uuid::new_v4()),
+            format!("/demand-merged/{}", uuid::Uuid::new_v4()),
         );
-        // Writer has sealed 20 at epoch 3 with bytes; executor merged 15 then 12.
         assert!(coordinator
             .publish_demand_event("t", &ev("s", 20, None, 3, EventSource::Writer))
             .await
             .unwrap());
-        let (c, o) = coordinator
-            .demand_release_changes(
-                "t",
-                &[ShardMerged {
-                    shard: "s".into(),
-                    merged_through: 15,
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!((c.len(), o.len()), (1, 1));
-        assert!(coordinator.transact(c, o).await.unwrap());
-        let read = |c: etcd_client::Client, coordinator: Coordinator| async move {
-            let key = coordinator.demand_event_key("t", "s");
-            let kv = c.clone().get(key, None).await.unwrap();
-            serde_json::from_slice::<DemandEvent>(kv.kvs()[0].value()).unwrap()
+        let shard = |m: u64| ShardMerged {
+            shard: "s".into(),
+            merged_through: m,
         };
-        let after = read(client.clone(), coordinator.clone()).await;
+        assert!(coordinator
+            .publish_merged_watermark("t", &shard(15))
+            .await
+            .unwrap());
+        let key = coordinator.demand_event_key("t", "s");
+        let read = |client: etcd_client::Client, key: String| async move {
+            serde_json::from_slice::<DemandEvent>(
+                client.clone().get(key, None).await.unwrap().kvs()[0].value(),
+            )
+            .unwrap()
+        };
+        let after = read(client.clone(), key.clone()).await;
         assert_eq!(after.merged_through, Some(15));
         assert_eq!(after.sealed_through, 20, "writer's sealed kept");
         assert_eq!(after.writer_epoch, 3, "writer's epoch kept");
         assert_eq!(after.sealed_bytes_through, 20_000, "writer's bytes kept");
-        assert_eq!(after.source, EventSource::Executor);
-        // A lower merged is skipped entirely: no compare, no op.
-        let (c, o) = coordinator
-            .demand_release_changes(
+        assert!(
+            !coordinator
+                .publish_merged_watermark("t", &shard(12))
+                .await
+                .unwrap(),
+            "lower merged is a no-op"
+        );
+        // Race: a writer flush lands between the executor's read and its CAS.
+        // Simulate by interleaving: publish writer sealed=25 then merged=18;
+        // both must survive regardless of which the stored record saw first.
+        let c1 = coordinator.clone();
+        let c2 = coordinator.clone();
+        let (w, m) = tokio::join!(
+            async move {
+                c1.publish_demand_event("t", &ev("s", 25, None, 3, EventSource::Writer))
+                    .await
+                    .unwrap()
+            },
+            async move { c2.publish_merged_watermark("t", &shard(18)).await.unwrap() }
+        );
+        assert!(w && m, "both writes must succeed (writer={w}, merged={m})");
+        let stored = read(client.clone(), key.clone()).await;
+        assert_eq!(
+            (stored.sealed_through, stored.merged_through),
+            (25, Some(18))
+        );
+        // Unknown shard: fresh executor record, sealed == merged, epoch 0.
+        assert!(coordinator
+            .publish_merged_watermark(
                 "t",
-                &[ShardMerged {
-                    shard: "s".into(),
-                    merged_through: 12,
-                }],
-            )
-            .await
-            .unwrap();
-        assert!(c.is_empty() && o.is_empty());
-        // Unknown shard: fresh executor record, sealed == merged.
-        let (c, o) = coordinator
-            .demand_release_changes(
-                "t",
-                &[ShardMerged {
+                &ShardMerged {
                     shard: "new".into(),
-                    merged_through: 7,
-                }],
+                    merged_through: 7
+                }
             )
             .await
-            .unwrap();
-        assert!(coordinator.transact(c, o).await.unwrap());
-        let key = coordinator.demand_event_key("t", "new");
-        let fresh: DemandEvent =
-            serde_json::from_slice(client.clone().get(key, None).await.unwrap().kvs()[0].value())
-                .unwrap();
-        assert_eq!((fresh.sealed_through, fresh.merged_through), (7, Some(7)));
-        let mut table = TableDemand::default();
-        table.fold(&after, 1, 0).unwrap();
-        table.fold(&fresh, 2, 0).unwrap();
-        assert_eq!(table.pending_generations(), 5);
+            .unwrap());
+        let fresh = read(client.clone(), coordinator.demand_event_key("t", "new")).await;
+        assert_eq!(
+            (
+                fresh.sealed_through,
+                fresh.merged_through,
+                fresh.writer_epoch
+            ),
+            (7, Some(7), 0)
+        );
     }
 
     #[test]

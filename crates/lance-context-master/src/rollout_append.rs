@@ -634,19 +634,43 @@ mod tests {
                 .unwrap();
             assert_eq!(marks.len(), 2, "{target}: {marks:?}");
             let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
-            let events = first
-                .task_store
-                .etcd_client()
-                .clone()
-                .get(
-                    format!(
-                        "{}/demand-events/{encoded}/",
-                        first.config.etcd.etcd_prefix.trim_end_matches('/')
-                    ),
-                    Some(etcd_client::GetOptions::new().with_prefix()),
-                )
-                .await
-                .unwrap();
+            let events_prefix = format!(
+                "{}/demand-events/{encoded}/",
+                first.config.etcd.etcd_prefix.trim_end_matches('/')
+            );
+            // The merged-watermark publish is detached from release; wait for
+            // both shards' records to carry a merged mark, with a bound.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let events = loop {
+                let events = first
+                    .task_store
+                    .etcd_client()
+                    .clone()
+                    .get(
+                        events_prefix.as_str(),
+                        Some(etcd_client::GetOptions::new().with_prefix()),
+                    )
+                    .await
+                    .unwrap();
+                let merged_count = events
+                    .kvs()
+                    .iter()
+                    .filter(|kv| {
+                        serde_json::from_slice::<lance_context_merge::demand::DemandEvent>(
+                            kv.value(),
+                        )
+                        .is_ok_and(|e| e.merged_through.is_some())
+                    })
+                    .count();
+                if merged_count == 2 {
+                    break events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{target}: merged watermarks never published ({merged_count}/2)"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             assert_eq!(events.kvs().len(), 2, "{target}");
             let mut table = lance_context_merge::demand::TableDemand::default();
             for kv in events.kvs() {
