@@ -1172,6 +1172,14 @@ fn spawn_pool_poller(
     spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
 }
 
+/// Decrements a gauge when dropped, so unwinding pays it back.
+struct GaugeHold(metrics::Gauge);
+impl Drop for GaugeHold {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
 fn spawn_filtered_pool_poller(
     state: Arc<MasterState>,
     pool: Arc<Semaphore>,
@@ -1245,11 +1253,15 @@ fn spawn_filtered_pool_poller(
                         let running = running.clone();
                         running.increment(1.0);
                         tokio::spawn(async move {
+                            // Decrement on every exit, including a panic in
+                            // run_task: the permits are dropped by unwinding,
+                            // so the gauge must be too, or capacity reads as
+                            // consumed forever.
+                            let _held = GaugeHold(running);
                             run_task(&st, claim, timing).await;
                             drop(permit);
                             drop(compact_permit);
                             drop(operation);
-                            running.decrement(1.0);
                         });
                     }
                     Ok(None) => break,
