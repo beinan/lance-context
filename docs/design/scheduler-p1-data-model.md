@@ -167,11 +167,17 @@ executor, garbage-collected after 10 min. No executor binds anything in P1.
 ## 3. Leader
 
 ```
-P/leader   (leased)   { "v": 1, "token": "<uuid>", "instance": "...", "since_ms": ... }
+P/leader         (leased)  { "v": 1, "token": "<uuid>", "instance": "...", "since_ms": ... }
+P/leader-token   (leased)  "<uuid>"      // bare token so writes can compare on it
 ```
 
-Campaign with `Version(P/leader) == 0`; every planner write compares
-`P/leader == own token`. Followers watch `demand-events/`, `demand/`,
+Campaign with `Version(P/leader) == 0`, writing both keys under one lease in
+one txn. Every planner write txn compares `P/leader-token == own token`, and
+every reconcile reads it first even when there is nothing to write, so a
+deposed leader notices on its next tick, not on its next change. Keepalive
+every `TTL/3`; a failed or expired keepalive ends leadership and the loop
+re-campaigns after a short pause. `PLANNER_ENABLED` (default off) gates all of
+this; `PLANNER_RECONCILE_SECS` (default 30) sets the full-fold cadence. Followers watch `demand-events/`, `demand/`,
 `executors/`, `assignments/`, `merge-executions/`, `target-locks/` to keep a
 warm cache. The leader's cycle is triggered by those watches plus a 1 s tick.
 

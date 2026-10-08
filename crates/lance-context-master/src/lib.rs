@@ -4,6 +4,7 @@ pub mod admission;
 pub mod catchup;
 pub mod config;
 pub mod demand_publish;
+pub mod planner;
 pub use lance_context_merge::demand;
 pub mod discovery;
 pub mod eligibility;

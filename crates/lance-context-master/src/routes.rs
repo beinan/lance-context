@@ -572,6 +572,93 @@ pub async fn list_cooldowns(
         .map_err(MasterError::from_lance)
 }
 
+#[derive(Deserialize, Default)]
+pub struct DemandQuery {
+    pub target: Option<String>,
+}
+
+/// One table's demand as the planner sees it.
+#[derive(Debug, Serialize)]
+pub struct DemandView {
+    pub target: String,
+    pub pending_generations: u64,
+    pub pending_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_ms: Option<i64>,
+    pub shards: usize,
+    pub observed_revision: i64,
+    pub updated_ms: i64,
+    pub record: lance_context_merge::demand::TableDemand,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DemandReport {
+    /// Whether this master currently holds planner leadership.
+    pub leader: Option<crate::planner::LeaderRecord>,
+    pub tables: Vec<DemandView>,
+}
+
+/// `GET /api/v1/scheduler/demand[?target=]` — the planner's demand cache,
+/// folded from per-shard watermark events. Read-only; this is what the
+/// planner would schedule from. Absent while no planner has run.
+pub async fn scheduler_demand(
+    State(state): State<Arc<MasterState>>,
+    Query(query): Query<DemandQuery>,
+) -> Result<Json<DemandReport>, MasterError> {
+    let keys = crate::planner::Keys::new(&state.config.etcd.etcd_prefix);
+    let mut client = state.task_store.etcd_client().clone();
+    let leader = client
+        .get(keys.leader(), None)
+        .await
+        .map_err(|e| MasterError::Internal(e.to_string()))?
+        .kvs()
+        .first()
+        .and_then(|kv| serde_json::from_slice(kv.value()).ok());
+    let response = match &query.target {
+        Some(target) => {
+            if target.is_empty() || target.len() > 512 {
+                return Err(MasterError::InvalidRequest("invalid target".into()));
+            }
+            client.get(keys.demand(target), None).await
+        }
+        None => {
+            client
+                .get(
+                    keys.demand_prefix(),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+        }
+    }
+    .map_err(|e| MasterError::Internal(e.to_string()))?;
+    let prefix = keys.demand_prefix();
+    let mut tables = Vec::new();
+    for kv in response.kvs() {
+        let Ok(record) =
+            serde_json::from_slice::<lance_context_merge::demand::TableDemand>(kv.value())
+        else {
+            continue;
+        };
+        let key = String::from_utf8_lossy(kv.key());
+        let target = key
+            .strip_prefix(prefix.as_str())
+            .and_then(crate::planner::unhex)
+            .unwrap_or_else(|| key.to_string());
+        tables.push(DemandView {
+            target,
+            pending_generations: record.pending_generations(),
+            pending_bytes: record.pending_bytes(),
+            oldest_pending_ms: record.oldest_pending_ms(),
+            shards: record.shards.len(),
+            observed_revision: record.observed_revision,
+            updated_ms: record.updated_ms,
+            record,
+        });
+    }
+    tables.sort_by_key(|t| std::cmp::Reverse(t.pending_generations));
+    Ok(Json(DemandReport { leader, tables }))
+}
+
 /// `GET /api/v1/scheduler/repairs` — base-table repairs the master performed,
 /// most recent first: which fragments were dropped from which store, when,
 /// and how many rows they held.
@@ -835,6 +922,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
             post(crate::catchup::trigger).get(crate::catchup::status),
         )
         .route("/scheduler/cooldowns", get(list_cooldowns))
+        .route("/scheduler/demand", get(scheduler_demand))
         .route("/scheduler/repairs", get(list_repairs))
         .route("/registry/diff", get(registry_diff))
         .route("/registry/backfill", post(registry_backfill))
@@ -901,6 +989,7 @@ mod tests {
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
+            planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
