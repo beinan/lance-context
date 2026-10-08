@@ -92,10 +92,14 @@ Sources, in order of freshness:
    lost or duplicated event cannot corrupt the count. Merge release writes the merged
    watermark per shard in the same `release` txn; pending = sealed − merged per shard.
 2. **Pull reconciliation**: the existing stats scanner (L6) continues at 300 s and writes
-   `TableDemand` with the etcd/manifest revision it observed. A snapshot may only *lower* a
-   shard's watermark if its `observed_revision` is newer than the event that set it; this
-   stops a stale scan from hiding fresh flushes. After migration it no longer enqueues,
-   retires or compacts directly (retirement becomes a `Retire` kind, see 4.3).
+   the same per‑shard watermark records as writers do, with `source: scan`. etcd
+   revisions and manifest versions are different clocks and are never compared with each
+   other. The only ordering used is the shard's own: `(writer_epoch, sealed_through)`. A
+   scan may **raise** a shard's `sealed_through` at an equal epoch and may **replace** the
+   shard record only with a strictly higher `writer_epoch` (a retired writer whose shard
+   was re‑observed); it may never lower a watermark at an equal epoch, however late the
+   snapshot was written. After migration the scanner no longer enqueues, retires or
+   compacts directly (retirement becomes a `Retire` kind, see 4.3).
 3. **Targeted probe**: when `last_observed_ms` is older than `demand_stale_secs` for a
    table with recent demand, the planner schedules a cheap `Observe` unit (manifest‑only
    read) instead of running a discovery loop.
@@ -143,7 +147,16 @@ rather than a tendency:
 * `max_turn_wait_secs[kind]` (default compaction/index commit = 900, tail merge = 3600):
   a unit that has waited longer is promoted to class 1 regardless of score.
 
-Both are per‑table policy fields and both are exported as `scheduler_turn_wait_seconds`.
+Promotion to class 1 is not by itself a guarantee: class 1 is still sorted by score, so
+a low‑backlog table promoted for age can keep losing to hot tables whose critical merges
+are also class 1. The cross‑table rule is therefore **oldest‑first within class 1**: class
+1 sorts by `wait_since_ms` ascending, not by score, and the planner must place the
+oldest class‑1 unit before any other unit whenever a feasible executor exists (invariant
+4 is restated accordingly). Score ordering applies only in classes 2–5. A table can
+starve only if no executor is ever feasible for it, which is a capacity fault surfaced
+by `scheduler_schedule_to_bind_seconds`, not a fairness fault.
+
+All three are per‑table policy fields and are exported as `scheduler_turn_wait_seconds`.
 
 ### 4.3 Units of work and the per‑table write‑turn state machine
 
@@ -247,9 +260,24 @@ written in the executor's `release` txn so it is atomic with the fence.
 
 The planner publishes per‑table `backlog_class ∈ {ok, warn, critical}` into the demand
 record. The rollout server already 503s reads past 4096 pending generations; it should also
-read `backlog_class` and (a) raise flush interval / coalesce generations when `critical`
-(ClickHouse `parts_to_delay_insert`), (b) export it as a metric. This is the only place
-where the scheduler influences writers.
+read `backlog_class` and export it as a metric, and may use it to shape ingestion. Any
+shaping must respect two constraints that reducing generation *count* alone does not:
+
+* **Memory**: stretching the flush interval or coalescing generations keeps more rows in
+  the writer's memtable. The server's existing `ROLLOUT_WAL_PENDING_MAX_*` and memtable
+  budget remain the hard caps; shaping may only move work *between* a longer flush interval
+  and a slower admission rate, never past those caps. If the memtable budget would be
+  exceeded, the server must flush (producing a generation) rather than hold rows.
+* **Durability latency**: rows are durable only when flushed. Shaping must not extend the
+  time between a write being acknowledged and being flushed beyond the server's configured
+  durability bound (`ROLLOUT_FLUSH_INTERVAL_SECS` is that bound today). The alternative
+  lever under `critical` is therefore admission delay (ClickHouse `parts_to_delay_insert`,
+  TiKV flow control): slow the writer's accept rate proportionally, keep flush cadence.
+
+Backpressure therefore converts backlog into **slower ingestion**, never into memory
+pressure or longer un‑flushed windows. This is the only place where the scheduler
+influences writers, and it is gated per table by policy (`backpressure: off | metric |
+delay_admission`), default `metric`.
 
 ### 4.8 Policy and configuration
 
@@ -327,8 +355,10 @@ that leaderlessly is exactly what produced five cursor loops and a 7‑key claim
 2. An assignment is never written to an executor whose heartbeat lease is dead.
 3. Sum of `reserved_bytes` over live assignments on an executor ≤ its `bytes_total`,
    computed from `assignments/`, never from sampled `bytes_free`.
-4. A table with `pending_generations ≥ critical_generations` is placed before any class ≥ 3
-   unit if any feasible executor exists.
+4. Class 1 is served oldest‑first: the class‑1 unit with the smallest `wait_since_ms` is
+   placed before any other unit whenever a feasible executor exists. Within that rule a
+   table with `pending_generations ≥ critical_generations` is placed before any class ≥ 3
+   unit.
 5. A commit‑ready request is satisfied within `max_consecutive_turns` write turns of the
    same table, and any unit waits at most `max_turn_wait_secs` before promotion to class 1.
 5a. Demand folding is idempotent: replaying any subset of `demand-events` in any order

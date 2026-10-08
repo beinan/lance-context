@@ -38,10 +38,14 @@ Rules:
 * Executors write `merged_through` for the shards they merged **in the same
   txn as the merge-crate `release`**, so demand and ownership agree.
 * The stats scan (source `scan`) writes the same record when it observes a
-  shard, but may only **lower** `sealed_through` if `writer_epoch` is strictly
-  greater than the stored one (a retired shard whose writer is gone). A scan
-  with an equal epoch may raise but never lower a watermark: a stale scan must
-  not hide a fresh flush (review point 3).
+  shard. Ordering is by the shard's own `(writer_epoch, sealed_through)` only;
+  etcd revisions and manifest versions are different clocks and are never
+  compared with each other. A scan may raise `sealed_through` at an equal
+  epoch and may replace the shard record only with a strictly greater
+  `writer_epoch` (a retired shard whose writer is gone). It may never lower a
+  watermark at an equal epoch, regardless of when the snapshot was written
+  (review point 3). `observed_revision` on the table record is bookkeeping for
+  "how fresh is this cache", not an ordering input.
 
 ### 1.2 Table record — maintained by the planner
 
@@ -196,3 +200,13 @@ existing loop keeps running for every table throughout P1.
    decision as the old leader on the same inputs.
 5. Shadow mode writes nothing an executor reads (grep‑level test on the
    executor code paths plus an etcd test that binds nothing).
+6. Class 1 is served oldest‑first: with two class‑1 tables, a low‑score table
+   promoted for age is placed before a high‑score critical merge that has
+   waited less, given one feasible executor.
+7. A late scan snapshot with an equal epoch and a lower `sealed_through`
+   leaves the table record unchanged; only a strictly higher epoch may lower
+   it (already covered by `scan_may_raise_but_not_lower_without_higher_epoch`
+   in #344; keep it).
+8. Backpressure shaping never raises the writer's un‑flushed row count or
+   delays a flush past the configured interval; under `critical` the
+   observable effect is a slower accept rate, not a larger memtable.
