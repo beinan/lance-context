@@ -9,6 +9,7 @@ pub use lance_context_merge::demand;
 pub mod discovery;
 pub mod eligibility;
 pub mod error;
+pub mod executors;
 mod maintenance_execution;
 mod merge_execution;
 mod resident_recovery;

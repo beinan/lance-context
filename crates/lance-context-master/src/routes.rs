@@ -659,6 +659,20 @@ pub async fn scheduler_demand(
     Ok(Json(DemandReport { leader, tables }))
 }
 
+/// `GET /api/v1/scheduler/executors` — every live executor heartbeat with
+/// its headroom computed from durable assignments, never from the sampled
+/// free bytes. An executor with assignments but no heartbeat appears as
+/// draining with zero totals.
+pub async fn scheduler_executors(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<crate::executors::Headroom>>, MasterError> {
+    let keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
+    let headroom = crate::executors::load_headroom(state.task_store.etcd_client(), &keys)
+        .await
+        .map_err(MasterError::Internal)?;
+    Ok(Json(headroom.into_values().collect()))
+}
+
 /// `GET /api/v1/scheduler/repairs` — base-table repairs the master performed,
 /// most recent first: which fragments were dropped from which store, when,
 /// and how many rows they held.
@@ -923,6 +937,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         )
         .route("/scheduler/cooldowns", get(list_cooldowns))
         .route("/scheduler/demand", get(scheduler_demand))
+        .route("/scheduler/executors", get(scheduler_executors))
         .route("/scheduler/repairs", get(list_repairs))
         .route("/registry/diff", get(registry_diff))
         .route("/registry/backfill", post(registry_backfill))

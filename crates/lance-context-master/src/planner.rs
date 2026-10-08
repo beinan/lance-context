@@ -337,6 +337,19 @@ pub(crate) async fn reconcile_once(
             return Err("leadership lost during reconcile".into());
         }
     }
+    // Executor view: heartbeats plus reservations. Read every tick so the
+    // leader always has it warm; nothing is placed from it yet.
+    let executors_keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
+    match crate::executors::load_headroom(&client, &executors_keys).await {
+        Ok(headroom) => {
+            metrics::gauge!("planner_executors").set(headroom.len() as f64);
+            let reserved: u64 = headroom.values().map(|h| h.bytes_reserved).sum();
+            metrics::gauge!("planner_reserved_bytes_total").set(reserved as f64);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "planner could not load executor headroom");
+        }
+    }
     metrics::gauge!("planner_tables").set(existing.kvs().len() as f64);
     metrics::gauge!("planner_pending_generations_total").set(total_pending as f64);
     metrics::histogram!("planner_reconcile_seconds").record(started.elapsed().as_secs_f64());
