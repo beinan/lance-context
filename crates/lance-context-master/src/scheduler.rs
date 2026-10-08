@@ -980,6 +980,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::wal_tail::spawn(state);
     crate::resident_recovery::spawn(state);
     crate::planner::spawn(state);
+    crate::executors::spawn(state);
     // Retry metadata independently of coarse stats sweeps. Every replica may
     // enqueue; the existing task dedupe/claim transaction elects one executor.
     let retry_state = state.clone();
