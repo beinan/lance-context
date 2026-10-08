@@ -145,11 +145,21 @@ the remedies are scheduling remedies:
   yielding once. Raise `COMPACTION_COMMIT_WAIT_SECS` / `INDEX_COMMIT_WAIT_SECS`
   for that kind as a stopgap so the preparer survives more than one turn; the
   design fix is `max_consecutive_turns` (design §4.2).
-* If the table is hot enough that it never leaves the critical class, defer
-  compaction/index for it (`MERGE_DRAIN_TARGETS` is **not** the tool — that
-  stops merge too). Today the only per‑table lever is to remove it from
-  `COMPACTION_PREPARE_TARGETS` / `INDEX_PREPARE_TARGETS` so it is not
-  repeatedly prepared and discarded; schedule the build in a quiet window.
+* If the table is hot enough that it never leaves the critical class, there
+  is **no per‑table lever today** to defer its compaction/index without side
+  effects, and two tempting ones are wrong:
+  * `MERGE_DRAIN_TARGETS` stops merge as well as maintenance.
+  * Removing the table from `COMPACTION_PREPARE_TARGETS` /
+    `INDEX_PREPARE_TARGETS` does **not** pause the task. It switches that
+    table back to the legacy path, which takes the table write lock *before*
+    compacting or indexing — so the next Compact/IndexId task blocks WAL
+    publication for the whole build. That is strictly worse than repeated
+    preparation expiry.
+  Fleet‑wide levers exist: `COMPACTION_INTERVAL_SECS` and `quiet_hours` on the
+  compaction sweep, and raising `MIN_FRAGMENTS` so the sweep does not pick the
+  table up. A manual `POST /api/v1/tasks {"kind":"compact","target":...}` in a
+  quiet window still works. A per‑table `kinds_allowed` policy is design §4.8
+  and does not exist yet.
 * A preparation that expires is discarded and rebuilt from scratch. Repeated
   expiry on a large table is wasted IO, not a correctness problem.
 
