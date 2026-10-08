@@ -1631,6 +1631,114 @@ mod tests {
         }
     }
 
+    /// The stats scan publishes a scan-sourced demand event for every shard
+    /// it observes, including shards whose writer never ran the server
+    /// flush path, and a later scan cannot lower a watermark a writer or
+    /// executor set at the same epoch.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_publishes_every_shard_and_never_lowers_a_watermark() {
+        use lance_context_core::RolloutStoreOptions;
+        use lance_context_merge::demand::{DemandEvent, EventSource, TableDemand};
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        for shard in ["a", "b"] {
+            let writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                writer
+                    .add(&[rollout_record(&format!("{shard}-{i}"))])
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+        }
+        state.registry.upsert("exp", &uri).await.unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        let prefix = state
+            .config
+            .etcd
+            .etcd_prefix
+            .trim_end_matches('/')
+            .to_string();
+        let encoded: String = "exp".bytes().map(|b| format!("{b:02x}")).collect();
+        let events_prefix = format!("{prefix}/demand-events/{encoded}/");
+        let client = state.task_store.etcd_client().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let events = loop {
+            let kvs = client
+                .clone()
+                .get(
+                    events_prefix.as_str(),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap();
+            if kvs.kvs().len() >= 2 {
+                break kvs;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan demand never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(events.kvs().len(), 2, "one scan event per shard");
+        let mut table = TableDemand::default();
+        for kv in events.kvs() {
+            let event: DemandEvent = serde_json::from_slice(kv.value()).unwrap();
+            assert_eq!(event.source, EventSource::Scan);
+            assert!(event.sealed_through >= 3, "{event:?}");
+            table.fold(&event, kv.mod_revision(), 0).unwrap();
+        }
+        assert_eq!(table.pending_generations(), 6);
+
+        // An executor reports merged=2 on shard "a" at the same epoch. A
+        // second scan (which knows nothing about merged) must not lower it.
+        let coordinator = state.task_store.merge_coordinator();
+        let (key, mut a): (String, DemandEvent) = events
+            .kvs()
+            .iter()
+            .map(|kv| {
+                (
+                    String::from_utf8_lossy(kv.key()).to_string(),
+                    serde_json::from_slice::<DemandEvent>(kv.value()).unwrap(),
+                )
+            })
+            .next()
+            .unwrap();
+        a.merged_through = Some(2);
+        a.source = EventSource::Executor;
+        assert!(coordinator.publish_demand_event("exp", &a).await.unwrap());
+        let before = client.clone().get(key.as_str(), None).await.unwrap().kvs()[0].mod_revision();
+        crate::scanner::scan_once(&state).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = client.clone().get(key.as_str(), None).await.unwrap();
+        let stored: DemandEvent = serde_json::from_slice(after.kvs()[0].value()).unwrap();
+        assert_eq!(
+            stored.merged_through,
+            Some(2),
+            "scan lowered merged: {stored:?}"
+        );
+        assert_eq!(stored.sealed_through, a.sealed_through);
+        assert_eq!(
+            after.kvs()[0].mod_revision(),
+            before,
+            "an unchanged scan must not rewrite the record"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn compact_noop_survives_restart_and_changes_invalidate_it() {

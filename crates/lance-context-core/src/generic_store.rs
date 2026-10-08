@@ -641,6 +641,13 @@ impl GenericStore {
         self.base.own_shard_watermark().await
     }
 
+    /// Every shard's watermark from its latest manifest. Metadata only.
+    pub async fn all_shard_watermarks(
+        &self,
+    ) -> LanceResult<Vec<crate::store_base::ShardWatermark>> {
+        self.base.all_shard_watermarks().await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock
