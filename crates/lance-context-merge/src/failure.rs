@@ -33,12 +33,16 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn classify(error: &str) -> FailureClass {
-    // A stable code wins over any prose, path or wrapper format. Ownership
-    // is checked first because an unresolved owner must never be retried
-    // as an ordinary conflict.
+    // Priority: unresolved ownership, then explicit permanent signals that
+    // must never be laundered by a code (auth failures), then the stable
+    // code, then legacy text. A code beats prose, paths and wrapper formats
+    // but never beats a 401/403 that wraps it.
     let lowered = error.to_ascii_lowercase();
     if lowered.contains("ownership unresolved") {
         return FailureClass::OwnershipUnresolved;
+    }
+    if has_http_status(&lowered, &["401", "403"]) {
+        return FailureClass::DataOrConfiguration;
     }
     if let Some(code) = MaintenanceErrorCode::parse(error) {
         return match code {
@@ -83,6 +87,17 @@ pub fn classify(error: &str) -> FailureClass {
 // Do not exempt arbitrary errors merely containing "reprepare".
 fn is_preparation_conflict(error: &str) -> bool {
     let message = error.strip_prefix("invalid user input: ").unwrap_or(error);
+    // Tolerate a trailing lowercase code suffix on the message segment so a
+    // tagged string is also recognised by the text path (defence in depth).
+    let message = message
+        .split_once(" [lc_stale_preparation]")
+        .map_or(message, |(head, tail)| {
+            // Re-join head with the location tail if the code sat before it.
+            if tail.starts_with(", crates/") {
+                return head;
+            }
+            message
+        });
     let message = match message.split_once(", crates/lance-context-core/src/store_base.rs:") {
         Some((message, location)) => {
             let Some((line, column)) = location.split_once(':') else {
@@ -169,10 +184,11 @@ impl ShardFailure {
     // moving the failure timestamp, or mutating ownership/durable records.
     // The next fenced completion persists the normal retry result.
     fn corrected(mut self) -> Self {
+        // One rule set: whatever `classify` says today is the effective
+        // class. Only a DataOrConfiguration record can be softened; a stored
+        // Retryable is never hardened on read.
         if self.class == FailureClass::DataOrConfiguration
-            && (MaintenanceErrorCode::parse(&self.last_error)
-                == Some(MaintenanceErrorCode::StalePreparation)
-                || is_preparation_conflict(&self.last_error.to_ascii_lowercase()))
+            && classify(&self.last_error) == FailureClass::Retryable
         {
             self.class = FailureClass::Retryable;
             let (attention, delay) = Self::retry_policy(&self.class, self.consecutive_attempts);
@@ -418,7 +434,7 @@ mod tests {
     #[test]
     fn coded_preparation_conflicts_classify_regardless_of_wrapper_or_path() {
         let tagged = MaintenanceErrorCode::StalePreparation
-            .tag("compaction source fragment changed; reprepare");
+            .tag_forced("compaction source fragment changed; reprepare");
         for error in [
             format!(
                 "Invalid user input: {tagged}, crates/lance-context-core/src/store_base.rs:1529:24"
@@ -430,11 +446,39 @@ mod tests {
         ] {
             assert_eq!(classify(&error), FailureClass::Retryable, "{error}");
         }
-        // Ownership still wins, and the code does not launder a 403.
+        // Ownership still wins, and the code does not launder a 401/403
+        // regardless of where the status appears relative to the code.
         assert_eq!(
             classify(&format!("ownership unresolved: {tagged}")),
             FailureClass::OwnershipUnresolved
         );
+        for error in [
+            format!("HTTP 403: {tagged}"),
+            format!("{tagged}; status 403"),
+            format!("status code 401 {tagged}"),
+        ] {
+            assert_eq!(
+                classify(&error),
+                FailureClass::DataOrConfiguration,
+                "{error}"
+            );
+            // And corrected() must not soften such a record either.
+            let old = ShardFailure {
+                target: "table".into(),
+                endpoint: "master:compact".into(),
+                class: FailureClass::DataOrConfiguration,
+                consecutive_attempts: 1,
+                last_failure_ms: 2,
+                next_retry_ms: 3_602_000,
+                needs_attention: true,
+                last_error: error.clone(),
+            };
+            assert_eq!(
+                old.corrected().class,
+                FailureClass::DataOrConfiguration,
+                "{error}"
+            );
+        }
         // An old DataOrConfiguration record carrying a code is corrected too.
         let old = ShardFailure {
             target: "table".into(),
@@ -450,6 +494,36 @@ mod tests {
         assert_eq!(corrected.class, FailureClass::Retryable);
         assert_eq!(corrected.consecutive_attempts, 4);
         assert_eq!(corrected.last_failure_ms, 2);
+    }
+
+    /// Mixed-version rollout: a master older than the code reader classifies
+    /// by exact text. Emission must therefore be off by default so new
+    /// executors keep producing the exact legacy string, and the legacy text
+    /// path must still recognise a tagged string once emission is enabled.
+    #[test]
+    fn code_emission_is_off_by_default_and_text_path_tolerates_the_code() {
+        // Default: no code in the string (unless the test env sets the var).
+        if std::env::var("MAINTENANCE_ERROR_CODES").is_err() {
+            assert_eq!(
+                MaintenanceErrorCode::StalePreparation.tag("index metadata changed; reprepare"),
+                "index metadata changed; reprepare"
+            );
+        }
+        // Legacy exact matcher, byte-for-byte, as an old master sees a
+        // message produced with emission off.
+        let plain = "Invalid user input: index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:1529:24";
+        assert!(is_preparation_conflict(&plain.to_ascii_lowercase()));
+        // With emission on, the text path alone (no code parsing) still
+        // recognises it, so a reader with only the text path is not fooled.
+        let tagged = format!(
+            "Invalid user input: {}, crates/lance-context-core/src/store_base.rs:1529:24",
+            MaintenanceErrorCode::StalePreparation.tag_forced("index metadata changed; reprepare")
+        );
+        assert!(
+            is_preparation_conflict(&tagged.to_ascii_lowercase()),
+            "{tagged}"
+        );
+        assert_eq!(classify(&tagged), FailureClass::Retryable);
     }
 
     #[test]

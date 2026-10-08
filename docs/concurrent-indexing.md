@@ -36,11 +36,16 @@ the original snapshot read version, allowing Lance to check intervening commits
 as well. Newly appended fragments remain unindexed and query planning scans them;
 index publication must preserve merge watermarks and newly appended rows.
 
-Stale-preparation validation failures carry the stable code
-`[LC_STALE_PREPARATION]` in their message. The failure classifier recognises the
-code regardless of how Lance wraps the error or where the check lives in the
-source tree; the older exact-text matcher remains only for failure records
-written by binaries that predate the code. These failures use the ordinary
+Stale-preparation validation failures can carry the stable code
+`[LC_STALE_PREPARATION]` at the end of their message. The failure classifier
+recognises the code regardless of how Lance wraps the error or where the check
+lives in the source tree, but never above an explicit HTTP 401/403 or an
+unresolved-ownership prefix. Emission is **off by default**
+(`MAINTENANCE_ERROR_CODES=1` enables it): a master older than the code reader
+classifies by exact text and would treat a tagged message as a permanent error
+with a one-hour cooldown. Roll out readers to every master and executor first,
+then enable emission. The exact-text matcher stays for records from older
+binaries and also tolerates the code suffix. These failures use the ordinary
 bounded retry budget. The first two failed
 attempts wait two seconds; repeated failures back off and eventually require
 attention. Existing records incorrectly classified as data/configuration errors
