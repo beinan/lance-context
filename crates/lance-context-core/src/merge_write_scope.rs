@@ -105,6 +105,9 @@ pub struct MergeWriteScope {
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
     pin_opened_handles: bool,
     leaves: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Test-only storage shim applied **beneath** the progress wrapper, so a
+    /// delayed or frozen store is still observed as real IO by the watchdog.
+    io_shim: Option<Arc<dyn lance_io::object_store::WrappingObjectStore>>,
 }
 
 impl MergeWriteScope {
@@ -154,6 +157,22 @@ impl MergeWriteScope {
             authorizer: Some(authorizer),
             pin_opened_handles: true,
             observe_file_io: true,
+            ..Self::default()
+        })
+    }
+
+    /// Preparation scope whose object stores are wrapped by `shim` under the
+    /// progress wrapper. For tests that delay or freeze storage beneath a
+    /// real build to prove the watchdog judges actual IO.
+    pub fn with_preparation_authorizer_and_io_shim(
+        authorizer: Arc<dyn CommitAuthorizer>,
+        shim: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            authorizer: Some(authorizer),
+            pin_opened_handles: true,
+            observe_file_io: true,
+            io_shim: Some(shim),
             ..Self::default()
         })
     }
@@ -273,13 +292,39 @@ pub(crate) fn preparation_store_wrapper(
     CURRENT
         .try_with(|scope| {
             scope.observe_file_io.then(|| {
-                Arc::new(crate::preparation_io::ProgressWrapper(
-                    scope.completed_steps.clone(),
-                )) as Arc<dyn lance_io::object_store::WrappingObjectStore>
+                let progress: Arc<dyn lance_io::object_store::WrappingObjectStore> = Arc::new(
+                    crate::preparation_io::ProgressWrapper(scope.completed_steps.clone()),
+                );
+                match &scope.io_shim {
+                    // Progress outermost: it counts the shimmed store's
+                    // completed operations, exactly as it would real storage.
+                    Some(shim) => Arc::new(Layered {
+                        outer: progress,
+                        inner: shim.clone(),
+                    })
+                        as Arc<dyn lance_io::object_store::WrappingObjectStore>,
+                    None => progress,
+                }
             })
         })
         .ok()
         .flatten()
+}
+
+#[derive(Debug)]
+struct Layered {
+    outer: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+    inner: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for Layered {
+    fn wrap(
+        &self,
+        name: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        self.outer.wrap(name, self.inner.wrap(name, original))
+    }
 }
 
 pub(crate) fn observes_preparation_io() -> bool {

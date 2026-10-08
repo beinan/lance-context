@@ -16,7 +16,7 @@ pub mod merge_budget;
 pub mod merge_write_scope;
 pub mod metrics;
 mod namespace;
-mod preparation_io;
+pub mod preparation_io;
 mod record;
 mod registry;
 mod registry_etcd;
