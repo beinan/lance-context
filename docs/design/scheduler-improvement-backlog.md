@@ -25,8 +25,9 @@ order in which to fix it. Evidence comes from the code inventory (Oct 2026, `mai
 ### A1. No single owner of "what runs next"
 Six producers enqueue into `P/queue/` (L3, L4, L5, L7, L8→L3, `schedule_repair`, HTTP
 routes, dedicated executor), each with its own eligibility rules. Ordering of the queue is
-by random id (`generate_id()`, `task_store.rs:1885`), so despite the docs it is **not FIFO**
-and has no priority. The only priority signals are stats‑desc ordering at enqueue time (lost
+by UUIDv7 (`generate_id()` → `Uuid::now_v7()`, `core/src/id.rs:28`), so it is approximately
+enqueue‑time ordered but has **no priority**: a 4000‑generation backlog enqueued after a
+2‑generation tail waits behind it. The only priority signals are stats‑desc ordering at enqueue time (lost
 once in the queue), the MergeWal→commit‑ready yield (#324), and catch‑up rotation.
 → Design §4.1–4.5.
 
@@ -75,10 +76,11 @@ combinations at boot. No API returns the effective mode for a table.
 ## 2. Correctness / robustness defects
 
 ### C1. Error classification by message text (#328)
-`merge/failure.rs` strips `"invalid user input: "` and matches on
-`"index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:"`. A line
-renumber or a Lance error‑format change silently reverts to a 1‑hour permanent cooldown —
-exactly the bug #328 fixed. **Fix**: typed `enum MaintenanceError` in core with stable codes;
+`merge/failure.rs:74‑79` strips `"invalid user input: "` and matches on
+`"…; reprepare, crates/lance-context-core/src/store_base.rs:<line>:<col>"` (any digits are
+accepted, so renumbering is safe). Moving the file, renaming the crate, or a change in how
+Lance wraps `InvalidInput` silently reverts to a 1‑hour permanent cooldown — exactly the bug
+#328 fixed. **Fix**: typed `enum MaintenanceError` in core with stable codes;
 classify by code. Also required by the unified ledger (Design §4.6).
 
 ### C2. Retry storm across #327 + #330 + #328
@@ -93,7 +95,11 @@ class with per‑kind thresholds.
 The regression test asserts `legacy-queued` remains `Queued` indefinitely while legacy RPCs
 hold the pool. The real fault — legacy worker RPCs have no bound on slot hold time (#316/#318
 fixed body/response stalls, not total duration) — is unaddressed. **Fix**: legacy RPC gets
-its own executor kind with its own slots (Design §4.4), not a side door for resident tasks.
+its own executor kind with its own slots (Design §4.4) so it cannot consume resident
+capacity. That bounds blast radius only; a stuck legacy execution is still detected and
+replaced by the merge‑crate progress watchdog on that execution's actual read/encode/commit
+progress, then cancelled, fenced and taken over. Heartbeats, retry backoff and total run time
+are not substitutes for that judgement.
 
 ### C4. Fairness hint without version or metric (#324)
 `compact-commit-ready` is honoured only by upgraded binaries; nothing records
@@ -105,9 +111,10 @@ for commit‑ready requests served vs. expired; include `protocol` in the hint v
 `execution_changed_retry` when they disagree. **Fix**: one range read at a single etcd
 revision (`WithRevision`) or a txn; return a typed struct, not `serde_json::json!`.
 
-### C6. Random‑id queue order makes "oldest first" impossible
-Any starvation fix today must scan the whole queue. **Fix**: Design §4.2 scoring; interim:
-prefix queue keys with `{class:1}{enqueue_ms:013}` so lexicographic order is meaningful.
+### C6. Time‑ordered queue has no priority dimension
+UUIDv7 keys give approximate FIFO, but a critical backlog cannot overtake an older tail
+task and any fairness fix must scan the whole queue. **Fix**: Design §4.2 scoring; interim:
+prefix queue keys with `{class:1}` so lexicographic order is class‑then‑time.
 
 ### C7a. Backpressure is a cliff, not a slope
 The only write‑side signal today is read‑side: 503 at 4096 pending generations, warn at
@@ -173,15 +180,19 @@ planner extracted as pure functions (§4 P0.1), reviews become tractable.
 6. Write the operator runbook (O2).
 
 ### P1 — Demand table + shadow planner (2–3 weeks)
-7. `P/demand/` records; stats scanner writes demand only; rollout server flush signal
-   generalised to `demand-events`.
+7. `P/demand/` records; stats scanner *additionally* writes demand (its existing enqueue
+   and retirement behaviour is untouched in P1); rollout server flush signal generalised
+   to per‑shard `demand-events` watermarks.
 8. Leader election; planner computes scores and *logs* placements it would make; compare
    against actual queue behaviour for a week. Ship `GET /scheduler/demand`.
 9. Executor heartbeats with (slots, bytes).
 
 ### P2 — Planner owns MergeWal (2–3 weeks)
-10. Per‑table policy document; `mode: active` tables are placed by the planner; L3/L5/L7/L8
-    skip those tables. Legacy workers become an executor kind (C3).
+10. Per‑table policy document; `mode: planner` tables are placed by the planner and
+    L3/L5/L7/L8 skip them. Only binaries that understand policy consult it, so a table is
+    switched only after every master in the fleet runs the new binary; until then all old
+    loops keep running for every table (no scheduling gap). Legacy workers become an
+    executor kind (C3).
 11. Delete resident‑only pool (#331), wal‑tail sweep, resident discovery for migrated tables.
 
 ### P3 — Compaction / Index / Repair / Retire (2 weeks)
@@ -198,6 +209,9 @@ planner extracted as pure functions (§4 P0.1), reviews become tractable.
     `wal-tail-cursor`, `resident-wal-discovery*`). Split `task_store.rs`.
 
 ### Mixed‑version rules for the whole migration
+* The old loops are never disabled fleet‑wide by a phase; they are disabled per table by
+  policy, and only once the fleet is homogeneous. Shadow mode places nothing and removes
+  nothing.
 * Old masters ignore unknown key families and continue to honour `target-locks` /
   `merge-executions`; the planner treats a legacy `claims/` + `target-locks` pair as
   `Holding‑turn`.

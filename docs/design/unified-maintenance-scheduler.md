@@ -86,12 +86,16 @@ last_success_ms[kind], last_observed_ms, observed_by
 
 Sources, in order of freshness:
 1. **Push**: the rollout server already notifies on flush (`merge-requests`). Generalise to
-   `PUT P/demand-events/<hex>` carrying `{shard, pending_generations_delta, bytes}`; the
-   planner folds it into `TableDemand` and deletes the event. Merge/compact completion
-   updates demand in the same `release` txn.
-2. **Pull reconciliation**: the existing stats scanner (L6) continues at 300 s, but its
-   *only* scheduling output is a `TableDemand` overwrite; it no longer enqueues, retires or
-   compacts directly (retirement becomes a `Retire` kind, see 4.3).
+   per‑shard **watermarks**, not deltas: `PUT P/demand-events/<hex>/<shard>` carrying
+   `{sealed_through_seq, bytes_through_seq, flushed_at_ms}`. Watermarks are idempotent:
+   the planner keeps the max `sealed_through_seq` per shard and sums across shards, so a
+   lost or duplicated event cannot corrupt the count. Merge release writes the merged
+   watermark per shard in the same `release` txn; pending = sealed − merged per shard.
+2. **Pull reconciliation**: the existing stats scanner (L6) continues at 300 s and writes
+   `TableDemand` with the etcd/manifest revision it observed. A snapshot may only *lower* a
+   shard's watermark if its `observed_revision` is newer than the event that set it; this
+   stops a stale scan from hiding fresh flushes. After migration it no longer enqueues,
+   retires or compacts directly (retirement becomes a `Retire` kind, see 4.3).
 3. **Targeted probe**: when `last_observed_ms` is older than `demand_stale_secs` for a
    table with recent demand, the planner schedules a cheap `Observe` unit (manifest‑only
    read) instead of running a discovery loop.
@@ -127,9 +131,19 @@ Priority classes (strict ordering, then score within class):
 | 4 Compaction / Index | `compact_score ≥ 1`, `index_score ≥ 1` | |
 | 5 Tail / housekeeping | `0 < merge_score < 1` after aging, `Retire`, `Observe` | Replaces wal‑tail sweep. |
 
-A per‑table **round‑robin counter** between classes 2/3 ensures a continuous merger and a
-preparer alternate turns; a table cannot be picked in class 3 twice in a row while a
-class‑2 request is pending.
+Class ordering alone starves: a hot table can sit above `critical_generations` for hours,
+so a class‑1 merger would always beat a class‑2 commit‑ready compaction, and in‑class aging
+never lifts anything across a class boundary. Two **hard bounds** make fairness a guarantee
+rather than a tendency:
+
+* `max_consecutive_turns[kind]` (default merge = 2): after N consecutive write turns of the
+  same kind on one table, the next turn goes to the highest‑scored *other* kind with a
+  pending request (typically commit‑ready compaction/index). This applies across classes,
+  including class 1.
+* `max_turn_wait_secs[kind]` (default compaction/index commit = 900, tail merge = 3600):
+  a unit that has waited longer is promoted to class 1 regardless of score.
+
+Both are per‑table policy fields and both are exported as `scheduler_turn_wait_seconds`.
 
 ### 4.3 Units of work and the per‑table write‑turn state machine
 
@@ -142,10 +156,13 @@ Idle ──plan──► Assigned ──bind──► Holding‑turn ──relea
                  └─(prepare‑only)──► Preparing ──commit‑ready──► (class‑2 request)
 ```
 
-* Exactly one `Holding‑turn` per table at any time; this *is* the merge‑crate
+* Exactly one **write‑turn holder** per table at any time; this *is* the merge‑crate
   `target-locks`/`merge-executions` pair — the scheduler does not add a second lock.
-* `Preparing` units never hold the turn (today's `COMPACTION_PREPARE_TARGETS` /
-  `INDEX_PREPARE_TARGETS` behaviour becomes the default, not an allowlist).
+* `Preparing` units never hold the turn and run **concurrently with the turn holder and
+  with each other** (bounded only by executor capacity and one preparation slot per
+  (table, kind)). Today's `COMPACTION_PREPARE_TARGETS` / `INDEX_PREPARE_TARGETS` behaviour
+  becomes the default. The scheduler must never re‑serialise merge behind compaction or
+  index preparation; #308 and #327 removed exactly that.
 * `Cooldown(kind)` is produced by the failure ledger (4.6); successes write
   `last_success_ms` and no cooldown except a configurable `min_interval[kind]`.
 * The dependency DAG (`Compact → IndexId`, `Repair → X`) is expressed as *demand*, not as
@@ -163,8 +180,14 @@ Every process that can run work publishes a leased heartbeat `P/executors/<id>`:
 ```
 
 Capacity is a **slot supplier per kind plus one byte budget per process** (Temporal's model;
-also what `MergeMemoryBudget` already is). The planner never places a unit unless both are
-available; executors still enforce the budget locally. A unit's declared cost is
+also what `MergeMemoryBudget` already is). The heartbeat's `bytes_free` is a *sample* and is
+never used for placement arithmetic. Instead each assignment record carries
+`reserved_slots` and `reserved_bytes`, and the planner's view of an executor is
+`bytes_total − Σ reserved_bytes(live assignments on it)` — including assignments that have
+not yet bound. Reservations are therefore durable in etcd, rebuilt from `assignments/` on
+leader failover, and released in the executor's `release` txn. Executors still enforce
+`MergeMemoryBudget` locally; the planner's reservation prevents over‑dispatch, the local
+budget prevents OOM when an estimate is wrong. A unit's declared cost is
 `(1 slot[kind], expected_bytes)` where `expected_bytes = min(pending_bytes, max_bytes)×2`
 for staging, `1 GiB` default for compaction/index.
 
@@ -172,7 +195,11 @@ Placement score (K8s "score" phase), evaluated only on feasible executors:
 `prefer resident master already caching the table` > `worker that owns the shard` >
 `spawn catch‑up Job` (only when `pending_bytes` > `job_threshold_bytes` and no resident
 capacity for `job_wait_secs`). K8s Jobs become an *executor type* with on‑demand capacity,
-not a separate controller with its own admission.
+not a separate controller with its own admission. Legacy worker RPCs likewise become an
+executor type with their own slots. Isolation bounds blast radius only: a stuck execution is
+still recognised by the merge‑crate watchdog from that execution's actual read/encode/commit
+progress, then cancelled, fenced and taken over. Heartbeats, retry backoff and total run time
+are not progress.
 
 ### 4.5 Planner cycle (leader only)
 
@@ -186,8 +213,10 @@ Triggered by etcd watch events on `demand-events/`, `executors/`, `assignments/`
 4. For the top `max_placements_per_cycle` (default 8): **Filter** (ownership, draining,
    fence state from a *single* cached watch on `target-locks`/`merge-executions`, failure
    ledger) → **Place** (4.4) → **Reserve**: one etcd txn writing
-   `P/assignments/<hex> = {unit, executor, token, deadline}` guarded by
-   `Version(assignments/<hex>) == 0` and `executors/<id>.lease alive`.
+   `P/assignments/<hex>/<unit-id> = {unit, executor, token, deadline, reserved_bytes}`
+   guarded by `executors/<id>.lease alive`, `leader == own token`, and — for write‑turn
+   units — no other write‑turn assignment on the table. Preparation units need only a free
+   preparation slot for their (table, kind).
 5. Expire assignments not bound within `bind_timeout_secs` (default 30 s) → backoff queue
    with exponential delay (K8s `backoffQ`), not a failure.
 
@@ -292,12 +321,18 @@ that leaderlessly is exactly what produced five cursor loops and a 7‑key claim
 
 ## 7. Invariants (to be enforced by tests)
 
-1. At most one assignment per table; at most one `Holding‑turn` per table.
+1. At most one write‑turn assignment per table; preparation assignments are bounded only
+   by capacity and one preparation slot per (table, kind). Merge is never queued behind a
+   preparation.
 2. An assignment is never written to an executor whose heartbeat lease is dead.
-3. Sum of assigned `expected_bytes` on an executor ≤ its `bytes_total`.
+3. Sum of `reserved_bytes` over live assignments on an executor ≤ its `bytes_total`,
+   computed from `assignments/`, never from sampled `bytes_free`.
 4. A table with `pending_generations ≥ critical_generations` is placed before any class ≥ 3
    unit if any feasible executor exists.
-5. A class‑2 request is satisfied within two write turns of the same table.
+5. A commit‑ready request is satisfied within `max_consecutive_turns` write turns of the
+   same table, and any unit waits at most `max_turn_wait_secs` before promotion to class 1.
+5a. Demand folding is idempotent: replaying any subset of `demand-events` in any order
+   yields the same `TableDemand`.
 6. No planner cycle issues an etcd range read larger than one page of `demand-events`.
 7. All scheduling decisions are a pure function of `(DemandTable, ExecutorSet, FenceState,
    FailureLedger, Policies, now)` and are unit‑tested without etcd.
@@ -306,8 +341,8 @@ that leaderlessly is exactly what produced five cursor loops and a 7‑key claim
 
 Phase 0 extract pure eligibility/scoring functions + typed errors (no behaviour change) →
 Phase 1 demand table + leader planner running in *shadow mode* (logs decisions, enqueues
-nothing) → Phase 2 planner owns MergeWal placement for `mode: active` tables; old loops
-disabled per table by policy → Phase 3 compaction/index/repair/retire → Phase 4 delete
+nothing; **all existing loops keep running unchanged**) → Phase 2 planner owns MergeWal placement for `mode: planner` tables; old loops
+disabled per table by policy, and only once every master runs a policy‑aware binary → Phase 3 compaction/index/repair/retire → Phase 4 delete
 loops, pools, allowlists, and 15 of 27 etcd key families. Mixed‑version safety: old masters
 treat unknown `assignments/` keys as absent and still respect `target-locks`; new planner
 treats legacy `claims/`+`target-locks` as `Holding‑turn`.
