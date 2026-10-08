@@ -1517,9 +1517,36 @@ impl MaintenanceErrorCode {
         }
     }
 
-    /// Render `message` with this code attached.
+    /// Render `message` with this code attached, if code emission is
+    /// enabled for this process; otherwise return `message` unchanged.
+    ///
+    /// Emission is gated because older masters classify these errors by
+    /// exact text and would treat a tagged message as a permanent error
+    /// with a one-hour cooldown. Deploy readers (every master and executor
+    /// understanding `parse`) first, then set `MAINTENANCE_ERROR_CODES=1`.
+    /// The default flips to on once no pre-code binary remains supported.
     pub fn tag(self, message: &str) -> String {
-        format!("[{}] {message}", self.as_str())
+        if Self::emission_enabled() {
+            format!("{message} [{}]", self.as_str())
+        } else {
+            message.to_string()
+        }
+    }
+
+    /// Render with the code regardless of the process gate. For tests and
+    /// for callers that have verified every reader in the fleet.
+    pub fn tag_forced(self, message: &str) -> String {
+        format!("{message} [{}]", self.as_str())
+    }
+
+    pub fn emission_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("MAINTENANCE_ERROR_CODES")
+                .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false)
+        })
     }
 
     /// Find the first code tag in an error string, regardless of wrapping.
@@ -1834,11 +1861,18 @@ mod tests {
     #[test]
     fn maintenance_error_code_round_trips_through_wrappers() {
         let code = MaintenanceErrorCode::StalePreparation;
-        let tagged = code.tag("index metadata changed; reprepare");
+        let tagged = code.tag_forced("index metadata changed; reprepare");
         assert_eq!(
             tagged,
-            "[LC_STALE_PREPARATION] index metadata changed; reprepare"
+            "index metadata changed; reprepare [LC_STALE_PREPARATION]"
         );
+        if std::env::var("MAINTENANCE_ERROR_CODES").is_err() {
+            assert_eq!(
+                code.tag("index metadata changed; reprepare"),
+                "index metadata changed; reprepare",
+                "emission is off by default for mixed-version safety"
+            );
+        }
         let wrapped = format!("Invalid user input: {tagged}, crates/x/src/y.rs:1:2");
         assert_eq!(MaintenanceErrorCode::parse(&wrapped), Some(code));
         assert_eq!(
