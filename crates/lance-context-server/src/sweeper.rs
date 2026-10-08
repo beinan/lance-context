@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 /// reads, during which appends keep flowing) and a brief exclusive-lock commit.
 /// A trait over `&mut Store` would have forced the exclusive lock across the
 /// whole merge and quietly stalled the write path.
-pub(crate) trait Sweepable: Send + Sync + 'static {
+pub(crate) trait Sweepable: Clone + Send + Sync + 'static {
     /// Human-readable kind, for log and metric labels.
     fn kind() -> &'static str;
 
@@ -350,46 +350,69 @@ pub(crate) async fn merge_pass_coordinated<S: Sweepable>(
     }
 }
 
-async fn publish_demand<S: Sweepable>(
-    state: &Arc<crate::state::AppState>,
-    target: &str,
-    store: &S,
+/// Hard bound on one detached demand publish (manifest read + etcd put).
+/// Longer than any healthy path, far shorter than a flush pass timeout.
+const DEMAND_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded concurrency for detached publishes across every store in the
+/// process. When the slots are full the flush is not delayed; the publish is
+/// dropped and counted. The next flush republishes an absolute watermark,
+/// so a dropped publish loses nothing.
+static DEMAND_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
+
+/// Publish this writer's shard watermark off the flush path. Never awaited
+/// by the caller; bounded by `DEMAND_PUBLISH_TIMEOUT` and
+/// `DEMAND_PUBLISH_SLOTS`. Every outcome is counted under
+/// `rollout_wal_demand_events_total{result}`.
+fn spawn_publish_demand<S: Sweepable>(
+    state: Arc<crate::state::AppState>,
+    target: String,
+    store: S,
 ) {
-    let watermark = match store.own_shard_watermark().await {
-        Ok(Some(watermark)) => watermark,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::debug!(target, %error, "shard watermark unavailable");
-            return;
-        }
+    let Ok(permit) = DEMAND_PUBLISH_SLOTS.clone().try_acquire_owned() else {
+        metrics::counter!("rollout_wal_demand_events_total", "result" => "dropped").increment(1);
+        return;
     };
-    let event = lance_context_merge::demand::DemandEvent {
-        v: lance_context_merge::demand::SCHEMA_VERSION,
-        shard: watermark.shard_id.to_string(),
-        sealed_through: watermark.sealed_through,
-        sealed_bytes_through: 0,
-        merged_through: None,
-        flushed_at_ms: chrono::Utc::now().timestamp_millis(),
-        writer_epoch: watermark.writer_epoch,
-        source: lance_context_merge::demand::EventSource::Writer,
-    };
-    match state
-        .merge_executions
-        .publish_demand_event(target, &event)
-        .await
-    {
-        Ok(written) => {
-            metrics::counter!(
-                "rollout_wal_demand_events_total",
-                "result" => if written { "written" } else { "unchanged" }
-            )
-            .increment(1);
-        }
-        Err(error) => {
-            metrics::counter!("rollout_wal_demand_events_total", "result" => "failed").increment(1);
-            tracing::debug!(target, %error, "demand event publish failed");
-        }
-    }
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = tokio::time::timeout(DEMAND_PUBLISH_TIMEOUT, async {
+            let watermark = match store.own_shard_watermark().await? {
+                Some(watermark) => watermark,
+                None => return Ok(None),
+            };
+            let event = lance_context_merge::demand::DemandEvent {
+                v: lance_context_merge::demand::SCHEMA_VERSION,
+                shard: watermark.shard_id.to_string(),
+                sealed_through: watermark.sealed_through,
+                sealed_bytes_through: 0,
+                merged_through: None,
+                flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+                writer_epoch: watermark.writer_epoch,
+                source: lance_context_merge::demand::EventSource::Writer,
+            };
+            state
+                .merge_executions
+                .publish_demand_event(&target, &event)
+                .await
+                .map(Some)
+        })
+        .await;
+        let label = match result {
+            Ok(Ok(Some(true))) => "written",
+            Ok(Ok(Some(false))) => "unchanged",
+            Ok(Ok(None)) => "no_manifest",
+            Ok(Err(error)) => {
+                tracing::debug!(target = %target, %error, "demand event publish failed");
+                "failed"
+            }
+            Err(_) => {
+                tracing::debug!(target = %target, "demand event publish timed out");
+                "timeout"
+            }
+        };
+        metrics::counter!("rollout_wal_demand_events_total", "result" => label).increment(1);
+    });
 }
 
 /// Return true when routing handled the target (including drain/no-op).
@@ -408,9 +431,12 @@ async fn route_merge<S: Sweepable>(
         return Ok(true);
     }
     // Demand is published on every flush, below any count threshold, so the
-    // planner sees low-count tails without a sweep. Failure to publish never
-    // blocks the merge request path. Additive: `merge-requests` is unchanged.
-    publish_demand(state, &target, store).await;
+    // planner sees low-count tails without a sweep. It is detached and
+    // bounded: the flush pass never waits on a manifest read or an etcd put
+    // for telemetry, so a stuck publish cannot delay this table's merge
+    // request or the next table's flush. Additive: `merge-requests` is
+    // unchanged.
+    spawn_publish_demand(state.clone(), target.clone(), S::clone(store));
     if !state.merge_executions.owned(&target) {
         return Ok(false);
     }
@@ -526,6 +552,121 @@ mod tests {
         assert_eq!(store.read().await.count_base_rows().await.unwrap(), 0);
     }
 
+    /// A store whose watermark read hangs forever. The flush pass must still
+    /// complete promptly and still issue the merge request: demand telemetry
+    /// is detached and bounded, never on the flush or merge path.
+    #[derive(Clone)]
+    struct HangingWatermark(Arc<RwLock<GenericStore>>);
+
+    impl Sweepable for HangingWatermark {
+        fn kind() -> &'static str {
+            "generic"
+        }
+        async fn flush(&self) -> Result<(), String> {
+            self.0.flush().await
+        }
+        async fn count_merge_due(&self) -> Result<bool, String> {
+            self.0.count_merge_due().await
+        }
+        async fn own_shard_watermark(
+            &self,
+        ) -> Result<Option<lance_context_core::ShardWatermark>, String> {
+            std::future::pending().await
+        }
+        async fn merge_wal(&self) -> Result<usize, String> {
+            self.0.merge_wal().await
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn hung_demand_publish_never_delays_flush_or_merge_request() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let coordinator = lance_context_merge::Coordinator::new(
+            client,
+            format!("/hung-demand/{}", uuid::Uuid::new_v4()),
+        );
+        let state_dir = TempDir::new().unwrap();
+        let mut state = crate::state::AppState::new_for_test(state_dir.path().to_path_buf()).await;
+        state.merge_executions =
+            crate::merge_execution::Executions::new(Some(coordinator.clone()), 3600);
+        state
+            .merge_executions
+            .rollout
+            .owned_targets
+            .push("generic:s".into());
+        let state = Arc::new(state);
+        let dir = TempDir::new().unwrap();
+        let store = HangingWatermark(generic_with_pending(&dir, 2, 2).await);
+        let started = std::time::Instant::now();
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(30),
+            None,
+            Some(state.clone()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "flush pass waited on demand publish: {elapsed:?}"
+        );
+        // The merge request still went out despite the hung telemetry.
+        assert_eq!(
+            coordinator
+                .request_page(None)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|r| r.target)
+                .collect::<Vec<_>>(),
+            ["generic:s"]
+        );
+        // Flushing a second time while the first publish is still hung must
+        // also return immediately (slots or drop, never wait).
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            flush_pass_coordinated(
+                vec![("s".into(), store.clone())],
+                Duration::from_secs(30),
+                None,
+                Some(state.clone()),
+            )
+            .await;
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Publishes are detached; poll for the expected record with a bound.
+    async fn await_event<F>(
+        client: &etcd_client::Client,
+        key: &str,
+        mut accept: F,
+    ) -> lance_context_merge::demand::DemandEvent
+    where
+        F: FnMut(&lance_context_merge::demand::DemandEvent) -> bool,
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(kv) = client.clone().get(key, None).await.unwrap().kvs().first() {
+                let event: lance_context_merge::demand::DemandEvent =
+                    serde_json::from_slice(kv.value()).unwrap();
+                if accept(&event) {
+                    return event;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "demand event never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Demand is published on every flush, below the count threshold and for
     /// targets this master does not own, and is monotonic across flushes.
     #[tokio::test]
@@ -555,17 +696,16 @@ mod tests {
         .await;
         assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
         let encoded: String = "generic:s".bytes().map(|b| format!("{b:02x}")).collect();
-        let events = client
-            .clone()
-            .get(
-                format!("{prefix}/demand-events/{encoded}/"),
-                Some(etcd_client::GetOptions::new().with_prefix()),
-            )
+        let shard = store
+            .read()
             .await
-            .unwrap();
-        assert_eq!(events.kvs().len(), 1, "one event per shard");
-        let first: lance_context_merge::demand::DemandEvent =
-            serde_json::from_slice(events.kvs()[0].value()).unwrap();
+            .own_shard_watermark()
+            .await
+            .unwrap()
+            .unwrap()
+            .shard_id;
+        let key = format!("{prefix}/demand-events/{encoded}/{shard}");
+        let first = await_event(&client, &key, |_| true).await;
         assert_eq!(
             first.source,
             lance_context_merge::demand::EventSource::Writer
@@ -574,8 +714,11 @@ mod tests {
         let mut table = lance_context_merge::demand::TableDemand::default();
         table.fold(&first, 1, 0).unwrap();
         assert_eq!(table.pending_generations(), first.sealed_through);
-        // A second flush with no new generation changes nothing.
-        let revision = events.kvs()[0].mod_revision();
+        // A second flush with no new generation changes nothing: wait long
+        // enough for a detached publish to have landed, then check the
+        // revision is unchanged.
+        let revision =
+            client.clone().get(key.as_str(), None).await.unwrap().kvs()[0].mod_revision();
         flush_pass_coordinated(
             vec![("s".into(), store.clone())],
             Duration::from_secs(5),
@@ -583,11 +726,8 @@ mod tests {
             Some(state.clone()),
         )
         .await;
-        let again = client
-            .clone()
-            .get(events.kvs()[0].key(), None)
-            .await
-            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let again = client.clone().get(key.as_str(), None).await.unwrap();
         assert_eq!(
             again.kvs()[0].mod_revision(),
             revision,
@@ -607,14 +747,7 @@ mod tests {
             Some(state),
         )
         .await;
-        let advanced = client
-            .clone()
-            .get(events.kvs()[0].key(), None)
-            .await
-            .unwrap();
-        let second: lance_context_merge::demand::DemandEvent =
-            serde_json::from_slice(advanced.kvs()[0].value()).unwrap();
-        assert!(second.sealed_through > first.sealed_through);
+        let second = await_event(&client, &key, |e| e.sealed_through > first.sealed_through).await;
         assert_eq!(second.writer_epoch, first.writer_epoch);
     }
 
