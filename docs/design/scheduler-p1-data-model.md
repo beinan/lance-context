@@ -31,21 +31,39 @@ P/demand-events/<hex>/<shard-uuid>
 ```
 
 Rules:
-* `put` only; no deletes by writers. Each key is overwritten with a strictly
-  monotonic `(writer_epoch, sealed_through)`; a writer compares before writing
-  and skips if the stored pair is already ≥ its own. Loss or duplication of a
-  put cannot corrupt the count because the value is absolute.
-* Executors write `merged_through` for the shards they merged **in the same
-  txn as the merge-crate `release`**, so demand and ownership agree.
-* The stats scan (source `scan`) writes the same record when it observes a
-  shard. Ordering is by the shard's own `(writer_epoch, sealed_through)` only;
-  etcd revisions and manifest versions are different clocks and are never
-  compared with each other. A scan may raise `sealed_through` at an equal
-  epoch and may replace the shard record only with a strictly greater
-  `writer_epoch` (a retired shard whose writer is gone). It may never lower a
-  watermark at an equal epoch, regardless of when the snapshot was written
-  (review point 3). `observed_revision` on the table record is bookkeeping for
-  "how fresh is this cache", not an ordering input.
+* **Generation numbers are monotonic per shard across writer epochs.** Lance
+  keeps `current_generation` and `flushed_generations` when a new writer claims
+  a shard (`ShardManifest { writer_epoch: next, ..base }`). The epoch is a
+  writer fence and a tiebreak, never a numbering restart. A `merged_through`
+  reported under epoch 1 therefore still counts against a `sealed_through`
+  flushed under epoch 2 (merged 40, new writer flushes to 60 ⇒ 20 pending).
+* `put` only; no deletes by writers. The stored record is the **per‑dimension
+  join** of every event published so far: `sealed` and `merged` are each the
+  max of `(value, epoch)` across stored and new, taken independently. A writer
+  event with `merged_through: None` keeps the executor's merged mark; an
+  executor event with an older `sealed_through` still advances `merged`.
+  Nothing about one dimension ever lowers or replaces the other. The join is
+  idempotent and commutative, so loss, duplication and reordering cannot
+  corrupt the count, and a rebuild from stored records equals the in‑memory
+  fold.
+* Every publisher does read‑join‑CAS with a bounded retry on a lost race, so
+  no publisher's progress is lost to another's. Executors publish **after**
+  release, one shard per put, detached and bounded; the release transaction
+  carries no demand keys (no cross‑key contention with writer flushes, no etcd
+  txn‑size limit for many‑shard tables, no storage read on the release path).
+* Source is irrelevant to ordering: a lower value from any source simply loses
+  the max. A stale scan cannot lower anything. `merged_epoch` records the
+  epoch a merged mark was reported under when it differs from the record's
+  `writer_epoch`; provenance and tiebreak only.
+* `oldest_pending_ms` is the flush time of the lowest unmerged generation. The
+  stored record carries `sealed_times` (bounded to `SEALED_TIMES_CAP = 64`
+  lowest unmerged generations, min time per generation, pruned as `merged`
+  advances) so the age clock **survives a rebuild from etcd**. A newer flush
+  adds an entry and never resets the clock. Counts and bytes are exact in every
+  order; the age field is exact up to the cap and a lower bound beyond it.
+* Records carry `v`. A reader rejects an event it does not understand
+  (`Ignored::UnknownVersion`) and a publisher **refuses to overwrite a stored
+  record from a newer schema**; `v == 0` is read as version 1.
 
 ### 1.2 Table record — maintained by the planner
 

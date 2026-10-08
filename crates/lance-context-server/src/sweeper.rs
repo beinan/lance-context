@@ -390,6 +390,8 @@ fn spawn_publish_demand<S: Sweepable>(
                 flushed_at_ms: chrono::Utc::now().timestamp_millis(),
                 writer_epoch: watermark.writer_epoch,
                 source: lance_context_merge::demand::EventSource::Writer,
+                merged_epoch: None,
+                sealed_times: Default::default(),
             };
             state
                 .merge_executions
