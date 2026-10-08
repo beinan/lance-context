@@ -31,21 +31,36 @@ P/demand-events/<hex>/<shard-uuid>
 ```
 
 Rules:
-* `put` only; no deletes by writers. Each key is overwritten with a strictly
-  monotonic `(writer_epoch, sealed_through)`; a writer compares before writing
-  and skips if the stored pair is already ≥ its own. Loss or duplication of a
-  put cannot corrupt the count because the value is absolute.
+* `put` only; no deletes by writers. The stored record is the **per‑dimension
+  join** of every event published so far: `sealed` and `merged` are each the
+  max of `(writer_epoch, value)` across stored and new, taken independently.
+  A writer event with `merged_through: None` therefore keeps the executor's
+  merged mark, and an executor event with an older `sealed_through` still
+  advances `merged`. Nothing about one dimension ever lowers or replaces the
+  other. Loss or duplication of a put cannot corrupt the count because every
+  value is absolute and the join is idempotent and commutative.
+* Folding (`TableDemand::fold`) applies the same join. `pending` for a shard is
+  `sealed − merged` only when both marks are at the same epoch; a `merged`
+  from an older epoch says nothing about the current epoch's generations
+  (all pending), and a `merged` from a newer epoch means the shard was
+  replaced (none pending).
+* `oldest_pending_ms` is the flush time of the lowest unmerged generation,
+  kept in a bounded per‑shard map (`SEALED_TIMES_CAP = 64`) that is pruned as
+  `merged` advances. A newer flush adds an entry and never resets the age
+  clock. Pending counts and bytes are exact in every order; the age field is
+  exact up to the cap and a lower bound beyond it.
 * Executors write `merged_through` for the shards they merged **in the same
   txn as the merge-crate `release`**, so demand and ownership agree.
 * The stats scan (source `scan`) writes the same record when it observes a
-  shard. Ordering is by the shard's own `(writer_epoch, sealed_through)` only;
-  etcd revisions and manifest versions are different clocks and are never
-  compared with each other. A scan may raise `sealed_through` at an equal
-  epoch and may replace the shard record only with a strictly greater
-  `writer_epoch` (a retired shard whose writer is gone). It may never lower a
-  watermark at an equal epoch, regardless of when the snapshot was written
-  (review point 3). `observed_revision` on the table record is bookkeeping for
-  "how fresh is this cache", not an ordering input.
+  shard. Source is irrelevant to ordering: writer, executor and scan all report
+  absolute watermarks and the per‑dimension max wins, so a stale scan cannot
+  lower anything — a lower value simply loses the max. etcd revisions and
+  manifest versions are different clocks and are never compared.
+  `observed_revision` on the table record is bookkeeping for "how fresh is
+  this cache", not an ordering input.
+* Records carry `v`; `TableDemand::default()` sets it, a reader rejects any
+  version it does not understand (`Ignored::UnknownVersion`), and `v == 0` is
+  read as version 1.
 
 ### 1.2 Table record — maintained by the planner
 
@@ -192,7 +207,12 @@ existing loop keeps running for every table throughout P1.
 ## 7. Tests P1 must land with
 
 1. `fold` is idempotent and commutative over any permutation/duplication of
-   events (property test, no etcd).
+   events (property test, no etcd): every permutation of small streams and
+   forward/reverse/shuffled large randomized streams across shards, epochs,
+   sources and missing `merged` agree on sealed/merged marks, pending counts
+   and bytes; the age field agrees below the cap. Includes the review
+   counterexamples (old‑epoch merge beside new‑epoch flush; scan with older
+   sealed and newer merged) and "writer event never forgets merged".
 2. A scan with an equal epoch cannot lower `sealed_through`; a higher epoch can.
 3. Headroom is computed from assignments, not samples: an executor whose
    `bytes_free_sample` says 2 GiB but with 2 GiB reserved gets no placement.
