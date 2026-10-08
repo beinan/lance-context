@@ -2083,6 +2083,49 @@ impl StorageBase {
         builder.load().await
     }
 
+    /// Every shard's watermark (highest flushed generation and writer epoch)
+    /// from its latest manifest. Metadata only; bounded-concurrent like
+    /// [`Self::wal_shard_snapshots`], but does not enforce the read cap:
+    /// the scheduler must see an over-cap shard, not be refused by it.
+    pub async fn all_shard_watermarks(&self) -> LanceResult<Vec<ShardWatermark>> {
+        if self.is_version_pinned() {
+            return Ok(Vec::new());
+        }
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let marks: Vec<Option<ShardWatermark>> = stream::iter(shard_ids)
+            .map(|shard_id| {
+                let object_store = object_store.clone();
+                let branch_path = branch_path.clone();
+                async move {
+                    let manifest_store = ShardManifestStore::new(
+                        object_store,
+                        &branch_path,
+                        shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    Ok::<_, LanceError>(manifest_store.read_latest().await?.map(|manifest| {
+                        ShardWatermark {
+                            shard_id: manifest.shard_id,
+                            writer_epoch: manifest.writer_epoch,
+                            sealed_through: manifest
+                                .flushed_generations
+                                .iter()
+                                .map(|g| g.generation)
+                                .max()
+                                .unwrap_or(0),
+                            pending_generations: manifest.flushed_generations.len(),
+                        }
+                    }))
+                }
+            })
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
+        Ok(marks.into_iter().flatten().collect())
+    }
+
     /// Read the latest manifest for every MemWAL shard. Manifest reads are
     /// bounded-concurrent so stores with many writer instances do not pay one
     /// object-store round trip per shard serially.

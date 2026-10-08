@@ -330,18 +330,37 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
             let previous = previous.clone();
             let rollout_options = rollout_options.clone();
             let generic_options = generic_options.clone();
+            let state = state.clone();
             async move {
                 let prev = previous.get(&entry.name);
                 let observed = match entry.kind {
                     ScanKind::Rollout => {
-                        observe_one(&entry.name, &entry.uri, prev, rollout_options).await
+                        observe_one(&entry.name, &entry.uri, prev, rollout_options.clone()).await
                     }
                     ScanKind::Generic => {
-                        observe_generic(&entry.name, &entry.uri, prev, generic_options).await
+                        observe_generic(&entry.name, &entry.uri, prev, generic_options.clone())
+                            .await
                     }
                 };
                 match observed {
-                    Ok(result) => (entry.name, Some(result)),
+                    Ok(result) => {
+                        // Demand reconciliation rides the scan: publish every
+                        // shard's watermark as a scan-sourced event. Detached
+                        // and bounded; the scan never waits on it.
+                        let target = match entry.kind {
+                            ScanKind::Rollout => entry.name.clone(),
+                            ScanKind::Generic => format!("generic:{}", entry.name),
+                        };
+                        crate::demand_publish::spawn_scan_demand(
+                            state.clone(),
+                            target,
+                            entry.uri.clone(),
+                            entry.kind,
+                            rollout_options,
+                            generic_options,
+                        );
+                        (entry.name, Some(result))
+                    }
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
                         (entry.name, None)
@@ -517,7 +536,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
 /// that finishes inside its interval and one that never does.
 /// Which registry a scan entry came from, which decides how it is opened.
 #[derive(Debug, Clone, Copy)]
-enum ScanKind {
+pub(crate) enum ScanKind {
     Rollout,
     Generic,
 }
