@@ -27,7 +27,7 @@ restart something because it "has been running a long time", stop and check
 | Question | Look at |
 |---|---|
 | Is WAL piling up anywhere? | `master_wal_pending_generations_max`, `master_wal_pending_generations_total`, `master_stores_pending_over_read_cap`; per table `GET /api/v1/experiments/{name}` → `pending_wal_generations`, `fragment_count` |
-| Are tasks waiting instead of running? | `master_task_schedule_to_bind_seconds{kind}` (enqueue → claim). Rising with `master_task_pool_in_use{pool}` at capacity = **capacity**. Rising with pools idle = **admission is blocking** (§4). |
+| Are tasks waiting instead of running? | `master_task_schedule_to_bind_seconds{kind}` (enqueue → claim). Rising with `master_task_pool_in_use{pool,state="running"}` at capacity = **capacity**. Rising with `state="claiming"` high = **the etcd claim itself is slow or blocked** (§4, admission scan). Rising with both low = **nothing eligible** (§4). |
 | Is something queued at all? | `master_task_queue_depth`; `GET /api/v1/tasks/{id}` for a specific task |
 | Is a running merge actually working? | `GET /api/v1/merge-progress?target=<name>` (§3) |
 | Is compaction/index getting its commit turn? | `master_commit_turn_requests_total{kind,result}`: `served` vs `expired`; `master_commit_turn_wait_seconds`; `master_merge_yield_to_compaction_total` (§5) |
@@ -51,7 +51,7 @@ restart something because it "has been running a long time", stop and check
      a changing `sequence` is progress.
    * `reported` → read `work_report` (§3).
 3. If a task is live and progressing: this is **capacity**, not a fault. Check
-   `master_task_pool_in_use{pool="merge"}` and `{pool="resident_merge"}`; the
+   `master_task_pool_in_use{pool="merge",state="running"}` and `{pool="resident_merge",state="running"}`; the
    executor's memory budget (`ROLLOUT_APPEND_LOCAL_MEMORY_BYTES`,
    `CATCHUP_MERGE_MEMORY_BYTES`); and whether the table is
    oversized-generation bound (`work_report` shows waiting-for-memory phases).

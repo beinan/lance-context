@@ -1188,7 +1188,16 @@ fn spawn_filtered_pool_poller(
     } else {
         "general"
     };
-    let pool_total = pool.available_permits();
+    // Permits in use are split by what holds them: `claiming` while the etcd
+    // claim is outstanding, `running` once a task owns the permit. Both are
+    // updated at the permit boundaries themselves, so a claim that blocks on
+    // etcd for minutes shows as a held permit rather than as idle capacity.
+    let claiming =
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "claiming");
+    let running =
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "running");
+    claiming.set(0.0);
+    running.set(0.0);
     tokio::spawn(async move {
         loop {
             if report_depth {
@@ -1196,10 +1205,6 @@ fn spawn_filtered_pool_poller(
                     metrics::gauge!("master_task_queue_depth").set(queued as f64);
                 }
             }
-            // Every pool reports, including the resident-only slot added in
-            // #331 that the queue-depth gauge never covered.
-            metrics::gauge!("master_task_pool_in_use", "pool" => pool_label)
-                .set(pool_total.saturating_sub(pool.available_permits()) as f64);
             while pool.available_permits() > 0 {
                 // Reserve both budgets before taking durable table ownership.
                 let compact_permit = if kinds == TaskKinds::COMPACT {
@@ -1216,6 +1221,7 @@ fn spawn_filtered_pool_poller(
                 let Some(operation) = state.admission.try_admit() else {
                     break;
                 };
+                claiming.increment(1.0);
                 let claim_start = std::time::Instant::now();
                 let claim = if resident_only {
                     state
@@ -1225,6 +1231,7 @@ fn spawn_filtered_pool_poller(
                 } else {
                     state.task_store.claim_next_of_kinds(kinds).await
                 };
+                claiming.decrement(1.0);
                 match claim {
                     Ok(Some(claim)) => {
                         let claim_elapsed = claim_start.elapsed();
@@ -1235,11 +1242,14 @@ fn spawn_filtered_pool_poller(
                             permit_wait: Duration::ZERO,
                         };
                         let st = state.clone();
+                        let running = running.clone();
+                        running.increment(1.0);
                         tokio::spawn(async move {
                             run_task(&st, claim, timing).await;
                             drop(permit);
                             drop(compact_permit);
                             drop(operation);
+                            running.decrement(1.0);
                         });
                     }
                     Ok(None) => break,
