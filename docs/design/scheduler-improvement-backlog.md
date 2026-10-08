@@ -120,8 +120,9 @@ prefix queue keys with `{class:1}` so lexicographic order is class‑then‑time
 The only write‑side signal today is read‑side: 503 at 4096 pending generations, warn at
 256. Every mature LSM (RocksDB write stall, TiKV `soft-pending-compaction-bytes-limit`,
 ClickHouse `parts_to_delay_insert`, Pebble L0 sublevels) throttles *proportionally* before
-rejecting. **Fix**: Design §4.7 `backlog_class` driving flush‑interval stretch /
-generation coalescing in the rollout server.
+rejecting. **Fix**: Design §4.7 `backlog_class` driving proportional admission delay in
+the rollout server. Not flush‑interval stretching: that converts backlog into memtable
+memory and longer un‑flushed windows, which the memory budget and durability bound forbid.
 
 ### C7. Assignments without executor liveness
 Today a claim is leased by the *claimer*, but nothing verifies the claimer can actually run
