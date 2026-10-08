@@ -16,6 +16,8 @@ pub struct MasterConfig {
     pub append: crate::rollout_append::AppendConfig,
     #[command(flatten)]
     pub wal_tail: crate::wal_tail::WalTailConfig,
+    #[command(flatten)]
+    pub planner: crate::planner::PlannerConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,
