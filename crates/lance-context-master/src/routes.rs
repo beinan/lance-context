@@ -9,7 +9,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use lance_context_api::{
     CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
@@ -711,12 +711,51 @@ struct MergeProgressQuery {
     target: String,
 }
 
+/// What `/merge-progress` can say about a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MergeProgressStatus {
+    /// Execution, progress sequence and a matching work report were read
+    /// at one etcd revision.
+    Reported,
+    /// An execution exists but has published no work report for its
+    /// current progress sequence (older executor binary, or not yet).
+    ProgressDetailsUnavailable,
+    /// A MergeWal task is live but no execution record exists: a legacy
+    /// worker RPC with no telemetry. Not evidence of health.
+    ProgressUnknown,
+    /// No live task and no execution record.
+    NoActiveRecord,
+}
+
+/// Typed response for `GET /api/v1/merge-progress?target=`. Field names are
+/// a contract; add fields, never rename them.
+#[derive(Debug, Serialize)]
+struct MergeProgressReport {
+    target: String,
+    status: MergeProgressStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<lance_context_merge::Execution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<lance_context_merge::progress::ExecutionProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_report: Option<serde_json::Value>,
+    /// etcd revision the execution/progress/work triple was read at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<i64>,
+    sampled_at_ms: u64,
+}
+
 /// Exact target reads only. A live task/lease without execution telemetry is
 /// explicitly unknown, not evidence that a legacy merge is making progress.
+/// Execution, progress and work report come from one etcd revision, so the
+/// caller never has to retry on a torn read.
 async fn merge_progress(
     State(state): State<Arc<MasterState>>,
     Query(query): Query<MergeProgressQuery>,
-) -> Result<Json<serde_json::Value>, MasterError> {
+) -> Result<Json<MergeProgressReport>, MasterError> {
     if query.target.is_empty() || query.target.len() > 512 {
         return Err(MasterError::InvalidRequest("invalid merge target".into()));
     }
@@ -726,48 +765,41 @@ async fn merge_progress(
         .get_active_id(TaskKind::MergeWal, &query.target)
         .await
         .map_err(MasterError::from_lance)?;
-    let Some(execution) = coordinator
-        .get(&query.target)
+    let sampled_at_ms = lance_context_merge::failure::now_ms();
+    let Some(snapshot) = coordinator
+        .progress_snapshot(&query.target)
         .await
         .map_err(MasterError::Internal)?
     else {
-        return Ok(Json(
-            serde_json::json!({"target": query.target, "task_id": task_id, "status": if task_id.is_some() { "progress_unknown" } else { "no_active_record" }}),
-        ));
+        return Ok(Json(MergeProgressReport {
+            target: query.target,
+            status: if task_id.is_some() {
+                MergeProgressStatus::ProgressUnknown
+            } else {
+                MergeProgressStatus::NoActiveRecord
+            },
+            task_id,
+            execution: None,
+            progress: None,
+            work_report: None,
+            revision: None,
+            sampled_at_ms,
+        }));
     };
-    let progress = coordinator
-        .progress(&execution)
-        .await
-        .map_err(MasterError::Internal)?;
-    let work = coordinator
-        .work_progress(&execution)
-        .await
-        .map_err(MasterError::Internal)?;
-    if work
-        .as_ref()
-        .is_some_and(|report| report["sequence"].as_u64() != progress.as_ref().map(|p| p.sequence))
-    {
-        return Ok(Json(
-            serde_json::json!({"target":query.target,"status":"progress_changed_retry"}),
-        ));
-    }
-    if coordinator
-        .get(&query.target)
-        .await
-        .map_err(MasterError::Internal)?
-        .as_ref()
-        != Some(&execution)
-    {
-        return Ok(Json(
-            serde_json::json!({"target":query.target,"status":"execution_changed_retry"}),
-        ));
-    }
-    Ok(Json(serde_json::json!({
-        "target": query.target, "task_id": task_id, "execution": execution,
-        "progress": progress, "work_report": work,
-        "sampled_at_ms": lance_context_merge::failure::now_ms(),
-        "status": if work.is_some() { "reported" } else { "progress_details_unavailable" },
-    })))
+    Ok(Json(MergeProgressReport {
+        target: query.target,
+        status: if snapshot.work_report.is_some() {
+            MergeProgressStatus::Reported
+        } else {
+            MergeProgressStatus::ProgressDetailsUnavailable
+        },
+        task_id,
+        execution: Some(snapshot.execution),
+        progress: snapshot.progress,
+        work_report: snapshot.work_report,
+        revision: Some(snapshot.revision),
+        sampled_at_ms,
+    }))
 }
 
 async fn drain_executor(
@@ -937,9 +969,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report["status"], "progress_unknown");
-        assert_eq!(report["task_id"], claim.task.id);
-        assert!(report.get("work_report").is_none());
+        assert_eq!(report.status, MergeProgressStatus::ProgressUnknown);
+        assert_eq!(report.task_id.as_deref(), Some(claim.task.id.as_str()));
+        assert!(report.work_report.is_none());
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["status"], "progress_unknown");
+        assert!(wire.get("execution").is_none(), "absent fields are omitted");
         state
             .task_store
             .finish(claim, Ok("done".into()))
@@ -953,7 +988,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report["status"], "no_active_record");
+        assert_eq!(report.status, MergeProgressStatus::NoActiveRecord);
     }
 
     fn test_record(id: &str, with_blob: bool) -> RolloutRecord {

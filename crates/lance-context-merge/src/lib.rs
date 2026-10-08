@@ -731,6 +731,35 @@ mod tests {
                 .sequence,
             4
         );
+        // One-revision snapshot: execution, sequence and report agree.
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.execution, running);
+        assert_eq!(snapshot.progress.as_ref().map(|p| p.sequence), Some(4));
+        assert_eq!(snapshot.work_report, Some(report.clone()));
+        assert!(snapshot.revision > 0);
+        // A heartbeat that advances the sequence without a new report must
+        // not render the old report as current.
+        assert!(coordinator.publish_progress(&running, 5).await.unwrap());
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.progress.as_ref().map(|p| p.sequence), Some(5));
+        assert!(snapshot.work_report.is_none(), "stale report dropped");
+        assert!(coordinator
+            .publish_work_progress(&running, 4, report.clone())
+            .await
+            .unwrap());
+        assert!(coordinator
+            .progress_snapshot("absent")
+            .await
+            .unwrap()
+            .is_none());
         // A stale observation cannot revoke completed new work. Details have
         // their own key, so the established exact-byte sequence CAS still works.
         assert!(!coordinator.revoke_stalled(&running, Some(3)).await.unwrap());

@@ -27,10 +27,16 @@ for progress detection.
 
 Detailed reports and the established sequence are published in one
 execution-qualified transaction. The sequence keeps its original wire format,
-so mixed-version no-progress compare-and-swap remains valid. The API rejects a
-sample if the execution changed or independently read sequence/report versions
-disagree. Consumers must compare samples of the same execution and check the
-report timestamp; `reported` is not a health verdict. Zero append counters on a
+so mixed-version no-progress compare-and-swap remains valid. The endpoint reads
+execution, sequence and report in one etcd transaction guarded on the execution
+bytes, so every response is a single-revision sample; the `revision` field
+carries it. A report published for an older sequence than the current one is
+omitted rather than shown beside a newer heartbeat. The response is a fixed
+schema (`target`, `status`, `task_id`, `execution`, `progress`, `work_report`,
+`revision`, `sampled_at_ms`; absent fields are omitted) with `status` one of
+`reported`, `progress_details_unavailable`, `progress_unknown`,
+`no_active_record`. Consumers must compare samples of the same execution and
+check the report timestamp; `reported` is not a health verdict. Zero append counters on a
 different maintenance kind are not evidence that its work is stalled.
 
 The report is live execution state and is removed on normal release. A final
