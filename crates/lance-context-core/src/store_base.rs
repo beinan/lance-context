@@ -215,6 +215,17 @@ pub const PENDING_GENERATIONS_EXCEEDED: &str = "too many pending WAL generations
 pub const DEFAULT_PENDING_GENERATIONS_MAX: usize = 4096;
 
 /// Whether `err` is a read refused by the pending-generations cap.
+/// A writer shard's position, read from its own MemWAL manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardWatermark {
+    pub shard_id: Uuid,
+    pub writer_epoch: u64,
+    /// Highest flushed generation number; 0 when none are flushed.
+    pub sealed_through: u64,
+    /// Flushed generations not yet merged into the base table.
+    pub pending_generations: usize,
+}
+
 pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
     err.to_string().contains(PENDING_GENERATIONS_EXCEEDED)
 }
@@ -912,6 +923,32 @@ impl StorageBase {
         }
         self.prepare_merge_if_ready_inner(self.merge_after_generations, false)
             .await
+    }
+
+    /// This writer's shard watermark from its own manifest: highest flushed
+    /// generation, writer epoch and flushed generation count. Metadata only.
+    /// `None` when the shard has no manifest yet.
+    pub async fn own_shard_watermark(&self) -> LanceResult<Option<ShardWatermark>> {
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        Ok(manifest_store
+            .read_latest()
+            .await?
+            .map(|manifest| ShardWatermark {
+                shard_id: manifest.shard_id,
+                writer_epoch: manifest.writer_epoch,
+                sealed_through: manifest
+                    .flushed_generations
+                    .iter()
+                    .map(|g| g.generation)
+                    .max()
+                    .unwrap_or(0),
+                pending_generations: manifest.flushed_generations.len(),
+            }))
     }
 
     /// Metadata-only count trigger for a coordinated sweeper. Never prepares

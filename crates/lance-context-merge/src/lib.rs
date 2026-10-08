@@ -4,6 +4,7 @@
 //! Only the executor can publish its terminal outcome. Recovery first cancels
 //! and reconciles the old execution; it never clears a running fence on timeout.
 
+pub mod demand;
 pub mod failure;
 pub mod fencing;
 pub mod progress;

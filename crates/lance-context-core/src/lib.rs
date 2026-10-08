@@ -28,7 +28,8 @@ mod storage;
 mod store;
 mod store_base;
 pub use store_base::{
-    is_pending_generations_exceeded, DEFAULT_PENDING_GENERATIONS_MAX, PENDING_GENERATIONS_EXCEEDED,
+    is_pending_generations_exceeded, ShardWatermark, DEFAULT_PENDING_GENERATIONS_MAX,
+    PENDING_GENERATIONS_EXCEEDED,
 };
 
 // Request/DTO conversions, exported so the server does not keep its own copies.

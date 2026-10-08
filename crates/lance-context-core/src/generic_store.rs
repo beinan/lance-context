@@ -634,6 +634,13 @@ impl GenericStore {
         self.base.count_merge_due().await
     }
 
+    /// This writer's shard watermark from its own manifest. Metadata only.
+    pub async fn own_shard_watermark(
+        &self,
+    ) -> LanceResult<Option<crate::store_base::ShardWatermark>> {
+        self.base.own_shard_watermark().await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock

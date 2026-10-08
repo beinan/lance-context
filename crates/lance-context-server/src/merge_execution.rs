@@ -101,6 +101,18 @@ impl Executions {
         Ok(())
     }
 
+    pub(crate) async fn publish_demand_event(
+        &self,
+        target: &str,
+        event: &lance_context_merge::demand::DemandEvent,
+    ) -> Result<bool, String> {
+        self.coordinator()
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .publish_demand_event(target, event)
+            .await
+    }
+
     pub(crate) async fn request_merge(&self, target: &str) -> Result<(), String> {
         self.coordinator()
             .await

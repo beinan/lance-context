@@ -1,13 +1,18 @@
 //! Per-table maintenance demand folded from per-shard watermarks.
 //!
-//! Schema: `docs/design/scheduler-p1-data-model.md` §1. Everything here is a
-//! pure function of its inputs; no etcd. The record under `P/demand/<hex>`
-//! is a cache rebuilt from `demand-events/` plus the stats scan, so folding
-//! must be idempotent and order-independent.
+//! Schema: `docs/design/scheduler-p1-data-model.md` §1. The types and
+//! `TableDemand::fold` are pure; `Coordinator::publish_demand_event` is the
+//! one etcd write, a monotonic put keyed by `(writer_epoch, sealed_through)`.
+//! The record under `P/demand/<hex>` is a cache rebuilt from
+//! `demand-events/` plus the stats scan, so folding must be idempotent and
+//! order-independent.
 
 use std::collections::BTreeMap;
 
+use etcd_client::{Compare, CompareOp, TxnOp};
 use serde::{Deserialize, Serialize};
+
+use crate::{Coordinator, Result};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -130,7 +135,12 @@ impl TableDemand {
     /// * same epoch: `sealed` and `merged` only move forward, except that a
     ///   `Scan` may never lower `sealed` and no source may lower `merged`;
     /// * `flushed_at_ms` follows the newest `sealed`.
-    pub fn fold(&mut self, event: &DemandEvent, revision: i64, now_ms: i64) -> Result<(), Ignored> {
+    pub fn fold(
+        &mut self,
+        event: &DemandEvent,
+        revision: i64,
+        now_ms: i64,
+    ) -> std::result::Result<(), Ignored> {
         let entry = self.shards.entry(event.shard.clone());
         let changed = match entry {
             std::collections::btree_map::Entry::Vacant(slot) => {
@@ -190,6 +200,79 @@ impl TableDemand {
             self.updated_ms = now_ms;
         }
         Ok(())
+    }
+}
+
+impl Coordinator {
+    fn demand_event_key(&self, target: &str, shard: &str) -> String {
+        let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
+        format!(
+            "{}/demand-events/{encoded}/{shard}",
+            self.prefix.trim_end_matches('/')
+        )
+    }
+
+    /// Publish a shard watermark. Monotonic: if the stored event already has a
+    /// `(writer_epoch, sealed_through)` at least as new, nothing is written and
+    /// `Ok(false)` is returned. Never deletes. Safe to call on every flush.
+    pub async fn publish_demand_event(&self, target: &str, event: &DemandEvent) -> Result<bool> {
+        let key = self.demand_event_key(target, &event.shard);
+        let value = serde_json::to_vec(event).map_err(|e| e.to_string())?;
+        let mut client = self.client.clone();
+        let current = client
+            .get(key.as_str(), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(kv) = current.kvs().first() else {
+            let response = client
+                .txn(
+                    etcd_client::Txn::new()
+                        .when(vec![Compare::version(key.as_str(), CompareOp::Equal, 0)])
+                        .and_then(vec![TxnOp::put(key.as_str(), value, None)]),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(response.succeeded());
+        };
+        let stored: DemandEvent = match serde_json::from_slice(kv.value()) {
+            Ok(stored) => stored,
+            // An unreadable record is replaced rather than left poisoning the key.
+            Err(_) => DemandEvent {
+                v: 0,
+                shard: event.shard.clone(),
+                sealed_through: 0,
+                sealed_bytes_through: 0,
+                merged_through: None,
+                flushed_at_ms: 0,
+                writer_epoch: 0,
+                source: event.source,
+            },
+        };
+        let newer = (
+            event.writer_epoch,
+            event.sealed_through,
+            event.merged_through,
+        ) > (
+            stored.writer_epoch,
+            stored.sealed_through,
+            stored.merged_through,
+        );
+        if !newer {
+            return Ok(false);
+        }
+        let response = client
+            .txn(
+                etcd_client::Txn::new()
+                    .when(vec![Compare::mod_revision(
+                        key.as_str(),
+                        CompareOp::Equal,
+                        kv.mod_revision(),
+                    )])
+                    .and_then(vec![TxnOp::put(key.as_str(), value, None)]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(response.succeeded())
     }
 }
 
@@ -341,6 +424,54 @@ mod tests {
             Err(Ignored::NotNewer)
         );
         assert_eq!(table.observed_revision, 9, "ignored events do not advance");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn publish_is_monotonic_by_epoch_then_sealed_then_merged() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let coordinator =
+            Coordinator::new(client, format!("/demand-publish/{}", uuid::Uuid::new_v4()));
+        let publish = |e: DemandEvent| {
+            let c = coordinator.clone();
+            async move { c.publish_demand_event("t", &e).await.unwrap() }
+        };
+        assert!(publish(ev("s", 10, None, 1, EventSource::Writer)).await);
+        assert!(
+            !publish(ev("s", 10, None, 1, EventSource::Writer)).await,
+            "duplicate"
+        );
+        assert!(
+            !publish(ev("s", 9, None, 1, EventSource::Scan)).await,
+            "lower sealed"
+        );
+        assert!(
+            !publish(ev("s", 50, None, 0, EventSource::Writer)).await,
+            "lower epoch"
+        );
+        assert!(
+            publish(ev("s", 10, Some(4), 1, EventSource::Executor)).await,
+            "merged advances"
+        );
+        assert!(
+            !publish(ev("s", 10, Some(3), 1, EventSource::Executor)).await,
+            "merged regress"
+        );
+        assert!(
+            publish(ev("s", 12, None, 1, EventSource::Writer)).await,
+            "sealed advances"
+        );
+        assert!(
+            publish(ev("s", 1, None, 2, EventSource::Scan)).await,
+            "higher epoch"
+        );
+        assert!(
+            publish(ev("other", 1, None, 1, EventSource::Writer)).await,
+            "separate shard"
+        );
     }
 
     #[test]

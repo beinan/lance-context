@@ -50,6 +50,15 @@ pub(crate) trait Sweepable: Send + Sync + 'static {
         async { Ok(false) }
     }
 
+    /// This writer's shard watermark, metadata only. `None` when the store
+    /// has no shard manifest yet or does not publish demand.
+    fn own_shard_watermark(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<lance_context_core::ShardWatermark>, String>>
+           + Send {
+        async { Ok(None) }
+    }
+
     /// Fold **every** pending flushed generation into the base table; returns
     /// how many were reclaimed.
     fn merge_wal(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send;
@@ -70,6 +79,16 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
         self.read()
             .await
             .count_merge_due()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn own_shard_watermark(
+        &self,
+    ) -> Result<Option<lance_context_core::ShardWatermark>, String> {
+        self.read()
+            .await
+            .own_shard_watermark()
             .await
             .map_err(|e| e.to_string())
     }
@@ -145,6 +164,16 @@ impl Sweepable for Arc<RwLock<GenericStore>> {
         self.read()
             .await
             .count_merge_due()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn own_shard_watermark(
+        &self,
+    ) -> Result<Option<lance_context_core::ShardWatermark>, String> {
+        self.read()
+            .await
+            .own_shard_watermark()
             .await
             .map_err(|e| e.to_string())
     }
@@ -321,6 +350,48 @@ pub(crate) async fn merge_pass_coordinated<S: Sweepable>(
     }
 }
 
+async fn publish_demand<S: Sweepable>(
+    state: &Arc<crate::state::AppState>,
+    target: &str,
+    store: &S,
+) {
+    let watermark = match store.own_shard_watermark().await {
+        Ok(Some(watermark)) => watermark,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(target, %error, "shard watermark unavailable");
+            return;
+        }
+    };
+    let event = lance_context_merge::demand::DemandEvent {
+        v: lance_context_merge::demand::SCHEMA_VERSION,
+        shard: watermark.shard_id.to_string(),
+        sealed_through: watermark.sealed_through,
+        sealed_bytes_through: 0,
+        merged_through: None,
+        flushed_at_ms: chrono::Utc::now().timestamp_millis(),
+        writer_epoch: watermark.writer_epoch,
+        source: lance_context_merge::demand::EventSource::Writer,
+    };
+    match state
+        .merge_executions
+        .publish_demand_event(target, &event)
+        .await
+    {
+        Ok(written) => {
+            metrics::counter!(
+                "rollout_wal_demand_events_total",
+                "result" => if written { "written" } else { "unchanged" }
+            )
+            .increment(1);
+        }
+        Err(error) => {
+            metrics::counter!("rollout_wal_demand_events_total", "result" => "failed").increment(1);
+            tracing::debug!(target, %error, "demand event publish failed");
+        }
+    }
+}
+
 /// Return true when routing handled the target (including drain/no-op).
 async fn route_merge<S: Sweepable>(
     state: &Arc<crate::state::AppState>,
@@ -336,6 +407,10 @@ async fn route_merge<S: Sweepable>(
     if state.merge_executions.rollout.draining(&target) {
         return Ok(true);
     }
+    // Demand is published on every flush, below any count threshold, so the
+    // planner sees low-count tails without a sweep. Failure to publish never
+    // blocks the merge request path. Additive: `merge-requests` is unchanged.
+    publish_demand(state, &target, store).await;
     if !state.merge_executions.owned(&target) {
         return Ok(false);
     }
@@ -449,6 +524,98 @@ mod tests {
             2
         );
         assert_eq!(store.read().await.count_base_rows().await.unwrap(), 0);
+    }
+
+    /// Demand is published on every flush, below the count threshold and for
+    /// targets this master does not own, and is monotonic across flushes.
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn flush_publishes_shard_demand_below_threshold_and_without_ownership() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/demand-sweeper/{}", uuid::Uuid::new_v4());
+        let coordinator = lance_context_merge::Coordinator::new(client.clone(), prefix.clone());
+        let state_dir = TempDir::new().unwrap();
+        let mut state = crate::state::AppState::new_for_test(state_dir.path().to_path_buf()).await;
+        state.merge_executions =
+            crate::merge_execution::Executions::new(Some(coordinator.clone()), 3600);
+        // Deliberately NOT owned: demand must still be visible to a planner.
+        let state = Arc::new(state);
+        let dir = TempDir::new().unwrap();
+        // Threshold 8, only 2 pending: no merge request is expected.
+        let store = generic_with_pending(&dir, 8, 2).await;
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(5),
+            None,
+            Some(state.clone()),
+        )
+        .await;
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        let encoded: String = "generic:s".bytes().map(|b| format!("{b:02x}")).collect();
+        let events = client
+            .clone()
+            .get(
+                format!("{prefix}/demand-events/{encoded}/"),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.kvs().len(), 1, "one event per shard");
+        let first: lance_context_merge::demand::DemandEvent =
+            serde_json::from_slice(events.kvs()[0].value()).unwrap();
+        assert_eq!(
+            first.source,
+            lance_context_merge::demand::EventSource::Writer
+        );
+        assert!(first.sealed_through >= 2, "{first:?}");
+        let mut table = lance_context_merge::demand::TableDemand::default();
+        table.fold(&first, 1, 0).unwrap();
+        assert_eq!(table.pending_generations(), first.sealed_through);
+        // A second flush with no new generation changes nothing.
+        let revision = events.kvs()[0].mod_revision();
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(5),
+            None,
+            Some(state.clone()),
+        )
+        .await;
+        let again = client
+            .clone()
+            .get(events.kvs()[0].key(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.kvs()[0].mod_revision(),
+            revision,
+            "unchanged watermark not rewritten"
+        );
+        // New generation advances it.
+        store
+            .read()
+            .await
+            .add(&[json!({"id": "r9"}).as_object().unwrap().clone()])
+            .await
+            .unwrap();
+        flush_pass_coordinated(
+            vec![("s".into(), store.clone())],
+            Duration::from_secs(5),
+            None,
+            Some(state),
+        )
+        .await;
+        let advanced = client
+            .clone()
+            .get(events.kvs()[0].key(), None)
+            .await
+            .unwrap();
+        let second: lance_context_merge::demand::DemandEvent =
+            serde_json::from_slice(advanced.kvs()[0].value()).unwrap();
+        assert!(second.sealed_through > first.sealed_through);
+        assert_eq!(second.writer_epoch, first.writer_epoch);
     }
 
     fn spec() -> SchemaSpec {

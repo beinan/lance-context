@@ -666,6 +666,13 @@ impl RolloutStore {
         self.base.count_merge_due().await
     }
 
+    /// This writer's shard watermark from its own manifest. Metadata only.
+    pub async fn own_shard_watermark(
+        &self,
+    ) -> LanceResult<Option<crate::store_base::ShardWatermark>> {
+        self.base.own_shard_watermark().await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
     /// the time-triggered behavior of [`Self::cleanup_own_shard`].
     pub async fn prepare_cleanup_merge(
