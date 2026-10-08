@@ -8,6 +8,7 @@ description = "Durable ownership for cancellable WAL merge execution"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 etcd-client = { version = "0.19", features = ["tls"] }
+lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

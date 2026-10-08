@@ -3944,6 +3944,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "etcd-client",
+ "lance-context-api",
  "serde",
  "serde_json",
  "tokio",

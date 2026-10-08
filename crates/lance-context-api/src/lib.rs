@@ -1494,6 +1494,46 @@ pub enum CompactJobStatus {
 // Unified task scheduler (master control-plane)
 // ---------------------------------------------------------------------------
 
+/// Stable, machine-readable codes embedded in maintenance error messages.
+///
+/// Errors cross worker HTTP responses and durable etcd task records as
+/// strings, and Lance wraps our validation failures in its own error
+/// variants. A code lets the failure classifier recognise the error
+/// without matching on prose, file paths or wrapper formats. Codes are
+/// rendered as `[LC_…]` and must never be renamed once released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceErrorCode {
+    /// A prepared compaction, index or merge was validated against a
+    /// snapshot that another writer has since changed. Rebuilding against
+    /// the latest snapshot can succeed; retry promptly.
+    StalePreparation,
+}
+
+impl MaintenanceErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StalePreparation => "LC_STALE_PREPARATION",
+        }
+    }
+
+    /// Render `message` with this code attached.
+    pub fn tag(self, message: &str) -> String {
+        format!("[{}] {message}", self.as_str())
+    }
+
+    /// Find the first code tag in an error string, regardless of wrapping.
+    pub fn parse(error: &str) -> Option<Self> {
+        let start = error.find("[LC_")?;
+        let rest = &error[start + 1..];
+        let end = rest.find(']')?;
+        match &rest[..end] {
+            "LC_STALE_PREPARATION" => Some(Self::StalePreparation),
+            _ => None,
+        }
+    }
+}
+
 /// The kind of work a scheduled task performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1789,5 +1829,23 @@ mod tests {
         let req: EnqueueTaskRequest =
             serde_json::from_str(r#"{"kind":"index_id","target":"exp-9"}"#).unwrap();
         assert_eq!(req.kind, TaskKind::IndexId);
+    }
+
+    #[test]
+    fn maintenance_error_code_round_trips_through_wrappers() {
+        let code = MaintenanceErrorCode::StalePreparation;
+        let tagged = code.tag("index metadata changed; reprepare");
+        assert_eq!(
+            tagged,
+            "[LC_STALE_PREPARATION] index metadata changed; reprepare"
+        );
+        let wrapped = format!("Invalid user input: {tagged}, crates/x/src/y.rs:1:2");
+        assert_eq!(MaintenanceErrorCode::parse(&wrapped), Some(code));
+        assert_eq!(
+            MaintenanceErrorCode::parse(&wrapped.to_ascii_lowercase()),
+            None
+        );
+        assert_eq!(MaintenanceErrorCode::parse("[LC_UNKNOWN] x"), None);
+        assert_eq!(MaintenanceErrorCode::parse("no code"), None);
     }
 }

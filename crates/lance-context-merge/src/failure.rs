@@ -1,6 +1,7 @@
 //! Durable shard failures: task recreation must not reset a retry budget.
 use crate::{ClaimProof, Coordinator, Execution, Result};
 use etcd_client::{Compare, CompareOp, GetOptions, TxnOp};
+use lance_context_api::MaintenanceErrorCode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,10 +33,20 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn classify(error: &str) -> FailureClass {
-    let error = error.to_ascii_lowercase();
-    if error.contains("ownership unresolved") {
-        FailureClass::OwnershipUnresolved
-    } else if is_preparation_conflict(&error) {
+    // A stable code wins over any prose, path or wrapper format. Ownership
+    // is checked first because an unresolved owner must never be retried
+    // as an ordinary conflict.
+    let lowered = error.to_ascii_lowercase();
+    if lowered.contains("ownership unresolved") {
+        return FailureClass::OwnershipUnresolved;
+    }
+    if let Some(code) = MaintenanceErrorCode::parse(error) {
+        return match code {
+            MaintenanceErrorCode::StalePreparation => FailureClass::Retryable,
+        };
+    }
+    let error = lowered;
+    if is_preparation_conflict(&error) {
         FailureClass::Retryable
     } else if [
         "not found",
@@ -66,9 +77,10 @@ pub fn classify(error: &str) -> FailureClass {
     }
 }
 
-// These exact validation failures mean the prepared snapshot became stale.
-// Lance wraps them in InvalidInput, but rebuilding against the latest snapshot
-// can succeed. Do not exempt arbitrary errors merely containing "reprepare".
+// Legacy text matcher for failure records written by binaries that predate
+// `MaintenanceErrorCode`. New errors carry `[LC_STALE_PREPARATION]` and are
+// classified before this runs. Remove once no stored record lacks a code.
+// Do not exempt arbitrary errors merely containing "reprepare".
 fn is_preparation_conflict(error: &str) -> bool {
     let message = error.strip_prefix("invalid user input: ").unwrap_or(error);
     let message = match message.split_once(", crates/lance-context-core/src/store_base.rs:") {
@@ -158,7 +170,9 @@ impl ShardFailure {
     // The next fenced completion persists the normal retry result.
     fn corrected(mut self) -> Self {
         if self.class == FailureClass::DataOrConfiguration
-            && is_preparation_conflict(&self.last_error.to_ascii_lowercase())
+            && (MaintenanceErrorCode::parse(&self.last_error)
+                == Some(MaintenanceErrorCode::StalePreparation)
+                || is_preparation_conflict(&self.last_error.to_ascii_lowercase()))
         {
             self.class = FailureClass::Retryable;
             let (attention, delay) = Self::retry_policy(&self.class, self.consecutive_attempts);
@@ -399,6 +413,43 @@ mod tests {
         ] {
             assert_ne!(classify(error), FailureClass::Retryable, "{error}");
         }
+    }
+
+    #[test]
+    fn coded_preparation_conflicts_classify_regardless_of_wrapper_or_path() {
+        let tagged = MaintenanceErrorCode::StalePreparation
+            .tag("compaction source fragment changed; reprepare");
+        for error in [
+            format!(
+                "Invalid user input: {tagged}, crates/lance-context-core/src/store_base.rs:1529:24"
+            ),
+            format!("Invalid user input: {tagged}, /moved/elsewhere/writer.rs:7:3"),
+            format!("Some future Lance wrapper → {tagged}"),
+            format!("IO error: {tagged}"),
+            tagged.clone(),
+        ] {
+            assert_eq!(classify(&error), FailureClass::Retryable, "{error}");
+        }
+        // Ownership still wins, and the code does not launder a 403.
+        assert_eq!(
+            classify(&format!("ownership unresolved: {tagged}")),
+            FailureClass::OwnershipUnresolved
+        );
+        // An old DataOrConfiguration record carrying a code is corrected too.
+        let old = ShardFailure {
+            target: "table".into(),
+            endpoint: "master:compact".into(),
+            class: FailureClass::DataOrConfiguration,
+            consecutive_attempts: 4,
+            last_failure_ms: 2,
+            next_retry_ms: 3_602_000,
+            needs_attention: true,
+            last_error: format!("Invalid user input: {tagged}"),
+        };
+        let corrected = old.corrected();
+        assert_eq!(corrected.class, FailureClass::Retryable);
+        assert_eq!(corrected.consecutive_attempts, 4);
+        assert_eq!(corrected.last_failure_ms, 2);
     }
 
     #[test]

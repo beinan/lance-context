@@ -60,6 +60,7 @@ use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::session::Session;
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_context_api::MaintenanceErrorCode;
 use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
@@ -1109,9 +1110,9 @@ impl StorageBase {
             .get(&self.write_shard)
             .is_some_and(|high| merged_generations.iter().any(|g| g <= high))
         {
-            return Err(LanceError::io(
+            return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
                 "prepared merge overlaps committed rollout watermark; reprepare",
-            ));
+            )));
         }
 
         let watermark = if crate::rollout_append::has_cutover(&self.dataset, self.write_shard) {
@@ -1500,7 +1501,8 @@ impl StorageBase {
             || prepared.schema != Schema::from(self.dataset.schema())
         {
             return Err(LanceError::invalid_input(
-                "index dataset or schema changed; reprepare",
+                MaintenanceErrorCode::StalePreparation
+                    .tag("index dataset or schema changed; reprepare"),
             ));
         }
         let sources: HashMap<_, _> = self
@@ -1516,7 +1518,8 @@ impl StorageBase {
             .any(|old| sources.get(&old.id).copied() != Some(old))
         {
             return Err(LanceError::invalid_input(
-                "index source fragment changed; reprepare",
+                MaintenanceErrorCode::StalePreparation
+                    .tag("index source fragment changed; reprepare"),
             ));
         }
         let current = self.dataset.load_indices().await?;
@@ -1527,7 +1530,7 @@ impl StorageBase {
             .collect();
         if replaced != prepared.replaced {
             return Err(LanceError::invalid_input(
-                "index metadata changed; reprepare",
+                MaintenanceErrorCode::StalePreparation.tag("index metadata changed; reprepare"),
             ));
         }
         let transaction = Transaction::new(
@@ -1656,7 +1659,8 @@ impl StorageBase {
             || prepared.schema != Schema::from(self.dataset.schema())
         {
             return Err(LanceError::invalid_input(
-                "compaction dataset or schema changed; reprepare",
+                MaintenanceErrorCode::StalePreparation
+                    .tag("compaction dataset or schema changed; reprepare"),
             ));
         }
         // Reject a stale rewrite before any ReserveFragments/index commit.
@@ -1672,7 +1676,8 @@ impl StorageBase {
             for old in &task.original_fragments {
                 if sources.get(&old.id).copied() != Some(old) {
                     return Err(LanceError::invalid_input(
-                        "compaction source fragment changed; reprepare",
+                        MaintenanceErrorCode::StalePreparation
+                            .tag("compaction source fragment changed; reprepare"),
                     ));
                 }
             }
