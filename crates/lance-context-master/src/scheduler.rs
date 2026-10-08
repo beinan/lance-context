@@ -1229,7 +1229,10 @@ fn spawn_filtered_pool_poller(
                 let Some(operation) = state.admission.try_admit() else {
                     break;
                 };
+                // Held across the await so a poller aborted mid-claim (drain,
+                // shutdown, test teardown) still pays the gauge back.
                 claiming.increment(1.0);
+                let claiming_hold = GaugeHold(claiming.clone());
                 let claim_start = std::time::Instant::now();
                 let claim = if resident_only {
                     state
@@ -1239,7 +1242,7 @@ fn spawn_filtered_pool_poller(
                 } else {
                     state.task_store.claim_next_of_kinds(kinds).await
                 };
-                claiming.decrement(1.0);
+                drop(claiming_hold);
                 match claim {
                     Ok(Some(claim)) => {
                         let claim_elapsed = claim_start.elapsed();
