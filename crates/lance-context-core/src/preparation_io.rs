@@ -210,3 +210,130 @@ mod tests {
         assert_eq!(steps.load(Ordering::Relaxed), 4);
     }
 }
+
+/// Test support: an object-store shim that delays or freezes data-file IO
+/// beneath the progress wrapper. Lets a test drive a *real* index or
+/// compaction build whose storage is slow or stuck and observe what the
+/// watchdog does. Not for production use.
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[derive(Debug, Clone)]
+    pub struct Throttle {
+        /// Added to every data-file put/get/get_ranges.
+        pub delay: Duration,
+        /// While set, data-file IO parks forever (until cleared).
+        pub frozen: Arc<AtomicBool>,
+        /// Data-file operations started.
+        pub ops: Arc<AtomicU64>,
+    }
+
+    impl Throttle {
+        pub fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                frozen: Arc::new(AtomicBool::new(false)),
+                ops: Arc::new(AtomicU64::new(0)),
+            }
+        }
+        async fn gate(&self, path: &Path) {
+            if !data_file(path) {
+                return;
+            }
+            self.ops.fetch_add(1, Ordering::Relaxed);
+            while self.frozen.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ThrottleWrapper(pub Throttle);
+
+    impl WrappingObjectStore for ThrottleWrapper {
+        fn wrap(&self, _: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(ThrottledStore {
+                inner: original,
+                throttle: self.0.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ThrottledStore {
+        inner: Arc<dyn ObjectStore>,
+        throttle: Throttle,
+    }
+
+    impl std::fmt::Display for ThrottledStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Throttled({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ThrottledStore {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.throttle.gate(path).await;
+            self.inner.put_opts(path, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.throttle.gate(path).await;
+            self.inner.put_multipart_opts(path, opts).await
+        }
+        async fn get_opts(&self, path: &Path, opts: GetOptions) -> Result<GetResult> {
+            if !opts.head {
+                self.throttle.gate(path).await;
+            }
+            self.inner.get_opts(path, opts).await
+        }
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> Result<Vec<Bytes>> {
+            self.throttle.gate(path).await;
+            self.inner.get_ranges(path, ranges).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+        async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> Result<()> {
+            self.inner.rename_opts(from, to, opts).await
+        }
+    }
+}

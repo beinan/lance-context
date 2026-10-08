@@ -2283,6 +2283,178 @@ mod tests {
             .is_some_and(|d| d.contains("prepared outside write lock")));
     }
 
+    /// Review finding 6 on #340: prove the watchdog on a *real* index build
+    /// with real storage behaviour, not hand-placed checkpoints.
+    ///
+    /// (a) Throttled IO: every data/index operation sleeps longer than the
+    ///     idle timeout would allow between manual checkpoints, yet because
+    ///     each completed operation is progress, the build runs past the idle
+    ///     timeout and finishes.
+    /// (b) Frozen IO: the same build with storage parked part-way is cancelled
+    ///     by the watchdog with the stall error, within [IDLE, IDLE + 4).
+    /// (c) Isolation: a second, healthy preparation on another table running
+    ///     concurrently with (b) is not cancelled and does not keep (b) alive.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn real_index_build_survives_slow_io_and_is_cancelled_when_frozen() {
+        use lance_context_core::merge_write_scope::MergeWriteScope;
+        use lance_context_core::preparation_io::test_support::{Throttle, ThrottleWrapper};
+        const IDLE: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        // Plain local paths take Lance's direct file IO and bypass object-store
+        // wrappers; progress there comes from the io_tracker. The
+        // `file-object-store` scheme drives the same directory through the
+        // ObjectStore API, so the shim and the progress wrapper see every
+        // data/index operation exactly as they would on a cloud store, which
+        // is the path this test is about.
+        cfg.data_dir = format!("file-object-store://{}", dir.path().display());
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        cfg.maintenance.maintenance_idle_timeout_secs = IDLE;
+        cfg.merge_rollout.owned_targets = vec!["slow".into(), "frozen".into(), "healthy".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        // Enough rows to force several data-file operations during the build.
+        for target in ["slow", "frozen", "healthy"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(target))
+                .await
+                .unwrap();
+            let records: Vec<_> = (0..64)
+                .map(|i| rollout_record(&format!("{target}-{i}")))
+                .collect();
+            writer.add(&records).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let claim_for = |state: Arc<MasterState>, target: &'static str| async move {
+            enqueue(&state, TaskKind::IndexId, target).await.unwrap();
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.task.target, target);
+            assert!(claim.preparing_maintenance());
+            claim
+        };
+        let prepare =
+            |state: Arc<MasterState>, scope: Arc<MergeWriteScope>, target: &'static str| {
+                let uri = state.rollout_uri(target);
+                async move {
+                    scope
+                        .run(async {
+                            let store = RolloutStore::open_existing_with_options(
+                                &uri,
+                                state.rollout_store_options(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            store
+                                .prepare_id_key_index()
+                                .await
+                                .map(|_| "prepared")
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                }
+            };
+
+        // (a) Throttled: 1.2 s per data-file op, idle timeout 3 s. The build
+        // must take longer than IDLE in total and still complete.
+        let claim = claim_for(state.clone(), "slow").await;
+        let throttle = Throttle::new(Duration::from_millis(1200));
+        let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(PreparationOnly),
+            Arc::new(ThrottleWrapper(throttle.clone())),
+        );
+        let began = std::time::Instant::now();
+        let outcome = tokio::select! {
+            done = prepare(state.clone(), scope.clone(), "slow") => done,
+            error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+        };
+        let elapsed = began.elapsed();
+        let ops = throttle.ops.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ops >= 3,
+            "shim did not intercept data IO (ops={ops}); test is vacuous"
+        );
+        assert_eq!(
+            outcome,
+            Ok("prepared"),
+            "slow-but-alive real build was cancelled"
+        );
+        assert!(
+            elapsed > Duration::from_secs(IDLE),
+            "build finished in {elapsed:?}; did not outlive the idle timeout, test is vacuous"
+        );
+        state
+            .task_store
+            .finish(claim, Ok("a".into()))
+            .await
+            .unwrap();
+
+        // (b) + (c): freeze "frozen" after its first data op; run "healthy"
+        // concurrently with no throttle. Only "frozen" is cancelled.
+        let frozen_claim = claim_for(state.clone(), "frozen").await;
+        let healthy_claim = claim_for(state.clone(), "healthy").await;
+        let throttle = Throttle::new(Duration::ZERO);
+        throttle
+            .frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let frozen_scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(PreparationOnly),
+            Arc::new(ThrottleWrapper(throttle.clone())),
+        );
+        let healthy_scope = MergeWriteScope::with_preparation_authorizer(Arc::new(PreparationOnly));
+        let began = std::time::Instant::now();
+        let frozen_run = async {
+            tokio::select! {
+                done = prepare(state.clone(), frozen_scope.clone(), "frozen") => done,
+                error = watch_maintenance_preparation(&state, &frozen_claim, &frozen_scope) => Err(error),
+            }
+        };
+        let healthy_run = async {
+            // Give the healthy build a slow start so it overlaps the frozen
+            // one's stall window rather than finishing instantly.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                done = prepare(state.clone(), healthy_scope.clone(), "healthy") => done,
+                error = watch_maintenance_preparation(&state, &healthy_claim, &healthy_scope) => Err(error),
+            }
+        };
+        let (frozen_outcome, healthy_outcome) = tokio::join!(frozen_run, healthy_run);
+        let elapsed = began.elapsed();
+        assert_eq!(
+            frozen_outcome,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        assert!(
+            elapsed >= Duration::from_secs(IDLE) && elapsed < Duration::from_secs(IDLE + 4),
+            "frozen build cancelled after {elapsed:?}"
+        );
+        assert_eq!(
+            healthy_outcome,
+            Ok("prepared"),
+            "healthy build was collateral damage"
+        );
+        assert!(
+            throttle.ops.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "frozen shim never saw IO; test is vacuous"
+        );
+        throttle
+            .frozen
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        state
+            .task_store
+            .finish(frozen_claim, Err("stalled".into()))
+            .await
+            .unwrap();
+        state
+            .task_store
+            .finish(healthy_claim, Ok("h".into()))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn prepared_index_task_runs_with_fenced_publication() {
