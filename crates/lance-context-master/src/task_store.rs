@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::MasterConfig;
+use crate::eligibility;
 
 const TASK_POLL_BATCH: usize = 256;
 
@@ -805,6 +806,15 @@ impl EtcdTaskStore {
             .map_err(|_| lance::Error::io("etcd returned an invalid queue count"))
     }
 
+    fn eligibility_policy(&self) -> eligibility::Policy<'_> {
+        eligibility::Policy {
+            rollout: &self.rollout,
+            compaction_prepare_targets: &self.prepare_targets,
+            index_prepare_targets: &self.index_prepare_targets,
+            maintenance_catchup_targets: &self.maintenance_catchup_targets,
+        }
+    }
+
     async fn claim_next(
         &self,
         kinds: TaskKinds,
@@ -848,19 +858,18 @@ impl EtcdTaskStore {
                 .collect::<lance::Result<Vec<_>>>()?;
 
             for mut task in queued {
-                // Skip kinds this caller cannot run *before* the dependency
+                // Cheap kind/resident filtering happens before the dependency
                 // probe: an unrunnable kind should cost nothing, and this is
                 // what lets a scarce kind be found behind a dominant one.
-                if !kinds.contains(task.kind) {
-                    continue;
-                }
-                if resident_targets.is_some_and(|targets| {
-                    task.kind != TaskKind::MergeWal
-                        || task.target.starts_with("generic:")
-                        || !self.rollout.owned(&task.target)
-                        || self.rollout.draining(&task.target)
-                        || !targets.iter().any(|t| t == "*" || t == &task.target)
-                }) {
+                let policy = self.eligibility_policy();
+                if let Err(skip) = eligibility::pre_dependency_filter(
+                    task.kind,
+                    &task.target,
+                    |kind| kinds.contains(kind),
+                    resident_targets,
+                    &policy,
+                ) {
+                    tracing::trace!(task = %task.id, target = %task.target, ?skip, "task skipped");
                     continue;
                 }
                 match self.dependency_status(&task).await? {
@@ -874,28 +883,14 @@ impl EtcdTaskStore {
                     }
                 }
 
-                let preparation_targets: &[String] = match task.kind {
-                    TaskKind::Compact => &self.prepare_targets,
-                    TaskKind::IndexId => &self.index_prepare_targets,
-                    _ => &[],
-                };
-                let preparing = matches!(task.kind, TaskKind::Compact | TaskKind::IndexId)
-                    && !task.target.starts_with("generic:")
-                    && !self.rollout.draining(&task.target)
-                    && preparation_targets
-                        .iter()
-                        .any(|t| t == "*" || t == &task.target);
-                let write_claim = requires_target_lock(task.kind) && !preparing;
                 // Keep the existing wire keys so older masters also yield to
                 // prepared index commits. Compact/IndexId share one preparation
                 // slot per table; append merges need neither preparation slot.
-                let preparation_key = preparing.then(|| {
-                    format!(
-                        "{}/compact-preparations/{}",
-                        self.prefix,
-                        encode_segment(&task.target)
-                    )
-                });
+                let preparation_key = format!(
+                    "{}/compact-preparations/{}",
+                    self.prefix,
+                    encode_segment(&task.target)
+                );
                 let execution_key = lance_context_merge::execution_key(&self.prefix, &task.target);
                 let snapshot = self
                     .read_values(&[
@@ -904,13 +899,7 @@ impl EtcdTaskStore {
                         crate::catchup::store::active_key(&self.prefix, &task.target),
                         execution_key.replace("/merge-executions/", "/merge-claims/"),
                         self.claim_key(&task.id),
-                        preparation_key.clone().unwrap_or_else(|| {
-                            format!(
-                                "{}/compact-preparations/{}",
-                                self.prefix,
-                                encode_segment(&task.target)
-                            )
-                        }),
+                        preparation_key.clone(),
                         self.compaction_commit_key(&task.target),
                     ])
                     .await?;
@@ -919,56 +908,60 @@ impl EtcdTaskStore {
                     .map(serde_json::from_slice)
                     .transpose()
                     .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
-                // Preparation itself stays concurrent. Once its output is
-                // ready, yield the next merge turn so the short commit can win.
-                // An unresolved execution still needs merge recovery; never
-                // let a scheduling hint block that storage safety path.
-                if task.kind == TaskKind::MergeWal
-                    && merge_execution.is_none()
-                    && snapshot[6].is_some()
-                    && snapshot[6] == snapshot[5]
-                {
-                    metrics::counter!("master_merge_yield_to_compaction_total").increment(1);
-                    continue;
-                }
+                let shape = eligibility::claim_shape(
+                    task.kind,
+                    &task.target,
+                    &policy,
+                    snapshot[2].is_some(),
+                );
+                let preparing = shape.preparing;
+                let write_claim = shape.write_claim;
+                let preparation_key = preparing.then_some(preparation_key);
                 // Avoid lease grant/revoke for a clearly blocked candidate.
                 // The final transaction still checks every ownership predicate.
                 let expected_owner = merge_execution
                     .as_ref()
                     .map(lance_context_merge::execution_owner);
-                let shared_owner = snapshot[2].is_some()
-                    && matches!(task.kind, TaskKind::Compact | TaskKind::IndexId)
-                    && self.rollout.owned(&task.target)
-                    && !self.rollout.draining(&task.target)
-                    && !task.target.starts_with("generic:")
-                    && self.maintenance_catchup_targets.contains(&task.target);
-                let expected_job = only_id.map(|(_, job)| job.as_bytes()).or(if shared_owner {
-                    snapshot[2].as_deref()
-                } else {
-                    None
-                });
-                if snapshot[4].is_some()
-                    || (preparing
-                        && (snapshot[5].is_some() || (snapshot[2].is_some() && !shared_owner)))
-                    || (write_claim
-                        && (snapshot[2].as_deref() != expected_job
-                            || snapshot[3].is_some()
-                            || snapshot[1].as_deref()
-                                != expected_owner.as_deref().map(str::as_bytes)))
-                {
-                    metrics::counter!("master_task_admission_blocked_total").increment(1);
-                    continue;
-                }
-                // Only MergeWal reconciles a worker execution. A local fenced
-                // mutation may be recovered by any table writer after the
-                // exclusive reconciler lease has expired.
-                if !preparing
-                    && task.kind != TaskKind::MergeWal
-                    && merge_execution
+                let expected_job =
+                    only_id
+                        .map(|(_, job)| job.as_bytes())
+                        .or(if shape.shared_owner {
+                            snapshot[2].as_deref()
+                        } else {
+                            None
+                        });
+                let view = eligibility::Snapshot {
+                    merge_execution: snapshot[0].as_deref(),
+                    target_lock: snapshot[1].as_deref(),
+                    catchup_active: snapshot[2].as_deref(),
+                    merge_claim: snapshot[3].as_deref(),
+                    task_claim: snapshot[4].as_deref(),
+                    compact_preparation: snapshot[5].as_deref(),
+                    compact_commit_ready: snapshot[6].as_deref(),
+                };
+                match eligibility::admission_filter(
+                    task.kind,
+                    shape,
+                    &view,
+                    expected_owner.as_deref(),
+                    merge_execution
                         .as_ref()
-                        .is_some_and(|e| e.maintenance.is_none())
-                {
-                    continue;
+                        .is_some_and(|e| e.maintenance.is_none()),
+                    expected_job,
+                ) {
+                    Ok(()) => {}
+                    Err(eligibility::Skip::YieldToPreparedCommit) => {
+                        metrics::counter!("master_merge_yield_to_compaction_total").increment(1);
+                        continue;
+                    }
+                    Err(eligibility::Skip::OwnershipBlocked) => {
+                        metrics::counter!("master_task_admission_blocked_total").increment(1);
+                        continue;
+                    }
+                    Err(skip) => {
+                        tracing::trace!(task = %task.id, target = %task.target, ?skip, "task skipped");
+                        continue;
+                    }
                 }
                 let token = generate_id();
                 let lease_id = self.grant_lease().await?;
@@ -1860,13 +1853,6 @@ fn should_dedupe(kind: TaskKind, depends_on: &[String]) -> bool {
             kind,
             TaskKind::Compact | TaskKind::IndexId | TaskKind::MergeWal | TaskKind::Repair
         )
-}
-
-fn requires_target_lock(kind: TaskKind) -> bool {
-    matches!(
-        kind,
-        TaskKind::Compact | TaskKind::IndexId | TaskKind::Repair | TaskKind::MergeWal
-    )
 }
 
 fn kind_label(kind: TaskKind) -> &'static str {
