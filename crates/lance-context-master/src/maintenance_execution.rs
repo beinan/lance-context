@@ -261,7 +261,7 @@ where
     let scope = MergeWriteScope::with_pinned_authorizer(Arc::new(Guard {
         coordinator: coordinator.clone(),
         execution: running.clone(),
-        uri,
+        uri: uri.clone(),
     }));
     let executor_id = state.admission.status().executor_id;
     let outcome = std::panic::AssertUnwindSafe(async {
@@ -321,8 +321,39 @@ where
     {
         return Err("maintenance ownership changed before completion".into());
     }
-    if !coordinator.release(&proof, &terminal).await? {
+    // A successful WAL catch-up reclaimed generations: publish the merged
+    // watermark per shard in the release transaction so demand and ownership
+    // change together. Other maintenance kinds do not move WAL watermarks. A
+    // watermark read failure must not strand a completed merge; release
+    // without demand and let the next scan correct it.
+    let merged = if maintenance == MaintenanceKind::Catchup && outcome.is_ok() {
+        match lance_context_core::rollout_append::merged_watermarks(&uri).await {
+            Ok(marks) => marks
+                .into_iter()
+                .map(
+                    |(shard, generation)| lance_context_merge::demand::ShardMerged {
+                        shard: shard.to_string(),
+                        merged_through: generation,
+                    },
+                )
+                .collect(),
+            Err(error) => {
+                tracing::warn!(target = %running.target, %error,
+                    "merged watermarks unavailable; releasing without demand update");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !coordinator
+        .release_with_demand(&proof, &terminal, &merged)
+        .await?
+    {
         return Err("maintenance completion claim lost".into());
+    }
+    if !merged.is_empty() {
+        metrics::counter!("master_demand_merged_watermarks_total").increment(merged.len() as u64);
     }
     outcome
 }
