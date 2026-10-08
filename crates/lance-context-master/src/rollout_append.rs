@@ -626,6 +626,44 @@ mod tests {
                     format!("{target}-{id}")
                 );
             }
+            // The release published merged watermarks for both shards in
+            // the same transaction that gave up ownership, so a fold over
+            // the events shows no pending generations.
+            let marks = lance_context_core::rollout_append::merged_watermarks(&uri)
+                .await
+                .unwrap();
+            assert_eq!(marks.len(), 2, "{target}: {marks:?}");
+            let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
+            let events = first
+                .task_store
+                .etcd_client()
+                .clone()
+                .get(
+                    format!(
+                        "{}/demand-events/{encoded}/",
+                        first.config.etcd.etcd_prefix.trim_end_matches('/')
+                    ),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(events.kvs().len(), 2, "{target}");
+            let mut table = lance_context_merge::demand::TableDemand::default();
+            for kv in events.kvs() {
+                let event: lance_context_merge::demand::DemandEvent =
+                    serde_json::from_slice(kv.value()).unwrap();
+                assert_eq!(
+                    event.source,
+                    lance_context_merge::demand::EventSource::Executor
+                );
+                let expected = marks
+                    .iter()
+                    .find(|(shard, _)| shard.to_string() == event.shard)
+                    .map(|(_, generation)| *generation);
+                assert_eq!(event.merged_through, expected);
+                table.fold(&event, kv.mod_revision(), 0).unwrap();
+            }
+            assert_eq!(table.pending_generations(), 0, "{target}");
         }
     }
 
