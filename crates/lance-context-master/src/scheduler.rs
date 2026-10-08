@@ -2121,6 +2121,112 @@ mod tests {
         worker.abort();
     }
 
+    /// The preparation watchdog is progress-based, not wall-clock based.
+    /// A build that completes a step every second must outlive an idle
+    /// timeout shorter than its total duration; one that goes silent must be
+    /// cancelled close to the idle timeout; and a real index build under the
+    /// same short timeout must finish, proving data IO is observed as
+    /// progress. Guards the #327 + #330 + #328 interaction: a cancelled
+    /// slow-but-alive build would be classified retryable and rebuilt every
+    /// few seconds forever.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn slow_but_alive_preparation_outlives_idle_timeout() {
+        use lance_context_core::merge_write_scope::{checkpoint, MergeWriteScope};
+        const IDLE: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.maintenance.index_prepare_targets = vec!["exp".into()];
+        cfg.maintenance.maintenance_idle_timeout_secs = IDLE;
+        cfg.merge_rollout.owned_targets = vec!["exp".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        let mut writer = RolloutStore::open(&uri).await.unwrap();
+        writer.add(&[rollout_record("seed")]).await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+
+        let claim_preparation = |state: Arc<MasterState>| async move {
+            let task = enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(claim.preparing_maintenance());
+            (task, claim)
+        };
+
+        // (a) Slow but alive: 8 s of work, one completed step per second.
+        let (task, claim) = claim_preparation(state.clone()).await;
+        let scope = MergeWriteScope::with_preparation_authorizer(Arc::new(PreparationOnly));
+        let began = std::time::Instant::now();
+        let work = scope.run(async {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                checkpoint();
+            }
+            "finished"
+        });
+        let outcome = tokio::select! {
+            done = work => Ok(done),
+            error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+        };
+        assert_eq!(outcome, Ok("finished"), "alive preparation was cancelled");
+        assert!(began.elapsed() >= Duration::from_secs(8));
+        state
+            .task_store
+            .finish(claim, Ok("a".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+
+        // (b) Silent: no steps at all. Cancelled near IDLE, not before.
+        let (task, claim) = claim_preparation(state.clone()).await;
+        let scope = MergeWriteScope::with_preparation_authorizer(Arc::new(PreparationOnly));
+        let began = std::time::Instant::now();
+        let work = scope.run(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "finished"
+        });
+        let outcome = tokio::select! {
+            done = work => Ok(done),
+            error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+        };
+        assert_eq!(
+            outcome,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(IDLE) && elapsed < Duration::from_secs(IDLE + 4),
+            "stall detected after {elapsed:?}"
+        );
+        state
+            .task_store
+            .finish(claim, Err("stalled".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+
+        // (c) A real index build under the same short idle timeout completes:
+        // data/_indices IO is counted as progress by the preparation store.
+        let (task, claim) = claim_preparation(state.clone()).await;
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let status = state.task_store.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(status.state, TaskState::Done, "{status:?}");
+        assert!(status
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("prepared outside write lock")));
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn prepared_index_task_runs_with_fenced_publication() {
