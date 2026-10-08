@@ -138,6 +138,13 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
 
     metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "claim")
         .record(timing.claim.as_secs_f64());
+    // Time from enqueue to claim. Sustained growth with idle pools means
+    // admission is blocking (ownership, fairness), growth with full pools
+    // means capacity; either way it is the single backlog signal.
+    if let Some(started_at) = task.started_at {
+        let waited = (started_at - task.enqueued_at).max(0) as f64 / 1000.0;
+        metrics::histogram!("master_task_schedule_to_bind_seconds", "kind" => kind).record(waited);
+    }
     metrics::histogram!(
         "master_task_phase_duration_seconds",
         "kind" => kind,
@@ -391,6 +398,17 @@ async fn watch_maintenance_preparation(
     }
 }
 
+/// How long a prepared compaction/index waited for its write turn, and
+/// whether it got one. `expired` means the preparation is discarded and
+/// rebuilt: the fairness failure #324 addressed. Both are per kind.
+fn record_commit_turn(kind: TaskKind, waited: Duration, result: &'static str) {
+    let kind = kind_label(kind);
+    metrics::histogram!("master_commit_turn_wait_seconds", "kind" => kind, "result" => result)
+        .record(waited.as_secs_f64());
+    metrics::counter!("master_commit_turn_requests_total", "kind" => kind, "result" => result)
+        .increment(1);
+}
+
 async fn wait_for_maintenance_commit(
     state: &Arc<MasterState>,
     claim: &mut TaskClaim,
@@ -423,11 +441,13 @@ async fn wait_for_maintenance_commit(
             .await
             .map_err(|e| e.to_string())?
         {
+            record_commit_turn(claim.task.kind, waiting.elapsed(), "served");
             return Ok(());
         }
         // Check only after promotion has definitively declined. Never cancel
         // an in-flight acquisition and mistake an accepted claim for a timeout.
         if waiting.elapsed() >= Duration::from_secs(wait_budget) {
+            record_commit_turn(claim.task.kind, waiting.elapsed(), "expired");
             return Err("maintenance commit ownership wait budget exhausted; reprepare".into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1159,6 +1179,16 @@ fn spawn_filtered_pool_poller(
     report_depth: bool,
     resident_only: bool,
 ) -> tokio::task::JoinHandle<()> {
+    let pool_label: &'static str = if resident_only {
+        "resident_merge"
+    } else if kinds == TaskKinds::COMPACT {
+        "compact"
+    } else if kinds == TaskKinds::MERGE_WAL {
+        "merge"
+    } else {
+        "general"
+    };
+    let pool_total = pool.available_permits();
     tokio::spawn(async move {
         loop {
             if report_depth {
@@ -1166,6 +1196,10 @@ fn spawn_filtered_pool_poller(
                     metrics::gauge!("master_task_queue_depth").set(queued as f64);
                 }
             }
+            // Every pool reports, including the resident-only slot added in
+            // #331 that the queue-depth gauge never covered.
+            metrics::gauge!("master_task_pool_in_use", "pool" => pool_label)
+                .set(pool_total.saturating_sub(pool.available_permits()) as f64);
             while pool.available_permits() > 0 {
                 // Reserve both budgets before taking durable table ownership.
                 let compact_permit = if kinds == TaskKinds::COMPACT {

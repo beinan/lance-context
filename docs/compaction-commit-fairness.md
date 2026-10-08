@@ -24,6 +24,12 @@ block the storage recovery needed to make the table writable.
 No new per-file or per-generation polling is added: ready state is published once
 and read with the existing admission snapshot transaction. The counter
 `master_merge_yield_to_compaction_total` counts admission deferrals, not failures.
+Whether the hint actually worked is visible on the preparer's side:
+`master_commit_turn_requests_total{kind,result}` counts commit-ready requests that
+were `served` versus `expired` (preparation discarded and rebuilt), and
+`master_commit_turn_wait_seconds{kind,result}` records how long each waited. A
+growing `expired` count while `master_merge_yield_to_compaction_total` stays flat
+means some contender does not honor the hint.
 Deploy compatible scheduling/catchup binaries for every contender to honor the
 hint. It does not forcibly interrupt old binaries or guarantee completion before
 a progressing current merge finishes. Legacy worker self-merges outside master
