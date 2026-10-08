@@ -273,6 +273,15 @@ pub enum StageEvent {
     Failed(String),
 }
 
+/// Merged generation watermark per shard, read from the base table's MemWAL
+/// index at its latest version. Public so executors can report what they
+/// merged alongside releasing ownership. Empty when the table has no WAL
+/// index yet.
+pub async fn merged_watermarks(uri: &str) -> Result<HashMap<Uuid, u64>> {
+    let dataset = Dataset::open(uri).await?;
+    watermarks(&dataset).await
+}
+
 pub(crate) async fn watermarks(dataset: &Dataset) -> Result<HashMap<Uuid, u64>> {
     let indices = dataset.load_indices().await?;
     let Some(index) = indices.iter().find(|i| i.name == MEM_WAL_INDEX_NAME) else {

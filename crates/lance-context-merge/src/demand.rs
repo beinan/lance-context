@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Coordinator, Result};
 
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Who produced a watermark event.
@@ -203,7 +210,79 @@ impl TableDemand {
     }
 }
 
+/// A shard's merged watermark as observed by an executor after its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardMerged {
+    pub shard: String,
+    pub merged_through: u64,
+}
+
 impl Coordinator {
+    /// Compare/op pairs that publish `merged_through` for each shard, for
+    /// inclusion in a larger transaction. Reads current events first; a
+    /// shard with no stored event gets a fresh executor-sourced record with
+    /// `sealed_through = merged_through` (the writer's next flush raises it).
+    /// Skips shards whose stored `merged_through` is already ≥ the new one.
+    pub(crate) async fn demand_release_changes(
+        &self,
+        target: &str,
+        merged: &[ShardMerged],
+    ) -> Result<(Vec<Compare>, Vec<TxnOp>)> {
+        let mut compares = Vec::new();
+        let mut operations = Vec::new();
+        if merged.is_empty() {
+            return Ok((compares, operations));
+        }
+        let mut client = self.client.clone();
+        let now_ms = chrono_now_ms();
+        for shard in merged {
+            let key = self.demand_event_key(target, &shard.shard);
+            let current = client
+                .get(key.as_str(), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let stored: Option<DemandEvent> = current
+                .kvs()
+                .first()
+                .and_then(|kv| serde_json::from_slice(kv.value()).ok());
+            let next = match &stored {
+                Some(stored) => {
+                    if stored
+                        .merged_through
+                        .is_some_and(|m| m >= shard.merged_through)
+                    {
+                        continue;
+                    }
+                    DemandEvent {
+                        merged_through: Some(shard.merged_through),
+                        sealed_through: stored.sealed_through.max(shard.merged_through),
+                        source: EventSource::Executor,
+                        ..stored.clone()
+                    }
+                }
+                None => DemandEvent {
+                    v: SCHEMA_VERSION,
+                    shard: shard.shard.clone(),
+                    sealed_through: shard.merged_through,
+                    sealed_bytes_through: 0,
+                    merged_through: Some(shard.merged_through),
+                    flushed_at_ms: now_ms,
+                    writer_epoch: 0,
+                    source: EventSource::Executor,
+                },
+            };
+            let value = serde_json::to_vec(&next).map_err(|e| e.to_string())?;
+            compares.push(match current.kvs().first() {
+                Some(kv) => {
+                    Compare::mod_revision(key.as_str(), CompareOp::Equal, kv.mod_revision())
+                }
+                None => Compare::version(key.as_str(), CompareOp::Equal, 0),
+            });
+            operations.push(TxnOp::put(key, value, None));
+        }
+        Ok((compares, operations))
+    }
+
     fn demand_event_key(&self, target: &str, shard: &str) -> String {
         let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
         format!(
@@ -472,6 +551,80 @@ mod tests {
             publish(ev("other", 1, None, 1, EventSource::Writer)).await,
             "separate shard"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn release_changes_only_advance_merged_and_keep_writer_fields() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let coordinator = Coordinator::new(
+            client.clone(),
+            format!("/demand-release/{}", uuid::Uuid::new_v4()),
+        );
+        // Writer has sealed 20 at epoch 3 with bytes; executor merged 15 then 12.
+        assert!(coordinator
+            .publish_demand_event("t", &ev("s", 20, None, 3, EventSource::Writer))
+            .await
+            .unwrap());
+        let (c, o) = coordinator
+            .demand_release_changes(
+                "t",
+                &[ShardMerged {
+                    shard: "s".into(),
+                    merged_through: 15,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!((c.len(), o.len()), (1, 1));
+        assert!(coordinator.transact(c, o).await.unwrap());
+        let read = |c: etcd_client::Client, coordinator: Coordinator| async move {
+            let key = coordinator.demand_event_key("t", "s");
+            let kv = c.clone().get(key, None).await.unwrap();
+            serde_json::from_slice::<DemandEvent>(kv.kvs()[0].value()).unwrap()
+        };
+        let after = read(client.clone(), coordinator.clone()).await;
+        assert_eq!(after.merged_through, Some(15));
+        assert_eq!(after.sealed_through, 20, "writer's sealed kept");
+        assert_eq!(after.writer_epoch, 3, "writer's epoch kept");
+        assert_eq!(after.sealed_bytes_through, 20_000, "writer's bytes kept");
+        assert_eq!(after.source, EventSource::Executor);
+        // A lower merged is skipped entirely: no compare, no op.
+        let (c, o) = coordinator
+            .demand_release_changes(
+                "t",
+                &[ShardMerged {
+                    shard: "s".into(),
+                    merged_through: 12,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(c.is_empty() && o.is_empty());
+        // Unknown shard: fresh executor record, sealed == merged.
+        let (c, o) = coordinator
+            .demand_release_changes(
+                "t",
+                &[ShardMerged {
+                    shard: "new".into(),
+                    merged_through: 7,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(coordinator.transact(c, o).await.unwrap());
+        let key = coordinator.demand_event_key("t", "new");
+        let fresh: DemandEvent =
+            serde_json::from_slice(client.clone().get(key, None).await.unwrap().kvs()[0].value())
+                .unwrap();
+        assert_eq!((fresh.sealed_through, fresh.merged_through), (7, Some(7)));
+        let mut table = TableDemand::default();
+        table.fold(&after, 1, 0).unwrap();
+        table.fold(&fresh, 2, 0).unwrap();
+        assert_eq!(table.pending_generations(), 5);
     }
 
     #[test]

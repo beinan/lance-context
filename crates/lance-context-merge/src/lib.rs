@@ -290,11 +290,32 @@ impl Coordinator {
     /// Never delete on elapsed time, an HTTP error, or claim expiry. Both the
     /// terminal result and the current task claim must still match atomically.
     pub async fn release(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
+        self.release_with_demand(claim, execution, &[]).await
+    }
+
+    /// Release ownership and, in the same transaction, publish the merged
+    /// watermark for every shard in `merged` as a `demand-events` record with
+    /// source `executor`. Demand and ownership therefore change together: a
+    /// planner never sees a released table whose pending count still counts
+    /// the generations this execution merged. Each watermark write is
+    /// monotonic by the same rule as `publish_demand_event`; a shard whose
+    /// stored event is already at least as new is skipped, never lowered.
+    pub async fn release_with_demand(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+        merged: &[demand::ShardMerged],
+    ) -> Result<bool> {
         if !matches!(execution.phase, Phase::Finished | Phase::Recovered) {
             return Err("cannot release a live execution".into());
         }
         let key = execution_key(&self.prefix, &execution.target);
         let (mut compares, mut operations) = self.completion_changes(execution).await?;
+        let (demand_compares, demand_ops) = self
+            .demand_release_changes(&execution.target, merged)
+            .await?;
+        compares.extend(demand_compares);
+        operations.extend(demand_ops);
         compares.extend([
             Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
             Compare::value(key.as_str(), CompareOp::Equal, encode(execution)),
@@ -327,7 +348,11 @@ impl Coordinator {
         .await
     }
 
-    async fn transact(&self, compares: Vec<Compare>, operations: Vec<TxnOp>) -> Result<bool> {
+    pub(crate) async fn transact(
+        &self,
+        compares: Vec<Compare>,
+        operations: Vec<TxnOp>,
+    ) -> Result<bool> {
         self.client
             .clone()
             .txn(Txn::new().when(compares).and_then(operations))
