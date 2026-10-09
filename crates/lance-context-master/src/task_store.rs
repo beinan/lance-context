@@ -545,6 +545,27 @@ impl TaskStore {
 
     /// Whether the sweeps should skip this target for now because it has
     /// failed repeatedly. Manual enqueues are not gated by this.
+    /// Targets with a `kind` task queued or running right now, read in
+    /// pages. For the shadow planner's comparison against reality.
+    pub async fn list_active_targets(&self, kind: TaskKind) -> lance::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for prefix in [self.inner.queue_prefix(), self.inner.running_prefix()] {
+            let (kvs, _) = crate::planner::read_prefix_paged(&self.inner.client, &prefix)
+                .await
+                .map_err(lance::Error::io)?;
+            for kv in kvs {
+                if let Ok(task) = decode_task(&kv.value, &String::from_utf8_lossy(&kv.key)) {
+                    if task.kind == kind {
+                        out.push(task.target);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Id of the queued or running task that `enqueue(kind, target)` would
     /// dedupe into, if any. Lets a sweep tell a new task from a no-op.
     pub async fn get_active_id(

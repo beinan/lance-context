@@ -69,6 +69,71 @@ pub(crate) fn unhex(encoded: &str) -> Option<String> {
     String::from_utf8(bytes?).ok()
 }
 
+/// A key/value/revision triple from a paged prefix read.
+pub(crate) struct Kv {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub mod_revision: i64,
+}
+
+/// Page size for prefix reads. 13k tables x a few shards each must never go
+/// through one response: the etcd client caps a message at 4 MiB.
+const PAGE: i64 = 512;
+
+/// Read every key under `prefix` in pages, all at one revision so the
+/// result is a consistent snapshot. Returns the kvs and that revision.
+pub(crate) async fn read_prefix_paged(
+    client: &etcd_client::Client,
+    prefix: &str,
+) -> Result<(Vec<Kv>, i64), String> {
+    let mut client = client.clone();
+    let range_end = {
+        let mut end = prefix.as_bytes().to_vec();
+        for i in (0..end.len()).rev() {
+            if end[i] != u8::MAX {
+                end[i] += 1;
+                end.truncate(i + 1);
+                break;
+            }
+        }
+        end
+    };
+    let mut out = Vec::new();
+    let mut start = prefix.as_bytes().to_vec();
+    let mut revision: i64 = 0;
+    loop {
+        let mut opts = GetOptions::new()
+            .with_range(range_end.clone())
+            .with_limit(PAGE);
+        if revision > 0 {
+            opts = opts.with_revision(revision);
+        }
+        let response = client
+            .get(start.clone(), Some(opts))
+            .await
+            .map_err(|e| e.to_string())?;
+        if revision == 0 {
+            revision = response.header().map_or(0, |h| h.revision());
+        }
+        let more = response.more();
+        let last = response.kvs().last().map(|kv| kv.key().to_vec());
+        for kv in response.kvs() {
+            out.push(Kv {
+                key: kv.key().to_vec(),
+                value: kv.value().to_vec(),
+                mod_revision: kv.mod_revision(),
+            });
+        }
+        let Some(last) = last else { break };
+        if !more {
+            break;
+        }
+        start = last;
+        start.push(0);
+    }
+    Ok((out, revision))
+}
+
 pub(crate) struct Keys {
     prefix: String,
 }
@@ -213,6 +278,7 @@ async fn lead(state: &Arc<MasterState>) -> Result<bool, String> {
     let reconcile_every = Duration::from_secs(state.config.planner.planner_reconcile_secs.max(5));
     let mut reconcile = tokio::time::interval(reconcile_every);
     let mut keepalive = tokio::time::interval(keepalive_every);
+    let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
     let result = loop {
         tokio::select! {
             _ = keepalive.tick() => {
@@ -228,14 +294,32 @@ async fn lead(state: &Arc<MasterState>) -> Result<bool, String> {
                 if !state.admission.status().accepting {
                     break Ok(true);
                 }
-                if let Err(error) = reconcile_once(state, &keys, &token).await {
-                    tracing::warn!(%error, "planner reconcile failed");
-                    metrics::counter!("planner_reconcile_errors_total").increment(1);
+                // Reconcile runs detached so a slow pass (13k tables, many
+                // pages) can never starve this loop's lease keepalive. At
+                // most one pass in flight; a tick that finds one running is
+                // skipped and counted.
+                if let Some(h) = &inflight {
+                    if !h.is_finished() {
+                        metrics::counter!("planner_reconcile_skipped_total").increment(1);
+                        continue;
+                    }
                 }
+                let st = state.clone();
+                let k = Keys::new(&state.config.etcd.etcd_prefix);
+                let t = token.clone();
+                inflight = Some(tokio::spawn(async move {
+                    if let Err(error) = reconcile_once(&st, &k, &t).await {
+                        tracing::warn!(%error, "planner reconcile failed");
+                        metrics::counter!("planner_reconcile_errors_total").increment(1);
+                    }
+                }));
             }
         }
     };
     metrics::gauge!("planner_is_leader").set(0.0);
+    if let Some(h) = inflight.take() {
+        h.abort();
+    }
     drop(keeper);
     let _ = client.lease_revoke(lease).await;
     tracing::info!(token = %token, ?result, "planner leadership released");
@@ -251,31 +335,27 @@ pub(crate) async fn reconcile_once(
 ) -> Result<usize, String> {
     let started = std::time::Instant::now();
     let mut client = state.task_store.etcd_client().clone();
-    let events = client
-        .get(keys.events_prefix(), Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| e.to_string())?;
-    let header_revision = events.header().map_or(0, |h| h.revision());
+    let (events, header_revision) =
+        read_prefix_paged(state.task_store.etcd_client(), &keys.events_prefix()).await?;
     let now = now_ms();
     let (tables, skipped) = fold_events(
         keys,
         events
-            .kvs()
             .iter()
-            .map(|kv| (kv.key(), kv.value(), kv.mod_revision())),
+            .map(|kv| (kv.key.as_slice(), kv.value.as_slice(), kv.mod_revision)),
         now,
     );
+    metrics::gauge!("planner_events").set(events.len() as f64);
     if skipped > 0 {
         metrics::counter!("planner_events_skipped_total").increment(skipped as u64);
     }
-    let existing = client
-        .get(keys.demand_prefix(), Some(GetOptions::new().with_prefix()))
-        .await
-        .map_err(|e| e.to_string())?;
+    let (existing, _) =
+        read_prefix_paged(state.task_store.etcd_client(), &keys.demand_prefix()).await?;
+    let existing_count = existing.len();
     let mut existing_by_key: BTreeMap<Vec<u8>, TableDemand> = BTreeMap::new();
-    for kv in existing.kvs() {
-        if let Ok(record) = serde_json::from_slice::<TableDemand>(kv.value()) {
-            existing_by_key.insert(kv.key().to_vec(), record);
+    for kv in &existing {
+        if let Ok(record) = serde_json::from_slice::<TableDemand>(&kv.value) {
+            existing_by_key.insert(kv.key.clone(), record);
         }
     }
     let mut ops = Vec::new();
@@ -364,7 +444,7 @@ pub(crate) async fn reconcile_once(
             tracing::warn!(%error, "planner could not load executor headroom");
         }
     }
-    metrics::gauge!("planner_tables").set(existing.kvs().len() as f64);
+    metrics::gauge!("planner_tables").set(existing_count as f64);
     metrics::gauge!("planner_pending_generations_total").set(total_pending as f64);
     metrics::histogram!("planner_reconcile_seconds").record(started.elapsed().as_secs_f64());
     metrics::gauge!("planner_last_revision").set(header_revision as f64);
@@ -419,21 +499,18 @@ async fn shadow_pass(
     // Only Shadow records from previous passes are replaced; nothing else
     // under assignments/ is touched.
     let mut client = state.task_store.etcd_client().clone();
-    let existing = client
-        .get(
-            executors_keys.assignments_prefix(),
-            Some(GetOptions::new().with_prefix()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let (existing, _) = read_prefix_paged(
+        state.task_store.etcd_client(),
+        &executors_keys.assignments_prefix(),
+    )
+    .await?;
     let mut ops: Vec<TxnOp> = existing
-        .kvs()
         .iter()
         .filter(|kv| {
-            serde_json::from_slice::<Assignment>(kv.value())
+            serde_json::from_slice::<Assignment>(&kv.value)
                 .is_ok_and(|a| a.state == AssignmentState::Shadow)
         })
-        .map(|kv| TxnOp::delete(kv.key().to_vec(), None))
+        .map(|kv| TxnOp::delete(kv.key.clone(), None))
         .collect();
     // Headroom already counts previous Shadow records; release them in the
     // arithmetic too, since they are about to be replaced.
@@ -442,8 +519,8 @@ async fn shadow_pass(
         h.bytes_reserved = 0;
         h.assignments = 0;
     }
-    for kv in existing.kvs() {
-        if let Ok(a) = serde_json::from_slice::<Assignment>(kv.value()) {
+    for kv in &existing {
+        if let Ok(a) = serde_json::from_slice::<Assignment>(&kv.value) {
             if a.state != AssignmentState::Shadow && a.holds_capacity() {
                 if let Some(h) = headroom.get_mut(&a.executor) {
                     for (k, n) in &a.reserved_slots {
@@ -462,11 +539,22 @@ async fn shadow_pass(
         if s.class == Class::Tail {
             continue; // the real sweeps do not touch tails either
         }
-        // Estimated cost: staging buffers are ~2x decoded bytes, capped at
-        // the per-pass byte limit the append path enforces.
-        let expected_bytes = (s.pending_bytes.saturating_mul(2))
-            .min(state.config.append.rollout_append_max_bytes as u64 * 2)
-            .max(1);
+        // Estimated cost. A merge pass stages at most
+        // ROLLOUT_APPEND_MAX_BYTES of decoded data and the append path
+        // reserves ~2x that for buffers, so one unit costs at most
+        // 2 * max_bytes regardless of backlog. When pending bytes are
+        // unknown (writers do not measure; only the scan does) the estimate
+        // is that full cost, never a token: an unknown must reserve the
+        // worst case or the capacity check validates nothing.
+        let per_pass = state.config.append.rollout_append_max_bytes as u64 * 2;
+        let expected_bytes = if s.pending_bytes == 0 {
+            per_pass
+        } else {
+            s.pending_bytes.saturating_mul(2).min(per_pass).max(1)
+        };
+        if s.pending_bytes == 0 {
+            metrics::counter!("planner_shadow_bytes_unknown_total").increment(1);
+        }
         let pick = headroom
             .values_mut()
             .filter(|h| h.fits(TaskKind::MergeWal, expected_bytes))
@@ -521,12 +609,37 @@ async fn shadow_pass(
         }
     }
 
-    // Disagreement: planner says place vs. reality has no task; or planner
-    // says nothing (no demand scored, or tail) vs. reality is running one.
+    // Comparison with the live system. These are **observations, not a
+    // takeover gate**: the shadow planner has only demand and capacity,
+    // while the real queue also reflects ownership, eligibility, cooldowns
+    // and executors this planner cannot see. Each metric names one precise
+    // question so the answer can be interpreted:
+    //
+    //  discovery_miss   planner scored demand on a table that has no
+    //                   MergeWal task queued or running at all - the real
+    //                   discovery loops have not noticed it yet (or it is a
+    //                   tail they ignore by design).
+    //  placement_gap    planner found no executor headroom for a due table
+    //                   that reality is in fact running - the planner's
+    //                   capacity model is tighter than the real pools.
+    //  phantom_task     reality is running/queued a MergeWal task on a table
+    //                   the planner sees no demand for - either a lost
+    //                   demand event, or work the planner would not have
+    //                   scheduled.
+    //
+    // The old single "disagreement" counter is kept for continuity but is
+    // the sum of these and should not be read on its own.
     let placed: std::collections::BTreeSet<&str> =
         would_place.iter().map(|(t, _)| t.as_str()).collect();
-    let mut disagreements = 0u64;
+    let mut discovery_miss = 0u64;
+    let mut placement_gap = 0u64;
+    let mut agree = 0u64;
+    let mut scored_targets: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for s in &scored {
+        scored_targets.insert(s.target.as_str());
+        if s.class == Class::Tail {
+            continue;
+        }
         let active = state
             .task_store
             .get_active_id(TaskKind::MergeWal, &s.target)
@@ -534,15 +647,45 @@ async fn shadow_pass(
             .map_err(|e| e.to_string())?
             .is_some();
         let planner_wants = placed.contains(s.target.as_str());
-        if planner_wants != active {
-            disagreements += 1;
-            tracing::debug!(
-                target = %s.target, class = ?s.class, score = s.score,
-                planner_wants, reality_active = active,
-                "planner shadow disagreement"
-            );
+        match (planner_wants, active) {
+            (true, true) | (false, false) if planner_wants => agree += 1,
+            (true, false) => {
+                discovery_miss += 1;
+                tracing::debug!(target = %s.target, class = ?s.class, score = s.score,
+                    "shadow: planner would place, reality has no task");
+            }
+            (false, true) => {
+                placement_gap += 1;
+                tracing::debug!(target = %s.target, class = ?s.class, score = s.score,
+                    "shadow: due but unplaceable, reality is running it");
+            }
+            _ => {}
         }
     }
+    // Phantom tasks: live MergeWal tasks on tables with no scored demand.
+    let mut phantom_task = 0u64;
+    if let Ok(running) = state
+        .task_store
+        .list_active_targets(TaskKind::MergeWal)
+        .await
+    {
+        for target in running {
+            if !scored_targets.contains(target.as_str()) {
+                phantom_task += 1;
+                tracing::debug!(target = %target,
+                    "shadow: reality runs a MergeWal task with no scored demand");
+            }
+        }
+    }
+    for (label, n) in [
+        ("discovery_miss", discovery_miss),
+        ("placement_gap", placement_gap),
+        ("phantom_task", phantom_task),
+        ("agree", agree),
+    ] {
+        metrics::gauge!("planner_shadow_comparison", "outcome" => label).set(n as f64);
+    }
+    let disagreements = discovery_miss + placement_gap + phantom_task;
     metrics::counter!("scheduler_shadow_disagreements_total", "kind" => "merge_wal")
         .increment(disagreements);
     metrics::gauge!("planner_shadow_disagreements_last_pass").set(disagreements as f64);
@@ -611,6 +754,168 @@ mod tests {
         }
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
+    }
+
+    /// Round-5 finding 1 at production shape: 13,405 tables, two shards
+    /// each (about 12 MB of events, three times the etcd client's 4 MiB
+    /// message cap). A single-shot prefix read fails; the paged read must
+    /// return every record at one revision, the fold must count them all,
+    /// and a reconcile must complete while the leader keeps renewing its
+    /// lease (the slow-reconcile-starves-keepalive finding).
+    /// Seeds ~27k keys and reads them back several times; on a shared
+    /// single-node etcd this starves concurrently running tests with
+    /// `request timed out`. Run alone: `cargo test -p lance-context-master
+    /// --lib reconcile_at_production_scale -- --ignored --test-threads=1`.
+    /// Gated on `PLANNER_SCALE_TEST=1` so the ordinary `--ignored` sweep in
+    /// CI does not include it.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS and PLANNER_SCALE_TEST=1; run alone"]
+    async fn reconcile_at_production_scale_pages_reads_and_keeps_the_lease() {
+        if std::env::var("PLANNER_SCALE_TEST").is_err() {
+            eprintln!("PLANNER_SCALE_TEST unset; skipping");
+            return;
+        }
+        use crate::state::MasterState;
+        use clap::Parser;
+        const TABLES: usize = 13_405;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ]);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/planner-scale/{}", generate_id());
+        cfg.planner.planner_enabled = true;
+        cfg.planner.planner_reconcile_secs = 5;
+        cfg.etcd_lease_ttl_secs = 5;
+        cfg.stats_scan_interval_secs = 0;
+        cfg.compaction_interval_secs = 0;
+        cfg.merge_wal_interval_secs = 0;
+        let state = MasterState::new(cfg.clone()).await.unwrap();
+        let keys = Keys::new(&cfg.etcd.etcd_prefix);
+        let mut client = state.task_store.etcd_client().clone();
+
+        // Seed events directly, in batched txns, with realistic bodies.
+        let mut ops = Vec::with_capacity(128);
+        for i in 0..TABLES {
+            let target = format!("exp-{i:05}");
+            let pending = (i % 50) as u64; // 354-ish tables with real backlog is
+                                           // fewer than this; worst case is fine
+            for shard in [
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "aaaaaaaa-0000-0000-0000-000000000002",
+            ] {
+                let event = DemandEvent {
+                    v: SCHEMA_VERSION,
+                    shard: shard.into(),
+                    sealed_through: 1000 + pending,
+                    sealed_bytes_through: 64 << 20,
+                    merged_through: Some(1000),
+                    flushed_at_ms: 1_700_000_000_000,
+                    writer_epoch: 3,
+                    source: EventSource::Scan,
+                    merged_epoch: None,
+                    sealed_times: (1001..=1000 + pending)
+                        .map(|g| (g, 1_700_000_000_000 + g as i64))
+                        .collect(),
+                };
+                ops.push(TxnOp::put(
+                    format!("{}{}/{shard}", keys.events_prefix(), hex(&target)),
+                    serde_json::to_vec(&event).unwrap(),
+                    None,
+                ));
+                if ops.len() == 100 {
+                    client
+                        .txn(Txn::new().and_then(std::mem::take(&mut ops)))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        if !ops.is_empty() {
+            client.txn(Txn::new().and_then(ops)).await.unwrap();
+        }
+
+        // A single unpaged read of this prefix exceeds the client limit.
+        let single = client
+            .get(keys.events_prefix(), Some(GetOptions::new().with_prefix()))
+            .await;
+        assert!(
+            single.is_err(),
+            "expected the unpaged read to exceed the message cap; got {} kvs",
+            single.map(|r| r.kvs().len()).unwrap_or(0)
+        );
+
+        // The paged read returns everything at one revision.
+        let (kvs, revision) = read_prefix_paged(&client, &keys.events_prefix())
+            .await
+            .unwrap();
+        assert_eq!(kvs.len(), TABLES * 2);
+        assert!(revision > 0);
+        let (tables, skipped) = fold_events(
+            &keys,
+            kvs.iter()
+                .map(|kv| (kv.key.as_slice(), kv.value.as_slice(), kv.mod_revision)),
+            0,
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(tables.len(), TABLES);
+        let expected_pending: u64 = (0..TABLES as u64).map(|i| (i % 50) * 2).sum();
+        assert_eq!(
+            tables
+                .values()
+                .map(|t| t.pending_generations())
+                .sum::<u64>(),
+            expected_pending
+        );
+
+        // Lead for real: the reconcile runs detached, so the keepalive must
+        // keep firing and the leader key must survive a full pass.
+        let leader = tokio::spawn({
+            let state = state.clone();
+            async move { lead(&state).await }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let (cache, _) = read_prefix_paged(&client, &keys.demand_prefix())
+                .await
+                .unwrap();
+            if cache.len() == TABLES {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache incomplete: {}",
+                cache.len()
+            );
+            assert!(
+                !leader.is_finished(),
+                "leader loop ended during reconcile: {:?}",
+                leader.await
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // Lease is alive well past several TTLs.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let lk = client.get(keys.leader(), None).await.unwrap();
+        assert_eq!(
+            lk.kvs().len(),
+            1,
+            "leader lost its lease during/after the pass"
+        );
+        assert!(!leader.is_finished());
+        leader.abort();
+        let _ = client
+            .delete(
+                cfg.etcd.etcd_prefix.as_str(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await;
     }
 
     #[tokio::test]

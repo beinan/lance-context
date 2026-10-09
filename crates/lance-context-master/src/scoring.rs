@@ -86,7 +86,12 @@ pub fn score_merge(
     if pending == 0 {
         return None;
     }
-    let wait_ms = demand.oldest_pending_ms().map(|t| (now_ms - t).max(0));
+    // Only an exact oldest-pending time may drive aging and promotion. A
+    // shard whose age is known only as an upper bound (merged past the kept
+    // flush times) contributes no wait; its count still scores.
+    let wait_ms = demand
+        .oldest_pending_exact_ms()
+        .map(|t| (now_ms - t).max(0));
     let by_gens = pending as f64 / policy.min_generations.max(1) as f64;
     let by_bytes = if policy.min_bytes > 0 {
         bytes as f64 / policy.min_bytes as f64
@@ -234,6 +239,43 @@ mod tests {
         let mut v = [a.clone(), b.clone()];
         v.sort_by(planner_order);
         assert_eq!(v[0].target, "b", "class before score");
+    }
+
+    /// Round-5 finding 6: when the oldest pending time is only an upper
+    /// bound (merged past the kept entries), it must not promote for age
+    /// and must not inflate the score.
+    #[test]
+    fn an_age_bound_never_promotes() {
+        let p = MergePolicy {
+            max_turn_wait_secs: 10,
+            max_age_secs: 10,
+            ..Default::default()
+        };
+        let now = 1_000_000_000;
+        let mut t = demand(128, now - 500_000);
+        let _ = t.fold(
+            &DemandEvent {
+                v: SCHEMA_VERSION,
+                shard: "s".into(),
+                sealed_through: 128,
+                sealed_bytes_through: 0,
+                merged_through: Some(64),
+                flushed_at_ms: 0,
+                writer_epoch: 1,
+                source: EventSource::Executor,
+                merged_epoch: None,
+                sealed_times: Default::default(),
+            },
+            999,
+            0,
+        );
+        assert_eq!(t.pending_generations(), 64);
+        assert!(t.oldest_pending_ms().is_some(), "a bound is shown");
+        assert_eq!(t.oldest_pending_exact_ms(), None, "but is not exact");
+        let s = score_merge("x", &t, &p, now).unwrap();
+        assert_eq!(s.wait_ms, None);
+        assert_eq!(s.class, Class::Normal, "64/8 = 8 >= 1, not promoted");
+        assert!((s.score - 8.0).abs() < 1e-9, "no age boost: {}", s.score);
     }
 
     #[test]
