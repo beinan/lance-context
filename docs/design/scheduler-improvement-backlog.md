@@ -221,8 +221,9 @@ planner extracted as pure functions (§4 P0.1), reviews become tractable.
 
 ## 6. Open questions to answer before P1
 
-1. Actual table count and hot‑table fraction in production (sets `max_placements_per_cycle`
-   and whether a 1 s cycle is even needed).
+1. ~~Actual table count and hot‑table fraction in production~~ **Answered (review round
+   5): 13,405 tables, ~354 with pending WAL at a sample, 318 generic.** The design's
+   original "tens to hundreds" assumption was wrong; see #364 for what that broke.
 2. Real generation size distribution (bytes/rows) — drives `expected_bytes` estimates.
 3. p99 compaction and index‑build duration on the largest tables — drives `Deadline`
    thresholds and whether K8s Jobs remain necessary at all.

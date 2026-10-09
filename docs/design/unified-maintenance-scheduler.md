@@ -24,12 +24,12 @@ Numbers from `docs/*.md`, config defaults and benchmark notes; unknowns are call
 
 | Dimension | Value | Consequence |
 |---|---|---|
-| Tables | tens → low hundreds active, long cold tail (7‑day retire) | A single planner can hold the entire demand set in memory; no need for distributed scheduling. |
+| Tables | **13,405 registered, ~354 with pending WAL at a sample, 318 generic** (production, Oct 2026); long cold tail (7‑day retire) | A single planner can still hold the demand set in memory (~27k shard records, a few MB), but **every etcd read must be paged** and every per‑table operation must be O(1) per pass; a naive full‑prefix read fails the client's 4 MiB cap. The earlier draft of this row said "tens → low hundreds"; that was wrong by two orders of magnitude and drove several review findings (#364). |
 | Writers | thousands of generation workers → 1–N shards/table, 1 generation / shard / 30 s on hot tables | Demand is continuous for hot tables, bursty-then-idle for most. Hot/cold is bimodal. |
 | Backlog | 10³–10⁴ pending generations per shard has happened; reads 503 at 4096 | Backlog depth is the primary SLO signal; must be priority‑ordered, not FIFO. |
 | Task duration | MergeWal pass 1–3 s/64 MiB but slices run minutes–hours; compaction/index "many minutes" with opaque progress | Tasks are long and few; scheduling latency of ~1 s is irrelevant; **placement and memory** are what matter. |
 | Memory | master pod 2 GiB limit, append budget 2 GiB, worker 20 GiB/6 slots, catch‑up Job 8 GiB | Capacity must be modelled as (slots, bytes) per executor, not a single semaphore. |
-| Replicas | 3–6 masters, 4 K8s catch‑up Jobs, workers as StatefulSet | Conflict rate between replicas is low; optimistic multi‑scheduler (Omega‑style) buys nothing and costs the 7‑key claim txn. |
+| Replicas | 6 masters observed in production, 4 K8s catch‑up Jobs, workers as StatefulSet | Conflict rate between replicas is low; optimistic multi‑scheduler (Omega‑style) buys nothing and costs the 7‑key claim txn. |
 | Coordination | etcd only, 30 s leases | Watches + leases are cheap; full prefix scans per claim are not. |
 | Correctness | exactly one publisher per table; progress‑based liveness; mixed‑version rollout | Keep the fence; schedule by table *write turn*, not by task. |
 | Fairness | compaction starves behind continuous merge; low‑count tails never merge; alphabet‑late tables hidden | Need aging/round‑robin at the *planner*, not ad‑hoc cursors in every loop. |
@@ -234,7 +234,10 @@ Triggered by etcd watch events on `demand-events/`, `executors/`, `assignments/`
    with exponential delay (K8s `backoffQ`), not a failure.
 
 Complexity per cycle is O(tables log tables) in memory; etcd traffic is one txn per
-placement. No prefix scans on the hot path.
+placement plus paged snapshot reads (512 keys per page, all at one revision). A full
+pass over 13k tables is tens of pages and a few seconds; it runs detached from the
+leader's lease keepalive so it can never cost leadership. P1 measured this at
+production shape (#364).
 
 **Leadership**: `P/leader` leased key, campaign on startup, TTL = `ETCD_LEASE_TTL_SECS`.
 Non‑leaders keep the demand cache warm via watches so failover is sub‑second. All
@@ -344,8 +347,10 @@ that leaderlessly is exactly what produced five cursor loops and a 7‑key claim
 
 * Not a redesign of the merge‑crate fence, version barriers or progress watchdog.
 * Not a general job system; six kinds, fixed.
-* Not a multi‑scheduler. One leader is sufficient for ≤ 10⁴ tables; if that ever changes,
-  shard the planner by table hash — the model is unchanged.
+* Not a multi‑scheduler. One leader is sufficient at the current ~1.3 × 10⁴ tables with
+  paged reads; the next order of magnitude would call for incremental (watch‑driven)
+  folding instead of a full pass, and after that sharding the planner by table hash —
+  the model is unchanged in either case.
 
 ## 7. Invariants (to be enforced by tests)
 
