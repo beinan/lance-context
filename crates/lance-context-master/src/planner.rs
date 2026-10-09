@@ -76,9 +76,44 @@ pub(crate) struct Kv {
     pub mod_revision: i64,
 }
 
-/// Page size for prefix reads. 13k tables x a few shards each must never go
-/// through one response: the etcd client caps a message at 4 MiB.
-const PAGE: i64 = 512;
+/// Byte budget for one prefix page. The etcd client caps a response at
+/// 4 MiB; records are ~200–400 B but a shard record with a full
+/// `sealed_times` map is ~1.5 KiB, so a key count is not a bound. Pages
+/// are sized adaptively: start at `PAGE_KEYS`, and when a page comes back
+/// over `PAGE_BYTES` halve the key limit for the next one (etcd does not
+/// let a client ask for "N bytes"). A page that is still too big at the
+/// minimum limit is a hard error, not a silent retry loop.
+const PAGE_KEYS: i64 = 512;
+const PAGE_MIN_KEYS: i64 = 8;
+const PAGE_BYTES: usize = 1 << 20;
+
+/// Byte budget for one write transaction. etcd's `--max-request-bytes`
+/// defaults to 1.5 MiB; stay well under so a request is never rejected for
+/// size. Op count is capped separately at etcd's `--max-txn-ops` (128).
+const TXN_BYTES: usize = 768 * 1024;
+const TXN_OPS: usize = 100;
+
+/// Split `ops` into transactions that respect both the op-count and the
+/// request-size limits. Each `TxnOp` is measured by its serialised value
+/// size plus the key; an op larger than the budget on its own still gets a
+/// transaction of its own.
+pub(crate) fn chunk_ops(ops: Vec<(Vec<u8>, usize)>) -> Vec<Vec<usize>> {
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut bytes = 0usize;
+    for (i, (_, size)) in ops.iter().enumerate() {
+        if !current.is_empty() && (current.len() >= TXN_OPS || bytes + size > TXN_BYTES) {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        current.push(i);
+        bytes += size;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
 
 /// Read every key under `prefix` in pages, all at one revision so the
 /// result is a consistent snapshot. Returns the kvs and that revision.
@@ -101,19 +136,38 @@ pub(crate) async fn read_prefix_paged(
     let mut out = Vec::new();
     let mut start = prefix.as_bytes().to_vec();
     let mut revision: i64 = 0;
+    let mut limit = PAGE_KEYS;
     loop {
         let mut opts = GetOptions::new()
             .with_range(range_end.clone())
-            .with_limit(PAGE);
+            .with_limit(limit);
         if revision > 0 {
             opts = opts.with_revision(revision);
         }
-        let response = client
-            .get(start.clone(), Some(opts))
-            .await
-            .map_err(|e| e.to_string())?;
+        let response = match client.get(start.clone(), Some(opts)).await {
+            Ok(r) => r,
+            // A response over the client's message cap surfaces as a gRPC
+            // error; shrink the page and retry the same start key.
+            Err(e) if limit > PAGE_MIN_KEYS && e.to_string().contains("message length") => {
+                limit = (limit / 2).max(PAGE_MIN_KEYS);
+                metrics::counter!("planner_page_shrink_total").increment(1);
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         if revision == 0 {
             revision = response.header().map_or(0, |h| h.revision());
+        }
+        let page_bytes: usize = response
+            .kvs()
+            .iter()
+            .map(|kv| kv.key().len() + kv.value().len())
+            .sum();
+        if page_bytes > PAGE_BYTES && limit > PAGE_MIN_KEYS {
+            // Proactively shrink before we get close to the cap.
+            limit = (limit / 2).max(PAGE_MIN_KEYS);
+        } else if page_bytes < PAGE_BYTES / 4 && limit < PAGE_KEYS {
+            limit = (limit * 2).min(PAGE_KEYS);
         }
         let more = response.more();
         let last = response.kvs().last().map(|kv| kv.key().to_vec());
@@ -132,6 +186,60 @@ pub(crate) async fn read_prefix_paged(
         start.push(0);
     }
     Ok((out, revision))
+}
+
+/// Write `ops` under the leader token in size- and count-bounded txns.
+async fn write_chunked(
+    client: &mut etcd_client::Client,
+    keys: &Keys,
+    leader_token: &str,
+    ops: Vec<SizedOp>,
+    what: &str,
+) -> Result<(), String> {
+    let sizes: Vec<(Vec<u8>, usize)> = ops.iter().map(|o| (Vec::new(), o.size)).collect();
+    let mut ops: Vec<Option<TxnOp>> = ops.into_iter().map(|o| Some(o.op)).collect();
+    for chunk in chunk_ops(sizes) {
+        let batch: Vec<TxnOp> = chunk.into_iter().filter_map(|i| ops[i].take()).collect();
+        let response = client
+            .txn(
+                Txn::new()
+                    .when(vec![Compare::value(
+                        keys.leader_token().as_str(),
+                        CompareOp::Equal,
+                        leader_token,
+                    )])
+                    .and_then(batch),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.succeeded() {
+            return Err(format!("leadership lost during {what}"));
+        }
+    }
+    Ok(())
+}
+
+/// A txn op with the request bytes it will cost.
+pub(crate) struct SizedOp {
+    op: TxnOp,
+    size: usize,
+}
+
+impl SizedOp {
+    fn put(key: String, value: Vec<u8>) -> Self {
+        let size = key.len() + value.len() + 32;
+        Self {
+            op: TxnOp::put(key, value, None),
+            size,
+        }
+    }
+    fn delete(key: Vec<u8>) -> Self {
+        let size = key.len() + 32;
+        Self {
+            op: TxnOp::delete(key, None),
+            size,
+        }
+    }
 }
 
 pub(crate) struct Keys {
@@ -358,7 +466,7 @@ pub(crate) async fn reconcile_once(
             existing_by_key.insert(kv.key.clone(), record);
         }
     }
-    let mut ops = Vec::new();
+    let mut ops: Vec<SizedOp> = Vec::new();
     let mut written = 0usize;
     let mut total_pending = 0u64;
     let folded: BTreeMap<String, TableDemand> = tables.clone();
@@ -378,12 +486,12 @@ pub(crate) async fn reconcile_once(
             continue;
         }
         table.updated_ms = now;
-        ops.push(TxnOp::put(key, serde_json::to_vec(&table).unwrap(), None));
+        ops.push(SizedOp::put(key, serde_json::to_vec(&table).unwrap()));
         written += 1;
     }
     // Tables that no longer have any events: drop the cache row.
     for stale_key in existing_by_key.into_keys() {
-        ops.push(TxnOp::delete(stale_key, None));
+        ops.push(SizedOp::delete(stale_key));
         written += 1;
     }
     // Always confirm leadership, even with nothing to write, so a deposed
@@ -399,25 +507,10 @@ pub(crate) async fn reconcile_once(
     if !still_leader {
         return Err("leadership lost during reconcile".into());
     }
-    // etcd caps a txn at 128 ops by default; chunk, each guarded by the
-    // leader token so a deposed leader cannot write a stale cache.
-    for chunk in ops.chunks(100) {
-        let response = client
-            .txn(
-                Txn::new()
-                    .when(vec![Compare::value(
-                        keys.leader_token().as_str(),
-                        CompareOp::Equal,
-                        leader_token,
-                    )])
-                    .and_then(chunk.to_vec()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.succeeded() {
-            return Err("leadership lost during reconcile".into());
-        }
-    }
+    // Chunk by both op count (etcd --max-txn-ops) and request bytes
+    // (--max-request-bytes); each txn guarded by the leader token so a
+    // deposed leader cannot write a stale cache.
+    write_chunked(&mut client, keys, leader_token, ops, "reconcile").await?;
     // Executor view: heartbeats plus reservations, then the shadow pass.
     let executors_keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
     match crate::executors::load_headroom(&client, &executors_keys).await {
@@ -504,13 +597,13 @@ async fn shadow_pass(
         &executors_keys.assignments_prefix(),
     )
     .await?;
-    let mut ops: Vec<TxnOp> = existing
+    let mut ops: Vec<SizedOp> = existing
         .iter()
         .filter(|kv| {
             serde_json::from_slice::<Assignment>(&kv.value)
                 .is_ok_and(|a| a.state == AssignmentState::Shadow)
         })
-        .map(|kv| TxnOp::delete(kv.key.clone(), None))
+        .map(|kv| SizedOp::delete(kv.key.clone()))
         .collect();
     // Headroom already counts previous Shadow records; release them in the
     // arithmetic too, since they are about to be replaced.
@@ -539,18 +632,30 @@ async fn shadow_pass(
         if s.class == Class::Tail {
             continue; // the real sweeps do not touch tails either
         }
-        // Estimated cost. A merge pass stages at most
-        // ROLLOUT_APPEND_MAX_BYTES of decoded data and the append path
-        // reserves ~2x that for buffers, so one unit costs at most
-        // 2 * max_bytes regardless of backlog. When pending bytes are
-        // unknown (writers do not measure; only the scan does) the estimate
-        // is that full cost, never a token: an unknown must reserve the
-        // worst case or the capacity check validates nothing.
-        let per_pass = state.config.append.rollout_append_max_bytes as u64 * 2;
-        let expected_bytes = if s.pending_bytes == 0 {
-            per_pass
+        // Estimated cost. ROLLOUT_APPEND_MAX_BYTES is the *target* for one
+        // pass, not a ceiling: the append path reads a whole generation
+        // before checking it, so one oversized generation (decoded) sets
+        // the real floor, and buffers cost ~2x decoded. The planner does
+        // not know per-generation sizes, so the estimate is
+        //   2 x max(max_bytes, largest_generation_seen_for_table)
+        // where the largest generation is approximated from the table's
+        // sealed-bytes watermark growth per generation when the scan has
+        // reported bytes, and the configured local budget otherwise - an
+        // unknown must reserve the worst case this executor could be asked
+        // to hold, or the capacity check validates nothing.
+        let per_pass_target = state.config.append.rollout_append_max_bytes as u64;
+        let largest_generation = if s.pending_bytes > 0 && s.pending_generations > 0 {
+            s.pending_bytes / s.pending_generations
         } else {
-            s.pending_bytes.saturating_mul(2).min(per_pass).max(1)
+            0
+        };
+        let worst_known = per_pass_target.max(largest_generation);
+        let expected_bytes = if s.pending_bytes == 0 {
+            // No size data at all: the whole local budget, because that is
+            // what a single oversized generation can consume.
+            (state.config.append.rollout_append_local_memory_bytes as u64).max(per_pass_target * 2)
+        } else {
+            worst_known.saturating_mul(2).max(1)
         };
         if s.pending_bytes == 0 {
             metrics::counter!("planner_shadow_bytes_unknown_total").increment(1);
@@ -581,111 +686,100 @@ async fn shadow_pass(
             created_ms: now,
             bind_deadline_ms: now + 30_000,
         };
-        ops.push(TxnOp::put(
+        ops.push(SizedOp::put(
             executors_keys.assignment(&s.target, &unit_id),
             serde_json::to_vec(&a).unwrap(),
-            None,
         ));
         would_place.push((s.target.clone(), h.executor.clone()));
     }
     metrics::gauge!("planner_shadow_placements").set(would_place.len() as f64);
     metrics::gauge!("planner_shadow_unplaceable").set(unplaceable as f64);
 
-    for chunk in ops.chunks(100) {
-        let response = client
-            .txn(
-                Txn::new()
-                    .when(vec![Compare::value(
-                        keys.leader_token().as_str(),
-                        CompareOp::Equal,
-                        leader_token,
-                    )])
-                    .and_then(chunk.to_vec()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.succeeded() {
-            return Err("leadership lost during shadow pass".into());
-        }
-    }
+    write_chunked(&mut client, keys, leader_token, ops, "shadow pass").await?;
 
     // Comparison with the live system. These are **observations, not a
     // takeover gate**: the shadow planner has only demand and capacity,
     // while the real queue also reflects ownership, eligibility, cooldowns
-    // and executors this planner cannot see. Each metric names one precise
-    // question so the answer can be interpreted:
+    // and executors this planner cannot see. Reality is read once, in
+    // pages, as two separate sets - queued (discovery happened) and running
+    // (execution happened) - and the comparison is **per due table**, not
+    // per placement, so a table the planner wanted but could not place is
+    // still compared on discovery. If reality cannot be read the pass
+    // records nothing rather than zeros.
     //
-    //  discovery_miss   planner scored demand on a table that has no
-    //                   MergeWal task queued or running at all - the real
-    //                   discovery loops have not noticed it yet (or it is a
-    //                   tail they ignore by design).
-    //  placement_gap    planner found no executor headroom for a due table
-    //                   that reality is in fact running - the planner's
-    //                   capacity model is tighter than the real pools.
-    //  phantom_task     reality is running/queued a MergeWal task on a table
-    //                   the planner sees no demand for - either a lost
-    //                   demand event, or work the planner would not have
-    //                   scheduled.
+    //  discovery_miss   due (non-tail) demand, but reality has this table
+    //                   neither queued nor running: the real discovery
+    //                   loops have not noticed it.
+    //  queued_only      due demand that reality has queued but not running:
+    //                   discovered, waiting on admission or capacity.
+    //  running          due demand that reality is executing.
+    //  placement_gap    due demand the planner could not place for lack of
+    //                   headroom (independent of reality): the planner's
+    //                   capacity model vs. the real pools.
+    //  phantom_task     reality has this table queued or running with no
+    //                   scored demand at all: a lost demand event, or work
+    //                   the planner would not have scheduled.
     //
-    // The old single "disagreement" counter is kept for continuity but is
-    // the sum of these and should not be read on its own.
+    // The summed `scheduler_shadow_disagreements_total` is kept only for
+    // continuity; read the components.
+    let (queued, running) = match state
+        .task_store
+        .list_queued_and_running_targets(TaskKind::MergeWal)
+        .await
+    {
+        Ok(sets) => sets,
+        Err(error) => {
+            tracing::warn!(%error, "shadow comparison skipped: could not read task queue");
+            metrics::counter!("planner_shadow_comparison_skipped_total").increment(1);
+            return Ok(());
+        }
+    };
+    let queued: std::collections::BTreeSet<&str> = queued.iter().map(String::as_str).collect();
+    let running: std::collections::BTreeSet<&str> = running.iter().map(String::as_str).collect();
     let placed: std::collections::BTreeSet<&str> =
         would_place.iter().map(|(t, _)| t.as_str()).collect();
     let mut discovery_miss = 0u64;
-    let mut placement_gap = 0u64;
-    let mut agree = 0u64;
+    let mut queued_only = 0u64;
+    let mut running_n = 0u64;
+    let mut placement_gap_n = 0u64;
     let mut scored_targets: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for s in &scored {
         scored_targets.insert(s.target.as_str());
         if s.class == Class::Tail {
             continue;
         }
-        let active = state
-            .task_store
-            .get_active_id(TaskKind::MergeWal, &s.target)
-            .await
-            .map_err(|e| e.to_string())?
-            .is_some();
-        let planner_wants = placed.contains(s.target.as_str());
-        match (planner_wants, active) {
-            (true, true) | (false, false) if planner_wants => agree += 1,
-            (true, false) => {
-                discovery_miss += 1;
-                tracing::debug!(target = %s.target, class = ?s.class, score = s.score,
-                    "shadow: planner would place, reality has no task");
-            }
-            (false, true) => {
-                placement_gap += 1;
-                tracing::debug!(target = %s.target, class = ?s.class, score = s.score,
-                    "shadow: due but unplaceable, reality is running it");
-            }
-            _ => {}
+        let t = s.target.as_str();
+        if running.contains(t) {
+            running_n += 1;
+        } else if queued.contains(t) {
+            queued_only += 1;
+        } else {
+            discovery_miss += 1;
+            tracing::debug!(target = %t, class = ?s.class, score = s.score,
+                "shadow: due demand, reality has no task queued or running");
+        }
+        if !placed.contains(t) {
+            placement_gap_n += 1;
         }
     }
-    // Phantom tasks: live MergeWal tasks on tables with no scored demand.
     let mut phantom_task = 0u64;
-    if let Ok(running) = state
-        .task_store
-        .list_active_targets(TaskKind::MergeWal)
-        .await
-    {
-        for target in running {
-            if !scored_targets.contains(target.as_str()) {
-                phantom_task += 1;
-                tracing::debug!(target = %target,
-                    "shadow: reality runs a MergeWal task with no scored demand");
-            }
+    for t in queued.union(&running) {
+        if !scored_targets.contains(t) {
+            phantom_task += 1;
+            tracing::debug!(target = %t,
+                "shadow: reality has a MergeWal task with no scored demand");
         }
     }
     for (label, n) in [
         ("discovery_miss", discovery_miss),
-        ("placement_gap", placement_gap),
+        ("queued_only", queued_only),
+        ("running", running_n),
+        ("placement_gap", placement_gap_n),
         ("phantom_task", phantom_task),
-        ("agree", agree),
     ] {
         metrics::gauge!("planner_shadow_comparison", "outcome" => label).set(n as f64);
     }
-    let disagreements = discovery_miss + placement_gap + phantom_task;
+    let disagreements = discovery_miss + phantom_task;
     metrics::counter!("scheduler_shadow_disagreements_total", "kind" => "merge_wal")
         .increment(disagreements);
     metrics::gauge!("planner_shadow_disagreements_last_pass").set(disagreements as f64);
@@ -790,6 +884,12 @@ mod tests {
             .map(str::to_owned)
             .collect();
         cfg.etcd.etcd_prefix = format!("/planner-scale/{}", generate_id());
+        let _cleanup = PrefixCleanup(
+            etcd_client::Client::connect(cfg.etcd.etcd_endpoints.clone(), None)
+                .await
+                .unwrap(),
+            cfg.etcd.etcd_prefix.clone(),
+        );
         cfg.planner.planner_enabled = true;
         cfg.planner.planner_reconcile_secs = 5;
         cfg.etcd_lease_ttl_secs = 5;
@@ -910,6 +1010,214 @@ mod tests {
         );
         assert!(!leader.is_finished());
         leader.abort();
+        let _ = client
+            .delete(
+                cfg.etcd.etcd_prefix.as_str(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await;
+    }
+
+    /// Deletes a test prefix on drop so a failed assertion cannot leave
+    /// tens of thousands of keys behind to slow every later test.
+    struct PrefixCleanup(etcd_client::Client, String);
+    impl Drop for PrefixCleanup {
+        fn drop(&mut self) {
+            let mut client = self.0.clone();
+            let prefix = self.1.clone();
+            tokio::spawn(async move {
+                let _ = client
+                    .delete(
+                        prefix.as_str(),
+                        Some(etcd_client::DeleteOptions::new().with_prefix()),
+                    )
+                    .await;
+            });
+        }
+    }
+
+    #[test]
+    fn chunk_ops_respects_both_count_and_bytes() {
+        // 300 small ops -> 3 chunks of 100.
+        let small: Vec<(Vec<u8>, usize)> = (0..300).map(|_| (Vec::new(), 100)).collect();
+        let chunks = chunk_ops(small);
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [100, 100, 100]
+        );
+        // 20 ops of 100 KiB -> bytes bind at 7 per chunk (7 * 100 KiB < 768 KiB).
+        let big: Vec<(Vec<u8>, usize)> = (0..20).map(|_| (Vec::new(), 100 * 1024)).collect();
+        let chunks = chunk_ops(big);
+        assert!(chunks.iter().all(|c| c.len() <= 7), "{chunks:?}");
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 20);
+        // One op larger than the budget still goes out, alone.
+        let huge = vec![(Vec::new(), 2 * TXN_BYTES), (Vec::new(), 10)];
+        let chunks = chunk_ops(huge);
+        assert_eq!(chunks, vec![vec![0], vec![1]]);
+    }
+
+    /// Round-6 findings 1 and 2 at the reviewer's shapes: 512 tables x 8
+    /// shards with full `sealed_times` maps (~5.6 MB of events: a 512-key
+    /// page exceeds the 4 MiB cap) and a cache write for 20-shard tables
+    /// (100 records ~2.7 MB: exceeds etcd's 1.5 MiB request cap). Both must
+    /// complete; the paged read must have shrunk its page at least once.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS and PLANNER_SCALE_TEST=1; run alone"]
+    async fn large_records_page_by_bytes_and_write_within_request_limits() {
+        if std::env::var("PLANNER_SCALE_TEST").is_err() {
+            eprintln!("PLANNER_SCALE_TEST unset; skipping");
+            return;
+        }
+        use crate::state::MasterState;
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ]);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/planner-bytes/{}", generate_id());
+        let _cleanup = PrefixCleanup(
+            etcd_client::Client::connect(cfg.etcd.etcd_endpoints.clone(), None)
+                .await
+                .unwrap(),
+            cfg.etcd.etcd_prefix.clone(),
+        );
+        cfg.planner.planner_enabled = true;
+        cfg.stats_scan_interval_secs = 0;
+        cfg.compaction_interval_secs = 0;
+        cfg.merge_wal_interval_secs = 0;
+        let state = MasterState::new(cfg.clone()).await.unwrap();
+        let keys = Keys::new(&cfg.etcd.etcd_prefix);
+        let mut client = state.task_store.etcd_client().clone();
+
+        // Shape A: 512 tables x 8 shards, each with a 64-entry times map.
+        let full_times: BTreeMap<u64, i64> = (1..=64u64)
+            .map(|g| (1_000_000_000_000 + g, 1_700_000_000_000 + g as i64 * 1000))
+            .collect();
+        let mut ops = Vec::new();
+        for i in 0..512 {
+            let target = format!("wide-{i:04}");
+            for sh in 0..8 {
+                let event = DemandEvent {
+                    v: SCHEMA_VERSION,
+                    shard: format!("bbbbbbbb-0000-0000-0000-{sh:012}"),
+                    sealed_through: 64,
+                    sealed_bytes_through: 64 << 20,
+                    merged_through: None,
+                    flushed_at_ms: 1_700_000_000_000,
+                    writer_epoch: 1,
+                    source: EventSource::Writer,
+                    merged_epoch: None,
+                    sealed_times: full_times.clone(),
+                };
+                ops.push(TxnOp::put(
+                    format!("{}{}/{}", keys.events_prefix(), hex(&target), event.shard),
+                    serde_json::to_vec(&event).unwrap(),
+                    None,
+                ));
+                if ops.len() == 50 {
+                    client
+                        .txn(Txn::new().and_then(std::mem::take(&mut ops)))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        if !ops.is_empty() {
+            client.txn(Txn::new().and_then(ops)).await.unwrap();
+        }
+        // The whole prefix exceeds the cap (so this fixture is not vacuous);
+        // the paged reader must still return every record.
+        let unpaged = client
+            .get(keys.events_prefix(), Some(GetOptions::new().with_prefix()))
+            .await;
+        assert!(
+            unpaged.is_err(),
+            "expected the unpaged read to exceed the message cap"
+        );
+        let (kvs, _) = read_prefix_paged(&client, &keys.events_prefix())
+            .await
+            .unwrap();
+        assert_eq!(kvs.len(), 512 * 8);
+        let total: usize = kvs.iter().map(|kv| kv.key.len() + kv.value.len()).sum();
+        assert!(
+            total > 4 << 20,
+            "fixture must exceed 4 MiB in total: {total}"
+        );
+        let (tables, skipped) = fold_events(
+            &keys,
+            kvs.iter()
+                .map(|kv| (kv.key.as_slice(), kv.value.as_slice(), kv.mod_revision)),
+            0,
+        );
+        assert_eq!((tables.len(), skipped), (512, 0));
+
+        // Shape B: the cache write. 20-shard tables produce ~27 KB records;
+        // 100 of them in one txn is ~2.7 MB. Drive a real reconcile under a
+        // real leader token and assert every record landed.
+        let wide20: BTreeMap<u64, i64> = (1..=64u64).map(|g| (g, 1_700_000_000_000)).collect();
+        let mut ops = Vec::new();
+        for i in 0..100 {
+            let target = format!("deep-{i:03}");
+            for sh in 0..20 {
+                let event = DemandEvent {
+                    v: SCHEMA_VERSION,
+                    shard: format!("cccccccc-0000-0000-0000-{sh:012}"),
+                    sealed_through: 64,
+                    sealed_bytes_through: 0,
+                    merged_through: None,
+                    flushed_at_ms: 1_700_000_000_000,
+                    writer_epoch: 1,
+                    source: EventSource::Writer,
+                    merged_epoch: None,
+                    sealed_times: wide20.clone(),
+                };
+                ops.push(TxnOp::put(
+                    format!("{}{}/{}", keys.events_prefix(), hex(&target), event.shard),
+                    serde_json::to_vec(&event).unwrap(),
+                    None,
+                ));
+                if ops.len() == 40 {
+                    client
+                        .txn(Txn::new().and_then(std::mem::take(&mut ops)))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        if !ops.is_empty() {
+            client.txn(Txn::new().and_then(ops)).await.unwrap();
+        }
+        let token = generate_id();
+        client
+            .put(keys.leader_token(), token.clone(), None)
+            .await
+            .unwrap();
+        let written = reconcile_once(&state, &keys, &token).await.unwrap();
+        assert_eq!(
+            written,
+            512 + 100,
+            "every table record written in one reconcile"
+        );
+        let (cache, _) = read_prefix_paged(&client, &keys.demand_prefix())
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 612);
+        let deep: TableDemand = serde_json::from_slice(
+            &cache
+                .iter()
+                .find(|kv| kv.key.ends_with(hex("deep-000").as_bytes()))
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        assert_eq!(deep.shards.len(), 20);
         let _ = client
             .delete(
                 cfg.etcd.etcd_prefix.as_str(),

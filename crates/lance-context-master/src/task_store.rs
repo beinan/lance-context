@@ -545,11 +545,20 @@ impl TaskStore {
 
     /// Whether the sweeps should skip this target for now because it has
     /// failed repeatedly. Manual enqueues are not gated by this.
-    /// Targets with a `kind` task queued or running right now, read in
-    /// pages. For the shadow planner's comparison against reality.
-    pub async fn list_active_targets(&self, kind: TaskKind) -> lance::Result<Vec<String>> {
-        let mut out = Vec::new();
-        for prefix in [self.inner.queue_prefix(), self.inner.running_prefix()] {
+    /// Targets with a `kind` task queued and targets with one running,
+    /// separately, read in pages. For the shadow planner's comparison
+    /// against reality: "queued" is discovery, "running" is execution, and
+    /// the two must not be conflated.
+    pub async fn list_queued_and_running_targets(
+        &self,
+        kind: TaskKind,
+    ) -> lance::Result<(Vec<String>, Vec<String>)> {
+        let mut queued = Vec::new();
+        let mut running = Vec::new();
+        for (prefix, out) in [
+            (self.inner.queue_prefix(), &mut queued),
+            (self.inner.running_prefix(), &mut running),
+        ] {
             let (kvs, _) = crate::planner::read_prefix_paged(&self.inner.client, &prefix)
                 .await
                 .map_err(lance::Error::io)?;
@@ -560,10 +569,10 @@ impl TaskStore {
                     }
                 }
             }
+            out.sort();
+            out.dedup();
         }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        Ok((queued, running))
     }
 
     /// Id of the queued or running task that `enqueue(kind, target)` would
