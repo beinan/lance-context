@@ -347,10 +347,9 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
                         // Demand reconciliation rides the scan: publish every
                         // shard's watermark as a scan-sourced event. Detached
                         // and bounded; the scan never waits on it.
-                        let target = match entry.kind {
-                            ScanKind::Rollout => entry.name.clone(),
-                            ScanKind::Generic => format!("generic:{}", entry.name),
-                        };
+                        // `entry.name` is already the task target: bare for
+                        // rollout, `generic:<name>` for generic stores.
+                        let target = entry.name.clone();
                         crate::demand_publish::spawn_scan_demand(
                             state.clone(),
                             target,

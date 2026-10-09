@@ -56,11 +56,17 @@ Rules:
   epoch a merged mark was reported under when it differs from the record's
   `writer_epoch`; provenance and tiebreak only.
 * `oldest_pending_ms` is the flush time of the lowest unmerged generation. The
-  stored record carries `sealed_times` (bounded to `SEALED_TIMES_CAP = 64`
-  lowest unmerged generations, min time per generation, pruned as `merged`
-  advances) so the age clock **survives a rebuild from etcd**. A newer flush
-  adds an entry and never resets the clock. Counts and bytes are exact in every
-  order; the age field is exact up to the cap and a lower bound beyond it.
+  stored record carries `sealed_times`: the lowest `SEALED_TIMES_CAP − 1 = 63`
+  recorded generations plus the newest, min time per generation, bounded by
+  cap **only** (pruning by `merged` would make the kept set depend on arrival
+  order). Entries at or below `merged` are ignored on read. The age clock
+  therefore **survives a rebuild from etcd** and a newer flush never resets
+  it. The answer carries a bound: **Exact** when the oldest pending
+  generation's own time is kept; **Upper** (the lowest kept time above it,
+  at worst the newest sealed) once merging has consumed every kept entry on a
+  shard that had more than the cap pending. Only an Exact age drives aging
+  and promotion; a bound is displayed but never promotes. Counts and bytes
+  are exact in every order.
 * Records carry `v`. A reader rejects an event it does not understand
   (`Ignored::UnknownVersion`) and a publisher **refuses to overwrite a stored
   record from a newer schema**; `v == 0` is read as version 1.
@@ -88,13 +94,23 @@ source of truth, and may be rebuilt from events + scan at any time. Folding is
 a pure function `fold(table, event) -> table` and is tested for commutativity
 and idempotency (design invariant 5a).
 
+### 1.2a Reads at scale
+
+Production has ~13,400 tables and ~27,000 shard records. A single prefix
+read of `demand-events/` exceeds the etcd client's 4 MiB message cap. Every
+planner prefix read (`demand-events/`, `demand/`, `executors/`,
+`assignments/`, `queue/`, `running/`) is paged (512 keys) **at one
+revision**, so each pass sees a consistent snapshot. The reconcile runs
+detached from the leader loop so a slow pass can never starve the lease
+keepalive; at most one pass is in flight and skipped ticks are counted.
+
 ### 1.3 What writes what in P1
 
 | Source | Writes | Change from today |
 |---|---|---|
 | Rollout server flush (`sweeper.rs::route_merge`) | `demand-events/<hex>/<shard>` **in addition to** `merge-requests/<hex>` | additive |
 | Master append merge release (`rollout_append.rs`, `merge_execution.rs`) | `merged_through` per shard in the release txn | additive |
-| Stats scanner (`scanner.rs`) | `demand-events` with `source: scan` for every shard it observes, plus `fragment_count`/`index_stale` into `demand/` | additive; existing enqueue/retire paths untouched |
+| Stats scanner (`scanner.rs`) | `demand-events` with `source: scan` for every shard it observes, carrying **both** the shard manifest's `sealed_through` and the base table's merged watermark for that shard, so a lost completion event is corrected on the next scan and an old table's first contact does not read generation 1001 as 1001 pending | additive; existing enqueue/retire paths untouched |
 | Planner (new, leader only) | `demand/<hex>` | new |
 
 No existing key is removed or re-purposed in P1.
@@ -164,10 +180,35 @@ leadership). The planner scores `MergeWal` demand only (design §4.2: classes
 Critical / Normal / Tail; class 1 oldest‑first), places against headroom, and
 writes assignments **only in shadow mode**: state `shadow`, replaced wholesale
 every pass, never read by any executor (a source‑level test enforces this), no
-binding. Tails are not placed, matching the real sweeps. Each pass then
-compares its placements with whether a real `MergeWal` task is active per
-table and increments `scheduler_shadow_disagreements_total{kind}`; the
-per‑pass count is `planner_shadow_disagreements_last_pass`. Compaction and
+binding. Tails are not placed, matching the real sweeps.
+
+Each pass then compares itself with the live system. **These are
+observations, not a takeover gate.** The shadow planner sees demand and
+capacity; the real queue also reflects ownership, eligibility, cooldowns,
+and executors the planner cannot see (legacy workers, catch‑up Jobs). The
+comparison therefore answers three precise questions, each its own gauge
+`planner_shadow_comparison{outcome}`:
+
+| outcome | meaning |
+|---|---|
+| `discovery_miss` | planner scored due demand on a table with no `MergeWal` task queued or running — the real discovery loops have not noticed it |
+| `placement_gap` | planner found no headroom for a due table that reality is running — the planner's capacity model is tighter than the real pools |
+| `phantom_task` | reality has a `MergeWal` task on a table the planner sees no demand for — a lost demand event, or work the planner would not schedule |
+| `agree` | both would run it |
+
+`scheduler_shadow_disagreements_total{kind}` is the sum of the first three,
+kept for continuity; read the components. What "approach zero" means per
+component: `discovery_miss` falling to the tail population says the demand
+feed is complete; `phantom_task` at zero says no demand events are lost;
+`placement_gap` is expected to stay non‑zero until legacy workers and
+catch‑up Jobs heartbeat as executors, and is not a defect of the planner.
+
+Byte estimates: writers do not measure generation sizes, so `pending_bytes`
+is zero for most tables. An unknown reserves the **full per‑pass cost**
+(`2 × ROLLOUT_APPEND_MAX_BYTES`), never a token — a capacity model that
+reserves 1 byte validates nothing. `planner_shadow_bytes_unknown_total`
+counts these. Measured sizes come with the scan reading generation data
+statistics, a later change. Compaction and
 index scoring, commit‑ready class 2 and `max_consecutive_turns` come with P2's
 preparation integration; catch‑up Job heartbeats come when Jobs become an
 executor kind.

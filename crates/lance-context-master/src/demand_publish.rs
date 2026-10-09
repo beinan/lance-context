@@ -65,7 +65,7 @@ pub(crate) fn spawn_scan_demand(
                     shard: mark.shard_id.to_string(),
                     sealed_through: mark.sealed_through,
                     sealed_bytes_through: 0,
-                    merged_through: None,
+                    merged_through: mark.merged_through,
                     flushed_at_ms: now_ms,
                     writer_epoch: mark.writer_epoch,
                     source: EventSource::Scan,

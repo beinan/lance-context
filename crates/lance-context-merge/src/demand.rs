@@ -120,6 +120,15 @@ pub struct ShardDemand {
     pub sealed_times: BTreeMap<u64, i64>,
 }
 
+/// How much to trust an oldest-pending time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeBound {
+    Exact,
+    /// The true time is at or before this; never promote on it.
+    Upper,
+}
+
 impl ShardDemand {
     pub fn pending_generations(&self) -> u64 {
         self.sealed
@@ -127,21 +136,55 @@ impl ShardDemand {
             .saturating_sub(self.merged.map_or(0, |m| m.value))
     }
 
-    /// Flush time of the oldest generation still unmerged, if known.
-    pub fn oldest_pending_ms(&self) -> Option<i64> {
+    /// Flush time of the oldest generation still unmerged, with how much
+    /// to trust it.
+    ///
+    /// The record keeps flush times for at most `SEALED_TIMES_CAP` of the
+    /// lowest pending generations. While the oldest pending generation's
+    /// own time is kept the answer is **exact**. Once merging has consumed
+    /// every kept entry (a shard that had more than the cap pending), only
+    /// the newest sealed time is known; that is an **upper** bound on the
+    /// oldest pending flush time, so it must never drive age-based
+    /// promotion. Never `None` while something is pending.
+    pub fn oldest_pending(&self) -> Option<(i64, AgeBound)> {
         if self.pending_generations() == 0 {
             return None;
         }
-        self.sealed_times.values().next().copied()
+        let oldest = self.merged.map_or(0, |m| m.value) + 1;
+        if let Some(t) = self.sealed_times.get(&oldest) {
+            return Some((*t, AgeBound::Exact));
+        }
+        // Entries at or below merged are stale and ignored. The lowest kept
+        // entry above `oldest` is an upper bound on its flush time; the
+        // newest sealed generation is always kept (see `prune_times`), so
+        // there is always one to give.
+        self.sealed_times
+            .range(oldest..)
+            .next()
+            .map(|(_, t)| (*t, AgeBound::Upper))
     }
 
+    /// Convenience: the time only, whatever its bound.
+    pub fn oldest_pending_ms(&self) -> Option<i64> {
+        self.oldest_pending().map(|(t, _)| t)
+    }
+
+    /// Exact oldest-pending time, or `None` when only a bound is known.
+    /// What the scheduler uses for promotion: a bound never promotes.
+    pub fn oldest_pending_exact_ms(&self) -> Option<i64> {
+        match self.oldest_pending() {
+            Some((t, AgeBound::Exact)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Bound the map by cap **only**. Dropping entries at or below `merged`
+    /// here would make the kept set depend on whether the merge or the
+    /// flushes arrived first (merge-first keeps 65..128, flush-first keeps
+    /// 1..63 and 128), which breaks order independence. Entries at or below
+    /// merged are ignored at read time instead.
     fn prune(&mut self) {
-        if let Some(m) = self.merged {
-            self.sealed_times.retain(|g, _| *g > m.value);
-        }
-        while self.sealed_times.len() > SEALED_TIMES_CAP {
-            self.sealed_times.pop_last();
-        }
+        prune_times(&mut self.sealed_times);
     }
 }
 
@@ -192,6 +235,23 @@ pub enum Ignored {
     UnknownVersion(u32),
 }
 
+/// Bound a times map: the lowest `SEALED_TIMES_CAP - 1` generations plus
+/// the single highest. Both parts are functions of the set, so the result
+/// is order independent. Keeping the highest means an upper bound on every
+/// pending age survives even when merging consumes all the low entries.
+fn prune_times(times: &mut BTreeMap<u64, i64>) {
+    if times.len() <= SEALED_TIMES_CAP {
+        return;
+    }
+    let newest = times.pop_last();
+    while times.len() > SEALED_TIMES_CAP - 1 {
+        times.pop_last();
+    }
+    if let Some((g, t)) = newest {
+        times.insert(g, t);
+    }
+}
+
 /// Insert `time` for `generation`, keeping the earliest. Returns whether the
 /// map changed.
 fn note_time(times: &mut BTreeMap<u64, i64>, generation: u64, time: i64) -> bool {
@@ -238,11 +298,21 @@ impl TableDemand {
             .sum()
     }
 
-    /// Flush time of the oldest generation still unmerged on any shard.
+    /// Flush time of the oldest generation still unmerged on any shard,
+    /// whatever its bound. For display.
     pub fn oldest_pending_ms(&self) -> Option<i64> {
         self.shards
             .values()
             .filter_map(ShardDemand::oldest_pending_ms)
+            .min()
+    }
+
+    /// Oldest **exact** pending time across shards. What promotion uses;
+    /// a shard whose age is only an upper bound contributes nothing.
+    pub fn oldest_pending_exact_ms(&self) -> Option<i64> {
+        self.shards
+            .values()
+            .filter_map(ShardDemand::oldest_pending_exact_ms)
             .min()
     }
 
@@ -282,8 +352,11 @@ impl TableDemand {
         // Age bookkeeping: this event's own flush time plus any times it
         // carries from a stored record, min per generation, only for
         // generations still above merged.
-        let floor = shard.merged.map_or(0, |m| m.value);
-        if event.sealed_through > floor
+        // An executor's flushed_at_ms is its own observation time, not when
+        // the generation was flushed; only writer and scan events seed the
+        // age clock from their own timestamp.
+        if event.source != EventSource::Executor
+            && event.sealed_through > 0
             && note_time(
                 &mut shard.sealed_times,
                 event.sealed_through,
@@ -293,7 +366,7 @@ impl TableDemand {
             changed = true;
         }
         for (g, t) in &event.sealed_times {
-            if *g > floor && note_time(&mut shard.sealed_times, *g, *t) {
+            if note_time(&mut shard.sealed_times, *g, *t) {
                 changed = true;
             }
         }
@@ -326,18 +399,14 @@ pub fn join_events(stored: Option<&DemandEvent>, event: &DemandEvent) -> Option<
         if fresh.merged_epoch == Some(fresh.writer_epoch) {
             fresh.merged_epoch = None;
         }
-        let floor = fresh.merged_through.unwrap_or(0);
-        if fresh.sealed_through > floor {
+        if fresh.source != EventSource::Executor && fresh.sealed_through > 0 {
             note_time(
                 &mut fresh.sealed_times,
                 fresh.sealed_through,
                 fresh.flushed_at_ms,
             );
         }
-        fresh.sealed_times.retain(|g, _| *g > floor);
-        while fresh.sealed_times.len() > SEALED_TIMES_CAP {
-            fresh.sealed_times.pop_last();
-        }
+        prune_times(&mut fresh.sealed_times);
         return Some(fresh);
     };
     let s_sealed = Mark {
@@ -369,23 +438,19 @@ pub fn join_events(stored: Option<&DemandEvent>, event: &DemandEvent) -> Option<
     };
 
     // Times: union of everything known, min per generation.
-    let floor = best_merged.map_or(0, |m| m.value);
     let mut times = stored.sealed_times.clone();
     for (g, t) in &event.sealed_times {
         note_time(&mut times, *g, *t);
     }
-    for (g, t) in [
-        (stored.sealed_through, stored.flushed_at_ms),
-        (event.sealed_through, event.flushed_at_ms),
+    for (src, g, t) in [
+        (stored.source, stored.sealed_through, stored.flushed_at_ms),
+        (event.source, event.sealed_through, event.flushed_at_ms),
     ] {
-        if g > floor {
+        if src != EventSource::Executor && g > 0 {
             note_time(&mut times, g, t);
         }
     }
-    times.retain(|g, _| *g > floor);
-    while times.len() > SEALED_TIMES_CAP {
-        times.pop_last();
-    }
+    prune_times(&mut times);
     let times_changed = times != stored.sealed_times;
 
     if !sealed_wins && !merged_wins && !times_changed {
@@ -401,9 +466,9 @@ pub fn join_events(stored: Option<&DemandEvent>, event: &DemandEvent) -> Option<
     next.merged_epoch = best_merged
         .map(|m| m.epoch)
         .filter(|e| *e != next.writer_epoch);
-    if merged_wins && !sealed_wins {
-        next.source = event.source;
-    }
+    // `source` and `flushed_at_ms` describe who set `sealed_through` and
+    // when it was flushed; they stay with the sealed mark so a rebuild
+    // re-derives exactly the time entries the fold did.
     next.sealed_times = times;
     next.v = SCHEMA_VERSION;
     Some(next)
@@ -701,10 +766,20 @@ mod tests {
             Err(Ignored::NotNewer)
         );
         // A "newer epoch" with a lower generation cannot occur in Lance; if
-        // reported it loses the max.
+        // reported it loses the max. Its flush time is recorded once (the
+        // map is bounded by cap only; see ShardDemand::prune) and is inert:
+        // generation 2 is below merged and never read.
+        table
+            .fold(&ev("a", 2, None, 4, EventSource::Scan), 5, 0)
+            .unwrap();
         assert_eq!(
-            table.fold(&ev("a", 2, None, 4, EventSource::Scan), 5, 0),
+            table.fold(&ev("a", 2, None, 4, EventSource::Scan), 6, 0),
             Err(Ignored::NotNewer)
+        );
+        assert_eq!(
+            table.shards["a"].oldest_pending_ms(),
+            Some(150),
+            "gen 15's time, not gen 2's"
         );
         assert_eq!(
             table.shards["a"].sealed,
@@ -776,10 +851,67 @@ mod tests {
         table.fold(&merged, 4, 0).unwrap();
         assert_eq!(table.oldest_pending_ms(), Some(2000));
         let stored = join_events(Some(&stored), &merged).unwrap();
-        assert_eq!(stored.sealed_times.values().next(), Some(&2000));
+        let mut from_stored = TableDemand::default();
+        from_stored.fold(&stored, 0, 0).unwrap();
+        assert_eq!(from_stored.oldest_pending_ms(), Some(2000));
         let all = [flush(1, 1000), flush(2, 2000), flush(3, 3000), merged];
         assert_eq!(rebuild(&all).oldest_pending_ms(), Some(2000));
         assert_order_independent(&all);
+    }
+
+    /// Round-5 finding 6: 128 pending, merge the first 64. The oldest
+    /// pending is generation 65, whose time the cap never kept. The answer
+    /// must not be unknown and must not drive promotion as if exact: it is
+    /// reported as an Upper bound (the newest kept or sealed time), excluded
+    /// from `oldest_pending_exact_ms`, and identical after a rebuild.
+    #[test]
+    fn age_after_merging_past_the_cap_is_a_flagged_bound() {
+        let flush = |g: u64| DemandEvent {
+            flushed_at_ms: g as i64 * 1000,
+            ..ev("s", g, None, 1, EventSource::Writer)
+        };
+        let mut events: Vec<_> = (1..=128).map(flush).collect();
+        let table = fold_all(&events);
+        assert_eq!(
+            table.shards["s"].oldest_pending(),
+            Some((1000, AgeBound::Exact))
+        );
+        assert_eq!(table.oldest_pending_exact_ms(), Some(1000));
+        events.push(ev("s", 128, Some(64), 1, EventSource::Executor));
+        let table = fold_all(&events);
+        let (t, bound) = table.shards["s"]
+            .oldest_pending()
+            .expect("64 pending: not unknown");
+        assert_eq!(bound, AgeBound::Upper, "gen 65's time was never kept");
+        assert!(
+            t >= 65_000,
+            "an upper bound is at or after the true time: {t}"
+        );
+        assert_eq!(
+            table.oldest_pending_exact_ms(),
+            None,
+            "a bound never promotes"
+        );
+        assert_eq!(table.oldest_pending_ms(), Some(t), "but is shown");
+        assert_eq!(
+            rebuild(&events).shards["s"].oldest_pending(),
+            Some((t, AgeBound::Upper))
+        );
+        let mut reversed = events.clone();
+        reversed.reverse();
+        assert_eq!(
+            fold_all(&reversed).shards["s"].oldest_pending(),
+            Some((t, AgeBound::Upper))
+        );
+        // Below the cap the answer is exact again: 10 pending, merge 3 -> gen 4.
+        let small: Vec<_> = (1..=10)
+            .map(flush)
+            .chain([ev("s", 10, Some(3), 1, EventSource::Executor)])
+            .collect();
+        assert_eq!(
+            fold_all(&small).shards["s"].oldest_pending(),
+            Some((4000, AgeBound::Exact))
+        );
     }
 
     #[test]

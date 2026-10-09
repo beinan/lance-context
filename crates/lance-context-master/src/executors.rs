@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use etcd_client::{GetOptions, PutOptions};
+use etcd_client::PutOptions;
 use lance_context_api::TaskKind;
 use serde::{Deserialize, Serialize};
 
@@ -322,38 +322,23 @@ pub(crate) async fn load_headroom(
     client: &etcd_client::Client,
     keys: &Keys,
 ) -> Result<BTreeMap<String, Headroom>, String> {
-    let mut client = client.clone();
-    let hbs = client
-        .get(
-            keys.executors_prefix(),
-            Some(GetOptions::new().with_prefix()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let (hbs, _) = crate::planner::read_prefix_paged(client, &keys.executors_prefix()).await?;
     let prefix = keys.executors_prefix();
     let heartbeats: Vec<(String, Heartbeat)> = hbs
-        .kvs()
         .iter()
         .filter_map(|kv| {
-            let id = std::str::from_utf8(kv.key())
+            let id = std::str::from_utf8(&kv.key)
                 .ok()?
                 .strip_prefix(prefix.as_str())?
                 .to_string();
-            let hb: Heartbeat = serde_json::from_slice(kv.value()).ok()?;
+            let hb: Heartbeat = serde_json::from_slice(&kv.value).ok()?;
             (hb.v == SCHEMA_VERSION).then_some((id, hb))
         })
         .collect();
-    let asg = client
-        .get(
-            keys.assignments_prefix(),
-            Some(GetOptions::new().with_prefix()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let (asg, _) = crate::planner::read_prefix_paged(client, &keys.assignments_prefix()).await?;
     let assignments: Vec<Assignment> = asg
-        .kvs()
         .iter()
-        .filter_map(|kv| serde_json::from_slice::<Assignment>(kv.value()).ok())
+        .filter_map(|kv| serde_json::from_slice::<Assignment>(&kv.value).ok())
         .filter(|a| a.v == SCHEMA_VERSION)
         .collect();
     Ok(headroom(

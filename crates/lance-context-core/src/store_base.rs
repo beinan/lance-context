@@ -224,6 +224,10 @@ pub struct ShardWatermark {
     pub sealed_through: u64,
     /// Flushed generations not yet merged into the base table.
     pub pending_generations: usize,
+    /// Highest generation the base table's MemWAL index records as merged
+    /// for this shard, when the caller read the base index. `None` means
+    /// "not read", not "nothing merged".
+    pub merged_through: Option<u64>,
 }
 
 pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
@@ -948,6 +952,7 @@ impl StorageBase {
                     .max()
                     .unwrap_or(0),
                 pending_generations: manifest.flushed_generations.len(),
+                merged_through: None,
             }))
     }
 
@@ -2091,6 +2096,15 @@ impl StorageBase {
         if self.is_version_pinned() {
             return Ok(Vec::new());
         }
+        // The base table's MemWAL index is the authority on what has been
+        // merged. A scan must report it, or a lost completion event leaves
+        // a fully merged shard looking pending forever, and an old table's
+        // first contact reads generation 1001 as 1001 pending.
+        let merged = Arc::new(
+            crate::rollout_append::watermarks(&self.dataset)
+                .await
+                .unwrap_or_default(),
+        );
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
         let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
@@ -2098,6 +2112,7 @@ impl StorageBase {
             .map(|shard_id| {
                 let object_store = object_store.clone();
                 let branch_path = branch_path.clone();
+                let merged = merged.clone();
                 async move {
                     let manifest_store = ShardManifestStore::new(
                         object_store,
@@ -2116,6 +2131,7 @@ impl StorageBase {
                                 .max()
                                 .unwrap_or(0),
                             pending_generations: manifest.flushed_generations.len(),
+                            merged_through: merged.get(&manifest.shard_id).copied(),
                         }
                     }))
                 }
