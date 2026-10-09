@@ -219,19 +219,19 @@ says no demand events are lost; `placement_gap` is expected to stay
 non‑zero until legacy workers and catch‑up Jobs heartbeat as executors.
 
 Byte estimates: `ROLLOUT_APPEND_MAX_BYTES` is a per‑pass *target*, not a
-ceiling — the append path reads a whole generation before checking it, so
-one oversized generation sets the real floor and buffers cost ~2× decoded.
-The estimate is `2 × max(max_bytes, largest generation seen)`, where the
-largest generation is approximated from the table's bytes‑per‑generation
-when the scan has reported bytes. When no size is known at all the reservation
-is the executor's **whole local budget**, because that is what a single
-oversized generation can consume. Writers do not measure generation sizes, so
-this is the common case today; `planner_shadow_bytes_unknown_total` counts it.
-Measured per‑generation sizes come with the scan reading generation data
-statistics, a later change. Compaction and
-index scoring, commit‑ready class 2 and `max_consecutive_turns` come with P2's
-preparation integration; catch‑up Job heartbeats come when Jobs become an
-executor kind.
+ceiling — the append path reads a whole generation before checking it, so the
+largest single generation sets the real floor and buffers cost ~2× decoded.
+The planner does not know per‑generation sizes: a scan reports
+bytes‑through‑sealed, from which only an **average** per generation follows,
+and an average is not a maximum. Until per‑generation sizes are reported
+(a later change to the scan), every shadow reservation is the executor's
+**whole local budget**, which is the only honest answer for an unknown
+maximum. That makes the shadow capacity model deliberately pessimistic —
+it answers "could this executor safely take one unit" and **cannot** answer
+"how many units in parallel"; do not read `placement_gap` as a parallelism
+measurement. `planner_shadow_reservation_basis_total{basis}` and
+`planner_shadow_average_generation_bytes` record what information each
+reservation was based on so the gap to a size‑aware model is visible.
 
 ## 3. Leader
 

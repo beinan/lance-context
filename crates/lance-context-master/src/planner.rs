@@ -634,32 +634,30 @@ async fn shadow_pass(
         }
         // Estimated cost. ROLLOUT_APPEND_MAX_BYTES is the *target* for one
         // pass, not a ceiling: the append path reads a whole generation
-        // before checking it, so one oversized generation (decoded) sets
-        // the real floor, and buffers cost ~2x decoded. The planner does
-        // not know per-generation sizes, so the estimate is
-        //   2 x max(max_bytes, largest_generation_seen_for_table)
-        // where the largest generation is approximated from the table's
-        // sealed-bytes watermark growth per generation when the scan has
-        // reported bytes, and the configured local budget otherwise - an
-        // unknown must reserve the worst case this executor could be asked
-        // to hold, or the capacity check validates nothing.
+        // before checking it, so the largest single generation sets the
+        // real floor, and buffers cost ~2x decoded. The planner does not
+        // know per-generation sizes - a scan reports bytes-through-sealed,
+        // from which only an *average* per generation follows, and an
+        // average is not a maximum. Until per-generation sizes are
+        // reported the only honest reservation for a table whose largest
+        // generation is unknown is the executor's whole local budget. The
+        // average is recorded as a diagnostic so the gap between "what we
+        // reserve" and "what we would reserve with real sizes" is visible.
         let per_pass_target = state.config.append.rollout_append_max_bytes as u64;
-        let largest_generation = if s.pending_bytes > 0 && s.pending_generations > 0 {
+        let local_budget = state.config.append.rollout_append_local_memory_bytes as u64;
+        let average_generation = if s.pending_bytes > 0 && s.pending_generations > 0 {
             s.pending_bytes / s.pending_generations
         } else {
             0
         };
-        let worst_known = per_pass_target.max(largest_generation);
-        let expected_bytes = if s.pending_bytes == 0 {
-            // No size data at all: the whole local budget, because that is
-            // what a single oversized generation can consume.
-            (state.config.append.rollout_append_local_memory_bytes as u64).max(per_pass_target * 2)
-        } else {
-            worst_known.saturating_mul(2).max(1)
-        };
-        if s.pending_bytes == 0 {
-            metrics::counter!("planner_shadow_bytes_unknown_total").increment(1);
-        }
+        metrics::histogram!("planner_shadow_average_generation_bytes")
+            .record(average_generation as f64);
+        let expected_bytes = local_budget.max(per_pass_target * 2).max(1);
+        metrics::counter!(
+            "planner_shadow_reservation_basis_total",
+            "basis" => if s.pending_bytes == 0 { "no_size_data" } else { "average_only" }
+        )
+        .increment(1);
         let pick = headroom
             .values_mut()
             .filter(|h| h.fits(TaskKind::MergeWal, expected_bytes))
@@ -1347,6 +1345,7 @@ mod tests {
             axum::extract::State(first.clone()),
             axum::extract::Query(crate::routes::DemandQuery {
                 target: Some("hot".into()),
+                ..Default::default()
             }),
         )
         .await
@@ -1358,6 +1357,26 @@ mod tests {
         assert_eq!(report.tables.len(), 1);
         assert_eq!(report.tables[0].pending_generations, 42);
         assert_eq!(report.tables[0].shards, 2);
+        assert!(
+            report.tables[0].record.is_some(),
+            "single-target view carries the record"
+        );
+        // List mode: paged, bounded, pending-sorted, summary only.
+        let axum::Json(list) = crate::routes::scheduler_demand(
+            axum::extract::State(first.clone()),
+            axum::extract::Query(crate::routes::DemandQuery {
+                target: None,
+                limit: Some(1),
+                include_idle: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list.total_tables, 2, "hot and cold are both cached");
+        assert_eq!(list.tables_with_pending, 1);
+        assert_eq!(list.tables.len(), 1, "limit applied");
+        assert_eq!(list.tables[0].target, "hot");
+        assert!(list.tables[0].record.is_none(), "list view is summary only");
 
         // Shadow placement: with this master's heartbeat live, the hot table
         // (42 pending >= 8) gets exactly one Shadow assignment against it;

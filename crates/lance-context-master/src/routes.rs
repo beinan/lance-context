@@ -575,9 +575,16 @@ pub async fn list_cooldowns(
 #[derive(Deserialize, Default)]
 pub struct DemandQuery {
     pub target: Option<String>,
+    /// List mode only: at most this many tables, highest pending first.
+    /// Default 200, max 2000.
+    pub limit: Option<usize>,
+    /// List mode only: include tables with zero pending generations.
+    #[serde(default)]
+    pub include_idle: bool,
 }
 
-/// One table's demand as the planner sees it.
+/// One table's demand as the planner sees it. The full record is included
+/// only for a single-target query; the list view carries the summary.
 #[derive(Debug, Serialize)]
 pub struct DemandView {
     pub target: String,
@@ -588,63 +595,50 @@ pub struct DemandView {
     pub shards: usize,
     pub observed_revision: i64,
     pub updated_ms: i64,
-    pub record: lance_context_merge::demand::TableDemand,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<lance_context_merge::demand::TableDemand>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DemandReport {
-    /// Whether this master currently holds planner leadership.
+    /// Whether some master currently holds planner leadership.
     pub leader: Option<crate::planner::LeaderRecord>,
+    /// Tables in the cache (list mode), before `limit`/`include_idle`.
+    pub total_tables: usize,
+    /// Tables with pending > 0 in the cache (list mode).
+    pub tables_with_pending: usize,
     pub tables: Vec<DemandView>,
 }
 
-/// `GET /api/v1/scheduler/demand[?target=]` — the planner's demand cache,
-/// folded from per-shard watermark events. Read-only; this is what the
-/// planner would schedule from. Absent while no planner has run.
+/// `GET /api/v1/scheduler/demand[?target=|?limit=&include_idle=]` — the
+/// planner's demand cache, folded from per-shard watermark events.
+/// Read-only. With `target`, one table with its full record. Without, a
+/// paged read of the whole cache (13k tables is tens of pages) reduced to a
+/// bounded, pending-sorted summary so the response is never the size of
+/// the cache. Absent while no planner has run.
 pub async fn scheduler_demand(
     State(state): State<Arc<MasterState>>,
     Query(query): Query<DemandQuery>,
 ) -> Result<Json<DemandReport>, MasterError> {
+    use lance_context_merge::demand::TableDemand;
     let keys = crate::planner::Keys::new(&state.config.etcd.etcd_prefix);
-    let mut client = state.task_store.etcd_client().clone();
+    let client = state.task_store.etcd_client();
     let leader = client
+        .clone()
         .get(keys.leader(), None)
         .await
         .map_err(|e| MasterError::Internal(e.to_string()))?
         .kvs()
         .first()
         .and_then(|kv| serde_json::from_slice(kv.value()).ok());
-    let response = match &query.target {
-        Some(target) => {
-            if target.is_empty() || target.len() > 512 {
-                return Err(MasterError::InvalidRequest("invalid target".into()));
-            }
-            client.get(keys.demand(target), None).await
-        }
-        None => {
-            client
-                .get(
-                    keys.demand_prefix(),
-                    Some(etcd_client::GetOptions::new().with_prefix()),
-                )
-                .await
-        }
-    }
-    .map_err(|e| MasterError::Internal(e.to_string()))?;
     let prefix = keys.demand_prefix();
-    let mut tables = Vec::new();
-    for kv in response.kvs() {
-        let Ok(record) =
-            serde_json::from_slice::<lance_context_merge::demand::TableDemand>(kv.value())
-        else {
-            continue;
-        };
-        let key = String::from_utf8_lossy(kv.key());
+    let view = |key: &[u8], record: TableDemand, full: bool| {
+        let key = String::from_utf8_lossy(key);
         let target = key
             .strip_prefix(prefix.as_str())
             .and_then(crate::planner::unhex)
             .unwrap_or_else(|| key.to_string());
-        tables.push(DemandView {
+        DemandView {
             target,
             pending_generations: record.pending_generations(),
             pending_bytes: record.pending_bytes(),
@@ -652,11 +646,60 @@ pub async fn scheduler_demand(
             shards: record.shards.len(),
             observed_revision: record.observed_revision,
             updated_ms: record.updated_ms,
-            record,
-        });
+            record: full.then_some(record),
+        }
+    };
+    if let Some(target) = &query.target {
+        if target.is_empty() || target.len() > 512 {
+            return Err(MasterError::InvalidRequest("invalid target".into()));
+        }
+        let got = client
+            .clone()
+            .get(keys.demand(target), None)
+            .await
+            .map_err(|e| MasterError::Internal(e.to_string()))?;
+        let tables: Vec<DemandView> = got
+            .kvs()
+            .iter()
+            .filter_map(|kv| {
+                serde_json::from_slice::<TableDemand>(kv.value())
+                    .ok()
+                    .map(|r| view(kv.key(), r, true))
+            })
+            .collect();
+        let with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+        return Ok(Json(DemandReport {
+            leader,
+            total_tables: tables.len(),
+            tables_with_pending: with_pending,
+            tables,
+        }));
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 2000);
+    let (kvs, _) = crate::planner::read_prefix_paged(client, &prefix)
+        .await
+        .map_err(MasterError::Internal)?;
+    let total_tables = kvs.len();
+    let mut tables: Vec<DemandView> = kvs
+        .iter()
+        .filter_map(|kv| {
+            serde_json::from_slice::<TableDemand>(&kv.value)
+                .ok()
+                .map(|r| view(&kv.key, r, false))
+        })
+        .collect();
+    let tables_with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+    if !query.include_idle {
+        tables.retain(|t| t.pending_generations > 0);
     }
     tables.sort_by_key(|t| std::cmp::Reverse(t.pending_generations));
-    Ok(Json(DemandReport { leader, tables }))
+    tables.truncate(limit);
+    Ok(Json(DemandReport {
+        leader,
+        total_tables,
+        tables_with_pending,
+        tables,
+    }))
 }
 
 /// `GET /api/v1/scheduler/executors` — every live executor heartbeat with
