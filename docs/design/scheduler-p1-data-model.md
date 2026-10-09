@@ -64,9 +64,12 @@ Rules:
   it. The answer carries a bound: **Exact** when the oldest pending
   generation's own time is kept; **Upper** (the lowest kept time above it,
   at worst the newest sealed) once merging has consumed every kept entry on a
-  shard that had more than the cap pending. Only an Exact age drives aging
-  and promotion; a bound is displayed but never promotes. Counts and bytes
-  are exact in every order.
+  shard that had more than the cap pending, or a long‑lived table whose
+  early timestamps occupy the map. An Upper bound on the flush time is a
+  **floor on the wait** (the generation flushed no later than that), so
+  promotion for age uses the floor from either bound and is sound; score
+  aging uses the exact time only, so a bound cannot inflate a score. Counts
+  and bytes are exact in every order.
 * Records carry `v`. A reader rejects an event it does not understand
   (`Ignored::UnknownVersion`) and a publisher **refuses to overwrite a stored
   record from a newer schema**; `v == 0` is read as version 1.
@@ -96,13 +99,20 @@ and idempotency (design invariant 5a).
 
 ### 1.2a Reads at scale
 
-Production has ~13,400 tables and ~27,000 shard records. A single prefix
-read of `demand-events/` exceeds the etcd client's 4 MiB message cap. Every
+Production has ~13,400 tables and ~27,000 shard records; the shard count per
+table is not yet measured and records with a full `sealed_times` map are
+~1.5 KiB. A single prefix read of `demand-events/` exceeds the etcd client's
+4 MiB message cap, and so does a fixed 512‑key page of large records. Every
 planner prefix read (`demand-events/`, `demand/`, `executors/`,
-`assignments/`, `queue/`, `running/`) is paged (512 keys) **at one
-revision**, so each pass sees a consistent snapshot. The reconcile runs
-detached from the leader loop so a slow pass can never starve the lease
-keepalive; at most one pass is in flight and skipped ticks are counted.
+`assignments/`, `queue/`, `running/`) is therefore paged **by bytes**: start
+at 512 keys, halve the page on a response over 1 MiB or on a message‑size
+error, grow back when pages are small, all **at one revision** so each pass
+sees a consistent snapshot. Writes are chunked by **both** op count (etcd
+`--max-txn-ops`, 100 per txn) and request bytes (`--max-request-bytes`,
+768 KiB per txn). The reconcile runs detached from the leader loop so a slow
+pass can never starve the lease keepalive; at most one pass is in flight and
+skipped ticks are counted. Tested at 512 × 8 shards with full time maps and
+at 100 × 20 shards (both over the respective caps when unbounded).
 
 ### 1.3 What writes what in P1
 
@@ -191,23 +201,33 @@ comparison therefore answers three precise questions, each its own gauge
 
 | outcome | meaning |
 |---|---|
-| `discovery_miss` | planner scored due demand on a table with no `MergeWal` task queued or running — the real discovery loops have not noticed it |
-| `placement_gap` | planner found no headroom for a due table that reality is running — the planner's capacity model is tighter than the real pools |
-| `phantom_task` | reality has a `MergeWal` task on a table the planner sees no demand for — a lost demand event, or work the planner would not schedule |
-| `agree` | both would run it |
+| `discovery_miss` | due (non‑tail) demand, and reality has the table **neither queued nor running** — the real discovery loops have not noticed it |
+| `queued_only` | due demand that reality has queued but not running — discovered, waiting on admission or capacity |
+| `running` | due demand that reality is executing |
+| `placement_gap` | due demand the planner could not place for lack of headroom, **regardless of reality** — the planner's capacity model vs. the real pools |
+| `phantom_task` | reality has the table queued or running with no scored demand — a lost demand event, or work the planner would not schedule |
 
-`scheduler_shadow_disagreements_total{kind}` is the sum of the first three,
-kept for continuity; read the components. What "approach zero" means per
-component: `discovery_miss` falling to the tail population says the demand
-feed is complete; `phantom_task` at zero says no demand events are lost;
-`placement_gap` is expected to stay non‑zero until legacy workers and
-catch‑up Jobs heartbeat as executors, and is not a defect of the planner.
+Comparison is **per due table**, not per placement, so a table the planner
+wanted but could not place is still compared on discovery. Reality is read
+once per pass as two separate paged sets (queued, running); if that read
+fails the pass records nothing rather than zeros
+(`planner_shadow_comparison_skipped_total`).
+`scheduler_shadow_disagreements_total{kind}` is `discovery_miss +
+phantom_task`, kept for continuity; read the components. `discovery_miss`
+falling to zero says the demand feed is complete; `phantom_task` at zero
+says no demand events are lost; `placement_gap` is expected to stay
+non‑zero until legacy workers and catch‑up Jobs heartbeat as executors.
 
-Byte estimates: writers do not measure generation sizes, so `pending_bytes`
-is zero for most tables. An unknown reserves the **full per‑pass cost**
-(`2 × ROLLOUT_APPEND_MAX_BYTES`), never a token — a capacity model that
-reserves 1 byte validates nothing. `planner_shadow_bytes_unknown_total`
-counts these. Measured sizes come with the scan reading generation data
+Byte estimates: `ROLLOUT_APPEND_MAX_BYTES` is a per‑pass *target*, not a
+ceiling — the append path reads a whole generation before checking it, so
+one oversized generation sets the real floor and buffers cost ~2× decoded.
+The estimate is `2 × max(max_bytes, largest generation seen)`, where the
+largest generation is approximated from the table's bytes‑per‑generation
+when the scan has reported bytes. When no size is known at all the reservation
+is the executor's **whole local budget**, because that is what a single
+oversized generation can consume. Writers do not measure generation sizes, so
+this is the common case today; `planner_shadow_bytes_unknown_total` counts it.
+Measured per‑generation sizes come with the scan reading generation data
 statistics, a later change. Compaction and
 index scoring, commit‑ready class 2 and `max_consecutive_turns` come with P2's
 preparation integration; catch‑up Job heartbeats come when Jobs become an

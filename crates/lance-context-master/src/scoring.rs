@@ -86,19 +86,24 @@ pub fn score_merge(
     if pending == 0 {
         return None;
     }
-    // Only an exact oldest-pending time may drive aging and promotion. A
-    // shard whose age is known only as an upper bound (merged past the kept
-    // flush times) contributes no wait; its count still scores.
-    let wait_ms = demand
+    // Promotion uses a *floor* on the wait: an Upper bound on the flush time
+    // means the generation flushed no later than that, so it has waited at
+    // least this long - sound for "waited >= max_turn_wait". Score aging
+    // uses the exact time only, so a bound cannot inflate a score.
+    let wait_floor_ms = demand
+        .oldest_pending_wait_floor_ms()
+        .map(|t| (now_ms - t).max(0));
+    let wait_exact_ms = demand
         .oldest_pending_exact_ms()
         .map(|t| (now_ms - t).max(0));
+    let wait_ms = wait_floor_ms;
     let by_gens = pending as f64 / policy.min_generations.max(1) as f64;
     let by_bytes = if policy.min_bytes > 0 {
         bytes as f64 / policy.min_bytes as f64
     } else {
         0.0
     };
-    let age_boost = match wait_ms {
+    let age_boost = match wait_exact_ms {
         Some(w) if policy.max_age_secs > 0 => {
             1.0 + (w as f64 / 1000.0) / policy.max_age_secs as f64
         }
@@ -241,11 +246,11 @@ mod tests {
         assert_eq!(v[0].target, "b", "class before score");
     }
 
-    /// Round-5 finding 6: when the oldest pending time is only an upper
-    /// bound (merged past the kept entries), it must not promote for age
-    /// and must not inflate the score.
+    /// Round-5 finding 6 / round-6 finding 3: when the oldest pending time
+    /// is only an upper bound, it is a sound floor on wait and may promote,
+    /// but it must not inflate the score.
     #[test]
-    fn an_age_bound_never_promotes() {
+    fn an_age_bound_promotes_on_wait_but_does_not_boost_score() {
         let p = MergePolicy {
             max_turn_wait_secs: 10,
             max_age_secs: 10,
@@ -273,9 +278,18 @@ mod tests {
         assert!(t.oldest_pending_ms().is_some(), "a bound is shown");
         assert_eq!(t.oldest_pending_exact_ms(), None, "but is not exact");
         let s = score_merge("x", &t, &p, now).unwrap();
-        assert_eq!(s.wait_ms, None);
-        assert_eq!(s.class, Class::Normal, "64/8 = 8 >= 1, not promoted");
-        assert!((s.score - 8.0).abs() < 1e-9, "no age boost: {}", s.score);
+        // The bound is a floor on wait: newest sealed (gen 128) flushed at
+        // now - 500_000 + 128, so wait >= ~500 s >= max_turn_wait (10 s) and
+        // promotion is sound.
+        assert!(s.wait_ms.is_some_and(|w| w >= 499_000), "{:?}", s.wait_ms);
+        assert_eq!(s.class, Class::Critical);
+        assert_eq!(s.reason, "promoted_for_age");
+        // But the score itself carries no age boost from a bound.
+        assert!(
+            (s.score - 8.0).abs() < 1e-9,
+            "no age boost on a bound: {}",
+            s.score
+        );
     }
 
     #[test]

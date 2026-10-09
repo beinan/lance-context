@@ -125,7 +125,9 @@ pub struct ShardDemand {
 #[serde(rename_all = "snake_case")]
 pub enum AgeBound {
     Exact,
-    /// The true time is at or before this; never promote on it.
+    /// The true flush time is at or before this. As a bound on *waiting*
+    /// it is a floor (waited at least this long), which is sound for
+    /// promotion; as a bound on *score aging* it understates.
     Upper,
 }
 
@@ -169,8 +171,18 @@ impl ShardDemand {
         self.oldest_pending().map(|(t, _)| t)
     }
 
+    /// Oldest-pending time safe to use for **waiting-time** decisions.
+    ///
+    /// An `Upper` bound on the flush time is a **lower** bound on how long
+    /// the oldest generation has waited (it flushed no later than this), so
+    /// "waited at least `max_turn_wait`" is a sound conclusion from it.
+    /// Returns the time for both bounds; the distinction matters only when
+    /// a caller needs the exact age, not a floor on it.
+    pub fn oldest_pending_wait_floor_ms(&self) -> Option<i64> {
+        self.oldest_pending().map(|(t, _)| t)
+    }
+
     /// Exact oldest-pending time, or `None` when only a bound is known.
-    /// What the scheduler uses for promotion: a bound never promotes.
     pub fn oldest_pending_exact_ms(&self) -> Option<i64> {
         match self.oldest_pending() {
             Some((t, AgeBound::Exact)) => Some(t),
@@ -307,12 +319,21 @@ impl TableDemand {
             .min()
     }
 
-    /// Oldest **exact** pending time across shards. What promotion uses;
-    /// a shard whose age is only an upper bound contributes nothing.
+    /// Oldest **exact** pending time across shards.
     pub fn oldest_pending_exact_ms(&self) -> Option<i64> {
         self.shards
             .values()
             .filter_map(ShardDemand::oldest_pending_exact_ms)
+            .min()
+    }
+
+    /// Earliest time such that every shard's oldest pending generation
+    /// flushed **no later** than it. A sound floor on the table's wait: the
+    /// scheduler may promote on `now - this >= max_turn_wait` for any bound.
+    pub fn oldest_pending_wait_floor_ms(&self) -> Option<i64> {
+        self.shards
+            .values()
+            .filter_map(ShardDemand::oldest_pending_wait_floor_ms)
             .min()
     }
 
@@ -912,6 +933,46 @@ mod tests {
             fold_all(&small).shards["s"].oldest_pending(),
             Some((4000, AgeBound::Exact))
         );
+    }
+
+    /// Round-6 finding 3: a long-lived table whose first 70 generations
+    /// each merged immediately, then two generations sit for a day. The
+    /// first 63 timestamps occupy the bounded map forever, so the tail's
+    /// own times are known only as an upper bound - which is still a sound
+    /// *floor* on how long it has waited, and must drive promotion.
+    #[test]
+    fn long_lived_tail_still_reports_a_usable_wait() {
+        let mut events = Vec::new();
+        for g in 1..=70u64 {
+            events.push(DemandEvent {
+                flushed_at_ms: g as i64 * 1000,
+                ..ev("s", g, None, 1, EventSource::Writer)
+            });
+            events.push(ev("s", g, Some(g), 1, EventSource::Executor));
+        }
+        let day = 86_400_000i64;
+        events.push(DemandEvent {
+            flushed_at_ms: 100_000,
+            ..ev("s", 71, None, 1, EventSource::Writer)
+        });
+        events.push(DemandEvent {
+            flushed_at_ms: 100_000 + 30_000,
+            ..ev("s", 72, None, 1, EventSource::Writer)
+        });
+        let table = fold_all(&events);
+        assert_eq!(table.pending_generations(), 2);
+        let (t, bound) = table.shards["s"].oldest_pending().unwrap();
+        // Gen 71's own time (100_000) may or may not be kept; the newest
+        // sealed (gen 72, 130_000) always is. Either way the floor is no
+        // later than 130_000 and no earlier than 100_000.
+        assert!((100_000..=130_000).contains(&t), "{t} {bound:?}");
+        let now = 130_000 + day;
+        let wait = now - table.oldest_pending_wait_floor_ms().unwrap();
+        assert!(
+            wait >= day,
+            "a day-old tail must show at least a day of wait: {wait}"
+        );
+        assert_eq!(rebuild(&events).oldest_pending_wait_floor_ms(), Some(t));
     }
 
     #[test]
