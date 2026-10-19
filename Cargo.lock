@@ -4152,6 +4152,7 @@ dependencies = [
 name = "lance-context-server"
 version = "0.6.7"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "chrono",

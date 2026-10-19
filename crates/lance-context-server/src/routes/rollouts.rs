@@ -260,8 +260,8 @@ pub async fn get_rollout_store(
     let store = store_lock.read().await;
 
     Ok(Json(RolloutStoreInfo {
-        name: name.clone(),
-        uri: state.rollout_uri(&name),
+        name,
+        uri: store.uri().to_string(),
         version: Some(store.version()),
     }))
 }
