@@ -20,6 +20,19 @@ parse Arrow. The module requires neither Arrow nor a replication/log engine.
 cargo test -p lance-context-wal --features contract --lib
 ```
 
+The optional `arrow-contract` feature adds
+`ingest_contract::arrow_schema_fingerprint(&Schema)` for ingress and materializers.
+It recursively sorts JSON object keys, including nested metadata, and preserves
+field order, types, nullability and serialized dictionary attributes. Calculate
+it when binding a table generation, then retain the fingerprint on replicas.
+Only Arrow schema metadata is required; this feature does not decode IPC or load
+a replication engine. Arrow serialization changes require compatibility review
+before upgrading writers of existing contracts.
+
+```bash
+cargo test -p lance-context-wal --features arrow-contract --lib
+```
+
 The optional `record` feature provides opaque `Batch`/`BatchMeta` envelopes with
 shared `Bytes` payload ownership. `BatchMeta::check_body_length` validates frame
 lengths and a caller-supplied data/control limit before payload allocation;
