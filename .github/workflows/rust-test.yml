@@ -68,7 +68,18 @@ jobs:
           cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract --lib
           cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
       - name: WAL experiment process lifecycle tests
-        run: cargo test -p lance-context-wal --features runner --test runner
+        run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
+      - name: WAL resource observation in a container cgroup namespace
+        run: |
+          cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
+          wal_resource_test=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "resource" and (.target.kind | index("test")) and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("expected one resource test executable") end' "$RUNNER_TEMP/wal-resource-build.jsonl")
+          # Hosted runners use a host cgroup path. Remount cgroup2 inside private
+          # mount/cgroup namespaces, then drop privileges before running tests.
+          sudo unshare --mount --cgroup --propagation private sh -eu -c '
+            umount /sys/fs/cgroup
+            mount -t cgroup2 cgroup2 /sys/fs/cgroup
+            exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
+          ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
@@ -139,7 +150,20 @@ jobs:
       - name: Clean stale coverage profile data
         run: cargo llvm-cov clean --workspace
       - name: Collect coverage (unit and integration tests)
-        run: cargo llvm-cov --no-report --workspace --all-features
+        run: |
+          # All features include the resource integration test. Give coverage
+          # the same cgroup scope as the ordinary test job, without running
+          # Cargo or test executables as root. Preserve the build configuration.
+          sudo --preserve-env=CARGO_HOME,RUSTUP_HOME,RUSTUP_TOOLCHAIN,RUSTFLAGS,RUST_MIN_STACK,LANCE_MEM_POOL_SIZE,RUST_BACKTRACE,CARGO_INCREMENTAL \
+            unshare --mount --cgroup --propagation private sh -eu -c '
+              umount /sys/fs/cgroup
+              mount -t cgroup2 cgroup2 /sys/fs/cgroup
+              wal_test_uid=$1
+              wal_test_gid=$2
+              shift 2
+              exec setpriv --reuid "$wal_test_uid" --regid "$wal_test_gid" --clear-groups --no-new-privs "$@"
+            ' sh "$(id -u)" "$(id -g)" env "HOME=$HOME" "PATH=$PATH" \
+            cargo llvm-cov --no-report --workspace --all-features
       - name: Collect coverage (etcd-backed ignored tests)
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
