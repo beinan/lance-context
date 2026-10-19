@@ -2460,7 +2460,8 @@ impl StorageBase {
             handler,
         )));
 
-        Dataset::write(batches, uri, Some(params)).await
+        crate::merge_write_scope::at_initial_version(Dataset::write(batches, uri, Some(params)))
+            .await
     }
 }
 
