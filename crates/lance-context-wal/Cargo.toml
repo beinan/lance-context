@@ -7,6 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
+contract = ["dep:serde", "dep:sha2"]
 record = ["dep:bytes", "bytes/serde", "dep:serde", "dep:sha2", "dep:uuid"]
 placement = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:sha2", "dep:uuid"]
 admission = ["dep:anyhow", "dep:serde"]
