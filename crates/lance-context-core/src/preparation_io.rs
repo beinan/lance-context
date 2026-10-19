@@ -13,6 +13,13 @@ use std::sync::{
 pub(crate) struct ProgressWrapper(pub Arc<AtomicU64>);
 
 impl WrappingObjectStore for ProgressWrapper {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
     fn wrap(&self, _: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(ProgressStore {
             inner: original,
@@ -81,6 +88,7 @@ impl ObjectStore for ProgressStore {
         let meta = result.meta.clone();
         let range = result.range.clone();
         let attributes = result.attributes.clone();
+        let extensions = result.extensions.clone();
         let steps = self.steps.clone();
         // Count body chunks after they arrive, not successful response headers.
         // into_stream also observes actual local file reads without buffering.
@@ -99,6 +107,7 @@ impl ObjectStore for ProgressStore {
             meta,
             range,
             attributes,
+            extensions,
         })
     }
 
@@ -257,6 +266,13 @@ pub mod test_support {
     pub struct ThrottleWrapper(pub Throttle);
 
     impl WrappingObjectStore for ThrottleWrapper {
+        fn wrap_paginated(
+            &self,
+            _: &str,
+            original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            Some(original)
+        }
         fn wrap(&self, _: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
             Arc::new(ThrottledStore {
                 inner: original,

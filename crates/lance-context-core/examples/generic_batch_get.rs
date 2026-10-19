@@ -1,5 +1,6 @@
 //! Run with `cargo run -p lance-context-core --example generic_batch_get`.
 //! Supply `--uri` to benchmark an existing store without changing its data.
+#![recursion_limit = "256"]
 
 use std::time::Instant;
 

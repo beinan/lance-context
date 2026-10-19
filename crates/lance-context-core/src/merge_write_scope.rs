@@ -318,6 +318,15 @@ struct Layered {
 }
 
 impl lance_io::object_store::WrappingObjectStore for Layered {
+    fn wrap_paginated(
+        &self,
+        name: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        self.inner
+            .wrap_paginated(name, original)
+            .and_then(|inner| self.outer.wrap_paginated(name, inner))
+    }
     fn wrap(
         &self,
         name: &str,
@@ -439,7 +448,7 @@ pub(crate) async fn drain_generations(
     let resource = format!("shard:{}", store.shard_id());
     for _ in 0..10 {
         let mut next = store
-            .read_latest()
+            .refresh_latest()
             .await?
             .ok_or_else(|| Error::io("Shard manifest not found"))?;
         if next.writer_epoch != epoch {
@@ -449,17 +458,17 @@ pub(crate) async fn drain_generations(
             .version
             .checked_add(1)
             .ok_or_else(|| Error::io("manifest version overflow"))?;
-        next.flushed_generations
+        next.sstables
             .retain(|g| !generations.contains(&g.generation));
         authorize(&resource, next.version).await?;
         let writer = store.clone();
         let scope = CURRENT.try_with(Arc::clone).ok();
         let (next, written) = shield_observed(
             async move {
-                let written = writer.write(&next).await;
+                let written = commit_exact_shard(&writer, &next).await;
                 if written
                     .as_ref()
-                    .is_err_and(|e| !e.to_string().contains("already exists"))
+                    .is_err_and(|e| !matches!(e, Error::RetryableCommitConflict { .. }))
                 {
                     if let Some(scope) = scope {
                         scope.mark_uncertain();
@@ -472,11 +481,36 @@ pub(crate) async fn drain_generations(
         .await?;
         match written {
             Ok(_) => return Ok(next),
-            Err(error) if error.to_string().contains("already exists") => continue,
+            Err(Error::RetryableCommitConflict { .. }) => continue,
             Err(error) => return Err(error),
         }
     }
     Err(Error::io("shard drain exceeded conditional-write retries"))
+}
+
+/// Adapt Lance's retrying update API to one previously authorized version.
+/// Returning the SAME manifest on a retry makes Lance's successor check reject
+/// a moved predecessor before any new PUT; the caller must authorize again.
+pub(crate) async fn commit_exact_shard(
+    store: &lance::dataset::mem_wal::ShardManifestStore,
+    next: &lance_index::mem_wal::ShardManifest,
+) -> Result<lance_index::mem_wal::ShardManifest> {
+    let moved = std::sync::atomic::AtomicBool::new(false);
+    let result = store
+        .commit_update(next.writer_epoch, |current| {
+            if current.version.checked_add(1) != Some(next.version) {
+                moved.store(true, Ordering::Relaxed);
+            }
+            next.clone()
+        })
+        .await;
+    if result.is_err() && moved.load(Ordering::Relaxed) {
+        return Err(Error::retryable_commit_conflict_source(
+            next.version,
+            "shard manifest predecessor changed; reauthorize".into(),
+        ));
+    }
+    result
 }
 
 /// The owned protocol is supported only with immutable conditional manifest
@@ -569,7 +603,7 @@ pub async fn fence_manifest_versions(
         let mut fenced = false;
         for _ in 0..64 {
             let mut next = store
-                .read_latest()
+                .refresh_latest()
                 .await?
                 .ok_or_else(|| Error::io("Shard manifest missing during recovery"))?;
             if next.version > *high {
@@ -580,9 +614,9 @@ pub async fn fence_manifest_versions(
                 .version
                 .checked_add(1)
                 .ok_or_else(|| Error::io("manifest version overflow"))?;
-            match store.write(&next).await {
+            match commit_exact_shard(&store, &next).await {
                 Ok(_) => {}
-                Err(error) if error.to_string().contains("already exists") => {}
+                Err(Error::RetryableCommitConflict { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
