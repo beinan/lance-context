@@ -67,6 +67,8 @@ jobs:
         run: |
           cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract --lib
           cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
+      - name: WAL experiment process lifecycle tests
+        run: cargo test -p lance-context-wal --features runner --test runner
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0

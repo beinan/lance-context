@@ -4194,6 +4194,7 @@ dependencies = [
  "bytes",
  "clap",
  "hdrhistogram",
+ "libc",
  "raft-engine",
  "raft-proto",
  "serde",
