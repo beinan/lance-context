@@ -132,6 +132,15 @@ prepared before timing and reused across rounds. Compression is disabled unless
 inspection. This measures local durable writes, not replicated ACKs, crashes,
 power loss or Blob/Lance publication.
 
+Disk footprint is observed after the writers finish and the engine closes,
+outside write and reopen timing. `disk_apparent_bytes` sums regular file lengths;
+`disk_allocated_bytes` sums their allocated blocks on Unix and is null elsewhere.
+`disk_bytes` conservatively sums the larger apparent/allocated size of each file
+(apparent size on other platforms). These are directory footprint observations,
+not physical bytes written or write amplification. The pinned engine's segment
+estimate is reported separately as `engine_estimated_disk_bytes`: large records
+can overshoot the target segment size and make that estimate too small.
+
 The pinned raft-engine 0.4.2 has a separate `sync-probe` command to inspect empty
 sync versus a nonempty synced barrier:
 
