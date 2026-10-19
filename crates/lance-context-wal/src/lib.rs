@@ -13,3 +13,6 @@ pub mod admission;
 
 #[cfg(feature = "ipc")]
 pub mod ipc;
+
+#[cfg(feature = "record")]
+pub mod record;

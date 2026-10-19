@@ -3,6 +3,27 @@
 Feature-gated Rust measurements for choosing a WAL payload path and durable
 local log engine. This crate does not change production ingestion or Lance OSS.
 
+Implementation and validation are tracked in
+[#378](https://github.com/lance-format/lance-context/issues/378). Related PRs should
+include `Refs #378`; individual steps should leave the tracking issue open.
+
+The optional `record` feature provides opaque `Batch`/`BatchMeta` envelopes with
+shared `Bytes` payload ownership. `BatchMeta::check_body_length` validates frame
+lengths and a caller-supplied data/control limit before payload allocation;
+`Batch::validate` also checks the complete SHA-256 digest. Construction and cloning
+retain the input allocation. Digest computation scans the payload; this is not
+end-to-end zero-copy. Replication can use this feature without Arrow or a log engine.
+
+Routing, producer sequencing/fencing, control commands and durable commit still
+require separate validation. The record domain tags reserve the single-group,
+multi-group and source-control formats used by the ingestion experiments. This
+PR adds the envelope, not their state machines. Serialize metadata separately
+from bulk bytes in network paths; `Debug` excludes the body.
+
+```bash
+cargo test -p lance-context-wal --features record --lib
+```
+
 The optional `ipc` feature exposes `ipc::decode(Bytes, expected_schema)` for
 materializers. It decodes multiple uncompressed record batches and dictionaries
 while sharing binary payload ownership with the input. Numeric alignment repair,
