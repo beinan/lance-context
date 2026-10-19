@@ -9,7 +9,8 @@ description = "Independent Rust WAL experiments owned by lance-context"
 [features]
 placement = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:sha2", "dep:uuid"]
 admission = ["dep:anyhow", "dep:serde"]
-lab = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "dep:raft-proto", "dep:serde_json"]
+ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes"]
+lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
@@ -28,6 +29,7 @@ sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
 
 [dev-dependencies]
+arrow-ipc = { version = "58", features = ["zstd"] }
 tempfile = "3"
 
 [[bin]]

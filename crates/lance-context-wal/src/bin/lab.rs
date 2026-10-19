@@ -9,8 +9,7 @@ use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StringArray, UInt64Array};
-use arrow_buffer::Buffer;
-use arrow_ipc::reader::{read_footer_length, FileDecoder, FileReader};
+use arrow_ipc::reader::FileReader;
 use arrow_ipc::writer::FileWriter;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -131,21 +130,10 @@ fn encode(batch: &RecordBatch) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn decode(buffer: &Buffer, schema: arrow_schema::SchemaRef) -> Result<RecordBatch> {
-    let end = buffer.len().checked_sub(10).context("short IPC file")?;
-    let len = read_footer_length(buffer[end..].try_into()?)?;
-    let start = end.checked_sub(len).context("bad footer")?;
-    let footer = arrow_ipc::root_as_footer(&buffer[start..end])
-        .map_err(|e| anyhow::anyhow!("invalid IPC footer: {e}"))?;
-    let decoder = FileDecoder::new(schema, footer.version());
-    let blocks = footer.recordBatches().context("no batches")?;
-    ensure!(blocks.len() == 1, "one batch required");
-    let block = blocks.get(0);
-    let length = block.bodyLength() as usize + block.metaDataLength() as usize;
-    let bytes = buffer.slice_with_length(block.offset() as usize, length);
-    decoder
-        .read_record_batch(block, &bytes)?
-        .context("missing batch")
+fn decode(buffer: &Bytes, schema: arrow_schema::SchemaRef) -> Result<RecordBatch> {
+    let mut batches = lance_context_wal::ipc::decode(buffer.clone(), schema)?;
+    ensure!(batches.len() == 1, "one benchmark batch required");
+    Ok(batches.remove(0))
 }
 
 fn measured<T>(
@@ -178,15 +166,15 @@ fn measured<T>(
 fn codec(size: usize, rows: usize, iterations: usize) -> Result<()> {
     ensure!(size > 0 && rows > 0 && iterations > 0);
     let batch = make_batch(rows, size)?;
-    let buffer = Buffer::from_vec(encode(&batch)?);
+    let buffer = Bytes::from(encode(&batch)?);
     verify_shared_decode(&buffer, &batch)?;
-    let reader_batch = FileReader::try_new(Cursor::new(buffer.as_slice()), None)?
+    let reader_batch = FileReader::try_new(Cursor::new(buffer.as_ref()), None)?
         .next()
         .context("missing reader batch")??;
     ensure!(reader_batch == batch, "reader round trip mismatch");
     measured("encode_ipc", iterations, buffer.len(), || encode(&batch))?;
     measured("file_reader", iterations, buffer.len(), || {
-        Ok(FileReader::try_new(Cursor::new(buffer.as_slice()), None)?
+        Ok(FileReader::try_new(Cursor::new(buffer.as_ref()), None)?
             .next()
             .context("missing batch")??)
     })?;
@@ -197,7 +185,7 @@ fn codec(size: usize, rows: usize, iterations: usize) -> Result<()> {
     let mut unaligned = Vec::with_capacity(buffer.len() + 1);
     unaligned.push(0);
     unaligned.extend_from_slice(&buffer);
-    let unaligned = Buffer::from_vec(unaligned).slice(1);
+    let unaligned = Bytes::from(unaligned).slice(1..);
     verify_shared_decode(&unaligned, &batch)?;
     measured(
         "unaligned_shared_buffer_decoder",
@@ -226,7 +214,7 @@ fn codec(size: usize, rows: usize, iterations: usize) -> Result<()> {
 
 /// Check equality and actual payload ownership outside the measured interval.
 /// Numeric offset buffers can still allocate when fixing alignment.
-fn verify_shared_decode(buffer: &Buffer, expected: &RecordBatch) -> Result<()> {
+fn verify_shared_decode(buffer: &Bytes, expected: &RecordBatch) -> Result<()> {
     let decoded = decode(buffer, expected.schema())?;
     ensure!(&decoded == expected, "full Arrow round trip mismatch");
     let bodies = decoded
