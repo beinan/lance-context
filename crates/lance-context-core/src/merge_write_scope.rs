@@ -22,10 +22,17 @@ use tokio::sync::{oneshot, Notify};
 
 tokio::task_local! { static CURRENT: Arc<MergeWriteScope>; }
 tokio::task_local! { static EXPECTED_BASE_VERSION: u64; }
+tokio::task_local! { static INITIAL_DATASET_CREATE: (); }
 
 /// Pin the next publication without replacing a dataset's captured owner guard.
 pub(crate) async fn at_base_version<F: Future>(version: u64, work: F) -> F::Output {
     EXPECTED_BASE_VERSION.scope(version, work).await
+}
+
+/// A racing create may only publish version one. This is scoped to the create
+/// future so the returned dataset remains usable for subsequent normal writes.
+pub(crate) async fn at_initial_version<F: Future>(work: F) -> F::Output {
+    INITIAL_DATASET_CREATE.scope((), work).await
 }
 
 #[derive(Debug, Default)]
@@ -660,6 +667,18 @@ impl CommitHandler for GuardedCommit {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let work = async {
+            if INITIAL_DATASET_CREATE
+                .try_with(|()| manifest.version != 1)
+                .unwrap_or(false)
+            {
+                // Lance can rebase a raced Create into an overwrite of the
+                // winner. Reject before the inner commit, without inviting
+                // another conflict retry or retaining a restriction on the
+                // returned dataset handle.
+                return Err(CommitError::OtherError(Error::invalid_input(
+                    "dataset creation cannot publish a successor manifest",
+                )));
+            }
             if EXPECTED_BASE_VERSION
                 .try_with(|version| manifest.version != *version)
                 .unwrap_or(false)
@@ -767,6 +786,10 @@ impl CommitHandler for GuardedCommit {
         self.inner.delete(base_path).await
     }
 }
+
+#[cfg(test)]
+#[path = "merge_write_scope/create_tests.rs"]
+mod create_tests;
 
 #[cfg(test)]
 mod tests {
