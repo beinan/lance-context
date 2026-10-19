@@ -11,7 +11,9 @@ use lance_context_api::{
     CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
     ListRolloutStoresResponse, ListRolloutsResponse, RolloutStoreInfo, VersionResponse,
 };
-use lance_context_core::{rollout_record_from_add_request, rollout_record_to_dto};
+#[cfg(test)]
+use lance_context_core::rollout_record_from_add_request;
+use lance_context_core::rollout_record_to_dto;
 use lance_context_core::{
     CompactionConfig, RolloutFilters, RolloutRecord, RolloutStore, RolloutStoreOptions,
 };
@@ -356,10 +358,7 @@ pub async fn add_rollouts(
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
-    let core_records: Vec<RolloutRecord> = records
-        .iter()
-        .map(rollout_record_from_add_request)
-        .collect();
+    let core_records: Vec<RolloutRecord> = records.into_iter().map(RolloutRecord::from).collect();
     let count = core_records.len();
 
     // A read lock: `add` is `&self` and MemWAL appends are internally
