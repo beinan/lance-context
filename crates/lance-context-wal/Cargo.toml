@@ -8,6 +8,7 @@ description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
 placement = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:sha2", "dep:uuid"]
+admission = ["dep:anyhow", "dep:serde"]
 lab = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "dep:raft-proto", "dep:serde_json"]
 
 [dependencies]
@@ -25,6 +26,9 @@ serde_json = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "context-wal-lab"
