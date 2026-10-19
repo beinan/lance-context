@@ -29,7 +29,7 @@ struct Accounting {
 pub struct Budget {
     directory: PathBuf,
     written: Arc<AtomicU64>,
-    data_limit: u64,
+    data_limit: AtomicU64,
     max: u64,
     accounting: Mutex<Accounting>,
     filesystem: Arc<RwLock<()>>,
@@ -58,13 +58,27 @@ impl Budget {
             written,
             filesystem,
             max: max as u64,
-            data_limit: (max - reserve) as u64,
+            data_limit: AtomicU64::new((max - reserve) as u64),
             accounting: Mutex::new(Accounting {
                 measured,
                 counter_at_measurement: counter,
                 pending: 0,
             }),
         }))
+    }
+    /// Tighten new-proposal admission to leave additional space for checkpoint
+    /// copies and engine rewrites. All groups observe the same ceiling. Existing
+    /// reservations remain charged; lowering the limit does not revoke them.
+    /// The total budget and already accepted replication traffic are unchanged.
+    pub fn limit_data(&self, bytes: usize) -> Result<()> {
+        let bytes = u64::try_from(bytes)?;
+        let _state = self.accounting.lock().unwrap();
+        ensure!(
+            bytes > 0 && bytes <= self.data_limit.load(Ordering::Acquire),
+            "data limit must be positive and cannot raise the producer ceiling"
+        );
+        self.data_limit.store(bytes, Ordering::Release);
+        Ok(())
     }
     fn accounted(&self, state: &Accounting) -> u64 {
         state.measured.saturating_add(
@@ -79,7 +93,11 @@ impl Budget {
     pub fn reserve(self: &Arc<Self>, bytes: usize, data: bool) -> Result<Reservation> {
         let bytes = u64::try_from(bytes)?;
         let mut state = self.accounting.lock().unwrap();
-        let limit = if data { self.data_limit } else { self.max };
+        let limit = if data {
+            self.data_limit.load(Ordering::Acquire)
+        } else {
+            self.max
+        };
         ensure!(
             self.accounted(&state)
                 .saturating_add(state.pending)
@@ -124,7 +142,7 @@ impl Budget {
             measured_disk_bytes: state.measured,
             accounted_disk_bytes: self.accounted(&state),
             reserved_proposal_bytes: state.pending,
-            data_limit: self.data_limit,
+            data_limit: self.data_limit.load(Ordering::Acquire),
             max_log_bytes: self.max,
         }
     }
@@ -168,6 +186,31 @@ fn retained_disk_bytes(directory: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lower_ceiling_keeps_pending_proposals_and_maintenance_charged() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let budget = Budget::new(
+            directory.path(),
+            Arc::new(AtomicU64::new(0)),
+            8 * 1024 * 1024,
+            Arc::new(RwLock::new(())),
+        )?;
+        let data = budget.reserve(4 * 1024 * 1024, true)?;
+        budget.limit_data(2 * 1024 * 1024)?;
+        assert!(budget.limit_data(0).is_err());
+        assert!(budget.limit_data(3 * 1024 * 1024).is_err());
+        assert_eq!(budget.snapshot().data_limit, 2 * 1024 * 1024);
+        assert_eq!(budget.snapshot().reserved_proposal_bytes, 4 * 1024 * 1024);
+        assert!(budget.reserve(1, true).is_err());
+        let maintenance = budget.reserve(4 * 1024 * 1024, false)?;
+        assert!(budget.reserve(1, false).is_err());
+        drop(data);
+        // Maintenance still occupies the shared producer ceiling.
+        assert!(budget.reserve(1, true).is_err());
+        drop(maintenance);
+        assert!(budget.reserve(2 * 1024 * 1024, true).is_ok());
+        Ok(())
+    }
     #[test]
     fn racing_groups_share_admission_and_preserve_control_window() -> Result<()> {
         let directory = tempfile::tempdir()?;

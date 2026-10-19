@@ -139,24 +139,25 @@ pub struct Receipt {
 mod tests {
     use super::*;
 
-    fn measured_layout() -> Layout {
+    fn synthetic_layout() -> Layout {
         Layout {
-            cluster: Uuid::parse_str("b2da8f23-3a69-4538-9f86-2c10a61540cc").unwrap(),
-            nodes: (1..=3).map(|id| (id, format!(
-                "context-wal-lab-20261018-{}.context-wal-lab-20261018.souschef.svc.cluster.local:7800", id-1))).collect(),
-            groups: (1..=3).map(|id| (id, vec![1,2,3])).collect(),
+            cluster: Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap(),
+            nodes: (1..=3)
+                .map(|id| (id, format!("wal-{}.example.invalid:7800", id - 1)))
+                .collect(),
+            groups: (1..=3).map(|id| (id, vec![1, 2, 3])).collect(),
             buckets: (0..1024).map(|bucket| 1 + bucket % 3).collect(),
         }
     }
 
     #[test]
-    fn layout_fingerprint_matches_recorded_multinode_experiment() -> Result<()> {
-        // Fixed compatibility vector from the real PHX protocol10 experiment.
+    fn layout_fingerprint_matches_synthetic_compatibility_vector() -> Result<()> {
+        // Synthetic compatibility vector, independently checked with OpenSSL.
         // Changing serialization or the hash domain must not reroute old data.
-        let layout = measured_layout();
+        let layout = synthetic_layout();
         let expected = [
-            32, 110, 106, 153, 114, 83, 142, 215, 88, 81, 79, 126, 93, 225, 129, 65, 94, 127, 167,
-            140, 244, 218, 38, 47, 110, 21, 222, 171, 71, 7, 133, 7,
+            44, 57, 66, 143, 150, 96, 112, 119, 182, 55, 27, 115, 233, 38, 124, 127, 206, 205, 105,
+            78, 241, 190, 203, 129, 173, 136, 224, 91, 83, 23, 187, 33,
         ];
         assert_eq!(layout.fingerprint()?, expected);
         let decoded: Layout = serde_json::from_slice(&serde_json::to_vec(&layout)?)?;
@@ -172,19 +173,19 @@ mod tests {
 
     #[test]
     fn placement_rejects_ambiguous_or_incomplete_ownership() {
-        let mut layout = measured_layout();
+        let mut layout = synthetic_layout();
         layout.groups.insert(1, vec![1, 1, 3]);
         assert!(layout.validate().is_err());
-        let mut layout = measured_layout();
+        let mut layout = synthetic_layout();
         layout.nodes.insert(2, layout.nodes[&1].clone());
         assert!(layout.validate().is_err());
-        let mut layout = measured_layout();
+        let mut layout = synthetic_layout();
         layout.buckets[0] = 99;
         assert!(layout.validate().is_err());
-        let mut layout = measured_layout();
+        let mut layout = synthetic_layout();
         layout.nodes.insert(4, "unused:7800".into());
         assert!(layout.validate().is_err());
-        let mut layout = measured_layout();
+        let mut layout = synthetic_layout();
         layout.groups = (1..=9).map(|id| (id, vec![1, 2, 3])).collect();
         layout.buckets = (0..16).map(|id| 1 + id % 9).collect();
         assert!(layout.validate().is_err());
@@ -197,7 +198,7 @@ mod tests {
         // SHA-256 of the literal v1 prefix and three LE-u64 length=1 fields
         // a/b/c, independently checked with OpenSSL: c5f0901a5b7f96b9... .
         assert_eq!(bucket_for("a", "b", "c", 65536)?, 0xf0c5);
-        let layout = measured_layout();
+        let layout = synthetic_layout();
         let restored: Layout = serde_json::from_slice(&serde_json::to_vec(&layout)?)?;
         for session in ["session-1", "session-2", "训练会话", ""] {
             let bucket = layout.session_bucket("tenant", "namespace/table", session)?;

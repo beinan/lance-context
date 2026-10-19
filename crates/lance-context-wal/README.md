@@ -15,8 +15,8 @@ here. A receipt identifies a position and is not authentication or proof of comm
 cargo test -p lance-context-wal --features placement --lib
 ```
 
-Compatibility tests preserve a layout fingerprint recorded by a real three-node
-experiment and a fixed session-hash vector. Other tests reject ambiguous ownership
+Compatibility tests preserve a synthetic layout fingerprint and a fixed
+session-hash vector. Other tests reject ambiguous ownership
 and ensure routes survive JSON serialization and restart.
 
 The independent `admission` feature provides one proposal budget shared by all
@@ -25,6 +25,13 @@ groups on a node. Data proposals leave 25% of the configured budget (up to
 counters account for peer, control and rewrite traffic between directory scans.
 Refresh measures file lengths and allocated blocks, rather than estimating
 segment sizes. Successful admission does not walk the directory.
+
+`Budget::limit_data` can lower the shared producer ceiling to leave more space
+for checkpoint copies and log rewrites. It never raises the total budget or
+cancels outstanding reservations. Maintenance callers use the total-budget
+reservation path; using producer admission for checkpoints can prevent recovery
+of space precisely when producers are throttled. The default 25% control window
+alone does not guarantee enough temporary space for full-copy maintenance.
 
 This is proposal admission, not filesystem space reservation or a limit on
 already accepted replication traffic. Callers must supply a monotonic write
