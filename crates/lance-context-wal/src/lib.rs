@@ -7,3 +7,6 @@
 
 #[cfg(feature = "placement")]
 pub mod placement;
+
+#[cfg(feature = "admission")]
+pub mod admission;

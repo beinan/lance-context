@@ -19,6 +19,23 @@ Compatibility tests preserve a layout fingerprint recorded by a real three-node
 experiment and a fixed session-hash vector. Other tests reject ambiguous ownership
 and ensure routes survive JSON serialization and restart.
 
+The independent `admission` feature provides one proposal budget shared by all
+groups on a node. Data proposals leave 25% of the configured budget (up to
+256 MiB) for control traffic. Reservations release on drop; encoded engine-write
+counters account for peer, control and rewrite traffic between directory scans.
+Refresh measures file lengths and allocated blocks, rather than estimating
+segment sizes. Successful admission does not walk the directory.
+
+This is proposal admission, not filesystem space reservation or a limit on
+already accepted replication traffic. Callers must supply a monotonic write
+counter covering every group and protect file lifecycle changes with the shared
+lock. Snapshot collection and replica-pressure coordination are still required
+for sustained operation. No production writer is connected to this module yet.
+
+```bash
+cargo test -p lance-context-wal --features admission --lib
+```
+
 ```bash
 cargo build --release -p lance-context-wal --features lab --bin context-wal-lab
 target/release/context-wal-lab codec --payload-bytes 262144 --rows 8 --iterations 30
