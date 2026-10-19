@@ -19,3 +19,6 @@ pub mod record;
 
 #[cfg(feature = "contract")]
 pub mod ingest_contract;
+
+#[cfg(feature = "vectored-io")]
+pub mod transport_io;

@@ -65,7 +65,7 @@ jobs:
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
       - name: WAL placement, admission, record, contract and IPC decoding tests
         run: |
-          cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract --lib
+          cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract,vectored-io --lib
           cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
       - name: WAL experiment process lifecycle tests
         run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
