@@ -16,3 +16,6 @@ pub mod ipc;
 
 #[cfg(feature = "record")]
 pub mod record;
+
+#[cfg(feature = "contract")]
+pub mod ingest_contract;

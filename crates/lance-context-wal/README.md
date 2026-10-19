@@ -7,6 +7,19 @@ Implementation and validation are tracked in
 [#378](https://github.com/lance-format/lance-context/issues/378). Related PRs should
 include `Refs #378`; individual steps should leave the tracking issue open.
 
+The independent `contract` feature defines ingestion routing keys, the schema
+fingerprint, immutable-ID policy and record byte/row limits. Validation checks
+the representation after decoding; callers must durably bind and compare the
+complete contract for each table generation. The ingress still validates actual
+Arrow input, and the materializer must support the registered maximum record.
+This component does not enforce persistence, authentication or ID uniqueness.
+Schema hashing accepts already canonical bytes; it does not normalize JSON or
+parse Arrow. The module requires neither Arrow nor a replication/log engine.
+
+```bash
+cargo test -p lance-context-wal --features contract --lib
+```
+
 The optional `record` feature provides opaque `Batch`/`BatchMeta` envelopes with
 shared `Bytes` payload ownership. `BatchMeta::check_body_length` validates frame
 lengths and a caller-supplied data/control limit before payload allocation;
