@@ -10,3 +10,6 @@ pub mod placement;
 
 #[cfg(feature = "admission")]
 pub mod admission;
+
+#[cfg(feature = "ipc")]
+pub mod ipc;
