@@ -18,6 +18,9 @@ use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
 use raft_proto::eraftpb::Entry;
 use serde_json::json;
 
+#[path = "lab/disk_usage.rs"]
+mod disk_usage;
+
 struct CountingAllocator;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -314,8 +317,11 @@ fn disk(
         )?;
     }
     let elapsed = writes_started.elapsed();
-    let disk_bytes = engine.get_used_size();
+    let engine_estimated_disk_bytes = engine.get_used_size();
     drop(engine);
+    // The pinned engine estimates segment count * target size; a large batch
+    // can overshoot that target. Observe actual files outside write/reopen timing.
+    let disk_usage = disk_usage::measure(&directory)?;
     let recovery_started = Instant::now();
     let engine = Engine::open(config)?;
     let reopen = recovery_started.elapsed();
@@ -342,7 +348,11 @@ fn disk(
         "rounds":rounds, "compression_threshold":compression, "payload_mib": size as f64 * batch as f64 * rounds as f64 * writers as f64 / 1048576.0,
         "elapsed_seconds":elapsed.as_secs_f64(), "payload_mib_per_second":size as f64 * batch as f64 * rounds as f64 * writers as f64 / 1048576.0 / elapsed.as_secs_f64(),
         "batch_latency_us_p50":latency.value_at_quantile(0.5),"batch_latency_us_p99":latency.value_at_quantile(0.99),
-        "disk_bytes":disk_bytes,"reopen_seconds":reopen.as_secs_f64(),"verify_seconds":verify_started.elapsed().as_secs_f64(),
+        "disk_bytes":disk_usage.accounted_bytes,
+        "disk_apparent_bytes":disk_usage.apparent_bytes,
+        "disk_allocated_bytes":disk_usage.allocated_bytes,
+        "engine_estimated_disk_bytes":engine_estimated_disk_bytes,
+        "reopen_seconds":reopen.as_secs_f64(),"verify_seconds":verify_started.elapsed().as_secs_f64(),
         "verified_entries":writers * rounds * batch,"preparation_seconds": writes_started.duration_since(start).as_secs_f64(),
         "directory":directory})
     );

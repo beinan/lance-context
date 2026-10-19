@@ -62,6 +62,7 @@ jobs:
       - name: WAL component correctness smoke tests
         run: |
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
+          cargo test -p lance-context-wal --features lab --bin context-wal-lab
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
       - name: WAL placement, admission, record, contract and IPC decoding tests
         run: |
