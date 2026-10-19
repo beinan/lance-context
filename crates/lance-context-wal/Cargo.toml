@@ -1,0 +1,28 @@
+[package]
+name = "lance-context-wal"
+version = "0.6.7"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Independent Rust WAL experiments owned by lance-context"
+
+[features]
+lab = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "dep:raft-proto", "dep:serde_json"]
+
+[dependencies]
+anyhow = { version = "1", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-buffer = { version = "58", optional = true }
+arrow-ipc = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+bytes = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+hdrhistogram = { version = "7", optional = true }
+raft-engine = { version = "=0.4.2", default-features = false, optional = true }
+raft-proto = { version = "=0.7.0", optional = true }
+serde_json = { version = "1", optional = true }
+
+[[bin]]
+name = "context-wal-lab"
+path = "src/bin/lab.rs"
+required-features = ["lab"]

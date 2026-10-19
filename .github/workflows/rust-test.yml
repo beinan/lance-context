@@ -59,6 +59,10 @@ jobs:
         # regression test was dead weight in CI. `--workspace` covers the crates
         # that were silently untested (api, server, client, metrics, the facade).
         run: cargo test --workspace --all-targets
+      - name: WAL component correctness smoke tests
+        run: |
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
