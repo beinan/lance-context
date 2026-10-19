@@ -76,7 +76,8 @@ jobs:
           # Hosted runners use a host cgroup path. Remount cgroup2 inside private
           # mount/cgroup namespaces, then drop privileges before running tests.
           sudo unshare --mount --cgroup --propagation private sh -eu -c '
-            mount -t cgroup2 none /sys/fs/cgroup
+            umount /sys/fs/cgroup
+            mount -t cgroup2 cgroup2 /sys/fs/cgroup
             exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
           ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
       - name: Start etcd for HA scheduler test
