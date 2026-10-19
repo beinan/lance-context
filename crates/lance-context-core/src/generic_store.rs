@@ -528,7 +528,7 @@ impl GenericStore {
         // pending WAL generations before the key/work budgets can reject it.
         collect_scan_keys(dataset, &mut ids, &mut id_bytes, &mut scanned).await?;
         for snapshot in snapshots {
-            for generation in &snapshot.flushed_generations {
+            for generation in &snapshot.sstables {
                 let path = self
                     .base
                     .flushed_generation_uri(snapshot.shard_id, &generation.path);

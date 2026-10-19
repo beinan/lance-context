@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use axum::Router;
 use clap::Parser;
 use tokio::net::TcpListener;

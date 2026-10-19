@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use lance_context_api::AddRecordRequest;
 use lance_context_core::{
     record_from_add_request, ContextStore, RolloutRecord, RolloutStore, RolloutStoreOptions,

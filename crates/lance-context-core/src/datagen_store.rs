@@ -335,7 +335,7 @@ impl DatagenStore {
         let mut generations: Vec<(u64, String)> = snapshots
             .iter()
             .flat_map(|snapshot| {
-                snapshot.flushed_generations.iter().map(|generation| {
+                snapshot.sstables.iter().map(|generation| {
                     (
                         generation.generation,
                         self.base

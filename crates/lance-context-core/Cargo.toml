@@ -19,9 +19,10 @@ metrics = ["dep:metrics"]
 
 [dependencies]
 async-trait = "0.1.92"
-lance-table = "9.0.0"
-lance-io = "9.0.0"
-object_store = "0.13.2"
+lance-table = "13.0.0"
+lance-io = "13.0.0"
+lance-file = "13.0.0"
+object_store = "0.14.2"
 base64 = "0.22"
 bytes = "1"
 arrow-array = "58"
@@ -31,10 +32,10 @@ arrow-schema = "58"
 arrow-select = "58"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 datafusion = { version = "54", default-features = false, features = ["nested_expressions"] }
-lance = "9.0.0"
+lance = "13.0.0"
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
-lance-index = "9.0.0"
-lance-namespace = "9.0.0"
+lance-index = "13.0.0"
+lance-namespace = "13.0.0"
 # Version-matched with lance-context-server/-master so one process-wide recorder
 # serves every crate.
 metrics = { version = "0.24", optional = true }

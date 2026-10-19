@@ -813,7 +813,7 @@ impl RolloutStore {
         let last_updated = self.base.dataset.manifest.timestamp().timestamp_millis();
         let pending_wal_generations = shard_snapshots
             .iter()
-            .map(|snapshot| snapshot.flushed_generations.len() as i64)
+            .map(|snapshot| snapshot.sstables.len() as i64)
             .sum();
         Ok(RolloutObservation {
             row_count,
@@ -1067,7 +1067,7 @@ impl RolloutStore {
         .await?;
 
         for snapshot in snapshots {
-            for generation in snapshot.flushed_generations {
+            for generation in snapshot.sstables {
                 let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
                 let dataset = self.open_flushed_dataset(&uri).await?;
                 Self::append_non_blob_records_from_dataset(
@@ -1144,7 +1144,7 @@ impl RolloutStore {
 
         let mut generation_uris = Vec::new();
         for snapshot in shard_snapshots {
-            for generation in snapshot.flushed_generations {
+            for generation in snapshot.sstables {
                 generation_uris
                     .push(self.flushed_generation_uri(snapshot.shard_id, &generation.path));
             }
@@ -1471,7 +1471,7 @@ impl RolloutStore {
         let uris: Vec<String> = snapshots
             .iter()
             .flat_map(|snapshot| {
-                snapshot.flushed_generations.iter().map(|generation| {
+                snapshot.sstables.iter().map(|generation| {
                     self.flushed_generation_uri(snapshot.shard_id, &generation.path)
                 })
             })
@@ -2338,16 +2338,16 @@ mod tests {
                             snapshot.shard_id,
                             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
                         );
-                        let current = manifests.read_latest().await.unwrap().unwrap();
+                        let current = manifests.refresh_latest().await.unwrap().unwrap();
                         manifests
                             .commit_update(current.writer_epoch, |m| ShardManifest {
                                 version: m.version + 1,
-                                flushed_generations: vec![],
+                                sstables: vec![],
                                 ..m.clone()
                             })
                             .await
                             .unwrap();
-                        for generation in &snapshot.flushed_generations {
+                        for generation in &snapshot.sstables {
                             store
                                 .remove_dir_all(
                                     path.clone()
@@ -2749,10 +2749,10 @@ mod tests {
             store.base.write_shard,
             16,
         );
-        let before = manifests.read_latest().await.unwrap().unwrap();
+        let before = manifests.refresh_latest().await.unwrap().unwrap();
         let mut late_drain = before.clone();
         late_drain.version += 1;
-        late_drain.flushed_generations.clear();
+        late_drain.sstables.clear();
         let plan = std::collections::BTreeMap::from([(
             format!("shard:{}", store.base.write_shard),
             late_drain.version,
@@ -2760,22 +2760,103 @@ mod tests {
         crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
             .await
             .unwrap();
-        assert!(manifests
-            .write(&late_drain)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
-        let after = manifests.read_latest().await.unwrap().unwrap();
+        assert!(matches!(
+            crate::merge_write_scope::commit_exact_shard(&manifests, &late_drain).await,
+            Err(lance::Error::RetryableCommitConflict { .. })
+        ));
+        let after = manifests.refresh_latest().await.unwrap().unwrap();
         assert!(after.version > late_drain.version);
         assert_eq!(
             after.writer_epoch, before.writer_epoch,
             "recovery must not fence live ingest"
         );
-        assert_eq!(after.flushed_generations, before.flushed_generations);
+        assert_eq!(after.sstables, before.sstables);
         store.cleanup_own_shard().await.unwrap();
         assert_eq!(flushed_generation_count(&store).await, 0);
         assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_drain_reauthorizes_after_a_concurrent_manifest_commit() {
+        use crate::merge_write_scope::{drain_generations, CommitAuthorizer, MergeWriteScope};
+        use lance::dataset::mem_wal::ShardManifestStore;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Debug)]
+        struct RaceThenRevoke {
+            peer: ShardManifestStore,
+            epoch: u64,
+            admitted: AtomicU64,
+            refused: AtomicU64,
+        }
+        impl CommitAuthorizer for RaceThenRevoke {
+            fn authorize<'a>(
+                &'a self,
+                _resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if self.admitted.swap(version, Ordering::SeqCst) != 0 {
+                        self.refused.store(version, Ordering::SeqCst);
+                        return Err(lance::Error::io("execution revoked"));
+                    }
+                    // A different handle wins the admitted immutable version
+                    // before this drain writes. Lance may internally retry,
+                    // but it must not drain at the next, unadmitted version.
+                    let won = self
+                        .peer
+                        .commit_update(self.epoch, |current| {
+                            let mut next = current.clone();
+                            next.version += 1;
+                            next
+                        })
+                        .await?;
+                    assert_eq!(won.version, version);
+                    Ok(())
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        store.add(&[assistant_record("pending")]).await.unwrap();
+        store.flush().await.unwrap();
+        let object_store = store.base.dataset.object_store(None).await.unwrap();
+        let path = &store.base.dataset.branch_location().path;
+        let shard = store.base.write_shard;
+        let manifests = ShardManifestStore::new(object_store.clone(), path, shard, 16);
+        let before = manifests.refresh_latest().await.unwrap().unwrap();
+        let gate = Arc::new(RaceThenRevoke {
+            peer: ShardManifestStore::new(object_store, path, shard, 16),
+            epoch: before.writer_epoch,
+            admitted: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+        });
+        let scope = MergeWriteScope::with_authorizer(gate.clone());
+        let result = scope
+            .run(drain_generations(
+                manifests,
+                before.writer_epoch,
+                before.sstables.iter().map(|s| s.generation).collect(),
+            ))
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("execution revoked"));
+        scope.drain().await;
+        assert_eq!(gate.refused.load(Ordering::SeqCst), before.version + 2);
+        let after = gate.peer.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(after.version, before.version + 1);
+        assert_eq!(after.sstables, before.sstables);
+        assert_eq!(scope.completed_steps(), 0);
+        assert!(!scope.has_uncertain_commit());
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 1);
         store.close().await.unwrap();
     }
 
@@ -3729,10 +3810,10 @@ mod tests {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         manifest_store
-            .read_latest()
+            .refresh_latest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0)
     }
 
@@ -3749,7 +3830,7 @@ mod tests {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         manifest_store
-            .read_latest()
+            .refresh_latest()
             .await
             .unwrap()
             .map(|m| m.writer_epoch)

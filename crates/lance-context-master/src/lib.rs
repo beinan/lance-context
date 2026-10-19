@@ -1,4 +1,5 @@
 //! Control-plane (master) library surface.
+#![recursion_limit = "256"]
 
 pub mod admission;
 pub mod catchup;

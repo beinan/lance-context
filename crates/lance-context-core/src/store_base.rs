@@ -772,8 +772,8 @@ impl StorageBase {
         let Some(writer) = writer else {
             return Ok(FlushOutcome::Noop);
         };
-        match writer.force_seal_active().await {
-            Ok(()) => {}
+        let fence = match writer.force_seal_active().await {
+            Ok(fence) => fence,
             // A fence means a merge superseded our epoch; the next `put` reopens
             // and replays. Nothing to flush against the dead epoch.
             Err(err) if is_fenced_error(&err) => {
@@ -781,8 +781,8 @@ impl StorageBase {
                 return Ok(FlushOutcome::Fenced);
             }
             Err(err) => return Err(err),
-        }
-        writer.wait_for_flush_drain().await?;
+        };
+        fence.wait().await?;
         Ok(FlushOutcome::Sealed)
     }
 
@@ -940,18 +940,18 @@ impl StorageBase {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         Ok(manifest_store
-            .read_latest()
+            .refresh_latest()
             .await?
             .map(|manifest| ShardWatermark {
                 shard_id: manifest.shard_id,
                 writer_epoch: manifest.writer_epoch,
                 sealed_through: manifest
-                    .flushed_generations
+                    .sstables
                     .iter()
                     .map(|g| g.generation)
                     .max()
                     .unwrap_or(0),
-                pending_generations: manifest.flushed_generations.len(),
+                pending_generations: manifest.sstables.len(),
                 merged_through: None,
             }))
     }
@@ -968,9 +968,10 @@ impl StorageBase {
             self.write_shard,
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
-        Ok(manifest_store.read_latest().await?.is_some_and(|manifest| {
-            manifest.flushed_generations.len() >= self.merge_after_generations
-        }))
+        Ok(manifest_store
+            .refresh_latest()
+            .await?
+            .is_some_and(|manifest| manifest.sstables.len() >= self.merge_after_generations))
     }
 
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
@@ -1004,10 +1005,10 @@ impl StorageBase {
             self.write_shard,
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
-        let Some(manifest) = manifest_store.read_latest().await? else {
+        let Some(manifest) = manifest_store.refresh_latest().await? else {
             return Ok(None);
         };
-        let pending = manifest.flushed_generations.len();
+        let pending = manifest.sstables.len();
         if pending == 0 || pending < threshold.max(1) {
             return Ok(None);
         }
@@ -1058,13 +1059,11 @@ impl StorageBase {
         let marks = crate::rollout_append::watermarks(&latest).await?;
         let mut manifest = manifest.clone();
         if let Some(high) = marks.get(&self.write_shard) {
-            manifest
-                .flushed_generations
-                .retain(|g| g.generation > *high);
+            manifest.sstables.retain(|g| g.generation > *high);
         }
-        manifest.flushed_generations.sort_by_key(|g| g.generation);
+        manifest.sstables.sort_by_key(|g| g.generation);
         let manifest = &manifest;
-        if manifest.flushed_generations.is_empty() {
+        if manifest.sstables.is_empty() {
             return Ok(None);
         }
 
@@ -1131,11 +1130,11 @@ impl StorageBase {
         // Several sweepers can prepare the same immutable generations under a
         // shared lock. Once the first commit drains them, later prepared copies
         // are stale and must not write the same rows again.
-        let Some(current_manifest) = manifest_store.read_latest().await? else {
+        let Some(current_manifest) = manifest_store.refresh_latest().await? else {
             return Ok(false);
         };
         if !current_manifest
-            .flushed_generations
+            .sstables
             .iter()
             .any(|generation| merged_generations.contains(&generation.generation))
         {
@@ -1161,7 +1160,7 @@ impl StorageBase {
             merged_generations
                 .iter()
                 .max()
-                .map(|high| lance_index::mem_wal::MergedGeneration::new(self.write_shard, *high))
+                .map(|high| lance_index::mem_wal::CompactedSsTable::new(self.write_shard, *high))
         } else {
             None
         };
@@ -1317,12 +1316,12 @@ impl StorageBase {
         // first generation alone exceeds the budget. Leftovers stay pending.
         let mut buffered_bytes = 0usize;
         let budget = if self.merge_max_generations == 0 {
-            manifest.flushed_generations.len()
+            manifest.sstables.len()
         } else {
             self.merge_max_generations
         };
 
-        'generations: for flushed in manifest.flushed_generations.iter().take(budget) {
+        'generations: for flushed in manifest.sstables.iter().take(budget) {
             let gen_uri = format!(
                 "{}/_mem_wal/{}/{}",
                 base_uri, self.write_shard, flushed.path
@@ -1401,7 +1400,7 @@ impl StorageBase {
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
-        watermark: Option<lance_index::mem_wal::MergedGeneration>,
+        watermark: Option<lance_index::mem_wal::CompactedSsTable>,
     ) -> LanceResult<()> {
         // Predicate deletion projects only the key and row IDs, including for
         // unindexed fragments. It can use existing BTree/ZoneMap coverage but
@@ -2120,17 +2119,17 @@ impl StorageBase {
                         shard_id,
                         DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
                     );
-                    Ok::<_, LanceError>(manifest_store.read_latest().await?.map(|manifest| {
+                    Ok::<_, LanceError>(manifest_store.refresh_latest().await?.map(|manifest| {
                         ShardWatermark {
                             shard_id: manifest.shard_id,
                             writer_epoch: manifest.writer_epoch,
                             sealed_through: manifest
-                                .flushed_generations
+                                .sstables
                                 .iter()
                                 .map(|g| g.generation)
                                 .max()
                                 .unwrap_or(0),
-                            pending_generations: manifest.flushed_generations.len(),
+                            pending_generations: manifest.sstables.len(),
                             merged_through: merged.get(&manifest.shard_id).copied(),
                         }
                     }))
@@ -2169,10 +2168,10 @@ impl StorageBase {
                         shard_id,
                         DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
                     );
-                    let Some(manifest) = manifest_store.read_latest().await? else {
+                    let Some(manifest) = manifest_store.refresh_latest().await? else {
                         return Ok(None);
                     };
-                    let pending = manifest.flushed_generations.len();
+                    let pending = manifest.sstables.len();
                     observe_value!(crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS, pending);
                     if max_at != 0 && pending > max_at {
                         // A read over this shard would open `pending` datasets
@@ -2205,9 +2204,8 @@ impl StorageBase {
                     let mut snapshot = ShardSnapshot::new(shard_id)
                         .with_spec_id(manifest.shard_spec_id)
                         .with_current_generation(manifest.current_generation);
-                    for flushed in manifest.flushed_generations {
-                        snapshot =
-                            snapshot.with_flushed_generation(flushed.generation, flushed.path);
+                    for sstable in manifest.sstables {
+                        snapshot = snapshot.with_sstable(sstable.generation, sstable.path);
                     }
                     Ok::<_, LanceError>(Some(snapshot))
                 }
@@ -2223,7 +2221,7 @@ impl StorageBase {
         // and still opened 25k datasets on one lookup (OOMKilled the worker).
         let total: usize = snapshots
             .iter()
-            .map(|snapshot| snapshot.flushed_generations.len())
+            .map(|snapshot| snapshot.sstables.len())
             .sum();
         if max_at != 0 && total > max_at {
             note_read_refused(self.dataset.uri());
@@ -2244,7 +2242,7 @@ impl StorageBase {
             .wal_shard_snapshots()
             .await?
             .iter()
-            .map(|snapshot| snapshot.flushed_generations.len())
+            .map(|snapshot| snapshot.sstables.len())
             .sum())
     }
 
@@ -2254,7 +2252,7 @@ impl StorageBase {
         let generation_paths: Vec<String> = snapshots
             .iter()
             .flat_map(|snapshot| {
-                snapshot.flushed_generations.iter().map(|generation| {
+                snapshot.sstables.iter().map(|generation| {
                     self.flushed_generation_uri(snapshot.shard_id, &generation.path)
                 })
             })
