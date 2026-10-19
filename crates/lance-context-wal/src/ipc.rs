@@ -24,7 +24,17 @@ mod tests;
 /// workspace before calling. The format checks and row/count limits here do not
 /// replace process-wide memory admission or a transport checksum.
 /// Dictionary deltas and compressed batches are intentionally unsupported.
+/// Arrow dependency panics are converted to errors in panic-unwind builds;
+/// panic-abort builds cannot recover from dependency panics.
 pub fn decode(body: Bytes, schema: SchemaRef) -> Result<Vec<RecordBatch>> {
+    // Arrow's schema conversion is infallible in its API, but malformed type
+    // metadata can panic even after FlatBuffers verification. All decoder state
+    // is local to this attempt and is discarded on unwind, never reused.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_inner(body, schema)))
+        .map_err(|_| anyhow::anyhow!("Arrow IPC decoder panicked on invalid metadata"))?
+}
+
+fn decode_inner(body: Bytes, schema: SchemaRef) -> Result<Vec<RecordBatch>> {
     let buffer = Buffer::from(body);
     ensure!(
         buffer.len() >= 16 && &buffer[..6] == b"ARROW1",
@@ -38,8 +48,12 @@ pub fn decode(body: Bytes, schema: SchemaRef) -> Result<Vec<RecordBatch>> {
         .context("invalid IPC footer range")?;
     let footer = arrow_ipc::root_as_footer(&buffer[start..end])
         .map_err(|e| anyhow::anyhow!("invalid IPC footer: {e}"))?;
-    let source_schema =
-        arrow_ipc::convert::fb_to_schema(footer.schema().context("missing IPC schema")?);
+    let ipc_schema = footer.schema().context("missing IPC schema")?;
+    ensure!(
+        ipc_schema.endianness().equals_to_target_endianness(),
+        "IPC endianness differs from this system"
+    );
+    let source_schema = arrow_ipc::convert::fb_to_schema(ipc_schema);
     ensure!(
         source_schema == *schema,
         "IPC schema differs from expected schema"
@@ -152,6 +166,18 @@ fn validate_message(block: &Block, bytes: &[u8], dictionary: bool) -> Result<i64
                 .all(|node| (0..=MAX_ROWS).contains(&node.length())),
             "nested IPC row limit exceeded"
         );
+    }
+    if let Some(buffers) = batch.buffers() {
+        for buffer in buffers {
+            let end = buffer
+                .offset()
+                .checked_add(buffer.length())
+                .context("IPC array buffer overflow")?;
+            ensure!(
+                buffer.offset() >= 0 && buffer.length() >= 0 && end <= block.bodyLength(),
+                "IPC array buffer outside block body"
+            );
+        }
     }
     Ok(batch.length())
 }

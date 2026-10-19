@@ -7,11 +7,14 @@ The optional `ipc` feature exposes `ipc::decode(Bytes, expected_schema)` for
 materializers. It decodes multiple uncompressed record batches and dictionaries
 while sharing binary payload ownership with the input. Numeric alignment repair,
 schema parsing and Arrow metadata still allocate. The codec validates footer and
-block ranges, schema equality, row/count limits and unsupported expansion before
-constructing arrays. Compressed batches and dictionary deltas are rejected.
+block/array-buffer ranges, native endianness, schema equality, row/count limits
+and unsupported expansion before constructing arrays. Compressed batches and
+dictionary deltas are rejected.
 Callers still reserve input and decoding workspace within their own memory budget.
 Replication does not need to enable this module or decode Arrow. The `lab` codec
 measurement now uses the same validated path, including its validation overhead.
+Arrow dependency panics from malformed metadata become errors in panic-unwind
+builds; panic-abort builds cannot recover from dependency panics.
 
 ```bash
 cargo test -p lance-context-wal --features ipc --lib
