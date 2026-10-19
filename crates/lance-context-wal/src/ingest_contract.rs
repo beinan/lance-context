@@ -7,6 +7,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "arrow-contract")]
+mod arrow;
+#[cfg(feature = "arrow-contract")]
+pub use arrow::arrow_schema_fingerprint;
+
 /// Protocol ceiling. Deployments may set a smaller maximum in each contract;
 /// ingress and materializers must both have capacity for that maximum.
 pub const MAX_RECORD_BYTES: u32 = 255 * 1024 * 1024;
