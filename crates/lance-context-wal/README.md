@@ -3,6 +3,22 @@
 Feature-gated Rust measurements for choosing a WAL payload path and durable
 local log engine. This crate does not change production ingestion or Lance OSS.
 
+The independent `placement` feature provides `placement::Layout`, session bucket
+hashing and scoped `Receipt` types. A validated layout assigns each stable virtual
+bucket to one RF3 group, with explicit voters and StatefulSet DNS addresses. Use a
+canonical immutable tenant/table identity in the routing key, not a mutable display
+name. Worker count does not participate in routing. Persist the layout and its
+fingerprint; changing it requires a migration protocol, which is not implemented
+here. A receipt identifies a position and is not authentication or proof of commit.
+
+```bash
+cargo test -p lance-context-wal --features placement --lib
+```
+
+Compatibility tests preserve a layout fingerprint recorded by a real three-node
+experiment and a fixed session-hash vector. Other tests reject ambiguous ownership
+and ensure routes survive JSON serialization and restart.
+
 ```bash
 cargo build --release -p lance-context-wal --features lab --bin context-wal-lab
 target/release/context-wal-lab codec --payload-bytes 262144 --rows 8 --iterations 30

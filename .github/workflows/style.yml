@@ -55,8 +55,8 @@ jobs:
       # cfg-gated breakage is caught here instead of at release time.
       - name: Clippy (lance-context, default features)
         run: cargo clippy --manifest-path crates/lance-context/Cargo.toml --all-targets -- -D warnings
-      - name: Clippy (WAL component experiments)
-        run: cargo clippy -p lance-context-wal --features lab --all-targets -- -D warnings
+      - name: Clippy (WAL experiments)
+        run: cargo clippy -p lance-context-wal --features lab,placement --all-targets -- -D warnings
 
   typos:
     name: Spell Check
