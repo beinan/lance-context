@@ -1142,7 +1142,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
-    if state.config.append.rollout_append_local
+    if crate::local_merge::enabled(&state.config)
         && state.config.append.rollout_append_local_task_concurrency > 0
     {
         // Reserve before claiming. A saturated legacy RPC pool cannot consume
@@ -1239,7 +1239,7 @@ fn spawn_filtered_pool_poller(
                 let claim = if resident_only {
                     state
                         .task_store
-                        .claim_resident_merge(&state.config.append.rollout_append_targets)
+                        .claim_resident_merge(&crate::local_merge::targets(&state.config))
                         .await
                 } else {
                     state.task_store.claim_next_of_kinds(kinds).await
@@ -1291,6 +1291,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
@@ -1896,7 +1897,9 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.merge_rollout.owned_targets.retain(|t| t != "exp");
         cfg.merge_rollout.drain_targets.push("exp".into());
-        cfg.worker_endpoints = vec!["http://127.0.0.1:1".into()];
+        // A resident-only master must reconcile the recorded old execution
+        // even though it has no configured worker endpoints for fresh work.
+        cfg.worker_endpoints.clear();
         let state = MasterState::new(cfg).await.unwrap();
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         let claim = state
