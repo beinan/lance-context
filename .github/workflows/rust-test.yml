@@ -68,7 +68,17 @@ jobs:
           cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract --lib
           cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
       - name: WAL experiment process lifecycle tests
-        run: cargo test -p lance-context-wal --features runner --test runner
+        run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
+      - name: WAL resource observation in a container cgroup namespace
+        run: |
+          cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
+          wal_resource_test=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "resource" and (.target.kind | index("test")) and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("expected one resource test executable") end' "$RUNNER_TEMP/wal-resource-build.jsonl")
+          # Hosted runners use a host cgroup path. Remount cgroup2 inside private
+          # mount/cgroup namespaces, then drop privileges before running tests.
+          sudo unshare --mount --cgroup --propagation private sh -eu -c '
+            mount -t cgroup2 none /sys/fs/cgroup
+            exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
+          ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0

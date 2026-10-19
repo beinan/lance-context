@@ -44,6 +44,11 @@ path = "src/bin/runner.rs"
 required-features = ["runner"]
 
 [[bin]]
+name = "context-wal-resource"
+path = "src/bin/resource.rs"
+required-features = ["runner"]
+
+[[bin]]
 name = "context-wal-lab"
 path = "src/bin/lab.rs"
 required-features = ["lab"]
