@@ -788,100 +788,13 @@ impl CommitHandler for GuardedCommit {
 }
 
 #[cfg(test)]
+#[path = "merge_write_scope/create_tests.rs"]
+mod create_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[derive(Debug)]
-    struct CreationRace {
-        ready: tokio::sync::Barrier,
-        release: Notify,
-        arrivals: AtomicU64,
-    }
-
-    impl CommitAuthorizer for CreationRace {
-        fn authorize<'a>(
-            &'a self,
-            resource: &'a str,
-            version: u64,
-        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-            Box::pin(async move {
-                assert_eq!(resource, "base");
-                if version == 1 {
-                    let position = self.arrivals.fetch_add(1, Ordering::SeqCst);
-                    self.ready.wait().await;
-                    if position == 1 {
-                        self.release.notified().await;
-                    }
-                }
-                Ok(())
-            })
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stale_create_cannot_erase_the_winners_append() -> Result<()> {
-        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
-        use arrow_schema::{DataType, Field, Schema};
-        let root = tempfile::tempdir().unwrap();
-        let uri = root
-            .path()
-            .join("create.lance")
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )]));
-        let race = Arc::new(CreationRace {
-            ready: tokio::sync::Barrier::new(2),
-            release: Notify::new(),
-            arrivals: AtomicU64::new(0),
-        });
-        let scope = MergeWriteScope::with_authorizer(race.clone());
-        let mut creators = tokio::task::JoinSet::new();
-        for _ in 0..2 {
-            let (scope, uri, schema) = (scope.clone(), uri.clone(), schema.clone());
-            creators.spawn(async move {
-                scope
-                    .run(crate::store_base::StorageBase::create_with_options(
-                        &uri, schema, None, None,
-                    ))
-                    .await
-            });
-        }
-        // Both writers observed an absent dataset and reached the first
-        // manifest. Hold the loser while the winner appends a real row.
-        let mut winner =
-            tokio::time::timeout(std::time::Duration::from_secs(30), creators.join_next())
-                .await
-                .expect("creation did not resolve")
-                .unwrap()
-                .unwrap()?;
-        assert_eq!(winner.version().version, 1);
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![7]))])?;
-        winner
-            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
-            .await?;
-        assert_eq!(winner.version().version, 2);
-        race.release.notify_one();
-        let loser = tokio::time::timeout(std::time::Duration::from_secs(30), creators.join_next())
-            .await
-            .expect("stale creator did not resolve")
-            .unwrap()
-            .unwrap();
-        assert!(
-            loser.is_err(),
-            "a stale create must not rebase over committed data"
-        );
-        let reopened = lance::Dataset::open(&uri).await?;
-        assert_eq!(reopened.version().version, 2);
-        assert_eq!(reopened.count_rows(None).await?, 1);
-        Ok(())
-    }
 
     #[tokio::test]
     async fn phase_changes_and_observation_do_not_count_as_completed_work() {
