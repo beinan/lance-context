@@ -191,6 +191,100 @@ fn rotation_sync_panic_cannot_ack_another_group() -> Result<()> {
 }
 
 #[test]
+fn snapshot_install_sync_failure_recovers_all_old_or_all_new_state() -> Result<()> {
+    let layout = Layout {
+        cluster: uuid::Uuid::from_u128(24),
+        nodes: (1..=3)
+            .map(|id| (id, format!("wal-{id}.example.invalid:7800")))
+            .collect(),
+        groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![1, 2, 3])]),
+        buckets: vec![10, 20],
+    };
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("log");
+    let log = PhysicalLog::open(&path, &layout, 1)?;
+    let group = log.group(10)?;
+    group.bind_application(b"snapshot-install-fault/v1")?;
+    let entry = |index, term| Entry {
+        index,
+        term,
+        data: vec![(index + term) as u8; 4096].into(),
+        ..Default::default()
+    };
+    let old: Vec<_> = (1..=5).map(|i| entry(i, 2)).collect();
+    let old_hard = HardState {
+        term: 2,
+        vote: 1,
+        commit: 2,
+        ..Default::default()
+    };
+    group.persist(&old, Some(&old_hard))?;
+    let sibling = log.group(20)?;
+    let sibling_hard = HardState {
+        term: 7,
+        vote: 2,
+        commit: 1,
+        ..Default::default()
+    };
+    sibling.persist(&[entry(1, 7)], Some(&sibling_hard))?;
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 4;
+    snapshot.mut_metadata().term = 3;
+    snapshot
+        .mut_metadata()
+        .set_conf_state(group.initial_state()?.conf_state);
+    snapshot.data = b"snapshot-install-fault/descriptor".to_vec().into();
+    let suffix = vec![entry(5, 3), entry(6, 3)];
+    let new_hard = HardState {
+        term: 3,
+        vote: 2,
+        commit: 5,
+        ..Default::default()
+    };
+    group.node.fault.fail_once.store(true, Ordering::Release);
+    assert!(group
+        .install_snapshot(&snapshot, &suffix, &new_hard)
+        .is_err());
+    assert!(group.initial_state().is_err());
+    assert!(group.snapshot(0, 2).is_err());
+    assert!(sibling.persist(&[], None).is_err());
+    assert!(sibling.initial_state().is_err());
+    drop((group, sibling, log));
+    let log = PhysicalLog::open(&path, &layout, 1)?;
+    let group = log.group(10)?;
+    group.bind_application(b"snapshot-install-fault/v1")?;
+    match group.first_index()? {
+        1 => {
+            assert_eq!(group.initial_state()?.hard_state, old_hard);
+            assert_eq!(group.last_index()?, 5);
+            assert_eq!(
+                group.entries(1, 6, None, GetEntriesContext::empty(false))?,
+                old
+            );
+            assert!(group.snapshot(0, 2).is_err());
+        }
+        5 => {
+            assert_eq!(group.initial_state()?.hard_state, new_hard);
+            assert_eq!(group.last_index()?, 6);
+            assert_eq!(group.term(4)?, 3);
+            assert_eq!(group.snapshot(4, 2)?, snapshot);
+            assert_eq!(
+                group.entries(5, 7, None, GetEntriesContext::empty(false))?,
+                suffix
+            );
+        }
+        index => panic!("partial snapshot install boundary {index}"),
+    }
+    let sibling = log.group(20)?;
+    assert_eq!(sibling.initial_state()?.hard_state, sibling_hard);
+    assert_eq!(
+        sibling.entries(1, 2, None, GetEntriesContext::empty(false))?,
+        vec![entry(1, 7)]
+    );
+    Ok(())
+}
+
+#[test]
 fn checkpoint_sync_failure_fences_all_handles_and_recovers_one_complete_cut() -> Result<()> {
     let layout = Layout {
         cluster: uuid::Uuid::from_u128(3),

@@ -9,8 +9,10 @@
 //!
 //! An application may checkpoint a validated, durable committed cut. The small
 //! opaque descriptor and logical compaction cross one physical sync barrier.
-//! Application snapshot files, remote installation, physical file reclamation,
-//! membership changes and replica replacement require higher-level integration.
+//! A received Ready snapshot can atomically replace the log and persist its
+//! suffix and HardState. Application snapshot files/transfer, driver integration,
+//! physical reclamation, membership changes and replica replacement remain
+//! higher-level responsibilities.
 //! Only the owning process may modify the files.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -207,6 +209,64 @@ impl GroupState {
             "HardState does not match the durable log or membership"
         );
         Ok(())
+    }
+    fn appended(&self, entries: &[Entry], hard: Option<&HardState>) -> Result<Self> {
+        let next_hard = hard.unwrap_or(&self.hard);
+        ensure!(
+            next_hard.term >= self.hard.term
+                && next_hard.commit >= self.hard.commit
+                && (next_hard.term != self.hard.term
+                    || self.hard.vote == 0
+                    || next_hard.vote == self.hard.vote),
+            "HardState term, vote or commit regression"
+        );
+        let mut terms = self.terms.clone();
+        if let Some(first) = entries.first() {
+            ensure!(
+                first.index > self.hard.commit && first.index <= self.last() + 1,
+                "entries overwrite committed data or leave a gap"
+            );
+            let mut previous_index = first.index - 1;
+            let mut previous_term = self
+                .term(previous_index)
+                .context("missing preceding term")?;
+            for entry in entries {
+                ensure!(
+                    entry.index == previous_index + 1
+                        && entry.index < u64::MAX
+                        && entry.term > 0
+                        && entry.term >= previous_term
+                        && entry.term <= next_hard.term
+                        && entry.get_entry_type() == EntryType::EntryNormal,
+                    "noncontiguous entries, invalid term or unsupported membership change"
+                );
+                previous_index = entry.index;
+                previous_term = entry.term;
+            }
+            terms.retain(|range| range.first < first.index);
+            if let Some(last) = terms.last_mut() {
+                last.last = last.last.min(first.index - 1);
+            }
+            for entry in entries {
+                if let Some(last) = terms.last_mut().filter(|range| range.term == entry.term) {
+                    last.last = entry.index;
+                } else {
+                    terms.push(TermRange {
+                        first: entry.index,
+                        last: entry.index,
+                        term: entry.term,
+                    });
+                }
+            }
+        }
+        let next = GroupState {
+            hard: next_hard.clone(),
+            conf: self.conf.clone(),
+            terms,
+            snapshot: self.snapshot.clone(),
+        };
+        next.validate()?;
+        Ok(next)
     }
 }
 
@@ -467,61 +527,7 @@ impl GroupLog {
             .write()
             .map_err(|_| anyhow::anyhow!("group state lock poisoned"))?;
         self.node.check()?;
-        let next_hard = hard.unwrap_or(&state.hard);
-        ensure!(
-            next_hard.term >= state.hard.term
-                && next_hard.commit >= state.hard.commit
-                && (next_hard.term != state.hard.term
-                    || state.hard.vote == 0
-                    || next_hard.vote == state.hard.vote),
-            "HardState term, vote or commit regression"
-        );
-        let mut terms = state.terms.clone();
-        if let Some(first) = entries.first() {
-            ensure!(
-                first.index > state.hard.commit && first.index <= state.last() + 1,
-                "entries overwrite committed data or leave a gap"
-            );
-            let mut previous_index = first.index - 1;
-            let mut previous_term = state
-                .term(previous_index)
-                .context("missing preceding term")?;
-            for entry in entries {
-                ensure!(
-                    entry.index == previous_index + 1
-                        && entry.index < u64::MAX
-                        && entry.term > 0
-                        && entry.term >= previous_term
-                        && entry.term <= next_hard.term
-                        && entry.get_entry_type() == EntryType::EntryNormal,
-                    "noncontiguous entries, invalid term or unsupported membership change"
-                );
-                previous_index = entry.index;
-                previous_term = entry.term;
-            }
-            terms.retain(|range| range.first < first.index);
-            if let Some(last) = terms.last_mut() {
-                last.last = last.last.min(first.index - 1);
-            }
-            for entry in entries {
-                if let Some(last) = terms.last_mut().filter(|range| range.term == entry.term) {
-                    last.last = entry.index;
-                } else {
-                    terms.push(TermRange {
-                        first: entry.index,
-                        last: entry.index,
-                        term: entry.term,
-                    });
-                }
-            }
-        }
-        let next = GroupState {
-            hard: next_hard.clone(),
-            conf: state.conf.clone(),
-            terms,
-            snapshot: state.snapshot.clone(),
-        };
-        next.validate()?;
+        let next = state.appended(entries, hard)?;
         let mut batch = LogBatch::default();
         if !entries.is_empty() {
             batch.add_entries::<EntryIndex>(self.group, entries)?;

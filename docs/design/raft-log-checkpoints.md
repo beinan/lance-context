@@ -1,4 +1,4 @@
-# Durable local Raft checkpoint boundary
+# Durable Raft checkpoint storage
 
 Refs https://github.com/lance-format/lance-context/issues/378.
 
@@ -30,9 +30,25 @@ metadata. The pinned engine's convenience `compact_to` method is insufficient:
 it does not sync and does not return failures. Shared engine failures invalidate
 all group handles before any subsequent successful operation.
 
+`GroupLog::install_snapshot` supplies the different transition needed after Raft
+accepts a received snapshot. Its cut must advance beyond the previous durable
+commit. It replaces the entire prior log, including any divergent uncommitted
+tail, and installs the new descriptor, terms, HardState and optional suffix in
+one synced batch. Suffix entries begin immediately after the new cut. The
+snapshot cannot change static membership, move committed history backwards or
+change a vote within the same term. Repeated/stale installs are rejected.
+
+The engine's `Clean` command removes group metadata as well as entries. The
+install batch restores the immutable application binding and every owned group
+metadata key; the separate node/layout identity and sibling groups stay intact.
+Before giving a snapshot to Raft, the caller must validate and durably stage its
+complete application state. After receiving Ready, it must wait for this sync
+before releasing responses or applying suffix entries. On an uncertain write,
+retain both sets of application dependencies and recover the physical log.
+
 This increment supplies the storage boundary only. The current
-`replication::Node` still retains its complete log and does not invoke this API.
-Application state/payload packs, remote snapshot installation and transfer,
+`replication::Node` still retains its complete log and invokes neither snapshot
+API. Application state/payload packs, snapshot transfer and driver integration,
 reader/transfer pins, physical reclamation, admission during maintenance and
 Lance publication remain subsequent integration work. No production ingestion
 path or retention default changes.
@@ -44,3 +60,10 @@ metadata. Real child processes are killed before and after installation; an
 injected filesystem sync failure checks the shared failure fence and complete
 recovery boundary. These are storage correctness tests, not power-loss testing,
 snapshot network recovery or a throughput benchmark.
+
+Received-snapshot tests additionally exercise actual RawNode Ready output with
+a new suffix, replacement below the old uncommitted last index, an empty suffix,
+application-binding preservation, stale/invalid installs, process kills and
+injected sync failure. Recovery must expose the complete old state or complete
+new state. These tests do not authorize bootstrapping a lost disk under an old
+voter identity; replica replacement still needs a separate membership protocol.

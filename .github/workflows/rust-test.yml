@@ -75,7 +75,7 @@ jobs:
       - name: WAL durable Raft storage tests
         run: |
           cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
-          cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity --test raft_log_checkpoint
+          cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity --test raft_log_checkpoint --test raft_log_snapshot_install
       - name: Client journal durability and process recovery
         run: |
           cargo clippy -p lance-context-wal --features client-journal --all-targets -- -D warnings
