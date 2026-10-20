@@ -168,6 +168,10 @@ cases; their numbers are not performance evidence.
 
 ## Durable Raft log storage
 
+The replication layer also provides [durable publisher bindings and epochs](../../docs/design/wal-publisher-authority.md)
+through its catalog group's normal consensus path. This is an incremental
+publication prerequisite, not a production Lance writer or a manifest lease.
+
 The optional `raft-log` feature exposes `raft_log::PhysicalLog` and its cloneable
 `GroupLog` handles. One raft-engine directory hosts all groups assigned to a node
 by the existing immutable `placement::Layout`. Opening binds the full layout,

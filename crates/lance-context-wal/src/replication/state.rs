@@ -25,6 +25,10 @@ pub(super) fn validate_meta(
     body: &[u8],
     digest: bool,
 ) -> Result<()> {
+    if meta.kind == RecordKind::MultiPublication {
+        meta.validate_payload(body, publication::MAX_BYTES)?;
+        return publication::validate_record(layout, group, limits, meta, body);
+    }
     validate_identity(layout, group, meta)?;
     if digest {
         meta.validate_payload(body, limits.max_record_bytes as usize)?;
@@ -75,12 +79,13 @@ pub(super) fn validate_entry(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct State {
+    pub catalog: publication::Catalog,
     pub applied: u64,
     pub accepted: BTreeMap<u64, BatchMeta>,
     pub producers: BTreeMap<(Uuid, u32, Uuid), (BatchMeta, u64)>,
 }
 impl State {
-    /// The v1 image retains every accepted record. Producer tails must exactly
+    /// The image retains every accepted record. Producer tails must exactly
     /// match those records, including sequence continuity within each lane.
     /// Retirement will need a new format with independently retained tails.
     pub fn validate_checkpoint(
@@ -124,6 +129,7 @@ impl State {
             tails == self.producers,
             "checkpoint producer tails disagree"
         );
+        self.catalog.validate(layout, group, cut, limits)?;
         Ok(())
     }
 
@@ -137,6 +143,13 @@ impl State {
             return Ok(None);
         }
         let meta = decode_meta(&entry.context)?;
+        if meta.kind == RecordKind::MultiPublication {
+            return Ok(Some(Applied::Publisher(self.catalog.apply(
+                publication::decode(&entry.data)?,
+                entry.index,
+                limits.max_tables,
+            ))));
+        }
         let key = (meta.stream, meta.bucket, meta.producer);
         let previous = self.producers.get(&key);
         if let Some((old, index)) = previous {

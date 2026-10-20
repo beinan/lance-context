@@ -289,3 +289,118 @@ fn empty_application_cut_has_a_real_empty_pack_and_no_payload_fetch() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> Result<()> {
+    use crate::ingest_contract::{IngestContract, WritePolicy};
+    let root = tempfile::tempdir()?;
+    let (mut state, bodies) = fixture()?;
+    for id in [200, 201] {
+        let batch = publication::Acquire {
+            table: Uuid::from_u128(id),
+            destination: publication::Destination {
+                namespace: Uuid::from_u128(202),
+                dataset: format!("tables/{id}"),
+            },
+            ingest: IngestContract {
+                tenant: "test".into(),
+                qualified_table: format!("table-{id}"),
+                schema: [7; 32],
+                policy: WritePolicy::ImmutableUniqueIds,
+                max_record_bytes: 4096,
+                max_rows: 32,
+            },
+            owner: Uuid::from_u128(203),
+            request: Uuid::from_u128(id + 10),
+            expected_epoch: 0,
+        }
+        .batch(&layout())?;
+        let entry = Entry {
+            index: state.applied + 1,
+            term: 2,
+            context: state::encode_meta(&batch.meta)?.into(),
+            data: batch.body,
+            ..Default::default()
+        };
+        state::validate_entry(&layout(), 10, &Limits::default(), &entry, true)?;
+        state.apply(&entry, &Limits::default())?;
+    }
+    let built = build(
+        root.path(),
+        &layout(),
+        &Limits::default(),
+        Cut {
+            group: 10,
+            index: state.applied,
+            term: 2,
+            id: Uuid::from_u128(220),
+        },
+        state.clone(),
+        |index, _| Ok(bodies[&index].clone()),
+    )?;
+    let snapshot = built.image.snapshot()?;
+    assert_eq!(
+        load(root.path(), &snapshot, &layout(), &Limits::default(), 10)?.state,
+        state
+    );
+    assert_eq!(built.image.bytes(Part::Payload), 8192);
+    for index in [2, 5] {
+        assert_eq!(
+            built.image.read_for_validation(index)?,
+            Some(bodies[&index].clone())
+        );
+    }
+    let path = built.image.descriptor.paths(root.path())[0].clone();
+    let original = fs::read(&path)?;
+    // Locate frames from their encoded lengths, without assuming a fixed header.
+    let binding_len = u32::from_le_bytes(original[8..12].try_into()?) as usize;
+    let mut offset = 12 + binding_len + 3 * 8;
+    for _ in 0..state.accepted.len() + state.producers.len() {
+        offset += 8; // accepted index
+        let len = u32::from_le_bytes(original[offset..offset + 4].try_into()?) as usize;
+        offset += 4 + len;
+    }
+    let first_len = u32::from_le_bytes(original[offset..offset + 4].try_into()?) as usize;
+    let second = offset + 4 + first_len;
+    let second_len = u32::from_le_bytes(original[second..second + 4].try_into()?) as usize;
+    let first_table = publication::decode_table(&original[offset + 4..second])?;
+    let second_table = publication::decode_table(&original[second + 4..second + 4 + second_len])?;
+    for mutation in 0..4 {
+        let mut bytes = original[..offset].to_vec();
+        let mut tables = [first_table.clone(), second_table.clone()];
+        match mutation {
+            0 => tables.swap(0, 1),
+            1 => tables[1] = tables[0].clone(),
+            2 => tables[1].destination = tables[0].destination.clone(),
+            _ => tables[1].authority.grant_index = state.applied + 1,
+        }
+        for table in &tables {
+            write_frame(&mut bytes, &publication::encode_table(table)?)?;
+        }
+        fs::write(&path, &bytes)?;
+        let mut descriptor = built.image.descriptor.clone();
+        descriptor.metadata_bytes = bytes.len() as u64;
+        descriptor.metadata_digest = Sha256::digest(&bytes).into();
+        assert!(load(
+            root.path(),
+            &descriptor.snapshot()?,
+            &layout(),
+            &Limits::default(),
+            10
+        )
+        .is_err());
+    }
+    fs::write(&path, original)?;
+    let target = tempfile::tempdir()?;
+    let mut receiver = Receiver::new(
+        target.path(),
+        &snapshot,
+        layout(),
+        Limits::default(),
+        10,
+        Uuid::from_u128(221),
+    )?;
+    copy(&built.image, &mut receiver)?;
+    assert_eq!(receiver.finish()?.state, state);
+    Ok(())
+}

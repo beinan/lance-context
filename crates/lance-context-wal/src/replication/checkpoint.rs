@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 1;
-const MAGIC: &[u8; 8] = b"LCWALCP1";
+const FORMAT: u32 = 2;
+const MAGIC: &[u8; 8] = b"LCWALCP2";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -71,6 +71,7 @@ struct Descriptor {
     id: Uuid,
     records: u64,
     producers: u64,
+    tables: u64,
     metadata_bytes: u64,
     payload_bytes: u64,
     metadata_digest: [u8; 32],
@@ -80,7 +81,9 @@ struct Descriptor {
 fn metadata_limit(limits: &Limits) -> u64 {
     // A framed record needs at most 8 + 4 + 256 bytes, plus a bounded header.
     // limits.identity() validates all policy maxima before this is used.
-    (limits.max_records + limits.max_producers) * 268 + 1024
+    (limits.max_records + limits.max_producers) * 268
+        + limits.max_tables * (publication::MAX_BYTES as u64 + 4)
+        + 1024
 }
 
 impl Descriptor {
@@ -92,6 +95,8 @@ impl Descriptor {
                 && self.records <= limits.max_records
                 && self.producers <= limits.max_producers
                 && self.producers <= self.records
+                && self.tables <= limits.max_tables
+                && (group == publication::control_group(layout) || self.tables == 0)
                 && self.metadata_bytes <= metadata_limit(limits)
                 && self.payload_bytes <= self.records * limits.max_record_bytes,
             "application image format or bounds mismatch"
@@ -421,6 +426,7 @@ pub(super) fn build(
         id,
         records: state.accepted.len() as u64,
         producers: state.producers.len() as u64,
+        tables: state.catalog.tables.len() as u64,
         metadata_bytes: 0,
         payload_bytes,
         metadata_digest: [0; 32],
@@ -432,11 +438,15 @@ pub(super) fn build(
     write_frame(&mut metadata, &codec().serialize(&descriptor.binding)?)?;
     write_u64(&mut metadata, descriptor.records)?;
     write_u64(&mut metadata, descriptor.producers)?;
+    write_u64(&mut metadata, descriptor.tables)?;
     for (index, meta) in &state.accepted {
         write_meta(&mut metadata, *index, meta)?;
     }
     for (meta, index) in state.producers.values() {
         write_meta(&mut metadata, *index, meta)?;
+    }
+    for table in state.catalog.tables.values() {
+        write_frame(&mut metadata, &publication::encode_table(table)?)?;
     }
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
@@ -483,7 +493,8 @@ pub(super) fn load(
     );
     ensure!(
         read_u64(&mut metadata)? == descriptor.records
-            && read_u64(&mut metadata)? == descriptor.producers,
+            && read_u64(&mut metadata)? == descriptor.producers
+            && read_u64(&mut metadata)? == descriptor.tables,
         "image metadata count mismatch"
     );
     let mut state = State {
@@ -510,6 +521,18 @@ pub(super) fn load(
         );
         state.producers.insert(key, (meta, index));
         previous = Some(key);
+    }
+    let mut previous = None;
+    for _ in 0..descriptor.tables {
+        let (bytes, n) = read_frame::<{ publication::MAX_BYTES }>(&mut metadata)?;
+        let table = publication::decode_table(&bytes[..n])?;
+        let id = table.authority.table;
+        ensure!(
+            previous.is_none_or(|old| old < id),
+            "unordered or duplicate image table"
+        );
+        state.catalog.tables.insert(id, table);
+        previous = Some(id);
     }
     let metadata_file = metadata.finish(descriptor.metadata_bytes, descriptor.metadata_digest)?;
     state.validate_checkpoint(layout, group, limits, descriptor.binding.index)?;
