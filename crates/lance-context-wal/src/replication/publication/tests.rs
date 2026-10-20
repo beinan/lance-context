@@ -1,7 +1,7 @@
 use super::*;
 use crate::ingest_contract::WritePolicy;
 
-fn input() -> Acquire {
+pub(super) fn input() -> Acquire {
     Acquire {
         table: Uuid::from_u128(10),
         destination: Destination {
@@ -23,7 +23,14 @@ fn input() -> Acquire {
 }
 fn apply(catalog: &mut Catalog, acquire: Acquire, index: u64, capacity: u64) -> Result<Reply> {
     let batch = acquire.batch(&super::super::tests::layout())?;
-    Ok(catalog.apply(decode(&batch.body)?, index, capacity))
+    Ok(catalog.apply(
+        decode(&batch.body)?,
+        index,
+        &Limits {
+            max_tables: capacity,
+            ..Default::default()
+        },
+    ))
 }
 
 #[test]
@@ -93,7 +100,7 @@ fn bounded_decode_rejects_wrong_scopes_domains_and_unserviceable_ingest_limits()
     let mut trailing = batch.body.to_vec();
     trailing.push(0);
     assert!(decode(&trailing).is_err());
-    assert!(decode(&vec![0; MAX_BYTES + 1]).is_err());
+    assert!(decode(&vec![0; MAX_COMMAND_BYTES + 1]).is_err());
     let mut oversized = input();
     oversized.destination.dataset = "x".repeat(4097);
     assert!(oversized.batch(&layout).is_err());
@@ -140,6 +147,36 @@ fn checkpoint_catalog_requires_exact_scope_ordering_identity_and_unique_destinat
     duplicate.authority.table = other;
     catalog.tables.insert(other, duplicate);
     assert!(catalog.validate(&layout, 10, 4, &limits).is_err());
+    Ok(())
+}
+
+#[test]
+fn registered_records_must_fit_the_publication_source_budget() -> Result<()> {
+    let layout = super::super::tests::layout();
+    let limits = Limits {
+        max_plan_source_bytes: 512 * 1024,
+        ..Default::default()
+    };
+    limits.identity()?; // A small publication budget is valid for smaller contracts.
+    let mut acquire = input();
+    let batch = acquire.clone().batch(&layout)?;
+    assert!(
+        validate_record(&layout, 10, &limits, &batch.meta, &batch.body).is_err(),
+        "registered contract can admit a record no publication plan can select"
+    );
+    let mut catalog = Catalog::default();
+    apply(&mut catalog, acquire.clone(), 4, 1)?;
+    assert!(
+        catalog.validate(&layout, 10, 4, &limits).is_err(),
+        "checkpoint restored an unserviceable ingestion contract"
+    );
+
+    acquire.ingest.max_record_bytes = limits.max_plan_source_bytes as u32;
+    let batch = acquire.clone().batch(&layout)?;
+    validate_record(&layout, 10, &limits, &batch.meta, &batch.body)?;
+    let mut catalog = Catalog::default();
+    apply(&mut catalog, acquire, 4, 1)?;
+    catalog.validate(&layout, 10, 4, &limits)?;
     Ok(())
 }
 

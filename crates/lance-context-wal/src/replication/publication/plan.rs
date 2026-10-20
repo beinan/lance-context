@@ -1,0 +1,237 @@
+//! Immutable selection of source records and a fixed Lance transaction target.
+//! Source groups must subsequently verify their complete prefixes before pinning.
+use super::*;
+
+#[cfg(test)]
+mod tests;
+
+pub const MAX_INPUTS: usize = 512;
+pub(super) const MAX_PLAN_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRange {
+    pub after: u64,
+    pub through: u64,
+    pub records: Vec<(u64, BatchMeta)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    pub transaction: Uuid,
+    pub read_version: u64,
+    pub sources: BTreeMap<u64, SourceRange>,
+    /// Resume fair source selection from this group after publication.
+    pub next_group: u64,
+}
+impl Plan {
+    pub fn target_version(&self) -> Result<u64> {
+        ensure!(
+            self.read_version > 0,
+            "publication requires an existing dataset"
+        );
+        self.read_version
+            .checked_add(1)
+            .context("Lance version exhausted")
+    }
+
+    pub fn source_bytes(&self) -> Result<u64> {
+        self.sources
+            .values()
+            .flat_map(|range| &range.records)
+            .try_fold(0u64, |sum, (_, meta)| {
+                sum.checked_add(meta.body_bytes)
+                    .context("source byte sum overflow")
+            })
+    }
+
+    pub(super) fn validate(&self, layout: &Layout, table: Uuid, limits: &Limits) -> Result<()> {
+        self.target_version()?;
+        ensure!(
+            !self.transaction.is_nil()
+                && !table.is_nil()
+                && !self.sources.is_empty()
+                && self.sources.len() <= layout.groups.len()
+                && layout.groups.contains_key(&self.next_group),
+            "invalid publication plan identity or group selection"
+        );
+        let mut count = 0usize;
+        for (group, range) in &self.sources {
+            count = count
+                .checked_add(range.records.len())
+                .context("plan input count overflow")?;
+            ensure!(
+                count <= MAX_INPUTS
+                    && layout.groups.contains_key(group)
+                    && range.after < range.through
+                    && range.through < u64::MAX
+                    && !range.records.is_empty()
+                    && range.records.windows(2).all(|w| w[0].0 < w[1].0),
+                "invalid publication source range"
+            );
+            for (index, meta) in &range.records {
+                ensure!(
+                    *index > range.after
+                        && *index <= range.through
+                        && meta.stream == table
+                        && meta.kind == RecordKind::Data
+                        && !meta.producer.is_nil()
+                        && meta.sequence > 0
+                        && meta.sequence < u64::MAX
+                        && meta.body_bytes > 0
+                        && meta.body_bytes <= limits.max_record_bytes
+                        && layout.group_for_bucket(meta.bucket)? == *group,
+                    "invalid publication source metadata"
+                );
+            }
+        }
+        ensure!(
+            self.source_bytes()? <= limits.max_plan_source_bytes,
+            "publication source byte limit"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRequest {
+    pub authority: Authority,
+    pub plan: Plan,
+}
+impl PlanRequest {
+    pub(in crate::replication) fn batch(self, layout: &Layout, limits: &Limits) -> Result<Batch> {
+        self.validate(layout, limits)?;
+        Command::Plan(Box::new(self)).batch(layout)
+    }
+    pub(super) fn validate(&self, layout: &Layout, limits: &Limits) -> Result<()> {
+        let a = &self.authority;
+        ensure!(
+            a.cluster == layout.cluster
+                && a.layout == layout.fingerprint()?
+                && a.group == control_group(layout)
+                && !a.owner.is_nil()
+                && a.epoch > 0
+                && a.epoch <= a.grant_index
+                && a.grant_index < u64::MAX,
+            "invalid publication authority scope"
+        );
+        self.plan.validate(layout, a.table, limits)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPlan {
+    pub index: u64,
+    pub plan: Plan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Independent source-group positions; never collapse these to one maximum.
+    pub checkpoint: BTreeMap<u64, u64>,
+    pub minimum_read_version: u64,
+    /// Cloning a table view shares the immutable metadata; it never clones bodies.
+    pub pending: Option<Arc<PendingPlan>>,
+}
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            checkpoint: BTreeMap::new(),
+            minimum_read_version: 1,
+            pending: None,
+        }
+    }
+}
+impl Progress {
+    pub(super) fn matches(&self, plan: &Plan, ingest: &IngestContract) -> bool {
+        plan.read_version >= self.minimum_read_version
+            && plan.sources.iter().all(|(group, range)| {
+                range.after == self.checkpoint.get(group).copied().unwrap_or(0)
+                    && range
+                        .records
+                        .iter()
+                        .all(|(_, meta)| meta.body_bytes <= u64::from(ingest.max_record_bytes))
+            })
+    }
+
+    pub(super) fn validate(
+        &self,
+        layout: &Layout,
+        table: &Table,
+        cut: u64,
+        limits: &Limits,
+    ) -> Result<()> {
+        ensure!(
+            self.minimum_read_version > 0
+                && self.checkpoint.len() <= layout.groups.len()
+                && self.checkpoint.iter().all(|(group, position)| {
+                    layout.groups.contains_key(group) && *position > 0 && *position < u64::MAX
+                }),
+            "invalid publication progress"
+        );
+        if let Some(pending) = &self.pending {
+            pending
+                .plan
+                .validate(layout, table.authority.table, limits)?;
+            ensure!(
+                pending.index > 0
+                    && pending.index <= cut
+                    && pending.index != table.authority.grant_index
+                    && pending
+                        .plan
+                        .sources
+                        .get(&table.authority.group)
+                        .is_none_or(|range| range.through < pending.index)
+                    && self.matches(&pending.plan, &table.ingest),
+                "invalid pending publication plan"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Catalog {
+    pub(super) fn plan(&mut self, request: PlanRequest, index: u64, limits: &Limits) -> Reply {
+        let Some(table) = self.tables.get(&request.authority.table) else {
+            return Reply::Rejected(Rejection::Authority);
+        };
+        if table.authority != request.authority {
+            return Reply::Rejected(Rejection::Authority);
+        }
+        if let Some(pending) = &table.progress.pending {
+            return if pending.plan == request.plan {
+                Reply::Planned {
+                    index: pending.index,
+                }
+            } else {
+                Reply::Rejected(Rejection::PendingPlan)
+            };
+        }
+        if !table.progress.matches(&request.plan, &table.ingest)
+            || request
+                .plan
+                .sources
+                .get(&table.authority.group)
+                .is_some_and(|range| range.through >= index)
+        {
+            return Reply::Rejected(Rejection::SourcePosition);
+        }
+        if self
+            .tables
+            .values()
+            .filter(|t| t.progress.pending.is_some())
+            .count() as u64
+            >= limits.max_active_plans
+        {
+            return Reply::Rejected(Rejection::Capacity);
+        }
+        self.tables
+            .get_mut(&request.authority.table)
+            .expect("known table")
+            .progress
+            .pending = Some(Arc::new(PendingPlan {
+            index,
+            plan: request.plan,
+        }));
+        Reply::Planned { index }
+    }
+}

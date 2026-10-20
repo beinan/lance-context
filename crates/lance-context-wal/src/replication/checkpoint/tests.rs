@@ -238,7 +238,7 @@ fn metadata_counts_frames_trailing_bytes_and_exact_producer_tails_are_validated(
     try_bytes(&count)?;
     fs::write(&path, original)?;
     let (state, _) = fixture()?;
-    for mutation in 0..4 {
+    for mutation in 0..7 {
         let mut invalid = state.clone();
         match mutation {
             0 => invalid.producers.clear(),
@@ -325,6 +325,48 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
         state::validate_entry(&layout(), 10, &Limits::default(), &entry, true)?;
         state.apply(&entry, &Limits::default())?;
     }
+    let table = &state.catalog.tables[&Uuid::from_u128(200)];
+    let mut records = Vec::new();
+    for index in 1..=publication::MAX_INPUTS as u64 {
+        records.push((
+            index,
+            Batch::new(
+                table.authority.table,
+                1,
+                Uuid::from_u128(230),
+                index,
+                Bytes::from_static(b"source"),
+            )
+            .meta,
+        ));
+    }
+    let plan = publication::PlanRequest {
+        authority: table.authority.clone(),
+        plan: publication::Plan {
+            transaction: Uuid::from_u128(231),
+            read_version: 7,
+            sources: BTreeMap::from([(
+                20,
+                publication::SourceRange {
+                    after: 0,
+                    through: 1000,
+                    records,
+                },
+            )]),
+            next_group: 10,
+        },
+    }
+    .batch(&layout(), &Limits::default())?;
+    assert!(plan.body.len() > publication::MAX_ACQUIRE_BYTES);
+    let entry = Entry {
+        index: state.applied + 1,
+        term: 2,
+        context: state::encode_meta(&plan.meta)?.into(),
+        data: plan.body,
+        ..Default::default()
+    };
+    state::validate_entry(&layout(), 10, &Limits::default(), &entry, true)?;
+    state.apply(&entry, &Limits::default())?;
     let built = build(
         root.path(),
         &layout(),
@@ -365,14 +407,36 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
     let second_len = u32::from_le_bytes(original[second..second + 4].try_into()?) as usize;
     let first_table = publication::decode_table(&original[offset + 4..second])?;
     let second_table = publication::decode_table(&original[second + 4..second + 4 + second_len])?;
-    for mutation in 0..4 {
+    for mutation in 0..7 {
         let mut bytes = original[..offset].to_vec();
         let mut tables = [first_table.clone(), second_table.clone()];
         match mutation {
             0 => tables.swap(0, 1),
             1 => tables[1] = tables[0].clone(),
             2 => tables[1].destination = tables[0].destination.clone(),
-            _ => tables[1].authority.grant_index = state.applied + 1,
+            3 => tables[1].authority.grant_index = state.applied + 1,
+            4 => {
+                Arc::make_mut(tables[0].progress.pending.as_mut().unwrap()).index =
+                    state.applied + 1
+            }
+            5 => {
+                Arc::make_mut(tables[0].progress.pending.as_mut().unwrap())
+                    .plan
+                    .sources
+                    .get_mut(&20)
+                    .unwrap()
+                    .after = 1
+            }
+            _ => {
+                Arc::make_mut(tables[0].progress.pending.as_mut().unwrap())
+                    .plan
+                    .sources
+                    .get_mut(&20)
+                    .unwrap()
+                    .records[0]
+                    .1
+                    .bucket = 0
+            }
         }
         for table in &tables {
             write_frame(&mut bytes, &publication::encode_table(table)?)?;

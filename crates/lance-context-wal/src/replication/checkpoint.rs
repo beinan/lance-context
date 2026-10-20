@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 2;
-const MAGIC: &[u8; 8] = b"LCWALCP2";
+const FORMAT: u32 = 3;
+const MAGIC: &[u8; 8] = b"LCWALCP3";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -82,7 +82,8 @@ fn metadata_limit(limits: &Limits) -> u64 {
     // A framed record needs at most 8 + 4 + 256 bytes, plus a bounded header.
     // limits.identity() validates all policy maxima before this is used.
     (limits.max_records + limits.max_producers) * 268
-        + limits.max_tables * (publication::MAX_BYTES as u64 + 4)
+        + limits.max_tables * (publication::MAX_BASE_TABLE_BYTES as u64 + 4)
+        + limits.max_tables.min(limits.max_active_plans) * publication::MAX_COMMAND_BYTES as u64
         + 1024
 }
 
@@ -371,6 +372,20 @@ fn read_frame<const N: usize>(input: &mut impl Read) -> Result<([u8; N], usize)>
     input.read_exact(&mut bytes[..length])?;
     Ok((bytes, length))
 }
+fn read_table_frame(input: &mut impl Read) -> Result<Vec<u8>> {
+    let mut length = [0; 4];
+    input.read_exact(&mut length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    ensure!(
+        length > 0 && length <= publication::MAX_TABLE_BYTES,
+        "oversized publisher image frame"
+    );
+    // Plan metadata is larger than a record header. Allocate its actual bounded
+    // length on the heap rather than putting the maximum frame on the stack.
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
 fn write_meta(out: &mut impl Write, index: u64, meta: &BatchMeta) -> Result<()> {
     write_u64(out, index)?;
     write_frame(out, &state::encode_meta(meta)?)
@@ -524,8 +539,8 @@ pub(super) fn load(
     }
     let mut previous = None;
     for _ in 0..descriptor.tables {
-        let (bytes, n) = read_frame::<{ publication::MAX_BYTES }>(&mut metadata)?;
-        let table = publication::decode_table(&bytes[..n])?;
+        let bytes = read_table_frame(&mut metadata)?;
+        let table = publication::decode_table(&bytes)?;
         let id = table.authority.table;
         ensure!(
             previous.is_none_or(|old| old < id),
