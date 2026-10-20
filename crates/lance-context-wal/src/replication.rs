@@ -6,11 +6,14 @@
 //! commit. An isolated former leader cannot answer retries from local state.
 //!
 //! The owner schedules ticks, bounded network I/O and calls on one thread. This
-//! increment retains the full log and bounded metadata: it is not the production
-//! service, a snapshot/retention implementation, or a bounded disk allocator.
+//! component supports explicit application checkpoints and prepared snapshot
+//! transfer. It retains bounded metadata and all image files: it is not the
+//! production service, a physical retention policy, or a bounded disk allocator.
 //! Message scope checks are not authentication. Do not expose it to untrusted
 //! transport or enable ingestion without the remaining admission/lifecycle work.
 
+pub mod checkpoint;
+mod images;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -30,6 +33,7 @@ use crate::{
     raft_log::{GroupLog, PhysicalLog},
     record::{Batch, BatchMeta},
 };
+pub use images::{CheckpointTask, PreparedCheckpoint, SnapshotReceiver};
 use state::State;
 
 /// Immutable, replicated-state bounds. All peers and reopens must use the same
@@ -143,6 +147,8 @@ struct Group {
     state: State,
     // Index AND term prevents suffix replacement from completing another input.
     pending: BTreeMap<(u64, u64), (u64, BatchMeta)>,
+    image: Option<Arc<checkpoint::Image>>,
+    incoming: Option<PreparedCheckpoint>,
 }
 
 /// Owns all Raft groups in one shared physical engine. Do not call concurrently
@@ -155,6 +161,7 @@ pub struct Node {
     limits: Limits,
     id: u64,
     groups: BTreeMap<u64, Group>,
+    images: Arc<images::Owner>,
     failed: bool,
 }
 
@@ -172,6 +179,7 @@ impl Node {
                 limits: self.limits.clone(),
                 id: self.id,
                 groups: BTreeMap::from([(id, group)]),
+                images: self.images.clone(),
                 failed: self.failed,
             })
             .collect()
@@ -182,6 +190,7 @@ impl Node {
         let identity = limits.identity()?;
         let policy = Sha256::digest(&identity).into();
         let log = PhysicalLog::open(directory, &layout, id)?;
+        let images = images::Owner::new(directory)?;
         let mut groups = BTreeMap::new();
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         for (group, voters) in &layout.groups {
@@ -191,7 +200,13 @@ impl Node {
             let store = log.group(*group)?;
             store.bind_application(&identity)?;
             let committed = store.initial_state()?.hard_state.commit;
-            let mut state = State::default();
+            let (mut state, image) = if store.first_index()? > 1 {
+                let snapshot = store.snapshot(store.first_index()? - 1, id)?;
+                let loaded = checkpoint::load(directory, &snapshot, &layout, &limits, *group)?;
+                (loaded.state, Some(loaded.image))
+            } else {
+                (State::default(), None)
+            };
             while state.applied < committed {
                 let entries = store.entries(
                     state.applied + 1,
@@ -225,6 +240,8 @@ impl Node {
                     raw,
                     state,
                     pending: BTreeMap::new(),
+                    image,
+                    incoming: None,
                 },
             );
         }
@@ -235,6 +252,7 @@ impl Node {
             limits,
             id,
             groups,
+            images,
             failed: false,
         })
     }
@@ -327,8 +345,7 @@ impl Node {
         Ok(())
     }
 
-    pub fn step(&mut self, packet: Packet) -> Result<()> {
-        self.healthy()?;
+    fn validate_packet(&self, packet: &Packet) -> Result<()> {
         ensure!(
             packet.cluster == self.layout.cluster
                 && packet.layout == self.layout_hash
@@ -340,11 +357,23 @@ impl Node {
             .groups
             .get(&packet.group)
             .context("unknown group")?;
-        let message = packet.message;
+        let message = &packet.message;
         ensure!(
             message.to == self.id && message.from != self.id && voters.contains(&message.from),
             "invalid Raft peer route"
         );
+        ensure!(self.groups.contains_key(&packet.group), "unhosted group");
+        ensure!(
+            message.compute_size() <= 16 * 1024 * 1024,
+            "oversized message"
+        );
+        Ok(())
+    }
+
+    pub fn step(&mut self, packet: Packet) -> Result<()> {
+        self.healthy()?;
+        self.validate_packet(&packet)?;
+        let message = packet.message;
         ensure!(
             matches!(
                 message.get_msg_type(),
@@ -360,8 +389,8 @@ impl Node {
             "unsupported peer message"
         );
         ensure!(
-            message.compute_size() <= 16 * 1024 * 1024 && message.snapshot.is_none(),
-            "oversized message or unsupported snapshot"
+            message.snapshot.is_none(),
+            "snapshot requires receive_snapshot and step_snapshot"
         );
         for entry in &message.entries {
             state::validate_entry(&self.layout, packet.group, &self.limits, entry, true)?;
@@ -391,8 +420,11 @@ impl Node {
             let mut outbound = Vec::new();
             while group.raw.has_ready() {
                 let mut ready = group.raw.ready();
-                ensure!(ready.snapshot().is_empty(), "snapshot integration required");
-                group.raw.store().persist(ready.entries(), ready.hs())?;
+                if ready.snapshot().is_empty() {
+                    group.raw.store().persist(ready.entries(), ready.hs())?;
+                } else {
+                    images::install_received(group, &ready, *id, &mut events)?;
+                }
                 outbound.extend(ready.take_messages());
                 outbound.extend(ready.take_persisted_messages());
                 apply(
@@ -483,21 +515,11 @@ impl Node {
         let Some(meta) = group.state.accepted.get(&index) else {
             return Ok(None);
         };
-        let mut entries = group.raw.store().entries(
-            index,
-            index + 1,
-            None,
-            raft::GetEntriesContext::empty(false),
-        )?;
-        let entry = entries.pop().context("missing accepted payload")?;
-        ensure!(
-            &state::decode_meta(&entry.context)? == meta,
-            "accepted metadata mismatch"
-        );
-        meta.validate_payload(&entry.data, self.limits.max_record_bytes as usize)?;
+        let body = images::read_body(group.raw.store(), group.image.as_deref(), index, meta)?;
+        meta.validate_payload(&body, self.limits.max_record_bytes as usize)?;
         Ok(Some(Batch {
             meta: meta.clone(),
-            body: entry.data,
+            body,
         }))
     }
 }

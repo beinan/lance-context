@@ -6,7 +6,11 @@ use bytes::Bytes;
 use lance_context_wal::{
     placement::Layout,
     record::Batch,
-    replication::{Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, Status},
+    replication::{
+        checkpoint::{Image, Part},
+        Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
+        SnapshotReceiver, Status,
+    },
 };
 use protobuf::Message as _;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -59,6 +63,14 @@ enum Request {
     Status(u64),
     Read(u64, u64),
     Page(u64),
+    PrepareCheckpoint(u64, Uuid),
+    InstallCheckpoint,
+    ImageInfo(Vec<u8>),
+    ImageChunk(Vec<u8>, bool, u64, usize),
+    BeginSnapshot(WirePacket, Uuid),
+    ReceiveChunk(bool, u64, Bytes),
+    FinishSnapshot,
+    ReportSnapshot(u64, u64, bool),
 }
 #[derive(Serialize, Deserialize)]
 enum Response {
@@ -67,6 +79,9 @@ enum Response {
     Record(Option<Batch>),
     Page(Page),
     Error(String),
+    Image(Vec<u8>, u64, u64),
+    Chunk(Bytes),
+    Ok,
 }
 fn send<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
     let bytes = bincode::serialize(value)?;
@@ -84,7 +99,23 @@ fn receive<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
     stream.read_exact(&mut bytes)?;
     Ok(bincode::deserialize(&bytes)?)
 }
-fn run(node: &mut Node, request: Request) -> Result<Response> {
+struct Worker {
+    node: Node,
+    prepared: Option<PreparedCheckpoint>,
+    receiver: Option<SnapshotReceiver>,
+    images: BTreeMap<Vec<u8>, Arc<Image>>,
+}
+
+fn part(payload: bool) -> Part {
+    if payload {
+        Part::Payload
+    } else {
+        Part::Metadata
+    }
+}
+
+fn run(worker: &mut Worker, request: Request) -> Result<Response> {
+    let node = &mut worker.node;
     match request {
         Request::Campaign(group) => node.campaign(group)?,
         Request::Propose(group, token, batch) => node.propose(group, token, batch)?,
@@ -95,11 +126,78 @@ fn run(node: &mut Node, request: Request) -> Result<Response> {
             return Ok(Response::Record(node.read_accepted(group, index)?))
         }
         Request::Page(group) => return Ok(Response::Page(node.accepted(group, 0, 128)?)),
+        Request::PrepareCheckpoint(group, id) => {
+            ensure!(worker.prepared.is_none(), "existing prepared image");
+            let prepared = node.prepare_checkpoint(group, id)?.run()?;
+            let image = prepared.image();
+            let snapshot = image.snapshot()?.write_to_bytes()?;
+            let response = Response::Image(
+                snapshot.clone(),
+                image.bytes(Part::Metadata),
+                image.bytes(Part::Payload),
+            );
+            worker.images.insert(snapshot, image);
+            worker.prepared = Some(prepared);
+            return Ok(response);
+        }
+        Request::InstallCheckpoint => {
+            node.install_checkpoint(worker.prepared.take().context("no prepared image")?)?
+        }
+        Request::ImageInfo(snapshot) => {
+            let image = worker
+                .images
+                .get(&snapshot)
+                .context("no captured transfer image")?;
+            return Ok(Response::Image(
+                snapshot,
+                image.bytes(Part::Metadata),
+                image.bytes(Part::Payload),
+            ));
+        }
+        Request::ImageChunk(snapshot, payload, offset, bytes) => {
+            let image = worker
+                .images
+                .get(&snapshot)
+                .context("no captured transfer image")?;
+            return Ok(Response::Chunk(image.chunk(
+                part(payload),
+                offset,
+                bytes,
+            )?));
+        }
+        Request::BeginSnapshot(packet, id) => {
+            ensure!(worker.receiver.is_none(), "existing receiver");
+            worker.receiver = Some(node.receive_snapshot(packet.decode()?, id)?);
+            return Ok(Response::Ok);
+        }
+        Request::ReceiveChunk(payload, offset, bytes) => {
+            worker.receiver.as_mut().context("no receiver")?.write(
+                part(payload),
+                offset,
+                &bytes,
+            )?;
+            return Ok(Response::Ok);
+        }
+        Request::FinishSnapshot => {
+            node.step_snapshot(worker.receiver.take().context("no receiver")?.finish()?)?
+        }
+        Request::ReportSnapshot(group, to, delivered) => {
+            node.report_snapshot(group, to, delivered)?
+        }
     }
     let Events {
         messages,
         completions,
     } = node.poll()?;
+    for packet in &messages {
+        if packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgSnapshot {
+            let snapshot = packet.message.get_snapshot();
+            worker.images.insert(
+                snapshot.write_to_bytes()?,
+                node.snapshot_image(packet.group, snapshot)?,
+            );
+        }
+    }
     Ok(Response::Events(
         messages
             .into_iter()
@@ -118,7 +216,7 @@ fn replication_peer_fixture() -> Result<()> {
     let root = PathBuf::from(root);
     let id = std::env::var("CONTEXT_REPLICATION_NODE")?.parse()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    let mut node = Node::open(
+    let node = Node::open(
         &root.join(format!("data-{id}")),
         Arc::new(serde_json::from_slice(&std::fs::read(
             root.join("layout.json"),
@@ -126,6 +224,12 @@ fn replication_peer_fixture() -> Result<()> {
         id,
         Limits::default(),
     )?;
+    let mut worker = Worker {
+        node,
+        prepared: None,
+        receiver: None,
+        images: BTreeMap::new(),
+    };
     let address = PathBuf::from(std::env::var("CONTEXT_REPLICATION_ADDRESS_FILE")?);
     let temporary = address.with_extension("tmp");
     std::fs::write(&temporary, listener.local_addr()?.to_string())?;
@@ -137,7 +241,7 @@ fn replication_peer_fixture() -> Result<()> {
     loop {
         let request = receive(&mut stream)?;
         let response =
-            run(&mut node, request).unwrap_or_else(|error| Response::Error(format!("{error:#}")));
+            run(&mut worker, request).unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         send(&mut stream, &response)?;
     }
 }
@@ -210,6 +314,8 @@ struct Cluster {
     incarnations: BTreeMap<u64, u64>,
     queue: VecDeque<Packet>,
     completions: Vec<Completion>,
+    transfers: u64,
+    interrupt_next_snapshot: bool,
 }
 impl Cluster {
     fn new() -> Result<Self> {
@@ -232,6 +338,8 @@ impl Cluster {
             incarnations: BTreeMap::new(),
             queue: VecDeque::new(),
             completions: Vec::new(),
+            transfers: 0,
+            interrupt_next_snapshot: false,
         };
         for id in 1..=3 {
             this.start(id)?;
@@ -273,13 +381,95 @@ impl Cluster {
                 && allowed.contains(&packet.message.to)
                 && self.peers.contains_key(&packet.message.to)
             {
+                if packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgSnapshot {
+                    self.transfer(packet)?;
+                } else {
+                    self.command(
+                        packet.message.to,
+                        Request::Step(WirePacket::encode(packet)?),
+                    )?;
+                }
+            } else if packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgSnapshot
+                && allowed.contains(&packet.message.from)
+                && self.peers.contains_key(&packet.message.from)
+            {
                 self.command(
-                    packet.message.to,
-                    Request::Step(WirePacket::encode(packet)?),
+                    packet.message.from,
+                    Request::ReportSnapshot(packet.group, packet.message.to, false),
                 )?;
             }
         }
         anyhow::bail!("test message queue did not settle")
+    }
+
+    fn transfer(&mut self, packet: Packet) -> Result<()> {
+        let from = packet.message.from;
+        let to = packet.message.to;
+        let group = packet.group;
+        let snapshot = packet.message.get_snapshot().write_to_bytes()?;
+        let Response::Image(_, metadata, payload) = self
+            .peers
+            .get_mut(&from)
+            .context("missing image source")?
+            .call(Request::ImageInfo(snapshot.clone()))?
+        else {
+            anyhow::bail!("wrong image info");
+        };
+        self.transfers += 1;
+        let response = self
+            .peers
+            .get_mut(&to)
+            .unwrap()
+            .call(Request::BeginSnapshot(
+                WirePacket::encode(packet)?,
+                Uuid::from_u128(10_000 + u128::from(self.transfers)),
+            ))?;
+        ensure!(
+            matches!(response, Response::Ok),
+            "snapshot receiver did not start"
+        );
+        for (is_payload, total) in [(false, metadata), (true, payload)] {
+            let mut offset = 0;
+            while offset < total {
+                let size = if self.interrupt_next_snapshot {
+                    8
+                } else {
+                    (total - offset).min(64 * 1024) as usize
+                };
+                let Response::Chunk(bytes) =
+                    self.peers
+                        .get_mut(&from)
+                        .unwrap()
+                        .call(Request::ImageChunk(
+                            snapshot.clone(),
+                            is_payload,
+                            offset,
+                            size,
+                        ))?
+                else {
+                    anyhow::bail!("wrong image chunk");
+                };
+                ensure!(bytes.len() == size, "short transfer chunk");
+                let response = self
+                    .peers
+                    .get_mut(&to)
+                    .unwrap()
+                    .call(Request::ReceiveChunk(is_payload, offset, bytes))?;
+                ensure!(matches!(response, Response::Ok), "snapshot chunk rejected");
+                if self.interrupt_next_snapshot {
+                    self.interrupt_next_snapshot = false;
+                    // SIGKILL leaves only an incomplete, uninstalled image. The
+                    // restart below must use the original durable committed state.
+                    drop(self.peers.remove(&to));
+                    self.command(from, Request::ReportSnapshot(group, to, false))?;
+                    return Ok(());
+                }
+                offset += size as u64;
+            }
+        }
+        self.command(to, Request::FinishSnapshot)?;
+        self.command(from, Request::ReportSnapshot(group, to, true))?;
+        Ok(())
     }
     fn outcome(&mut self, token: u64) -> Option<Outcome> {
         self.completions
@@ -330,6 +520,136 @@ fn input(bucket: u32, sequence: u64, fill: u8) -> Batch {
         sequence,
         Bytes::from(vec![fill; 64 * 1024]),
     )
+}
+
+fn verify_records(peer: &mut Peer, group: u64, expected: &[Batch]) -> Result<()> {
+    let Response::Page(page) = peer.call(Request::Page(group))? else {
+        anyhow::bail!("wrong page");
+    };
+    assert_eq!(page.entries.len(), expected.len());
+    for ((index, meta), expected) in page.entries.into_iter().zip(expected) {
+        assert_eq!(&meta, &expected.meta);
+        let Response::Record(Some(actual)) = peer.call(Request::Read(group, index))? else {
+            anyhow::bail!("missing payload");
+        };
+        assert_eq!(&actual, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn application_snapshot_transfer_interruption_and_full_process_restart() -> Result<()> {
+    let mut c = Cluster::new()?;
+    let first = input(0, 1, 31);
+    let second = input(0, 2, 32);
+    let sibling = input(1, 1, 33);
+    c.command(1, Request::Campaign(10))?;
+    c.command(1, Request::Campaign(20))?;
+    c.pump(&[1, 2, 3])?;
+    c.command(1, Request::Propose(20, 100, sibling.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    c.command(1, Request::Propose(10, 101, first.clone()))?;
+    c.pump(&[1, 2])?;
+    assert!(matches!(
+        c.outcome(101),
+        Some(Outcome::Committed(Applied::Accepted { .. }))
+    ));
+    let response = c
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(10, Uuid::from_u128(501)))?;
+    assert!(matches!(response, Response::Image(_, _, _)));
+    // Kill after complete file sync but BEFORE the Raft descriptor transition.
+    drop(c.peers.remove(&1));
+    c.start(1)?;
+    verify_records(
+        c.peers.get_mut(&1).unwrap(),
+        10,
+        std::slice::from_ref(&first),
+    )?;
+    let leader = c.elect(1, 10, &[1, 2])?;
+    let response = c
+        .peers
+        .get_mut(&leader)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(10, Uuid::from_u128(502)))?;
+    assert!(matches!(response, Response::Image(_, _, _)));
+    c.command(leader, Request::InstallCheckpoint)?;
+    c.pump(&[1, 2])?;
+    // Keep a real suffix after the packed cut so restart/transfer must use both.
+    c.command(leader, Request::Propose(10, 102, second.clone()))?;
+    c.pump(&[1, 2])?;
+    let second_ack = c.outcome(102).context("second append had no ACK")?;
+    assert!(matches!(
+        second_ack,
+        Outcome::Committed(Applied::Accepted { .. })
+    ));
+    c.interrupt_next_snapshot = true;
+    for _ in 0..30 {
+        c.command(leader, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+        if !c.peers.contains_key(&3) {
+            break;
+        }
+    }
+    assert!(
+        !c.peers.contains_key(&3),
+        "partial snapshot kill was not reached"
+    );
+    assert_eq!(c.transfers, 1);
+    c.start(3)?;
+    verify_records(c.peers.get_mut(&3).unwrap(), 10, &[])?;
+    verify_records(
+        c.peers.get_mut(&3).unwrap(),
+        20,
+        std::slice::from_ref(&sibling),
+    )?;
+    for _ in 0..30 {
+        c.command(leader, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+        let Response::Status(status) = c.peers.get_mut(&3).unwrap().call(Request::Status(10))?
+        else {
+            anyhow::bail!("wrong status");
+        };
+        if status.accepted_records == 2 {
+            break;
+        }
+    }
+    assert!(c.transfers >= 2, "snapshot retry was not exercised");
+    for peer in c.peers.values_mut() {
+        verify_records(peer, 10, &[first.clone(), second.clone()])?;
+        verify_records(peer, 20, std::slice::from_ref(&sibling))?;
+    }
+    // Kill all peers after descriptor installation; preserve original volumes.
+    c.queue.clear();
+    c.peers.clear();
+    for id in 1..=3 {
+        c.start(id)?;
+    }
+    for peer in c.peers.values_mut() {
+        verify_records(peer, 10, &[first.clone(), second.clone()])?;
+        verify_records(peer, 20, std::slice::from_ref(&sibling))?;
+    }
+    let leader = c.elect(3, 10, &[1, 2, 3])?;
+    c.command(leader, Request::Propose(10, 103, second.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    assert_eq!(
+        c.outcome(103),
+        Some(second_ack),
+        "snapshot lost the original retry receipt"
+    );
+    let third = input(0, 3, 34);
+    c.command(leader, Request::Propose(10, 104, third.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    assert!(matches!(
+        c.outcome(104),
+        Some(Outcome::Committed(Applied::Accepted { .. }))
+    ));
+    for peer in c.peers.values_mut() {
+        verify_records(peer, 10, &[first.clone(), second.clone(), third.clone()])?;
+    }
+    Ok(())
 }
 
 #[test]

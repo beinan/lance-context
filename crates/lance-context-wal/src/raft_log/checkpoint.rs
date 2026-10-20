@@ -101,7 +101,7 @@ impl GroupLog {
     /// committed/uncommitted suffix and HardState. The same cut may only be
     /// retried with the identical descriptor. Remote snapshot installation and
     /// physical segment deletion are separate operations, not supplied here.
-    /// The current replication::Node does not invoke this interface.
+    /// replication::Node installs its validated application images here.
     pub fn checkpoint(&self, snapshot: &Snapshot) -> Result<()> {
         let mut state = self
             .state

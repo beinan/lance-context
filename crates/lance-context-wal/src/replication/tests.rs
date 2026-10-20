@@ -1,7 +1,7 @@
 use super::*;
 use bytes::Bytes;
 
-fn layout() -> Arc<Layout> {
+pub(super) fn layout() -> Arc<Layout> {
     Arc::new(Layout {
         cluster: Uuid::from_u128(1),
         nodes: (1..=3)
@@ -12,7 +12,7 @@ fn layout() -> Arc<Layout> {
     })
 }
 
-fn batch(sequence: u64) -> Batch {
+pub(super) fn batch(sequence: u64) -> Batch {
     Batch::new(
         Uuid::from_u128(2),
         0,
@@ -39,6 +39,271 @@ fn pump(nodes: &mut [Node]) -> Result<Vec<Completion>> {
         }
     }
     anyhow::bail!("message pump did not settle")
+}
+
+fn pump_images(
+    nodes: &mut [Node],
+    allowed: &[u64],
+    next_image: &mut u128,
+) -> Result<(Vec<Completion>, usize)> {
+    let mut completions = Vec::new();
+    let mut transfers = 0;
+    for _ in 0..100 {
+        let mut messages = Vec::new();
+        for node in nodes.iter_mut().filter(|n| allowed.contains(&n.id)) {
+            let events = node.poll()?;
+            completions.extend(events.completions);
+            for packet in events.messages {
+                let image = if packet.message.get_msg_type() == MessageType::MsgSnapshot {
+                    Some(node.snapshot_image(packet.group, packet.message.get_snapshot())?)
+                } else {
+                    None
+                };
+                messages.push((packet, image));
+            }
+        }
+        if messages.is_empty() {
+            return Ok((completions, transfers));
+        }
+        for (packet, image) in messages {
+            let target = packet.message.to;
+            if !allowed.contains(&target) {
+                if image.is_some() {
+                    nodes[packet.message.from as usize - 1].report_snapshot(
+                        packet.group,
+                        target,
+                        false,
+                    )?;
+                }
+                continue;
+            }
+            let node = &mut nodes[target as usize - 1];
+            if let Some(image) = image {
+                *next_image += 1;
+                let mut receiver = node.receive_snapshot(packet, Uuid::from_u128(*next_image))?;
+                for part in [checkpoint::Part::Metadata, checkpoint::Part::Payload] {
+                    let mut offset = 0;
+                    while offset < image.bytes(part) {
+                        let bytes = image.chunk(
+                            part,
+                            offset,
+                            (image.bytes(part) - offset).min(1024) as usize,
+                        )?;
+                        receiver.write(part, offset, &bytes)?;
+                        offset += bytes.len() as u64;
+                    }
+                }
+                node.step_snapshot(receiver.finish()?)?;
+                transfers += 1;
+            } else {
+                node.step(packet)?;
+            }
+        }
+    }
+    anyhow::bail!("image message pump did not settle")
+}
+
+#[test]
+fn application_images_keep_payloads_tails_suffix_and_lagging_peer_recovery() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let open = || {
+        (1..=3)
+            .map(|id| {
+                Node::open(
+                    &directory.path().join(id.to_string()),
+                    layout(),
+                    id,
+                    Limits::default(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let mut nodes = open()?;
+    nodes[0].campaign(10)?;
+    nodes[0].campaign(20)?;
+    pump(&mut nodes)?;
+    let mut next_image = 1000;
+    nodes[0].propose(10, 1, batch(1))?;
+    let (events, _) = pump_images(&mut nodes, &[1, 2], &mut next_image)?;
+    let first = events.into_iter().find(|c| c.request == 1).unwrap().outcome;
+    // Capture, then let ordinary append/commit proceed before its worker runs.
+    let task = nodes[0].prepare_checkpoint(10, Uuid::from_u128(100))?;
+    assert!(
+        nodes[0]
+            .prepare_checkpoint(20, Uuid::from_u128(101))
+            .is_err(),
+        "shared worker admission ignored"
+    );
+    nodes[0].propose(10, 2, batch(2))?;
+    let (_, transfers) = pump_images(&mut nodes, &[1, 2], &mut next_image)?;
+    assert_eq!(transfers, 0);
+    let prepared = std::thread::spawn(move || task.run()).join().unwrap()?;
+    let old_image = prepared.image();
+    let cut = old_image.snapshot()?.get_metadata().index;
+    nodes[0].install_checkpoint(prepared)?;
+    assert_eq!(nodes[0].groups[&10].raw.store().first_index()?, cut + 1);
+    assert!(
+        nodes[0].groups[&10].state.applied > cut,
+        "suffix was not exercised"
+    );
+    assert_eq!(nodes[0].groups[&10].state.accepted.len(), 2);
+    let latest = nodes[0]
+        .prepare_checkpoint(10, Uuid::from_u128(102))?
+        .run()?;
+    nodes[0].install_checkpoint(latest)?;
+    assert!(
+        nodes[0]
+            .prepare_checkpoint(10, Uuid::from_u128(103))
+            .is_err(),
+        "same cut rebuilt with a different identity"
+    );
+    assert!(
+        !old_image.chunk(checkpoint::Part::Payload, 0, 1)?.is_empty(),
+        "captured old transfer lost its files"
+    );
+    let mut transfers = 0;
+    for _ in 0..10 {
+        nodes[0].tick()?;
+        transfers += pump_images(&mut nodes, &[1, 2, 3], &mut next_image)?.1;
+        if nodes[2].status(10)?.accepted_records == 2 {
+            break;
+        }
+    }
+    assert!(
+        transfers > 0,
+        "lagging peer recovered without testing snapshot transfer"
+    );
+    assert!(nodes[2].groups[&10].raw.store().first_index()? > 1);
+    assert_eq!(nodes[2].groups[&10].state, nodes[0].groups[&10].state);
+    drop(nodes);
+    let mut nodes = open()?;
+    for node in &nodes {
+        for ((index, _), sequence) in node.accepted(10, 0, 128)?.entries.into_iter().zip(1..=2) {
+            assert_eq!(node.read_accepted(10, index)?, Some(batch(sequence)));
+        }
+        assert_eq!(node.accepted(10, 0, 128)?.entries.len(), 2);
+    }
+    nodes[0].campaign(10)?;
+    pump_images(&mut nodes, &[1, 2, 3], &mut next_image)?;
+    // Latest retry survives packing; an older sequence is still rejected.
+    nodes[0].propose(10, 3, batch(2))?;
+    let events = pump_images(&mut nodes, &[1, 2, 3], &mut next_image)?.0;
+    assert!(matches!(
+        events[0].outcome,
+        Outcome::Committed(Applied::Accepted { .. })
+    ));
+    nodes[0].propose(10, 4, batch(1))?;
+    let events = pump_images(&mut nodes, &[1, 2, 3], &mut next_image)?.0;
+    assert_eq!(
+        events[0].outcome,
+        Outcome::Committed(Applied::Rejected {
+            expected_sequence: 3
+        })
+    );
+    assert!(matches!(
+        first,
+        Outcome::Committed(Applied::Accepted { .. })
+    ));
+    nodes[0].propose(10, 5, batch(3))?;
+    pump_images(&mut nodes, &[1, 2, 3], &mut next_image)?;
+    assert_eq!(nodes[2].status(10)?.accepted_records, 3);
+    Ok(())
+}
+
+#[test]
+fn application_snapshot_sync_failure_fences_sibling_groups_and_recovers_complete_files(
+) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut nodes = (1..=3)
+        .map(|id| {
+            Node::open(
+                &directory.path().join(id.to_string()),
+                layout(),
+                id,
+                Limits::default(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    nodes[0].propose(10, 1, batch(1))?;
+    pump(&mut nodes)?;
+    let prepared = nodes[0]
+        .prepare_checkpoint(10, Uuid::from_u128(201))?
+        .run()?;
+    let accepted = nodes[0].accepted(10, 0, 128)?;
+    nodes[0].groups[&10].raw.store().fail_next_sync_for_test();
+    assert!(nodes[0].install_checkpoint(prepared).is_err());
+    assert!(nodes[0].status(20).is_err());
+    assert!(nodes[0].poll().is_err());
+    drop(nodes);
+    let node = Node::open(&directory.path().join("1"), layout(), 1, Limits::default())?;
+    assert_eq!(node.accepted(10, 0, 128)?, accepted);
+    assert_eq!(
+        node.read_accepted(10, accepted.entries[0].0)?,
+        Some(batch(1))
+    );
+    Ok(())
+}
+
+#[test]
+fn received_application_snapshot_sync_failure_releases_no_response() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut nodes = (1..=3)
+        .map(|id| {
+            Node::open(
+                &directory.path().join(id.to_string()),
+                layout(),
+                id,
+                Limits::default(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    nodes[0].propose(10, 1, batch(1))?;
+    let mut image_id = 10_000;
+    pump_images(&mut nodes, &[1, 2], &mut image_id)?;
+    let prepared = nodes[0]
+        .prepare_checkpoint(10, Uuid::from_u128(301))?
+        .run()?;
+    let image = prepared.image();
+    nodes[0].install_checkpoint(prepared)?;
+    let mut message = Message {
+        from: 1,
+        to: 3,
+        term: nodes[0].status(10)?.term,
+        ..Default::default()
+    };
+    message.set_msg_type(MessageType::MsgSnapshot);
+    message.set_snapshot(image.snapshot()?);
+    let packet = Packet {
+        cluster: nodes[0].layout.cluster,
+        layout: nodes[0].layout_hash,
+        policy: nodes[0].policy,
+        group: 10,
+        message,
+    };
+    let mut receiver = nodes[2].receive_snapshot(packet, Uuid::from_u128(302))?;
+    for part in [checkpoint::Part::Metadata, checkpoint::Part::Payload] {
+        let body = image.chunk(part, 0, image.bytes(part) as usize)?;
+        receiver.write(part, 0, &body)?;
+    }
+    nodes[2].step_snapshot(receiver.finish()?)?;
+    nodes[2].groups[&10].raw.store().fail_next_sync_for_test();
+    assert!(
+        nodes[2].poll().is_err(),
+        "snapshot response escaped a failed sync"
+    );
+    assert!(nodes[2].status(20).is_err());
+    drop(nodes);
+    let recovered = Node::open(&directory.path().join("3"), layout(), 3, Limits::default())?;
+    let entries = recovered.accepted(10, 0, 128)?.entries;
+    assert!(entries.len() <= 1);
+    if let Some((index, _)) = entries.first() {
+        assert_eq!(recovered.read_accepted(10, *index)?, Some(batch(1)));
+    }
+    Ok(())
 }
 
 #[test]
