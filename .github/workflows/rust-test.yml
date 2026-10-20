@@ -76,6 +76,10 @@ jobs:
         run: |
           cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
           cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity
+      - name: Replicated WAL quorum and process recovery
+        run: |
+          cargo clippy -p lance-context-wal --features replication --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features replication --lib --test replication_process
       - name: WAL resource observation in a container cgroup namespace
         run: |
           cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"

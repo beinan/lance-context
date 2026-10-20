@@ -367,6 +367,37 @@ pub struct GroupLog {
 }
 
 impl GroupLog {
+    #[cfg(all(test, feature = "replication"))]
+    pub(crate) fn fail_next_sync_for_test(&self) {
+        self.node.fault.fail_sync_for_test();
+    }
+
+    /// Bind an immutable application format/policy before its first entry.
+    /// Reopen must supply identical bytes; an unidentified existing log cannot
+    /// be silently interpreted as a different state machine.
+    pub fn bind_application(&self, identity: &[u8]) -> Result<()> {
+        ensure!(
+            !identity.is_empty() && identity.len() <= 4096,
+            "invalid application identity"
+        );
+        let state = self
+            .state
+            .write()
+            .map_err(|_| anyhow::anyhow!("group state lock poisoned"))?;
+        self.node.check()?;
+        if let Some(saved) = self.node.engine.get(self.group, b"application") {
+            ensure!(saved == identity, "application format or policy changed");
+            return self.node.check();
+        }
+        ensure!(
+            state.last() == 0,
+            "cannot identify an existing application log"
+        );
+        let mut batch = LogBatch::default();
+        batch.put(self.group, b"application".to_vec(), identity.to_vec())?;
+        self.node.write(&mut batch)
+    }
+
     fn read(&self) -> Result<RwLockReadGuard<'_, GroupState>> {
         self.node.check()?;
         let state = self

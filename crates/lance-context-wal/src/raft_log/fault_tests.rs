@@ -15,9 +15,17 @@ type FileHandle = <DefaultFileSystem as FileSystem>::Handle;
 #[derive(Default)]
 pub(super) struct FaultControl {
     fail_sync: AtomicBool,
+    fail_once: AtomicBool,
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
     release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl FaultControl {
+    #[cfg(feature = "replication")]
+    pub(super) fn fail_sync_for_test(&self) {
+        self.fail_once.store(true, Ordering::Release);
+    }
 }
 
 pub(super) struct FaultHandle {
@@ -36,7 +44,9 @@ impl Handle for FaultHandle {
 
     fn sync(&self) -> io::Result<()> {
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
-        if self.control.fail_sync.load(Ordering::Acquire) {
+        if self.control.fail_once.swap(false, Ordering::AcqRel)
+            || self.control.fail_sync.load(Ordering::Acquire)
+        {
             if let Some(entered) = self.control.entered.lock().unwrap().take() {
                 entered.send(()).unwrap();
             }
