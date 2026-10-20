@@ -236,6 +236,10 @@ impl Catalog {
             };
         }
         if !table.progress.matches(&request.plan, &table.ingest)
+            || table
+                .manifests
+                .as_ref()
+                .is_some_and(|m| m.head != request.plan.read_version)
             || request
                 .plan
                 .sources
