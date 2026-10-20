@@ -172,6 +172,10 @@ The replication layer also provides [durable publisher bindings and epochs](../.
 through its catalog group's normal consensus path. This is an incremental
 publication prerequisite, not a production Lance writer or a manifest lease.
 
+[Quorum application queries](../../docs/design/wal-quorum-queries.md) capture bounded
+catalog, producer-tail and accepted-page views after a safe read-index barrier.
+They share pending capacity with proposals and do not fetch bulk payloads.
+
 The optional `raft-log` feature exposes `raft_log::PhysicalLog` and its cloneable
 `GroupLog` handles. One raft-engine directory hosts all groups assigned to a node
 by the existing immutable `placement::Layout`. Opening binds the full layout,
