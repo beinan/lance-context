@@ -204,7 +204,9 @@ fn decode_terms(bytes: &[u8]) -> Result<Vec<TermRange>> {
         "truncated durable term index"
     );
     Ok(bytes
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .map(|bytes| TermRange {
             first: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             last: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
