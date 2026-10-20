@@ -2,7 +2,7 @@
 //! building and loading an image never decode Arrow or concatenate its bodies.
 //! File I/O belongs on a bounded worker, outside the Raft owner. Only a later
 //! durable Raft transition can install a prepared image. Files are retained on
-//! errors; physical collection and publication-aware retirement are separate.
+//! errors; images omit retired bodies but physical collection is separate.
 
 use super::*;
 use bincode::Options;
@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 8;
-const MAGIC: &[u8; 8] = b"LCWALCP8";
+const FORMAT: u32 = 9;
+const MAGIC: &[u8; 8] = b"LCWALCP9";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -74,6 +74,7 @@ struct Descriptor {
     tables: u64,
     pins: u64,
     closed: u64,
+    retired: u64,
     metadata_bytes: u64,
     payload_bytes: u64,
     metadata_digest: [u8; 32],
@@ -91,6 +92,7 @@ fn metadata_limit(limits: &Limits) -> u64 {
         + limits.max_manifest_records * 2048
         + limits.max_tables * 256
         + limits.max_tables * (source::MAX_CLOSED_BYTES as u64 + 4)
+        + limits.max_producers * (state::MAX_RETIRED_BYTES as u64 + 4)
         + 1024
 }
 
@@ -102,7 +104,7 @@ impl Descriptor {
                 && !self.id.is_nil()
                 && self.records <= limits.max_records
                 && self.producers <= limits.max_producers
-                && self.producers <= self.records
+                && self.retired <= self.producers
                 && self.tables <= limits.max_tables
                 && self.pins <= limits.max_tables.min(limits.max_active_plans)
                 && self.closed <= limits.max_tables
@@ -453,6 +455,7 @@ pub(super) fn build(
         tables: state.catalog.tables.len() as u64,
         pins: state.pins.len() as u64,
         closed: state.closed.len() as u64,
+        retired: state.retired.len() as u64,
         metadata_bytes: 0,
         payload_bytes,
         metadata_digest: [0; 32],
@@ -467,6 +470,7 @@ pub(super) fn build(
     write_u64(&mut metadata, descriptor.tables)?;
     write_u64(&mut metadata, descriptor.pins)?;
     write_u64(&mut metadata, descriptor.closed)?;
+    write_u64(&mut metadata, descriptor.retired)?;
     for (index, meta) in &state.accepted {
         write_meta(&mut metadata, *index, meta)?;
     }
@@ -481,6 +485,9 @@ pub(super) fn build(
     }
     for closed in state.closed.values() {
         write_frame(&mut metadata, &source::encode_closed(closed)?)?;
+    }
+    for (key, retired) in &state.retired {
+        write_frame(&mut metadata, &state::encode_retired(*key, *retired)?)?;
     }
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
@@ -530,7 +537,8 @@ pub(super) fn load(
             && read_u64(&mut metadata)? == descriptor.producers
             && read_u64(&mut metadata)? == descriptor.tables
             && read_u64(&mut metadata)? == descriptor.pins
-            && read_u64(&mut metadata)? == descriptor.closed,
+            && read_u64(&mut metadata)? == descriptor.closed
+            && read_u64(&mut metadata)? == descriptor.retired,
         "image metadata count mismatch"
     );
     let mut state = State {
@@ -593,6 +601,17 @@ pub(super) fn load(
         );
         state.closed.insert(table, Arc::new(closed));
         previous = Some(table);
+    }
+    let mut previous = None;
+    for _ in 0..descriptor.retired {
+        let (bytes, n) = read_frame::<{ state::MAX_RETIRED_BYTES }>(&mut metadata)?;
+        let (key, retired) = state::decode_retired(&bytes[..n])?;
+        ensure!(
+            previous.is_none_or(|old| old < key),
+            "unordered or duplicate retired boundary"
+        );
+        state.retired.insert(key, retired);
+        previous = Some(key);
     }
     let metadata_file = metadata.finish(descriptor.metadata_bytes, descriptor.metadata_digest)?;
     state.validate_checkpoint(layout, group, limits, descriptor.binding.index)?;

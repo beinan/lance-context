@@ -34,7 +34,7 @@ Pins survive local checkpoints, received snapshots and retained-storage restart;
 checkpoint validation verifies both signatures and complete source prefixes.
 Command and image metadata lengths and the number of active pins are bounded.
 
-The application/checkpoint format advances to v8 and rejects older identities
+The application/checkpoint format advances to v9 and rejects older identities
 and images. There is no in-place migration in this optional component.
 
 This increment retains pins and payloads. It does not enable release, advance

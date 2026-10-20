@@ -36,7 +36,7 @@ scope, epochs, grant positions, destination uniqueness and contracts, then repla
 the committed suffix. Metadata contains bounded, ordered table frames alongside
 the existing data records and producer tails. Payload packs still contain only
 opaque accepted data. The current replication identity and application image
-format are v8, including [immutable publication plans](wal-publication-plans.md)
+format are v9, including [immutable publication plans](wal-publication-plans.md)
 and [source pins](wal-source-pins.md).
 Earlier v1/v2/v3/v4/v5 application directories are rejected; this optional component does
 not provide an in-place migration or change the production ingestion path.

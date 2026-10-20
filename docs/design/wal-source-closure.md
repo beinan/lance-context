@@ -19,15 +19,15 @@ history. The compact closure retains no source record list or payload buffers.
 Subsequent pins must start at the saved source cursor and advance the catalog
 plan identity; retained history cannot be repinned from an old cursor.
 
-Application identity and image format advance to v8, without in-place migration
+Application identity and image format advance to v9, without in-place migration
 from older identities. Snapshot validation verifies closure signatures, scope,
 local index ordering and compatibility with any remaining active pins.
 
-This increment retains accepted payloads, producer tails, catalog selections,
-descriptors, manifests and image files. It does not yet advance the catalog to
-its next plan, retire payload metadata, reclaim disk or enable production
-ingestion. Those steps must preserve retry receipts and active image/read
-ownership before they can establish bounded sustained ingestion.
+Closure now also retires its exact accepted payload range as described in
+[source retirement](wal-source-retirement.md), preserving producer receipts and
+sequence boundaries. Catalog selections, descriptors, manifests and existing
+image files remain retained. Catalog advancement, physical disk reclamation and
+production ingestion are still separate work.
 
 Tests exercise closure after real Lance publication, dropped closure replies,
 source snapshots, full six-process restart, delayed pin rejection and exact

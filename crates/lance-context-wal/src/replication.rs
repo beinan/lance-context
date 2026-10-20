@@ -93,7 +93,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v8",
+            "lance-context/replicated-append/v9",
             self,
         ))?)
     }
@@ -459,7 +459,8 @@ impl Node {
     }
 
     /// Persist a catalog-authorized source closure and reject delayed pin
-    /// requests for the closed plan. Bodies remain retained until retirement.
+    /// requests for the closed plan. Retire selected payload metadata while
+    /// preserving latest producer receipts; physical collection is separate.
     pub fn close_source(&mut self, request: u64, permit: source::ClosurePermit) -> Result<()> {
         let group = permit.closure().group;
         let batch = permit.batch(&self.layout, &self.limits)?;

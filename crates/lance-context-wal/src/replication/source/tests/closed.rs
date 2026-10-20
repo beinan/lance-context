@@ -16,7 +16,13 @@ fn publisher(events: Events) -> Result<publication::Reply> {
 }
 
 fn fixture() -> Result<(Cluster, Permit, Uuid, Uuid)> {
-    let mut c = Cluster::new()?;
+    fixture_with_background(100_000, 12)
+}
+fn fixture_with_background(
+    max_records: u64,
+    background: u64,
+) -> Result<(Cluster, Permit, Uuid, Uuid)> {
+    let mut c = Cluster::with_policy(128, max_records)?;
     let authority = c.acquire(0)?;
     let incarnation = Uuid::from_u128(800);
     c.nodes[0].bootstrap_manifest(
@@ -37,7 +43,7 @@ fn fixture() -> Result<(Cluster, Permit, Uuid, Uuid)> {
     let publication::Reply::ManifestReserved(base) = publisher(c.pump()?)? else {
         anyhow::bail!("bootstrap missing")
     };
-    let plan = c.plan(|_| {})?;
+    let plan = c.plan_with_background(|_| {}, background)?;
     let permit = c.permit(plan)?;
     assert!(matches!(c.pin(permit.clone())?, Reply::Pinned { .. }));
     Ok((c, permit, incarnation, base.identity))
@@ -141,7 +147,7 @@ fn close(c: &mut Cluster, permit: ClosurePermit) -> Result<Reply> {
 }
 
 #[test]
-fn durable_closure_releases_pin_rejects_delayed_permits_and_preserves_data() -> Result<()> {
+fn closure_retires_selected_payloads_preserves_suffix_and_rejects_delayed_pins() -> Result<()> {
     let (mut c, pin, incarnation, predecessor) = fixture()?;
     assert!(closure_permit(&mut c, pin.selection().plan_index)?.is_none());
     let permit = publish(&mut c, incarnation, predecessor)?;
@@ -158,7 +164,8 @@ fn durable_closure_releases_pin_rejects_delayed_permits_and_preserves_data() -> 
         1,
         "raw streams must not allocate closure history"
     );
-    assert_eq!(state.accepted, before.accepted);
+    assert_eq!(state.accepted.len() + 2, before.accepted.len());
+    assert_eq!(state.retired.len(), 1);
     assert_eq!(state.producers, before.producers);
     assert_eq!(
         state.closed[&c.table].pin_index,
@@ -186,12 +193,126 @@ fn durable_closure_releases_pin_rejects_delayed_permits_and_preserves_data() -> 
         assert!(state.pins.is_empty());
         state.validate_checkpoint(&c.layout, 20, &c.limits, state.applied)?;
         for (index, meta) in &before.accepted {
+            if meta.stream == c.table && *index <= pin.selection().range.through {
+                assert!(node.read_accepted(20, *index)?.is_none());
+                continue;
+            }
             let record = node
                 .read_accepted(20, *index)?
                 .context("retained source disappeared")?;
             assert_eq!(&record.meta, meta);
             assert_eq!(record.body, Bytes::from(vec![meta.sequence as u8; 4096]));
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_payload_images_preserve_latest_retry_and_captured_old_images() -> Result<()> {
+    use checkpoint::Part;
+    let (mut c, pin, incarnation, predecessor) = fixture_with_background(2, 0)?;
+    let original_index = pin.selection().range.records.last().unwrap().0;
+    let permit = publish(&mut c, incarnation, predecessor)?;
+    let captured = c.nodes[3].prepare_checkpoint(20, Uuid::new_v4())?;
+    assert!(matches!(close(&mut c, permit)?, Reply::Closed { .. }));
+    let prepared = captured.run()?;
+    let old_image = prepared.image();
+    assert_eq!(old_image.bytes(Part::Payload), 8192);
+    assert_eq!(
+        old_image.chunk(Part::Payload, 0, 4096)?,
+        Bytes::from(vec![1; 4096])
+    );
+    drop(prepared);
+    for node in &mut c.nodes[3..] {
+        let prepared = node.prepare_checkpoint(20, Uuid::new_v4())?.run()?;
+        assert_eq!(prepared.image().bytes(Part::Payload), 0);
+        node.install_checkpoint(prepared)?;
+    }
+    c.reopen()?;
+    assert_eq!(
+        old_image.chunk(Part::Payload, 4096, 4096)?,
+        Bytes::from(vec![2; 4096])
+    );
+    let retry = Batch::new(
+        c.table,
+        1,
+        Uuid::from_u128(94),
+        2,
+        Bytes::from(vec![2; 4096]),
+    );
+    c.nodes[3].propose(20, 810, retry.clone())?;
+    assert!(c.pump()?.completions.iter().any(|c| c.request == 810
+        && c.outcome
+            == Outcome::Committed(Applied::Accepted {
+                index: original_index
+            })));
+    assert_eq!(
+        c.nodes[3].status(20)?.accepted_records,
+        0,
+        "retry resurrected payload"
+    );
+    let mut changed = retry;
+    changed.body = Bytes::from(vec![9; 4096]);
+    changed.meta.digest = Sha256::digest(&changed.body).into();
+    c.nodes[3].propose(20, 811, changed)?;
+    assert!(c
+        .pump()?
+        .completions
+        .iter()
+        .any(|c| c.request == 811
+            && matches!(c.outcome, Outcome::Committed(Applied::Rejected { .. }))));
+    // Both record slots were reclaimed, while the producer sequence continued.
+    c.append(c.table, 3)?;
+    c.append(c.table, 4)?;
+    assert_eq!(c.nodes[3].status(20)?.accepted_records, 2);
+    for node in &c.nodes[3..] {
+        let state = &node.groups[&20].state;
+        state.validate_checkpoint(&c.layout, 20, &c.limits, state.applied)?;
+        assert!(node.read_accepted(20, original_index)?.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn retirement_boundaries_cannot_fabricate_retry_receipts_or_skip_retained_sequences() -> Result<()>
+{
+    let (mut c, _, incarnation, predecessor) = fixture()?;
+    let permit = publish(&mut c, incarnation, predecessor)?;
+    c.append(c.table, 3)?;
+    close(&mut c, permit)?;
+    let state = c.nodes[3].groups[&20].state.clone();
+    let key = (c.table, 1, Uuid::from_u128(94));
+    for mutation in 0..8 {
+        let mut invalid = state.clone();
+        match mutation {
+            0 => {
+                invalid.retired.clear();
+            }
+            1 => {
+                invalid.producers.remove(&key);
+            }
+            2 => invalid.retired.get_mut(&key).unwrap().sequence += 1,
+            3 => invalid.retired.get_mut(&key).unwrap().index = state.applied,
+            4 => {
+                invalid.closed.remove(&c.table);
+            }
+            5 => {
+                invalid.accepted.retain(|_, meta| meta.stream != c.table);
+            }
+            6 => invalid.producers.get_mut(&key).unwrap().1 -= 1,
+            7 => {
+                invalid
+                    .retired
+                    .insert((Uuid::new_v4(), 1, Uuid::new_v4()), invalid.retired[&key]);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            invalid
+                .validate_checkpoint(&c.layout, 20, &c.limits, invalid.applied)
+                .is_err(),
+            "mutation {mutation}"
+        );
     }
     Ok(())
 }

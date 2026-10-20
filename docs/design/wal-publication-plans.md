@@ -37,7 +37,7 @@ the heap. Decoders reject noncanonical maps instead of silently accepting duplic
 keys normalized by the serializer.
 
 Source pins subsequently advance the optional application identity and checkpoint
-format to v8. Existing v1/v2/v3/v4/v5/v6/v7 directories and images are rejected; there is no in-place migration
+format to v9. Existing v1/v2/v3/v4/v5/v6/v7/v8 directories and images are rejected; there is no in-place migration
 or production rollout in this increment. Catalog-only and mixed data/catalog
 snapshots preserve plans, with semantic validation after checksum verification.
 
