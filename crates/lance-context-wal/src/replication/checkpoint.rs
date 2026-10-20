@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 3;
-const MAGIC: &[u8; 8] = b"LCWALCP3";
+const FORMAT: u32 = 4;
+const MAGIC: &[u8; 8] = b"LCWALCP4";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -72,6 +72,7 @@ struct Descriptor {
     records: u64,
     producers: u64,
     tables: u64,
+    pins: u64,
     metadata_bytes: u64,
     payload_bytes: u64,
     metadata_digest: [u8; 32],
@@ -84,6 +85,7 @@ fn metadata_limit(limits: &Limits) -> u64 {
     (limits.max_records + limits.max_producers) * 268
         + limits.max_tables * (publication::MAX_BASE_TABLE_BYTES as u64 + 4)
         + limits.max_tables.min(limits.max_active_plans) * publication::MAX_COMMAND_BYTES as u64
+        + limits.max_tables.min(limits.max_active_plans) * (source::MAX_PIN_BYTES as u64 + 4)
         + 1024
 }
 
@@ -97,6 +99,7 @@ impl Descriptor {
                 && self.producers <= limits.max_producers
                 && self.producers <= self.records
                 && self.tables <= limits.max_tables
+                && self.pins <= limits.max_tables.min(limits.max_active_plans)
                 && (group == publication::control_group(layout) || self.tables == 0)
                 && self.metadata_bytes <= metadata_limit(limits)
                 && self.payload_bytes <= self.records * limits.max_record_bytes,
@@ -372,12 +375,12 @@ fn read_frame<const N: usize>(input: &mut impl Read) -> Result<([u8; N], usize)>
     input.read_exact(&mut bytes[..length])?;
     Ok((bytes, length))
 }
-fn read_table_frame(input: &mut impl Read) -> Result<Vec<u8>> {
+fn read_dynamic_frame(input: &mut impl Read, maximum: usize) -> Result<Vec<u8>> {
     let mut length = [0; 4];
     input.read_exact(&mut length)?;
     let length = u32::from_le_bytes(length) as usize;
     ensure!(
-        length > 0 && length <= publication::MAX_TABLE_BYTES,
+        length > 0 && length <= maximum,
         "oversized publisher image frame"
     );
     // Plan metadata is larger than a record header. Allocate its actual bounded
@@ -442,6 +445,7 @@ pub(super) fn build(
         records: state.accepted.len() as u64,
         producers: state.producers.len() as u64,
         tables: state.catalog.tables.len() as u64,
+        pins: state.pins.len() as u64,
         metadata_bytes: 0,
         payload_bytes,
         metadata_digest: [0; 32],
@@ -454,6 +458,7 @@ pub(super) fn build(
     write_u64(&mut metadata, descriptor.records)?;
     write_u64(&mut metadata, descriptor.producers)?;
     write_u64(&mut metadata, descriptor.tables)?;
+    write_u64(&mut metadata, descriptor.pins)?;
     for (index, meta) in &state.accepted {
         write_meta(&mut metadata, *index, meta)?;
     }
@@ -462,6 +467,9 @@ pub(super) fn build(
     }
     for table in state.catalog.tables.values() {
         write_frame(&mut metadata, &publication::encode_table(table)?)?;
+    }
+    for pin in state.pins.values() {
+        write_frame(&mut metadata, &source::encode_pin(pin)?)?;
     }
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
@@ -509,7 +517,8 @@ pub(super) fn load(
     ensure!(
         read_u64(&mut metadata)? == descriptor.records
             && read_u64(&mut metadata)? == descriptor.producers
-            && read_u64(&mut metadata)? == descriptor.tables,
+            && read_u64(&mut metadata)? == descriptor.tables
+            && read_u64(&mut metadata)? == descriptor.pins,
         "image metadata count mismatch"
     );
     let mut state = State {
@@ -539,7 +548,7 @@ pub(super) fn load(
     }
     let mut previous = None;
     for _ in 0..descriptor.tables {
-        let bytes = read_table_frame(&mut metadata)?;
+        let bytes = read_dynamic_frame(&mut metadata, publication::MAX_TABLE_BYTES)?;
         let table = publication::decode_table(&bytes)?;
         let id = table.authority.table;
         ensure!(
@@ -548,6 +557,18 @@ pub(super) fn load(
         );
         state.catalog.tables.insert(id, table);
         previous = Some(id);
+    }
+    let mut previous = None;
+    for _ in 0..descriptor.pins {
+        let bytes = read_dynamic_frame(&mut metadata, source::MAX_PIN_BYTES)?;
+        let pin = source::decode_pin(&bytes)?;
+        let table = pin.permit.selection().table;
+        ensure!(
+            previous.is_none_or(|old| old < table),
+            "unordered or duplicate source pin"
+        );
+        state.pins.insert(table, Arc::new(pin));
+        previous = Some(table);
     }
     let metadata_file = metadata.finish(descriptor.metadata_bytes, descriptor.metadata_digest)?;
     state.validate_checkpoint(layout, group, limits, descriptor.binding.index)?;

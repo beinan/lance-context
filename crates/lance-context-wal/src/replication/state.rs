@@ -25,6 +25,10 @@ pub(super) fn validate_meta(
     body: &[u8],
     digest: bool,
 ) -> Result<()> {
+    if meta.kind == RecordKind::Source {
+        meta.validate_payload(body, source::MAX_BYTES)?;
+        return source::validate_record(layout, group, limits, meta, body);
+    }
     if meta.kind == RecordKind::MultiPublication {
         meta.validate_payload(body, publication::MAX_COMMAND_BYTES)?;
         return publication::validate_record(layout, group, limits, meta, body);
@@ -79,6 +83,7 @@ pub(super) fn validate_entry(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct State {
+    pub pins: BTreeMap<Uuid, Arc<source::Pin>>,
     pub catalog: publication::Catalog,
     pub applied: u64,
     pub accepted: BTreeMap<u64, BatchMeta>,
@@ -152,6 +157,7 @@ impl State {
             "checkpoint producer tails disagree"
         );
         self.catalog.validate(layout, group, cut, limits)?;
+        source::validate_state(self, layout, group, cut, limits)?;
         Ok(())
     }
 
@@ -165,6 +171,14 @@ impl State {
             return Ok(None);
         }
         let meta = decode_meta(&entry.context)?;
+        if meta.kind == RecordKind::Source {
+            return Ok(Some(Applied::Source(source::apply(
+                self,
+                source::decode(&entry.data)?,
+                entry.index,
+                limits,
+            ))));
+        }
         if meta.kind == RecordKind::MultiPublication {
             return Ok(Some(Applied::Publisher(self.catalog.apply(
                 publication::decode(&entry.data)?,

@@ -36,14 +36,16 @@ scope, epochs, grant positions, destination uniqueness and contracts, then repla
 the committed suffix. Metadata contains bounded, ordered table frames alongside
 the existing data records and producer tails. Payload packs still contain only
 opaque accepted data. The current replication identity and application image
-format are v3, including [immutable publication plans](wal-publication-plans.md).
-Earlier v1/v2 application directories are rejected; this optional component does
+format are v4, including [immutable publication plans](wal-publication-plans.md)
+and [source pins](wal-source-pins.md).
+Earlier v1/v2/v3 application directories are rejected; this optional component does
 not provide an in-place migration or change the production ingestion path.
 
 `Node::publisher` exposes only a local applied view. It is not a quorum read,
 lease, authorization check or proof of Lance visibility. A granted epoch alone
 does not stop an old owner from writing outside this protocol. Durable publication
-plans check the current authority at apply. Subsequent work must verify source dependencies, commit a
+plans check the current authority at apply. Source pins verify the immutable
+selection against the complete source prefix. Subsequent work must commit a
 pinned Lance target, resolve its immutable outcome and authorize retirement from
 that outcome. Table closing/rebinding, table-bound data admission and integration
 with the actual context catalog remain separate requirements.

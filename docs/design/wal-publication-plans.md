@@ -36,14 +36,14 @@ active plans. Large metadata frames allocate only their bounded actual length on
 the heap. Decoders reject noncanonical maps instead of silently accepting duplicate
 keys normalized by the serializer.
 
-This changes the optional application identity and checkpoint format to v3.
-Existing v1/v2 directories and images are rejected; there is no in-place migration
+Source pins subsequently advance the optional application identity and checkpoint
+format to v4. Existing v1/v2/v3 directories and images are rejected; there is no in-place migration
 or production rollout in this increment. Catalog-only and mixed data/catalog
 snapshots preserve plans, with semantic validation after checksum verification.
 
 A stored plan is not a source pin, proof of complete source selection or permission
-to commit a Lance manifest. Source groups must still validate their full selected
-prefixes through the subsequent pin protocol. Descriptor CAS, exact-target Lance
+to commit a Lance manifest. Source groups validate their full selected prefixes
+through the [source pin protocol](wal-source-pins.md). Descriptor CAS, exact-target Lance
 outcome recovery, resolution and cleanup commands remain subsequent work; this
 increment intentionally retains pending plans and advances no published cursor.
 No source payload can be retired on the strength of this plan alone.

@@ -33,6 +33,15 @@ fn pump(nodes: &mut [Node]) -> Result<Events> {
     }
     anyhow::bail!("query message pump did not settle")
 }
+fn evaluate(query: &Query, cut: &Cut, state: &State) -> Result<Value> {
+    query.evaluate(
+        state,
+        cut,
+        &super::super::tests::layout(),
+        &Limits::default(),
+        None,
+    )
+}
 
 #[test]
 fn new_leader_rejects_reads_until_its_first_current_term_entry_commits() -> Result<()> {
@@ -199,25 +208,34 @@ fn read_contexts_do_not_cross_request_reuse_reopen_or_unapplied_cuts() -> Result
         applied: 4,
     };
     tracker.confirm(&context, 5)?;
-    assert!(tracker.finish(cut.clone(), &state, true)?.is_empty());
+    assert!(tracker
+        .finish(cut.clone(), &state, true, evaluate)?
+        .is_empty());
     state.applied = 5;
     cut.applied = 5;
-    assert_eq!(tracker.finish(cut.clone(), &state, true)?.len(), 1);
+    assert_eq!(
+        tracker.finish(cut.clone(), &state, true, evaluate)?.len(),
+        1
+    );
     let next = tracker.enqueue(10, 2, query.clone())?;
     assert_ne!(next, context);
     tracker.confirm(&context, 5)?;
-    assert!(tracker.finish(cut.clone(), &state, true)?.is_empty());
+    assert!(tracker
+        .finish(cut.clone(), &state, true, evaluate)?
+        .is_empty());
     cut.term = 3;
     assert_eq!(
-        tracker.finish(cut.clone(), &state, true)?[0].outcome,
+        tracker.finish(cut.clone(), &state, true, evaluate)?[0].outcome,
         Outcome::Unknown
     );
     let mut reopened = Tracker::default();
     assert_ne!(reopened.enqueue(10, 3, query)?, context);
     reopened.confirm(&context, 5)?;
-    assert!(reopened.finish(cut.clone(), &state, true)?.is_empty());
+    assert!(reopened
+        .finish(cut.clone(), &state, true, evaluate)?
+        .is_empty());
     assert_eq!(
-        reopened.finish(cut, &state, false)?[0].outcome,
+        reopened.finish(cut, &state, false, evaluate)?[0].outcome,
         Outcome::Unknown
     );
     Ok(())

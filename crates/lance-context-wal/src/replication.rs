@@ -16,6 +16,7 @@ pub mod checkpoint;
 mod images;
 pub mod publication;
 pub mod query;
+pub mod source;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -42,6 +43,9 @@ use state::State;
 /// policy. These bounds do not account for queues in the caller's transport.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
+    /// Public Ed25519 key for catalog dependency attestations. Key changes are
+    /// application-policy migrations; private key bytes are never persisted here.
+    pub catalog_key: Option<[u8; 32]>,
     pub max_tables: u64,
     pub max_active_plans: u64,
     pub max_plan_source_bytes: u64,
@@ -54,6 +58,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            catalog_key: None,
             max_tables: 1024,
             max_active_plans: 128,
             max_plan_source_bytes: 64 * 1024 * 1024,
@@ -69,6 +74,7 @@ impl Limits {
     fn identity(&self) -> Result<Vec<u8>> {
         ensure!(
             (1..=16_384).contains(&self.max_tables)
+                && self.catalog_key.is_none_or(|key| key != [0; 32])
                 && (1..=256).contains(&self.max_active_plans)
                 && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
                 && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
@@ -80,7 +86,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v3",
+            "lance-context/replicated-append/v4",
             self,
         ))?)
     }
@@ -109,6 +115,7 @@ pub enum Applied {
         expected_sequence: u64,
     },
     Capacity,
+    Source(source::Reply),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +177,7 @@ struct Group {
 /// or retain storage handles outside it. An internal/disk error fences this node;
 /// drop it, reconcile outstanding requests and reopen the original directories.
 pub struct Node {
+    signer: Option<Arc<source::CatalogSigner>>,
     layout: Arc<Layout>,
     layout_hash: [u8; 32],
     policy: [u8; 32],
@@ -188,6 +196,11 @@ impl Node {
         self.groups
             .into_iter()
             .map(|(id, group)| Self {
+                signer: if id == publication::control_group(&self.layout) {
+                    self.signer.clone()
+                } else {
+                    None
+                },
                 layout: self.layout.clone(),
                 layout_hash: self.layout_hash,
                 policy: self.policy,
@@ -263,6 +276,7 @@ impl Node {
             );
         }
         Ok(Self {
+            signer: None,
             layout,
             layout_hash,
             policy,
@@ -280,6 +294,20 @@ impl Node {
         for group in self.groups.values() {
             group.raw.store().initial_state()?;
         }
+        Ok(())
+    }
+
+    /// Install the catalog's private dependency-attestation key. The persisted
+    /// policy pins its public key. Source-only replicas need only the public key.
+    pub fn set_catalog_signer(&mut self, signer: Arc<source::CatalogSigner>) -> Result<()> {
+        self.healthy()?;
+        ensure!(
+            self.groups
+                .contains_key(&publication::control_group(&self.layout))
+                && self.limits.catalog_key == Some(signer.public_key()),
+            "catalog signer does not match hosted scope and policy"
+        );
+        self.signer = Some(signer);
         Ok(())
     }
 
@@ -334,6 +362,12 @@ impl Node {
             "request token already pending"
         );
         query.validate(&self.layout, group)?;
+        if matches!(query, query::Query::Pin { .. }) {
+            ensure!(
+                self.signer.is_some(),
+                "catalog dependency signer unavailable"
+            );
+        }
         let g = self.groups.get_mut(&group).context("unhosted group")?;
         ensure!(g.raw.raft.state == StateRole::Leader, "not leader");
         // raft-rs 0.7 silently drops ReadIndex before this condition holds.
@@ -363,6 +397,14 @@ impl Node {
     pub fn plan_publication(&mut self, request: u64, plan: publication::PlanRequest) -> Result<()> {
         let batch = plan.batch(&self.layout, &self.limits)?;
         self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Verify a catalog quorum-read attestation and persist the exact complete
+    /// table prefix in its source group. Completion, never enqueue, pins it.
+    pub fn pin_source(&mut self, request: u64, permit: source::Permit) -> Result<()> {
+        let group = permit.selection().group;
+        let batch = permit.batch(&self.layout, &self.limits)?;
+        self.propose(group, request, batch)
     }
 
     /// Local applied view, not a quorum read or proof that an owner is current.
@@ -560,6 +602,15 @@ impl Node {
                 },
                 &group.state,
                 group.raw.raft.state == StateRole::Leader,
+                |query, cut, state| {
+                    query.evaluate(
+                        state,
+                        cut,
+                        &self.layout,
+                        &self.limits,
+                        self.signer.as_deref(),
+                    )
+                },
             )?);
             events
                 .messages

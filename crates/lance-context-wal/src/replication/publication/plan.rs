@@ -14,6 +14,49 @@ pub struct SourceRange {
     pub through: u64,
     pub records: Vec<(u64, BatchMeta)>,
 }
+impl SourceRange {
+    pub(in crate::replication) fn validate(
+        &self,
+        layout: &Layout,
+        table: Uuid,
+        group: u64,
+        limits: &Limits,
+    ) -> Result<()> {
+        ensure!(
+            layout.groups.contains_key(&group)
+                && self.after < self.through
+                && self.through < u64::MAX
+                && !self.records.is_empty()
+                && self.records.len() <= MAX_INPUTS
+                && self.records.windows(2).all(|w| w[0].0 < w[1].0),
+            "invalid publication source range"
+        );
+        let mut bytes = 0u64;
+        for (index, meta) in &self.records {
+            ensure!(
+                *index > self.after
+                    && *index <= self.through
+                    && meta.stream == table
+                    && meta.kind == RecordKind::Data
+                    && !meta.producer.is_nil()
+                    && meta.sequence > 0
+                    && meta.sequence < u64::MAX
+                    && meta.body_bytes > 0
+                    && meta.body_bytes <= limits.max_record_bytes
+                    && layout.group_for_bucket(meta.bucket)? == group,
+                "invalid publication source metadata"
+            );
+            bytes = bytes
+                .checked_add(meta.body_bytes)
+                .context("source byte sum overflow")?;
+        }
+        ensure!(
+            bytes <= limits.max_plan_source_bytes,
+            "publication source byte limit"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
@@ -59,30 +102,8 @@ impl Plan {
             count = count
                 .checked_add(range.records.len())
                 .context("plan input count overflow")?;
-            ensure!(
-                count <= MAX_INPUTS
-                    && layout.groups.contains_key(group)
-                    && range.after < range.through
-                    && range.through < u64::MAX
-                    && !range.records.is_empty()
-                    && range.records.windows(2).all(|w| w[0].0 < w[1].0),
-                "invalid publication source range"
-            );
-            for (index, meta) in &range.records {
-                ensure!(
-                    *index > range.after
-                        && *index <= range.through
-                        && meta.stream == table
-                        && meta.kind == RecordKind::Data
-                        && !meta.producer.is_nil()
-                        && meta.sequence > 0
-                        && meta.sequence < u64::MAX
-                        && meta.body_bytes > 0
-                        && meta.body_bytes <= limits.max_record_bytes
-                        && layout.group_for_bucket(meta.bucket)? == *group,
-                    "invalid publication source metadata"
-                );
-            }
+            ensure!(count <= MAX_INPUTS, "publication input count limit");
+            range.validate(layout, table, *group, limits)?;
         }
         ensure!(
             self.source_bytes()? <= limits.max_plan_source_bytes,
