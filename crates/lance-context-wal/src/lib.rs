@@ -28,3 +28,7 @@ pub mod ingest_contract;
 
 #[cfg(feature = "vectored-io")]
 pub mod transport_io;
+
+/// Local recoverable client state with bounded shared durable barriers.
+#[cfg(feature = "client-journal")]
+pub mod client_journal;
