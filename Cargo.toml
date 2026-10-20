@@ -12,6 +12,7 @@ members = [
     "python",
 ]
 resolver = "2"
+exclude = ["vendor/raft-engine"]
 
 [workspace.package]
 edition = "2021"

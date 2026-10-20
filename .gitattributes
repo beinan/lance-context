@@ -1,0 +1,5 @@
+# Preserve the published third-party source, including its existing whitespace.
+vendor/raft-engine/** linguist-vendored -whitespace
+# Keep the provenance and complete local delta prominent in review.
+vendor/raft-engine/LANCE_CONTEXT_PATCH.md -linguist-vendored
+vendor/raft-engine/read-cache-identity.patch -linguist-vendored

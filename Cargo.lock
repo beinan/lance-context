@@ -6439,8 +6439,6 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "raft-engine"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1213c3a24e3fee8afcc74b2be08c4081adde96f092e0fc1c607abb3e16ae722e"
 dependencies = [
  "byteorder",
  "crc32fast",
