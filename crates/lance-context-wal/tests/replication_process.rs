@@ -8,6 +8,9 @@ use lance_context_wal::{
     record::Batch,
     replication::{
         checkpoint::{Image, Part},
+        publication::{
+            Acquire, Destination, Rejection as PublisherRejection, Reply as PublisherReply, Table,
+        },
         Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
         SnapshotReceiver, Status,
     },
@@ -56,6 +59,8 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Acquire(u64, Acquire),
+    Publisher(Uuid),
     Campaign(u64),
     Propose(u64, u64, Batch),
     Step(WirePacket),
@@ -74,6 +79,7 @@ enum Request {
 }
 #[derive(Serialize, Deserialize)]
 enum Response {
+    Publisher(Option<Table>),
     Events(Vec<WirePacket>, Vec<Completion>),
     Status(Status),
     Record(Option<Batch>),
@@ -117,6 +123,10 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::Acquire(token, acquire) => node.acquire_publisher(token, acquire)?,
+        Request::Publisher(table) => {
+            return Ok(Response::Publisher(node.publisher(table)?.cloned()))
+        }
         Request::Campaign(group) => node.campaign(group)?,
         Request::Propose(group, token, batch) => node.propose(group, token, batch)?,
         Request::Step(packet) => node.step(packet.decode()?)?,
@@ -757,5 +767,146 @@ fn durable_quorum_retry_leader_loss_suffix_replacement_and_full_restart() -> Res
         Some(Outcome::Committed(Applied::Accepted { .. }))
     ));
     println!("verified real RF3 processes: durable majority ACK, latest retry, isolated old leader, replaced uncommitted suffix, two groups and full process restart with exact payloads");
+    Ok(())
+}
+
+#[test]
+fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -> Result<()> {
+    use lance_context_wal::ingest_contract::{IngestContract, WritePolicy};
+    let mut c = Cluster::new()?;
+    let mut acquire = Acquire {
+        table: Uuid::from_u128(700),
+        destination: Destination {
+            namespace: Uuid::from_u128(701),
+            dataset: "tables/example".into(),
+        },
+        ingest: IngestContract {
+            tenant: "test".into(),
+            qualified_table: "example".into(),
+            schema: [9; 32],
+            policy: WritePolicy::ImmutableUniqueIds,
+            max_record_bytes: 1024 * 1024,
+            max_rows: 1024,
+        },
+        owner: Uuid::from_u128(702),
+        request: Uuid::from_u128(703),
+        expected_epoch: 0,
+    };
+    c.command(1, Request::Campaign(10))?;
+    c.pump(&[1, 2, 3])?;
+    c.command(1, Request::Acquire(700, acquire.clone()))?;
+    assert!(
+        c.outcome(700).is_none(),
+        "local acquisition released authority without quorum"
+    );
+    c.pump(&[1, 2])?;
+    let first = c.outcome(700).context("missing committed authority")?;
+    let Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(first_authority))) = &first
+    else {
+        anyhow::bail!("unexpected acquisition {first:?}")
+    };
+    assert_eq!(first_authority.epoch, 1);
+    drop(c.peers.remove(&1));
+    assert_eq!(c.elect(2, 10, &[2, 3])?, 2);
+    c.command(2, Request::Acquire(701, acquire.clone()))?;
+    c.pump(&[2, 3])?;
+    assert_eq!(c.outcome(701), Some(first));
+
+    // A competing owner wins only at the exact epoch. The binding is immutable.
+    acquire.owner = Uuid::from_u128(704);
+    acquire.request = Uuid::from_u128(705);
+    acquire.expected_epoch = 1;
+    c.command(2, Request::Acquire(702, acquire.clone()))?;
+    c.pump(&[2, 3])?;
+    let second = c.outcome(702).context("takeover did not commit")?;
+    assert!(
+        matches!(&second, Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(a))) if a.epoch == 2)
+    );
+    let image = c
+        .peers
+        .get_mut(&2)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(10, Uuid::from_u128(710)))?;
+    assert!(
+        matches!(image, Response::Image(_, _, 0)),
+        "catalog unexpectedly retained control payloads as data"
+    );
+    c.command(2, Request::InstallCheckpoint)?;
+    c.pump(&[2, 3])?;
+    c.start(1)?;
+    for _ in 0..30 {
+        c.command(2, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+        if c.transfers > 0 {
+            break;
+        }
+    }
+    assert!(
+        c.transfers > 0,
+        "lagging owner did not receive an application image"
+    );
+    let Response::Publisher(Some(table)) = c
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .call(Request::Publisher(acquire.table))?
+    else {
+        anyhow::bail!("snapshot omitted publisher")
+    };
+    assert_eq!(table.authority.epoch, 2);
+    assert_eq!(table.destination, acquire.destination);
+    assert_eq!(table.ingest, acquire.ingest);
+
+    c.command(2, Request::Acquire(703, acquire.clone()))?;
+    c.pump(&[2])?;
+    assert!(
+        c.outcome(703).is_none(),
+        "isolated leader answered an authority retry from cache"
+    );
+    let leader = c.elect(1, 10, &[1, 3])?;
+    let stale = acquire.clone();
+    acquire.owner = Uuid::from_u128(706);
+    acquire.request = Uuid::from_u128(707);
+    acquire.expected_epoch = 2;
+    c.command(leader, Request::Acquire(704, acquire.clone()))?;
+    c.pump(&[1, 3])?;
+    let latest = c.outcome(704).context("third epoch unavailable")?;
+    assert!(
+        matches!(&latest, Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(a))) if a.epoch == 3)
+    );
+    c.command(leader, Request::Acquire(705, stale))?;
+    c.pump(&[1, 3])?;
+    assert_eq!(
+        c.outcome(705),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Rejected(PublisherRejection::Epoch { current: 3 })
+        )))
+    );
+    for _ in 0..4 {
+        c.command(leader, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+    }
+    c.queue.clear();
+    c.peers.clear();
+    for id in 1..=3 {
+        c.start(id)?;
+    }
+    for peer in c.peers.values_mut() {
+        let Response::Publisher(Some(table)) = peer.call(Request::Publisher(acquire.table))? else {
+            anyhow::bail!("restart omitted publisher")
+        };
+        assert_eq!(table.authority.epoch, 3);
+        assert_eq!(table.authority.owner, acquire.owner);
+        assert_eq!(table.ingest, acquire.ingest);
+        verify_records(peer, 10, &[])?;
+    }
+    let leader = c.elect(1, 10, &[1, 2, 3])?;
+    c.command(leader, Request::Acquire(706, acquire))?;
+    c.pump(&[1, 2, 3])?;
+    assert_eq!(
+        c.outcome(706),
+        Some(latest),
+        "restart changed the committed grant index"
+    );
     Ok(())
 }

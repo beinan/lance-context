@@ -14,6 +14,7 @@
 
 pub mod checkpoint;
 mod images;
+pub mod publication;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -40,6 +41,7 @@ use state::State;
 /// policy. These bounds do not account for queues in the caller's transport.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
+    pub max_tables: u64,
     pub max_record_bytes: u64,
     pub max_records: u64,
     pub max_producers: u64,
@@ -49,6 +51,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_tables: 1024,
             max_record_bytes: 8 * 1024 * 1024,
             max_records: 100_000,
             max_producers: 16_384,
@@ -60,7 +63,8 @@ impl Default for Limits {
 impl Limits {
     fn identity(&self) -> Result<Vec<u8>> {
         ensure!(
-            (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
+            (1..=16_384).contains(&self.max_tables)
+                && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
                 && (1..=500_000).contains(&self.max_records)
                 && (1..=100_000).contains(&self.max_producers)
                 && (1..=4096).contains(&self.max_pending)
@@ -69,7 +73,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v1",
+            "lance-context/replicated-append/v2",
             self,
         ))?)
     }
@@ -88,6 +92,7 @@ pub struct Packet {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Applied {
+    Publisher(publication::Reply),
     /// A new append or exact latest retry. Index identifies the original append.
     Accepted {
         index: u64,
@@ -296,6 +301,26 @@ impl Node {
             producers: g.state.producers.len(),
             pending: g.pending.len(),
         })
+    }
+
+    /// Queue a binding/epoch CAS in the one catalog group. Only a committed
+    /// Publisher completion from poll grants authority; no local cache shortcut.
+    pub fn acquire_publisher(&mut self, request: u64, acquire: publication::Acquire) -> Result<()> {
+        let batch = acquire.batch(&self.layout)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Local applied view, not a quorum read or proof that an owner is current.
+    pub fn publisher(&self, table: Uuid) -> Result<Option<&publication::Table>> {
+        self.healthy()?;
+        Ok(self
+            .groups
+            .get(&publication::control_group(&self.layout))
+            .context("catalog group not hosted")?
+            .state
+            .catalog
+            .tables
+            .get(&table))
     }
 
     /// Ok means queued locally, NOT durable or committed. A token may have only
