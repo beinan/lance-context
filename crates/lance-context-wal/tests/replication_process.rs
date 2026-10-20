@@ -9,8 +9,8 @@ use lance_context_wal::{
     replication::{
         checkpoint::{Image, Part},
         publication::{
-            Acquire, Destination, Plan, PlanRequest, Rejection as PublisherRejection,
-            Reply as PublisherReply, SourceRange, Table,
+            Acquire, Descriptors, Destination, Plan, PlanRequest, PrepareRequest,
+            Rejection as PublisherRejection, Reply as PublisherReply, SourceRange, Table,
         },
         query::{Completion as ReadCompletion, Outcome as ReadOutcome, Query, Value},
         source::{CatalogSigner, Permit, Reply as SourceReply},
@@ -62,6 +62,7 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Prepare(u64, PrepareRequest),
     Pin(u64, Permit),
     Query(u64, u64, Query),
     Plan(u64, PlanRequest),
@@ -129,6 +130,7 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::Prepare(token, prepared) => node.prepare_publication(token, prepared)?,
         Request::Pin(token, permit) => node.pin_source(token, permit)?,
         Request::Query(group, token, query) => node.query(group, token, query)?,
         Request::Plan(token, plan) => node.plan_publication(token, plan)?,
@@ -414,6 +416,7 @@ impl Cluster {
             Request::Query(group, token, _) => format!("query group {group}, token {token}"),
             Request::Acquire(token, _) => format!("acquire token {token}"),
             Request::Plan(token, _) => format!("plan token {token}"),
+            Request::Prepare(token, _) => format!("prepare token {token}"),
             Request::Pin(token, _) => format!("pin token {token}"),
             _ => "replication control".to_string(),
         };
@@ -1295,7 +1298,7 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
         Request::Plan(
             1021,
             PlanRequest {
-                authority,
+                authority: authority.clone(),
                 plan: Plan {
                     transaction,
                     read_version: 7,
@@ -1349,6 +1352,59 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
     else {
         anyhow::bail!("source pin missing");
     };
+    drop(c.peers.remove(&3));
+    let descriptors = Descriptors::lance_fragments(Bytes::from(vec![19; 192 * 1024]))?;
+    let prepared = PrepareRequest {
+        authority,
+        transaction,
+        plan_index,
+        descriptors: descriptors.clone(),
+    };
+    c.command(catalog, Request::Prepare(1031, prepared.clone()))?;
+    c.pump(&[1])?;
+    assert!(
+        c.outcome(1031).is_none(),
+        "preparation preceded durable quorum"
+    );
+    // The isolated pump dropped the first Append packets. Healing the link
+    // needs a heartbeat to resume replication, not just an empty queue drain.
+    for _ in 0..30 {
+        c.command(catalog, Request::Tick)?;
+        c.pump(&[1, 2])?;
+        if c.completions
+            .iter()
+            .any(|completion| completion.request == 1031)
+        {
+            break;
+        }
+    }
+    let prepared_outcome = c.outcome(1031);
+    let Some(Outcome::Committed(Applied::Publisher(PublisherReply::Prepared {
+        index: prepared_index,
+    }))) = prepared_outcome
+    else {
+        anyhow::bail!("prepared descriptors missing: {prepared_outcome:?}");
+    };
+    c.peers
+        .get_mut(&catalog)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(10, Uuid::from_u128(820)))?;
+    c.command(catalog, Request::InstallCheckpoint)?;
+    c.pump(&[1, 2])?;
+    let before_catalog_transfer = c.transfers;
+    c.start(3)?;
+    for _ in 0..40 {
+        c.command(catalog, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+        if c.transfers > before_catalog_transfer {
+            break;
+        }
+    }
+    assert!(
+        c.transfers > before_catalog_transfer,
+        "descriptors never crossed a catalog snapshot transfer"
+    );
+    let before_source_transfer = c.transfers;
     c.peers
         .get_mut(&4)
         .unwrap()
@@ -1359,12 +1415,12 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
     for _ in 0..40 {
         c.command(4, Request::Tick)?;
         c.pump(&[4, 5, 6])?;
-        if c.transfers > 0 {
+        if c.transfers > before_source_transfer {
             break;
         }
     }
     assert!(
-        c.transfers > 0,
+        c.transfers > before_source_transfer,
         "source pin never crossed a snapshot transfer"
     );
     drop(c.peers.remove(&4));
@@ -1382,6 +1438,34 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
             PublisherReply::Acquired(_)
         )))
     ));
+    let Response::Publisher(Some(taken_over)) = c
+        .peers
+        .get_mut(&catalog)
+        .unwrap()
+        .call(Request::Publisher(table))?
+    else {
+        anyhow::bail!("takeover table missing");
+    };
+    let mut retry = prepared.clone();
+    retry.authority = taken_over.authority;
+    c.command(catalog, Request::Prepare(1043, retry.clone()))?;
+    c.pump(&[2, 3])?;
+    assert_eq!(
+        c.outcome(1043),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Prepared {
+                index: prepared_index
+            }
+        )))
+    );
+    c.command(catalog, Request::Prepare(1044, prepared))?;
+    c.pump(&[2, 3])?;
+    assert_eq!(
+        c.outcome(1044),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Rejected(PublisherRejection::Authority)
+        )))
+    );
     c.command(catalog, Request::Query(10, 1041, query.clone()))?;
     c.pump(&[2, 3])?;
     let Some(ReadOutcome::Observed {
@@ -1434,8 +1518,40 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
     };
     assert_eq!(pin.index, index);
     assert_eq!(pin.permit.selection().plan_index, plan_index);
+    for id in 1..=3 {
+        let Response::Publisher(Some(recovered)) = c
+            .peers
+            .get_mut(&id)
+            .unwrap()
+            .call(Request::Publisher(table))?
+        else {
+            anyhow::bail!("restarted descriptor table missing");
+        };
+        let saved = recovered
+            .progress
+            .prepared
+            .context("restart lost descriptors")?;
+        assert_eq!(saved.index, prepared_index);
+        assert_eq!(saved.plan_index, plan_index);
+        assert_eq!(saved.transaction, transaction);
+        assert_eq!(saved.descriptors, descriptors);
+    }
+    c.command(catalog, Request::Prepare(1053, retry))?;
+    c.pump(&[1, 2, 3])?;
+    assert_eq!(
+        c.outcome(1053),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Prepared {
+                index: prepared_index
+            }
+        )))
+    );
     for id in 4..=6 {
         verify_records(c.peers.get_mut(&id).unwrap(), 20, &rows)?;
     }
     Ok(())
 }
+
+#[cfg(feature = "lance-integration")]
+#[path = "replication_process/lance_publication.rs"]
+mod lance_publication;

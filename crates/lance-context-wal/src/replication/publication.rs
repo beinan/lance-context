@@ -1,20 +1,24 @@
 //! Replicated table bindings and publisher epochs. These commands run through
 //! the same durable Raft path as appends; a local view is not an active lease.
-//! Immutable publication plans survive takeover. Source pins, manifest outcomes
-//! and retirement remain separate work. No Lance manifest is changed here.
+//! Immutable plans and prepared descriptors survive takeover. Source pins live
+//! in the source module; manifest outcomes and retirement remain separate work.
+//! No Lance manifest is changed here.
 use super::*;
 use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
 mod plan;
+mod prepared;
 pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
+pub use prepared::{Descriptors, PrepareRequest, Prepared, MAX_DESCRIPTOR_BYTES};
 #[cfg(test)]
 mod tests;
 
 pub(super) const MAX_ACQUIRE_BYTES: usize = 8192;
-pub(super) const MAX_COMMAND_BYTES: usize = plan::MAX_PLAN_BYTES;
+pub(super) const MAX_COMMAND_BYTES: usize = prepared::MAX_PREPARE_BYTES;
 pub(super) const MAX_BASE_TABLE_BYTES: usize = MAX_ACQUIRE_BYTES + 2048;
-pub(super) const MAX_TABLE_BYTES: usize = MAX_BASE_TABLE_BYTES + plan::MAX_PLAN_BYTES;
+pub(super) const MAX_TABLE_BYTES: usize =
+    MAX_BASE_TABLE_BYTES + plan::MAX_PLAN_BYTES + prepared::MAX_PREPARE_BYTES;
 fn codec(limit: usize) -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -62,25 +66,28 @@ impl Acquire {
 enum Command {
     Acquire(Box<Acquire>),
     Plan(Box<PlanRequest>),
+    Prepare(Box<PrepareRequest>),
 }
 impl Command {
     fn identity(&self) -> (Uuid, Uuid, u64) {
         match self {
             Self::Acquire(a) => (a.table, a.owner, a.expected_epoch + 1),
             Self::Plan(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
+            Self::Prepare(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
         }
     }
     fn byte_limit(&self) -> usize {
         match self {
             Self::Acquire(_) => MAX_ACQUIRE_BYTES,
-            Self::Plan(_) => MAX_COMMAND_BYTES,
+            Self::Plan(_) => plan::MAX_PLAN_BYTES,
+            Self::Prepare(_) => prepared::MAX_PREPARE_BYTES,
         }
     }
     fn batch(self, layout: &Layout) -> Result<Batch> {
         let (table, owner, sequence) = self.identity();
         let limit = self.byte_limit();
         let envelope = Envelope {
-            version: 2,
+            version: 3,
             cluster: layout.cluster,
             layout: layout.fingerprint()?,
             group: control_group(layout),
@@ -105,6 +112,24 @@ pub struct Authority {
     pub grant_index: u64,
 }
 
+impl Authority {
+    fn validate(&self, layout: &Layout) -> Result<()> {
+        let a = self;
+        ensure!(
+            a.cluster == layout.cluster
+                && a.layout == layout.fingerprint()?
+                && a.group == control_group(layout)
+                && !a.owner.is_nil()
+                && a.epoch > 0
+                && a.epoch <= a.grant_index
+                && a.grant_index < u64::MAX,
+            "invalid publication authority scope"
+        );
+        ensure!(!a.table.is_nil(), "nil authority table");
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Table {
     pub destination: Destination,
@@ -124,12 +149,15 @@ pub enum Rejection {
     Authority,
     PendingPlan,
     SourcePosition,
+    PlanIdentity,
+    PreparedConflict,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Acquired(Authority),
     Planned { index: u64 },
     Rejected(Rejection),
+    Prepared { index: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,7 +191,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Envelope> {
         "publisher command too large"
     );
     let envelope: Envelope = codec(MAX_COMMAND_BYTES).deserialize(bytes)?;
-    ensure!(envelope.version == 2, "unsupported publisher command");
+    ensure!(envelope.version == 3, "unsupported publisher command");
     ensure!(
         bytes.len() <= envelope.command.byte_limit(),
         "publisher command type byte limit"
@@ -205,6 +233,7 @@ pub(super) fn validate_record(
             "unserviceable ingestion limit"
         ),
         Command::Plan(p) => p.validate(layout, limits)?,
+        Command::Prepare(p) => p.validate(layout, limits)?,
     }
     Ok(())
 }
@@ -217,6 +246,7 @@ impl Catalog {
     pub fn apply(&mut self, e: Envelope, index: u64, limits: &Limits) -> Reply {
         let a = match e.command {
             Command::Plan(p) => return self.plan(*p, index, limits),
+            Command::Prepare(request) => return self.prepare(*request, index),
             Command::Acquire(a) => *a,
         };
         let old = self.tables.get(&a.table);
