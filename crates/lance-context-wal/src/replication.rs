@@ -49,6 +49,7 @@ pub struct Limits {
     pub max_tables: u64,
     pub max_active_plans: u64,
     pub max_plan_source_bytes: u64,
+    pub max_descriptor_bytes: u64,
     pub max_record_bytes: u64,
     pub max_records: u64,
     pub max_producers: u64,
@@ -62,6 +63,7 @@ impl Default for Limits {
             max_tables: 1024,
             max_active_plans: 128,
             max_plan_source_bytes: 64 * 1024 * 1024,
+            max_descriptor_bytes: 256 * 1024,
             max_record_bytes: 8 * 1024 * 1024,
             max_records: 100_000,
             max_producers: 16_384,
@@ -77,6 +79,8 @@ impl Limits {
                 && self.catalog_key.is_none_or(|key| key != [0; 32])
                 && (1..=256).contains(&self.max_active_plans)
                 && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
+                && (1..=publication::MAX_DESCRIPTOR_BYTES as u64)
+                    .contains(&self.max_descriptor_bytes)
                 && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
                 && (1..=500_000).contains(&self.max_records)
                 && (1..=100_000).contains(&self.max_producers)
@@ -86,7 +90,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v4",
+            "lance-context/replicated-append/v5",
             self,
         ))?)
     }
@@ -396,6 +400,17 @@ impl Node {
     /// plan is not a source pin or permission to commit an external manifest.
     pub fn plan_publication(&mut self, request: u64, plan: publication::PlanRequest) -> Result<()> {
         let batch = plan.batch(&self.layout, &self.limits)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Persist one immutable descriptor set for an exact pending plan. The
+    /// caller must separately validate source pins and coordinate Lance commits.
+    pub fn prepare_publication(
+        &mut self,
+        request: u64,
+        prepared: publication::PrepareRequest,
+    ) -> Result<()> {
+        let batch = prepared.batch(&self.layout, &self.limits)?;
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 

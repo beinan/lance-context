@@ -124,18 +124,8 @@ impl PlanRequest {
         Command::Plan(Box::new(self)).batch(layout)
     }
     pub(super) fn validate(&self, layout: &Layout, limits: &Limits) -> Result<()> {
-        let a = &self.authority;
-        ensure!(
-            a.cluster == layout.cluster
-                && a.layout == layout.fingerprint()?
-                && a.group == control_group(layout)
-                && !a.owner.is_nil()
-                && a.epoch > 0
-                && a.epoch <= a.grant_index
-                && a.grant_index < u64::MAX,
-            "invalid publication authority scope"
-        );
-        self.plan.validate(layout, a.table, limits)
+        self.authority.validate(layout)?;
+        self.plan.validate(layout, self.authority.table, limits)
     }
 }
 
@@ -152,6 +142,8 @@ pub struct Progress {
     pub minimum_read_version: u64,
     /// Cloning a table view shares the immutable metadata; it never clones bodies.
     pub pending: Option<Arc<PendingPlan>>,
+    /// Materialization result shares ownership independently of the selection.
+    pub prepared: Option<Arc<Prepared>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -159,6 +151,7 @@ impl Default for Progress {
             checkpoint: BTreeMap::new(),
             minimum_read_version: 1,
             pending: None,
+            prepared: None,
         }
     }
 }
@@ -189,6 +182,21 @@ impl Progress {
                 }),
             "invalid publication progress"
         );
+        if let Some(prepared) = &self.prepared {
+            let pending = self
+                .pending
+                .as_ref()
+                .context("prepared result without plan")?;
+            prepared.descriptors.validate(limits.max_descriptor_bytes)?;
+            ensure!(
+                prepared.plan_index == pending.index
+                    && prepared.transaction == pending.plan.transaction
+                    && prepared.index > pending.index
+                    && prepared.index <= cut
+                    && prepared.index != table.authority.grant_index,
+                "invalid prepared checkpoint identity or index"
+            );
+        }
         if let Some(pending) = &self.pending {
             pending
                 .plan

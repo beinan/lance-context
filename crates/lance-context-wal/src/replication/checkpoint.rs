@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 4;
-const MAGIC: &[u8; 8] = b"LCWALCP4";
+const FORMAT: u32 = 5;
+const MAGIC: &[u8; 8] = b"LCWALCP5";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -84,7 +84,8 @@ fn metadata_limit(limits: &Limits) -> u64 {
     // limits.identity() validates all policy maxima before this is used.
     (limits.max_records + limits.max_producers) * 268
         + limits.max_tables * (publication::MAX_BASE_TABLE_BYTES as u64 + 4)
-        + limits.max_tables.min(limits.max_active_plans) * publication::MAX_COMMAND_BYTES as u64
+        + limits.max_tables.min(limits.max_active_plans)
+            * (128 * 1024 + limits.max_descriptor_bytes + 1024)
         + limits.max_tables.min(limits.max_active_plans) * (source::MAX_PIN_BYTES as u64 + 4)
         + 1024
 }
