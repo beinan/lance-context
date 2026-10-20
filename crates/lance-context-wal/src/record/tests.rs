@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+fn payload_hash_backend_preserves_existing_digests_at_block_boundaries() {
+    use sha2::{Digest, Sha256};
+
+    let data: Vec<_> = (0..512 * 1024 + 3)
+        .map(|index| ((index * 29 + index / 251) % 256) as u8)
+        .collect();
+    for offset in [0, 1, 3] {
+        for size in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 512 * 1024] {
+            let body = &data[offset..offset + size];
+            let old_digest: [u8; 32] = Sha256::digest(body).into();
+            assert_eq!(payload_digest(body), old_digest);
+            if !body.is_empty() {
+                // A record written by the previous backend remains readable.
+                let mut batch = record(Bytes::copy_from_slice(body));
+                assert_eq!(batch.meta.digest, old_digest);
+                batch.meta.digest = old_digest;
+                batch.validate(size).unwrap();
+                batch.meta.digest[31] ^= 1;
+                assert_eq!(batch.validate(size), Err(ValidationError::DigestMismatch));
+            }
+        }
+    }
+}
+
 fn record(body: Bytes) -> Batch {
     Batch::new(
         Uuid::from_bytes([0x11; 16]),

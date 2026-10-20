@@ -7,8 +7,16 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+// Keep SHA-256 and its persisted bytes unchanged. Ring also has optimized
+// implementations for CPUs that do not expose dedicated SHA instructions.
+fn payload_digest(body: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, body);
+    let mut bytes = [0; 32];
+    bytes.copy_from_slice(digest.as_ref());
+    bytes
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchMeta {
@@ -102,7 +110,7 @@ impl BatchMeta {
     /// an envelope. Length/admission checks run before the digest scan.
     pub fn validate_payload(&self, body: &[u8], limit: usize) -> Result<(), ValidationError> {
         self.check_body_length(body.len(), limit)?;
-        if self.digest != <[u8; 32]>::from(Sha256::digest(body)) {
+        if self.digest != payload_digest(body) {
             return Err(ValidationError::DigestMismatch);
         }
         Ok(())
@@ -113,7 +121,7 @@ impl Batch {
     /// Retain the caller's allocation and compute its digest once. Routing and
     /// sequence admission still belong to the caller/replicated state machine.
     pub fn new(stream: Uuid, bucket: u32, producer: Uuid, sequence: u64, body: Bytes) -> Self {
-        let digest = Sha256::digest(&body).into();
+        let digest = payload_digest(&body);
         let body_bytes = body.len() as u64;
         Self {
             meta: BatchMeta {
