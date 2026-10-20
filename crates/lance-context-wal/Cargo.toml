@@ -8,7 +8,7 @@ description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
 client-journal = ["dep:anyhow", "dep:raft-engine", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
-replication = ["raft-log", "record", "contract", "dep:bincode", "dep:slog", "uuid/v4"]
+replication = ["raft-log", "record", "contract", "dep:bincode", "dep:slog", "uuid/v4", "serde/rc"]
 raft-log = ["placement", "dep:raft", "dep:raft-engine", "dep:raft-proto", "dep:protobuf"]
 vectored-io = ["dep:bytes", "dep:tokio"]
 runner = ["dep:anyhow", "dep:clap", "dep:libc", "dep:serde", "dep:serde_json", "dep:sha2"]

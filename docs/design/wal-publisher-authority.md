@@ -25,7 +25,7 @@ canonicalization belong to the authorized catalog integration; raw client URIs
 are not storage identities. The contract's record ceiling must fit the configured
 replication record limit.
 
-Commands have an 8 KiB decoding limit. The immutable replication policy bounds
+Acquisition commands have an 8 KiB size limit. The immutable replication policy bounds
 registered tables (default 1,024, maximum 16,384). Reaching the limit rejects new
 bindings while preserving retries and takeovers of existing tables. Control
 commands are not accepted data records or producer-lane entries. They do not
@@ -35,15 +35,15 @@ Application images preserve the complete catalog at the applied cut, validate
 scope, epochs, grant positions, destination uniqueness and contracts, then replay
 the committed suffix. Metadata contains bounded, ordered table frames alongside
 the existing data records and producer tails. Payload packs still contain only
-opaque accepted data. This changes the experimental replication identity to v2
-and application image format to v2. Earlier v1 application directories are
-rejected; this change does not provide an in-place migration or change the
-existing production ingestion path.
+opaque accepted data. The current replication identity and application image
+format are v3, including [immutable publication plans](wal-publication-plans.md).
+Earlier v1/v2 application directories are rejected; this optional component does
+not provide an in-place migration or change the production ingestion path.
 
 `Node::publisher` exposes only a local applied view. It is not a quorum read,
 lease, authorization check or proof of Lance visibility. A granted epoch alone
-does not stop an old owner from writing outside this protocol. Subsequent work
-must check it on durable publication plans, verify source dependencies, commit a
+does not stop an old owner from writing outside this protocol. Durable publication
+plans check the current authority at apply. Subsequent work must verify source dependencies, commit a
 pinned Lance target, resolve its immutable outcome and authorize retirement from
 that outcome. Table closing/rebinding, table-bound data admission and integration
 with the actual context catalog remain separate requirements.

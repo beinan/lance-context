@@ -176,6 +176,11 @@ publication prerequisite, not a production Lance writer or a manifest lease.
 catalog, producer-tail and accepted-page views after a safe read-index barrier.
 They share pending capacity with proposals and do not fetch bulk payloads.
 
+[Immutable publication plans](../../docs/design/wal-publication-plans.md) retain
+the exact source vector and Lance target through takeover, snapshots and restart.
+They share bounded metadata between views; source pins, outcome resolution and
+retirement remain separate integration steps.
+
 The optional `raft-log` feature exposes `raft_log::PhysicalLog` and its cloneable
 `GroupLog` handles. One raft-engine directory hosts all groups assigned to a node
 by the existing immutable `placement::Layout`. Opening binds the full layout,

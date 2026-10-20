@@ -1,20 +1,25 @@
 //! Replicated table bindings and publisher epochs. These commands run through
 //! the same durable Raft path as appends; a local view is not an active lease.
-//! Publication plans, manifest outcomes and source retirement build on these
-//! epochs in subsequent changes. No Lance manifest is changed by this module.
+//! Immutable publication plans survive takeover. Source pins, manifest outcomes
+//! and retirement remain separate work. No Lance manifest is changed here.
 use super::*;
 use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
+mod plan;
+pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
 #[cfg(test)]
 mod tests;
 
-pub(super) const MAX_BYTES: usize = 8192;
-fn codec() -> impl Options {
+pub(super) const MAX_ACQUIRE_BYTES: usize = 8192;
+pub(super) const MAX_COMMAND_BYTES: usize = plan::MAX_PLAN_BYTES;
+pub(super) const MAX_BASE_TABLE_BYTES: usize = MAX_ACQUIRE_BYTES + 2048;
+pub(super) const MAX_TABLE_BYTES: usize = MAX_BASE_TABLE_BYTES + plan::MAX_PLAN_BYTES;
+fn codec(limit: usize) -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_little_endian()
-        .with_limit(MAX_BYTES as u64)
+        .with_limit(limit as u64)
         .reject_trailing_bytes()
 }
 
@@ -49,22 +54,41 @@ impl Acquire {
     }
     pub(super) fn batch(self, layout: &Layout) -> Result<Batch> {
         self.validate()?;
+        Command::Acquire(Box::new(self)).batch(layout)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum Command {
+    Acquire(Box<Acquire>),
+    Plan(Box<PlanRequest>),
+}
+impl Command {
+    fn identity(&self) -> (Uuid, Uuid, u64) {
+        match self {
+            Self::Acquire(a) => (a.table, a.owner, a.expected_epoch + 1),
+            Self::Plan(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
+        }
+    }
+    fn byte_limit(&self) -> usize {
+        match self {
+            Self::Acquire(_) => MAX_ACQUIRE_BYTES,
+            Self::Plan(_) => MAX_COMMAND_BYTES,
+        }
+    }
+    fn batch(self, layout: &Layout) -> Result<Batch> {
+        let (table, owner, sequence) = self.identity();
+        let limit = self.byte_limit();
         let envelope = Envelope {
-            version: 1,
+            version: 2,
             cluster: layout.cluster,
             layout: layout.fingerprint()?,
             group: control_group(layout),
-            acquire: self,
+            command: self,
         };
-        let bytes = codec().serialize(&envelope)?;
-        ensure!(bytes.len() <= MAX_BYTES, "publisher command too large");
-        let mut batch = Batch::new(
-            envelope.acquire.table,
-            0,
-            envelope.acquire.owner,
-            envelope.acquire.expected_epoch + 1,
-            Bytes::from(bytes),
-        );
+        let bytes = codec(limit).serialize(&envelope)?;
+        ensure!(bytes.len() <= limit, "publisher command too large");
+        let mut batch = Batch::new(table, 0, owner, sequence, Bytes::from(bytes));
         batch.meta.kind = RecordKind::MultiPublication;
         Ok(batch)
     }
@@ -87,6 +111,7 @@ pub struct Table {
     pub ingest: IngestContract,
     pub authority: Authority,
     pub request: Uuid,
+    pub progress: Progress,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,10 +121,14 @@ pub enum Rejection {
     Epoch { current: u64 },
     RequestReused,
     Capacity,
+    Authority,
+    PendingPlan,
+    SourcePosition,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Acquired(Authority),
+    Planned { index: u64 },
     Rejected(Rejection),
 }
 
@@ -109,7 +138,7 @@ pub(super) struct Envelope {
     cluster: Uuid,
     layout: [u8; 32],
     group: u64,
-    acquire: Acquire,
+    command: Command,
 }
 pub(super) fn control_group(layout: &Layout) -> u64 {
     *layout
@@ -129,10 +158,23 @@ fn validate_binding(destination: &Destination, ingest: &IngestContract) -> Resul
     Ok(())
 }
 pub(super) fn decode(bytes: &[u8]) -> Result<Envelope> {
-    ensure!(bytes.len() <= MAX_BYTES, "publisher command too large");
-    let envelope: Envelope = codec().deserialize(bytes)?;
-    ensure!(envelope.version == 1, "unsupported publisher command");
-    envelope.acquire.validate()?;
+    ensure!(
+        bytes.len() <= MAX_COMMAND_BYTES,
+        "publisher command too large"
+    );
+    let envelope: Envelope = codec(MAX_COMMAND_BYTES).deserialize(bytes)?;
+    ensure!(envelope.version == 2, "unsupported publisher command");
+    ensure!(
+        bytes.len() <= envelope.command.byte_limit(),
+        "publisher command type byte limit"
+    );
+    if let Command::Acquire(a) = &envelope.command {
+        a.validate()?;
+    }
+    ensure!(
+        codec(MAX_COMMAND_BYTES).serialize(&envelope)? == bytes,
+        "noncanonical publisher command"
+    );
     Ok(envelope)
 }
 pub(super) fn validate_record(
@@ -143,19 +185,27 @@ pub(super) fn validate_record(
     body: &[u8],
 ) -> Result<()> {
     let e = decode(body)?;
+    let (table, owner, sequence) = e.command.identity();
     ensure!(
         group == control_group(layout)
             && e.group == group
             && e.cluster == layout.cluster
             && e.layout == layout.fingerprint()?
             && meta.kind == RecordKind::MultiPublication
-            && meta.stream == e.acquire.table
+            && meta.stream == table
             && meta.bucket == 0
-            && meta.producer == e.acquire.owner
-            && meta.sequence == e.acquire.expected_epoch + 1
-            && u64::from(e.acquire.ingest.max_record_bytes) <= limits.max_record_bytes,
+            && meta.producer == owner
+            && meta.sequence == sequence,
         "publisher scope/envelope or ingestion limit mismatch"
     );
+    match e.command {
+        Command::Acquire(a) => ensure!(
+            u64::from(a.ingest.max_record_bytes) <= limits.max_record_bytes
+                && u64::from(a.ingest.max_record_bytes) <= limits.max_plan_source_bytes,
+            "unserviceable ingestion limit"
+        ),
+        Command::Plan(p) => p.validate(layout, limits)?,
+    }
     Ok(())
 }
 
@@ -164,8 +214,11 @@ pub(super) struct Catalog {
     pub tables: BTreeMap<Uuid, Table>,
 }
 impl Catalog {
-    pub fn apply(&mut self, e: Envelope, index: u64, max_tables: u64) -> Reply {
-        let a = e.acquire;
+    pub fn apply(&mut self, e: Envelope, index: u64, limits: &Limits) -> Reply {
+        let a = match e.command {
+            Command::Plan(p) => return self.plan(*p, index, limits),
+            Command::Acquire(a) => *a,
+        };
         let old = self.tables.get(&a.table);
         if let Some(old) = old {
             if old.destination != a.destination || old.ingest != a.ingest {
@@ -189,7 +242,7 @@ impl Catalog {
             if self.tables.values().any(|t| t.destination == a.destination) {
                 return Reply::Rejected(Rejection::DestinationBound);
             }
-            if self.tables.len() as u64 >= max_tables {
+            if self.tables.len() as u64 >= limits.max_tables {
                 return Reply::Rejected(Rejection::Capacity);
             }
         }
@@ -202,6 +255,7 @@ impl Catalog {
             epoch: current + 1,
             grant_index: index,
         };
+        let progress = old.map(|table| table.progress.clone()).unwrap_or_default();
         self.tables.insert(
             a.table,
             Table {
@@ -209,6 +263,7 @@ impl Catalog {
                 ingest: a.ingest,
                 authority: authority.clone(),
                 request: a.request,
+                progress,
             },
         );
         Reply::Acquired(authority)
@@ -219,6 +274,14 @@ impl Catalog {
             "publisher catalog exceeds limit"
         );
         ensure!(
+            self.tables
+                .values()
+                .filter(|table| table.progress.pending.is_some())
+                .count() as u64
+                <= limits.max_active_plans,
+            "active publication plan limit"
+        );
+        ensure!(
             group == control_group(layout) || self.tables.is_empty(),
             "catalog in source group"
         );
@@ -226,6 +289,7 @@ impl Catalog {
         let mut destinations = std::collections::BTreeSet::new();
         for (id, table) in &self.tables {
             validate_binding(&table.destination, &table.ingest)?;
+            table.progress.validate(layout, table, cut, limits)?;
             let a = &table.authority;
             ensure!(
                 !id.is_nil()
@@ -239,6 +303,7 @@ impl Catalog {
                     && a.epoch <= a.grant_index
                     && a.grant_index <= cut
                     && u64::from(table.ingest.max_record_bytes) <= limits.max_record_bytes
+                    && u64::from(table.ingest.max_record_bytes) <= limits.max_plan_source_bytes
                     && destinations.insert(&table.destination),
                 "invalid publisher checkpoint state"
             );
@@ -247,8 +312,14 @@ impl Catalog {
     }
 }
 pub(super) fn encode_table(table: &Table) -> Result<Vec<u8>> {
-    Ok(codec().serialize(table)?)
+    Ok(codec(MAX_TABLE_BYTES).serialize(table)?)
 }
 pub(super) fn decode_table(bytes: &[u8]) -> Result<Table> {
-    Ok(codec().deserialize(bytes)?)
+    ensure!(bytes.len() <= MAX_TABLE_BYTES, "publisher table byte limit");
+    let table = codec(MAX_TABLE_BYTES).deserialize(bytes)?;
+    ensure!(
+        encode_table(&table)? == bytes,
+        "noncanonical publisher table"
+    );
+    Ok(table)
 }

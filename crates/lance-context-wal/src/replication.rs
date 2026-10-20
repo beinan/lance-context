@@ -43,6 +43,8 @@ use state::State;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     pub max_tables: u64,
+    pub max_active_plans: u64,
+    pub max_plan_source_bytes: u64,
     pub max_record_bytes: u64,
     pub max_records: u64,
     pub max_producers: u64,
@@ -53,6 +55,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_tables: 1024,
+            max_active_plans: 128,
+            max_plan_source_bytes: 64 * 1024 * 1024,
             max_record_bytes: 8 * 1024 * 1024,
             max_records: 100_000,
             max_producers: 16_384,
@@ -65,6 +69,8 @@ impl Limits {
     fn identity(&self) -> Result<Vec<u8>> {
         ensure!(
             (1..=16_384).contains(&self.max_tables)
+                && (1..=256).contains(&self.max_active_plans)
+                && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
                 && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
                 && (1..=500_000).contains(&self.max_records)
                 && (1..=100_000).contains(&self.max_producers)
@@ -74,7 +80,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v2",
+            "lance-context/replicated-append/v3",
             self,
         ))?)
     }
@@ -349,6 +355,13 @@ impl Node {
     /// Publisher completion from poll grants authority; no local cache shortcut.
     pub fn acquire_publisher(&mut self, request: u64, acquire: publication::Acquire) -> Result<()> {
         let batch = acquire.batch(&self.layout)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Persist an immutable publication plan through the catalog quorum. The
+    /// plan is not a source pin or permission to commit an external manifest.
+    pub fn plan_publication(&mut self, request: u64, plan: publication::PlanRequest) -> Result<()> {
+        let batch = plan.batch(&self.layout, &self.limits)?;
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 

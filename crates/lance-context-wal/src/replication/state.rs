@@ -26,7 +26,7 @@ pub(super) fn validate_meta(
     digest: bool,
 ) -> Result<()> {
     if meta.kind == RecordKind::MultiPublication {
-        meta.validate_payload(body, publication::MAX_BYTES)?;
+        meta.validate_payload(body, publication::MAX_COMMAND_BYTES)?;
         return publication::validate_record(layout, group, limits, meta, body);
     }
     validate_identity(layout, group, meta)?;
@@ -169,7 +169,7 @@ impl State {
             return Ok(Some(Applied::Publisher(self.catalog.apply(
                 publication::decode(&entry.data)?,
                 entry.index,
-                limits.max_tables,
+                limits,
             ))));
         }
         let key = (meta.stream, meta.bucket, meta.producer);

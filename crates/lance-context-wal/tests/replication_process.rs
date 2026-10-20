@@ -9,7 +9,8 @@ use lance_context_wal::{
     replication::{
         checkpoint::{Image, Part},
         publication::{
-            Acquire, Destination, Rejection as PublisherRejection, Reply as PublisherReply, Table,
+            Acquire, Destination, Plan, PlanRequest, Rejection as PublisherRejection,
+            Reply as PublisherReply, SourceRange, Table,
         },
         query::{Completion as ReadCompletion, Outcome as ReadOutcome, Query, Value},
         Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
@@ -61,6 +62,7 @@ impl WirePacket {
 #[derive(Serialize, Deserialize)]
 enum Request {
     Query(u64, u64, Query),
+    Plan(u64, PlanRequest),
     Acquire(u64, Acquire),
     Publisher(Uuid),
     Campaign(u64),
@@ -126,6 +128,7 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
         Request::Query(group, token, query) => node.query(group, token, query)?,
+        Request::Plan(token, plan) => node.plan_publication(token, plan)?,
         Request::Acquire(token, acquire) => node.acquire_publisher(token, acquire)?,
         Request::Publisher(table) => {
             return Ok(Response::Publisher(node.publisher(table)?.cloned()))
@@ -836,6 +839,49 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     assert!(
         matches!(&second, Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(a))) if a.epoch == 2)
     );
+    let Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(authority))) = &second
+    else {
+        anyhow::bail!("missing takeover authority");
+    };
+    c.command(2, Request::Campaign(20))?;
+    c.pump(&[2, 3])?;
+    let mut source = input(1, 1, 99);
+    source.meta.stream = acquire.table;
+    c.command(2, Request::Propose(20, 710, source.clone()))?;
+    c.pump(&[2, 3])?;
+    let Some(Outcome::Committed(Applied::Accepted {
+        index: source_index,
+    })) = c.outcome(710)
+    else {
+        anyhow::bail!("source did not commit");
+    };
+    let mut plan = PlanRequest {
+        authority: authority.clone(),
+        plan: Plan {
+            transaction: Uuid::from_u128(720),
+            read_version: 7,
+            sources: BTreeMap::from([(
+                20,
+                SourceRange {
+                    after: 0,
+                    through: source_index,
+                    records: vec![(source_index, source.meta.clone())],
+                },
+            )]),
+            next_group: 10,
+        },
+    };
+    c.command(2, Request::Plan(711, plan.clone()))?;
+    assert!(
+        c.outcome(711).is_none(),
+        "local plan completed without quorum"
+    );
+    c.pump(&[2, 3])?;
+    let Some(Outcome::Committed(Applied::Publisher(PublisherReply::Planned { index: plan_index }))) =
+        c.outcome(711)
+    else {
+        anyhow::bail!("plan did not commit");
+    };
     let image = c
         .peers
         .get_mut(&2)
@@ -870,6 +916,21 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     assert_eq!(table.authority.epoch, 2);
     assert_eq!(table.destination, acquire.destination);
     assert_eq!(table.ingest, acquire.ingest);
+    let saved = table
+        .progress
+        .pending
+        .as_ref()
+        .context("snapshot lost plan")?;
+    assert_eq!(saved.index, plan_index);
+    assert_eq!(saved.plan, plan.plan);
+    assert_eq!(saved.plan.target_version()?, 8);
+
+    c.command(2, Request::Plan(712, plan.clone()))?;
+    c.pump(&[2])?;
+    assert!(
+        c.outcome(712).is_none(),
+        "isolated leader answered a plan retry from cache"
+    );
 
     c.command(
         2,
@@ -910,6 +971,19 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     assert!(
         matches!(&latest, Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(a))) if a.epoch == 3)
     );
+    c.command(leader, Request::Plan(713, plan.clone()))?;
+    c.pump(&[1, 3])?;
+    assert_eq!(
+        c.outcome(713),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Rejected(PublisherRejection::Authority)
+        )))
+    );
+    let Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(authority))) = &latest
+    else {
+        anyhow::bail!("missing third authority");
+    };
+    plan.authority = authority.clone();
     c.command(leader, Request::Acquire(705, stale))?;
     c.pump(&[1, 3])?;
     assert_eq!(
@@ -934,7 +1008,15 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
         assert_eq!(table.authority.epoch, 3);
         assert_eq!(table.authority.owner, acquire.owner);
         assert_eq!(table.ingest, acquire.ingest);
+        let recovered = table
+            .progress
+            .pending
+            .as_ref()
+            .context("restart lost plan")?;
+        assert_eq!(recovered.index, plan_index);
+        assert_eq!(recovered.plan, plan.plan);
         verify_records(peer, 10, &[])?;
+        verify_records(peer, 20, std::slice::from_ref(&source))?;
     }
     let leader = c.elect(1, 10, &[1, 2, 3])?;
     c.command(leader, Request::Acquire(706, acquire))?;
@@ -943,6 +1025,14 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
         c.outcome(706),
         Some(latest),
         "restart changed the committed grant index"
+    );
+    c.command(leader, Request::Plan(714, plan))?;
+    c.pump(&[1, 2, 3])?;
+    assert_eq!(
+        c.outcome(714),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Planned { index: plan_index }
+        )))
     );
     assert_eq!(
         captured.authority.epoch, 2,
