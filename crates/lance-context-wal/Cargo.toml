@@ -16,7 +16,7 @@ vectored-io = ["dep:bytes", "dep:tokio"]
 runner = ["dep:anyhow", "dep:clap", "dep:libc", "dep:serde", "dep:serde_json", "dep:sha2"]
 contract = ["dep:serde", "dep:sha2"]
 arrow-contract = ["contract", "dep:arrow-schema", "arrow-schema/serde", "dep:serde_json"]
-record = ["dep:bytes", "bytes/serde", "dep:serde", "dep:sha2", "dep:uuid"]
+record = ["dep:bytes", "bytes/serde", "dep:serde", "dep:ring", "dep:uuid"]
 placement = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:sha2", "dep:uuid"]
 admission = ["dep:anyhow", "dep:serde"]
 ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes"]
@@ -52,6 +52,7 @@ sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
 
 [dev-dependencies]
+sha2 = "0.10"
 libc = "0.2"
 slog = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
