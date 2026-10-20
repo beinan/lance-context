@@ -6,6 +6,8 @@ on:
   pull_request:
     paths:
       - crates/**
+      - vendor/raft-engine/**
+      - .typos.toml
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/style.yml

@@ -1,0 +1,8 @@
+[files]
+# Preserve the vendored upstream source; its two-file correction is documented
+# separately instead of mixing unrelated upstream spelling changes into it.
+extend-exclude = ["vendor/raft-engine/**"]
+
+[default.extend-words]
+# Generalized advantage estimation in the rollout schema.
+GAE = "GAE"
