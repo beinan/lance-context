@@ -46,10 +46,10 @@ complete application state. After receiving Ready, it must wait for this sync
 before releasing responses or applying suffix entries. On an uncertain write,
 retain both sets of application dependencies and recover the physical log.
 
-This increment supplies the storage boundary only. The current
-`replication::Node` still retains its complete log and invokes neither snapshot
-API. Application state/payload packs, snapshot transfer and driver integration,
-reader/transfer pins, physical reclamation, admission during maintenance and
+These APIs supply the storage boundary. The `replication::Node` integration
+uses validated [application images](replicated-wal-images.md) before invoking
+them and supports explicit transfer of those immutable files. Production
+transport scheduling, collector pins, physical reclamation, disk admission and
 Lance publication remain subsequent integration work. No production ingestion
 path or retention default changes.
 

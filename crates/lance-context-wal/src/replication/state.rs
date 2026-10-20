@@ -25,6 +25,16 @@ pub(super) fn validate_meta(
     body: &[u8],
     digest: bool,
 ) -> Result<()> {
+    validate_identity(layout, group, meta)?;
+    if digest {
+        meta.validate_payload(body, limits.max_record_bytes as usize)?;
+    } else {
+        meta.check_body_length(body.len(), limits.max_record_bytes as usize)?;
+    }
+    Ok(())
+}
+
+fn validate_identity(layout: &Layout, group: u64, meta: &BatchMeta) -> Result<()> {
     ensure!(
         meta.kind == RecordKind::Data
             && !meta.stream.is_nil()
@@ -33,11 +43,6 @@ pub(super) fn validate_meta(
             && layout.group_for_bucket(meta.bucket)? == group,
         "invalid data identity, record kind or group placement"
     );
-    if digest {
-        meta.validate_payload(body, limits.max_record_bytes as usize)?;
-    } else {
-        meta.check_body_length(body.len(), limits.max_record_bytes as usize)?;
-    }
     Ok(())
 }
 pub(super) fn validate_entry(
@@ -68,13 +73,60 @@ pub(super) fn validate_entry(
     )
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct State {
     pub applied: u64,
     pub accepted: BTreeMap<u64, BatchMeta>,
     pub producers: BTreeMap<(Uuid, u32, Uuid), (BatchMeta, u64)>,
 }
 impl State {
+    /// The v1 image retains every accepted record. Producer tails must exactly
+    /// match those records, including sequence continuity within each lane.
+    /// Retirement will need a new format with independently retained tails.
+    pub fn validate_checkpoint(
+        &self,
+        layout: &Layout,
+        group: u64,
+        limits: &Limits,
+        cut: u64,
+    ) -> Result<()> {
+        ensure!(
+            cut > 0 && cut < u64::MAX && self.applied == cut,
+            "invalid application checkpoint cut"
+        );
+        ensure!(
+            self.accepted.len() as u64 <= limits.max_records
+                && self.producers.len() as u64 <= limits.max_producers,
+            "application checkpoint exceeds state limits"
+        );
+        let mut tails = BTreeMap::new();
+        for (index, meta) in &self.accepted {
+            ensure!(
+                *index > 0 && *index <= cut,
+                "accepted index outside checkpoint"
+            );
+            validate_identity(layout, group, meta)?;
+            meta.check_body_length(
+                usize::try_from(meta.body_bytes)?,
+                limits.max_record_bytes as usize,
+            )?;
+            let key = (meta.stream, meta.bucket, meta.producer);
+            let expected = tails
+                .get(&key)
+                .map_or(1, |(old, _): &(BatchMeta, u64)| old.sequence + 1);
+            ensure!(
+                meta.sequence == expected,
+                "checkpoint producer sequence gap"
+            );
+            tails.insert(key, (meta.clone(), *index));
+        }
+        ensure!(
+            tails == self.producers,
+            "checkpoint producer tails disagree"
+        );
+        Ok(())
+    }
+
     pub fn apply(&mut self, entry: &Entry, limits: &Limits) -> Result<Option<Applied>> {
         ensure!(
             entry.index == self.applied + 1,

@@ -62,8 +62,9 @@ answering directly from local state. A later quorum-read optimization must
 preserve that boundary. Pending local requests bind both log index and term;
 replacement of an uncommitted suffix cannot complete a different request.
 
-Reopen reconstructs accepted metadata and latest producer state by replaying
-only the durable committed prefix. The uncommitted suffix remains available to
+Reopen validates an installed application image, then reconstructs accepted
+metadata and latest producer state by replaying its durable committed suffix.
+Without an image, replay starts at index one. The uncommitted suffix remains available to
 Raft for reconciliation. Accepted pages and payload reads expose a **local
 durable applied view**, not a quorum read, authenticated receipt or proof of Lance
 visibility. Consumers must preserve the group/layout scope. Their use by a fenced
@@ -82,12 +83,17 @@ rejected, so a lagging replica cannot make the consumer move backward.
 The immutable policy bounds record size, accepted metadata, tracked producers,
 pending local requests and Raft's uncommitted-data budget. Capacity rejection is
 itself deterministic after commit; an exact latest retry can still succeed when
-metadata capacity is full. Historical accepted metadata and all raw log entries
-are retained in this increment, including rejected or duplicate proposals.
+metadata capacity is full. Historical accepted metadata remains retained.
+Explicit application checkpoints can compact the logical log prefix while
+keeping accepted payloads readable in an immutable image. Image files are retained.
 These are not bounded physical disk usage or an unlimited-duration retention
 policy. Transport must also bound frame decoding and queued messages.
 
-Producer slot reuse, authenticated ownership/revoke, snapshot transfer, replica
+See [application images](replicated-wal-images.md) for the explicit build,
+transfer and installation contract. The caller must implement the bounded
+transport/worker scheduling before enabling periodic checkpoints.
+
+Producer slot reuse, authenticated ownership/revoke, dynamic replica
 replacement, disk credits, log reclamation and fenced Lance publication remain
 subsequent increments. This feature is not a deployment-ready WAL service and
 does not establish the complete ingestion goal or a performance result.
