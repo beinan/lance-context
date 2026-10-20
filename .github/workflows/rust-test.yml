@@ -66,6 +66,11 @@ jobs:
           cargo test -p lance-context-wal --features lab --bin context-wal-lab
           cargo test -p lance-context-wal --features lab --test engine_cache
           cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
+      - name: Optional Lance object-store metrics
+        run: |
+          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
+          cargo check -p lance-context-server --features lance-io-metrics
+          cargo check -p lance-context-core --no-default-features
       - name: WAL placement, admission, record, contract and IPC decoding tests
         run: |
           cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract,vectored-io --lib
