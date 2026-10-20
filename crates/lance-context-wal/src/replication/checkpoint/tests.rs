@@ -396,7 +396,7 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
     let original = fs::read(&path)?;
     // Locate frames from their encoded lengths, without assuming a fixed header.
     let binding_len = u32::from_le_bytes(original[8..12].try_into()?) as usize;
-    let mut offset = 12 + binding_len + 3 * 8;
+    let mut offset = 12 + binding_len + 4 * 8;
     for _ in 0..state.accepted.len() + state.producers.len() {
         offset += 8; // accepted index
         let len = u32::from_le_bytes(original[offset..offset + 4].try_into()?) as usize;

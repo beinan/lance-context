@@ -20,6 +20,15 @@ pub enum Query {
         bucket: u32,
         producer: Uuid,
     },
+    Pin {
+        table: Uuid,
+        transaction: Uuid,
+        plan_index: u64,
+        source_group: u64,
+    },
+    SourcePin {
+        table: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +37,8 @@ pub enum Value {
     Accepted(Page),
     Producer(Option<(BatchMeta, u64)>),
     CursorAhead { applied: u64 },
+    Pin(Option<Box<source::Permit>>),
+    SourcePin(Option<Arc<source::Pin>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +72,21 @@ pub struct Completion {
 impl Query {
     pub(super) fn validate(&self, layout: &Layout, group: u64) -> Result<()> {
         match self {
+            Self::Pin {
+                table,
+                transaction,
+                plan_index,
+                source_group,
+            } => ensure!(
+                !table.is_nil()
+                    && !transaction.is_nil()
+                    && *plan_index > 0
+                    && *plan_index < u64::MAX
+                    && layout.groups.contains_key(source_group)
+                    && group == publication::control_group(layout),
+                "invalid catalog dependency query"
+            ),
+            Self::SourcePin { table } => ensure!(!table.is_nil(), "nil source table"),
             Self::Publisher { table } => ensure!(
                 !table.is_nil() && group == publication::control_group(layout),
                 "invalid publisher query scope"
@@ -81,8 +107,45 @@ impl Query {
         Ok(())
     }
 
-    fn evaluate(&self, state: &State) -> Result<Value> {
+    pub(super) fn evaluate(
+        &self,
+        state: &State,
+        cut: &Cut,
+        layout: &Layout,
+        limits: &Limits,
+        signer: Option<&source::CatalogSigner>,
+    ) -> Result<Value> {
         Ok(match self {
+            Self::Pin {
+                table,
+                transaction,
+                plan_index,
+                source_group,
+            } => {
+                let selected = state.catalog.tables.get(table).filter(|table| {
+                    table.progress.pending.as_ref().is_some_and(|p| {
+                        p.index == *plan_index
+                            && p.plan.transaction == *transaction
+                            && p.plan.sources.contains_key(source_group)
+                    })
+                });
+                Value::Pin(
+                    selected
+                        .map(|table| {
+                            source::Permit::issue(
+                                signer.context("catalog dependency signer unavailable")?,
+                                cut.clone(),
+                                layout,
+                                limits,
+                                table,
+                                *source_group,
+                            )
+                            .map(Box::new)
+                        })
+                        .transpose()?,
+                )
+            }
+            Self::SourcePin { table } => Value::SourcePin(state.pins.get(table).cloned()),
             Self::Publisher { table } => {
                 Value::Publisher(state.catalog.tables.get(table).cloned().map(Box::new))
             }
@@ -169,7 +232,13 @@ impl Tracker {
         pending.confirmed = Some(index);
         Ok(())
     }
-    pub fn finish(&mut self, cut: Cut, state: &State, leader: bool) -> Result<Vec<Completion>> {
+    pub fn finish(
+        &mut self,
+        cut: Cut,
+        state: &State,
+        leader: bool,
+        evaluate: impl Fn(&Query, &Cut, &State) -> Result<Value>,
+    ) -> Result<Vec<Completion>> {
         let done: Vec<_> = self
             .pending
             .iter()
@@ -186,12 +255,14 @@ impl Tracker {
             let outcome = if !leader || p.term != cut.term {
                 Outcome::Unknown
             } else {
+                let observed_cut = Cut {
+                    quorum_index: p.confirmed.expect("confirmed completed read"),
+                    ..cut.clone()
+                };
+                let value = evaluate(&p.query, &observed_cut, state)?;
                 Outcome::Observed {
-                    cut: Cut {
-                        quorum_index: p.confirmed.expect("confirmed completed read"),
-                        ..cut.clone()
-                    },
-                    value: p.query.evaluate(state)?,
+                    cut: observed_cut,
+                    value,
                 }
             };
             results.push(Completion {

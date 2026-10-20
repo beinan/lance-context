@@ -13,6 +13,7 @@ use lance_context_wal::{
             Reply as PublisherReply, SourceRange, Table,
         },
         query::{Completion as ReadCompletion, Outcome as ReadOutcome, Query, Value},
+        source::{CatalogSigner, Permit, Reply as SourceReply},
         Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
         SnapshotReceiver, Status,
     },
@@ -61,6 +62,7 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Pin(u64, Permit),
     Query(u64, u64, Query),
     Plan(u64, PlanRequest),
     Acquire(u64, Acquire),
@@ -127,6 +129,7 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::Pin(token, permit) => node.pin_source(token, permit)?,
         Request::Query(group, token, query) => node.query(group, token, query)?,
         Request::Plan(token, plan) => node.plan_publication(token, plan)?,
         Request::Acquire(token, acquire) => node.acquire_publisher(token, acquire)?,
@@ -234,14 +237,26 @@ fn replication_peer_fixture() -> Result<()> {
     let root = PathBuf::from(root);
     let id = std::env::var("CONTEXT_REPLICATION_NODE")?.parse()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    let node = Node::open(
+    let limits_path = root.join("limits.json");
+    let limits = if limits_path.exists() {
+        serde_json::from_slice(&std::fs::read(limits_path)?)?
+    } else {
+        Limits::default()
+    };
+    let mut node = Node::open(
         &root.join(format!("data-{id}")),
         Arc::new(serde_json::from_slice(&std::fs::read(
             root.join("layout.json"),
         )?)?),
         id,
-        Limits::default(),
+        limits,
     )?;
+    let key_path = root.join(format!("catalog-key-{id}.pkcs8"));
+    if key_path.exists() {
+        node.set_catalog_signer(Arc::new(CatalogSigner::from_pkcs8(&std::fs::read(
+            key_path,
+        )?)?))?;
+    }
     let mut worker = Worker {
         node,
         prepared: None,
@@ -338,7 +353,6 @@ struct Cluster {
 }
 impl Cluster {
     fn new() -> Result<Self> {
-        let root = tempfile::tempdir()?;
         let layout = Layout {
             cluster: Uuid::from_u128(50),
             nodes: (1..=3)
@@ -347,6 +361,23 @@ impl Cluster {
             groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![1, 2, 3])]),
             buckets: vec![10, 20],
         };
+        Self::with_layout(layout, None)
+    }
+    fn with_layout(layout: Layout, catalog_key: Option<&[u8]>) -> Result<Self> {
+        let root = tempfile::tempdir()?;
+        if let Some(key) = catalog_key {
+            let signer = CatalogSigner::from_pkcs8(key)?;
+            std::fs::write(
+                root.path().join("limits.json"),
+                serde_json::to_vec(&Limits {
+                    catalog_key: Some(signer.public_key()),
+                    ..Default::default()
+                })?,
+            )?;
+            for id in &layout.groups[layout.groups.first_key_value().unwrap().0] {
+                std::fs::write(root.path().join(format!("catalog-key-{id}.pkcs8")), key)?;
+            }
+        }
         std::fs::write(
             root.path().join("layout.json"),
             serde_json::to_vec(&layout)?,
@@ -361,8 +392,8 @@ impl Cluster {
             transfers: 0,
             interrupt_next_snapshot: false,
         };
-        for id in 1..=3 {
-            this.start(id)?;
+        for id in layout.nodes.keys() {
+            this.start(*id)?;
         }
         Ok(this)
     }
@@ -383,6 +414,7 @@ impl Cluster {
             Request::Query(group, token, _) => format!("query group {group}, token {token}"),
             Request::Acquire(token, _) => format!("acquire token {token}"),
             Request::Plan(token, _) => format!("plan token {token}"),
+            Request::Pin(token, _) => format!("pin token {token}"),
             _ => "replication control".to_string(),
         };
         let Response::Events(packets, completions, reads) = self
@@ -1171,6 +1203,239 @@ fn quorum_queries_capture_committed_tails_without_appends_and_reject_isolated_re
     assert_eq!(index, second_index);
     for peer in c.peers.values_mut() {
         verify_records(peer, 10, &[first.clone(), second.clone()])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> Result<()> {
+    use lance_context_wal::ingest_contract::{IngestContract, WritePolicy};
+    let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .map_err(|_| anyhow::anyhow!("test key generation failed"))?;
+    let layout = Layout {
+        cluster: Uuid::from_u128(810),
+        nodes: (1..=6)
+            .map(|id| (id, format!("wal-{id}.example.invalid:7800")))
+            .collect(),
+        groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![4, 5, 6])]),
+        buckets: vec![10, 20],
+    };
+    let mut c = Cluster::with_layout(layout, Some(key.as_ref()))?;
+    let catalog = c.elect(1, 10, &[1, 2, 3])?;
+    let source = c.elect(4, 20, &[4, 5, 6])?;
+    assert_eq!(source, 4);
+    drop(c.peers.remove(&6));
+    let table = Uuid::from_u128(811);
+    let rows: Vec<_> = (1..=3)
+        .map(|sequence| {
+            Batch::new(
+                table,
+                1,
+                Uuid::from_u128(812),
+                sequence,
+                Bytes::from(vec![sequence as u8; 64 * 1024]),
+            )
+        })
+        .collect();
+    for (n, row) in rows.iter().enumerate() {
+        c.command(source, Request::Propose(20, 1000 + n as u64, row.clone()))?;
+        c.pump(&[4, 5])?;
+        assert!(matches!(
+            c.outcome(1000 + n as u64),
+            Some(Outcome::Committed(Applied::Accepted { .. }))
+        ));
+    }
+    c.command(
+        source,
+        Request::Query(
+            20,
+            1010,
+            Query::Accepted {
+                after: 0,
+                limit: 128,
+            },
+        ),
+    )?;
+    c.pump(&[4, 5])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Accepted(page),
+        ..
+    }) = c.read_outcome(1010)
+    else {
+        anyhow::bail!("source quorum page missing");
+    };
+    let mut acquire = Acquire {
+        table,
+        destination: Destination {
+            namespace: Uuid::from_u128(813),
+            dataset: "tables/pinned".into(),
+        },
+        ingest: IngestContract {
+            tenant: "test".into(),
+            qualified_table: "pinned".into(),
+            schema: [3; 32],
+            policy: WritePolicy::ImmutableUniqueIds,
+            max_record_bytes: 1024 * 1024,
+            max_rows: 1024,
+        },
+        owner: Uuid::from_u128(814),
+        request: Uuid::from_u128(815),
+        expected_epoch: 0,
+    };
+    c.command(catalog, Request::Acquire(1020, acquire.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    let Some(Outcome::Committed(Applied::Publisher(PublisherReply::Acquired(authority)))) =
+        c.outcome(1020)
+    else {
+        anyhow::bail!("catalog authority missing");
+    };
+    let transaction = Uuid::from_u128(816);
+    c.command(
+        catalog,
+        Request::Plan(
+            1021,
+            PlanRequest {
+                authority,
+                plan: Plan {
+                    transaction,
+                    read_version: 7,
+                    next_group: 10,
+                    sources: BTreeMap::from([(
+                        20,
+                        SourceRange {
+                            after: 0,
+                            through: page.through,
+                            records: page.entries,
+                        },
+                    )]),
+                },
+            },
+        ),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    let Some(Outcome::Committed(Applied::Publisher(PublisherReply::Planned { index: plan_index }))) =
+        c.outcome(1021)
+    else {
+        anyhow::bail!("catalog plan missing");
+    };
+    let query = Query::Pin {
+        table,
+        transaction,
+        plan_index,
+        source_group: 20,
+    };
+    c.command(catalog, Request::Query(10, 1022, query.clone()))?;
+    assert!(
+        c.read_outcome(1022).is_none(),
+        "attestation preceded quorum confirmation"
+    );
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Pin(Some(permit)),
+        ..
+    }) = c.read_outcome(1022)
+    else {
+        anyhow::bail!("catalog attestation missing");
+    };
+    // The attestation crosses two real TCP connections and a process boundary.
+    // Source replicas have only the policy's public verification key.
+    c.command(source, Request::Pin(1030, *permit))?;
+    assert!(
+        c.outcome(1030).is_none(),
+        "pin preceded durable source quorum"
+    );
+    c.pump(&[4, 5])?;
+    let Some(Outcome::Committed(Applied::Source(SourceReply::Pinned { index }))) = c.outcome(1030)
+    else {
+        anyhow::bail!("source pin missing");
+    };
+    c.peers
+        .get_mut(&4)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(20, Uuid::from_u128(817)))?;
+    c.command(4, Request::InstallCheckpoint)?;
+    c.pump(&[4, 5])?;
+    c.start(6)?;
+    for _ in 0..40 {
+        c.command(4, Request::Tick)?;
+        c.pump(&[4, 5, 6])?;
+        if c.transfers > 0 {
+            break;
+        }
+    }
+    assert!(
+        c.transfers > 0,
+        "source pin never crossed a snapshot transfer"
+    );
+    drop(c.peers.remove(&4));
+    drop(c.peers.remove(&1));
+    let source = c.elect(6, 20, &[5, 6])?;
+    let catalog = c.elect(2, 10, &[2, 3])?;
+    acquire.owner = Uuid::from_u128(818);
+    acquire.request = Uuid::from_u128(819);
+    acquire.expected_epoch = 1;
+    c.command(catalog, Request::Acquire(1040, acquire))?;
+    c.pump(&[2, 3])?;
+    assert!(matches!(
+        c.outcome(1040),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Acquired(_)
+        )))
+    ));
+    c.command(catalog, Request::Query(10, 1041, query.clone()))?;
+    c.pump(&[2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Pin(Some(permit)),
+        ..
+    }) = c.read_outcome(1041)
+    else {
+        anyhow::bail!("takeover attestation missing");
+    };
+    c.command(source, Request::Pin(1042, *permit))?;
+    c.pump(&[5, 6])?;
+    assert_eq!(
+        c.outcome(1042),
+        Some(Outcome::Committed(Applied::Source(SourceReply::Pinned {
+            index
+        })))
+    );
+    c.queue.clear();
+    c.peers.clear();
+    for id in 1..=6 {
+        c.start(id)?;
+    }
+    let catalog = c.elect(2, 10, &[1, 2, 3])?;
+    let source = c.elect(6, 20, &[4, 5, 6])?;
+    c.command(catalog, Request::Query(10, 1050, query))?;
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Pin(Some(permit)),
+        ..
+    }) = c.read_outcome(1050)
+    else {
+        anyhow::bail!("restart attestation missing");
+    };
+    c.command(source, Request::Pin(1051, *permit))?;
+    c.pump(&[4, 5, 6])?;
+    assert_eq!(
+        c.outcome(1051),
+        Some(Outcome::Committed(Applied::Source(SourceReply::Pinned {
+            index
+        })))
+    );
+    c.command(source, Request::Query(20, 1052, Query::SourcePin { table }))?;
+    c.pump(&[4, 5, 6])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::SourcePin(Some(pin)),
+        ..
+    }) = c.read_outcome(1052)
+    else {
+        anyhow::bail!("restart source pin view missing");
+    };
+    assert_eq!(pin.index, index);
+    assert_eq!(pin.permit.selection().plan_index, plan_index);
+    for id in 4..=6 {
+        verify_records(c.peers.get_mut(&id).unwrap(), 20, &rows)?;
     }
     Ok(())
 }
