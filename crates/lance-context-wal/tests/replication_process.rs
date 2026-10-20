@@ -62,6 +62,10 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    ConfirmPublication(
+        u64,
+        lance_context_wal::replication::publication::ConfirmPublication,
+    ),
     BootstrapManifest(
         u64,
         lance_context_wal::replication::publication::BootstrapManifest,
@@ -138,6 +142,7 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::ConfirmPublication(token, request) => node.confirm_publication(token, request)?,
         Request::BootstrapManifest(token, request) => node.bootstrap_manifest(token, request)?,
         Request::ReserveManifest(token, request) => node.reserve_manifest(token, request)?,
         Request::Prepare(token, prepared) => node.prepare_publication(token, prepared)?,

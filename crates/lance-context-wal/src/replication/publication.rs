@@ -1,19 +1,21 @@
 //! Replicated table bindings and publisher epochs. These commands run through
 //! the same durable Raft path as appends; a local view is not an active lease.
 //! Immutable plans and prepared descriptors survive takeover. Source pins live
-//! in the source module; manifest outcomes and retirement remain separate work.
+//! in the source module; source closure and retirement remain separate work.
 //! No Lance manifest is changed here.
 use super::*;
 use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
 mod manifest;
+mod outcome;
 mod plan;
 mod prepared;
 pub use manifest::{
     BootstrapManifest, ManifestIndex, ManifestObject, ManifestRecord, ReserveManifest,
     MAX_MANIFEST_VERSIONS,
 };
+pub use outcome::{ConfirmPublication, Published};
 pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
 pub use prepared::{Descriptors, PrepareRequest, Prepared, MAX_DESCRIPTOR_BYTES};
 #[cfg(test)]
@@ -25,7 +27,8 @@ pub(super) const MAX_BASE_TABLE_BYTES: usize = MAX_ACQUIRE_BYTES + 2048;
 pub(super) const MAX_TABLE_BYTES: usize = MAX_BASE_TABLE_BYTES
     + plan::MAX_PLAN_BYTES
     + prepared::MAX_PREPARE_BYTES
-    + manifest::MAX_MANIFEST_INDEX_BYTES;
+    + manifest::MAX_MANIFEST_INDEX_BYTES
+    + outcome::MAX_OUTCOME_BYTES;
 fn codec(limit: usize) -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -76,6 +79,7 @@ enum Command {
     Prepare(Box<PrepareRequest>),
     BootstrapManifest(Box<BootstrapManifest>),
     ReserveManifest(Box<ReserveManifest>),
+    ConfirmPublication(Box<ConfirmPublication>),
 }
 impl Command {
     fn identity(&self) -> (Uuid, Uuid, u64) {
@@ -85,6 +89,9 @@ impl Command {
             Self::Prepare(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
             Self::BootstrapManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
             Self::ReserveManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
+            Self::ConfirmPublication(p) => {
+                (p.authority.table, p.authority.owner, p.authority.epoch)
+            }
         }
     }
     fn byte_limit(&self) -> usize {
@@ -95,13 +102,14 @@ impl Command {
             Self::BootstrapManifest(_) | Self::ReserveManifest(_) => {
                 manifest::MAX_MANIFEST_COMMAND_BYTES
             }
+            Self::ConfirmPublication(_) => outcome::MAX_OUTCOME_BYTES,
         }
     }
     fn batch(self, layout: &Layout) -> Result<Batch> {
         let (table, owner, sequence) = self.identity();
         let limit = self.byte_limit();
         let envelope = Envelope {
-            version: 4,
+            version: 5,
             cluster: layout.cluster,
             layout: layout.fingerprint()?,
             group: control_group(layout),
@@ -168,6 +176,7 @@ pub enum Rejection {
     PreparedConflict,
     ManifestIdentity,
     ManifestPredecessor,
+    PublicationIdentity,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
@@ -177,6 +186,7 @@ pub enum Reply {
     Prepared { index: u64 },
     ManifestReserved(Arc<ManifestRecord>),
     ManifestTaken(Arc<ManifestRecord>),
+    Published(Arc<Published>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -210,7 +220,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Envelope> {
         "publisher command too large"
     );
     let envelope: Envelope = codec(MAX_COMMAND_BYTES).deserialize(bytes)?;
-    ensure!(envelope.version == 4, "unsupported publisher command");
+    ensure!(envelope.version == 5, "unsupported publisher command");
     ensure!(
         bytes.len() <= envelope.command.byte_limit(),
         "publisher command type byte limit"
@@ -255,6 +265,7 @@ pub(super) fn validate_record(
         Command::Prepare(p) => p.validate(layout, limits)?,
         Command::BootstrapManifest(p) => p.validate(layout)?,
         Command::ReserveManifest(p) => p.validate(layout)?,
+        Command::ConfirmPublication(p) => p.validate(layout)?,
     }
     Ok(())
 }
@@ -273,6 +284,9 @@ impl Catalog {
             }
             Command::ReserveManifest(request) => {
                 return self.reserve_manifest(*request, index, limits)
+            }
+            Command::ConfirmPublication(request) => {
+                return self.confirm_publication(*request, index)
             }
             Command::Acquire(a) => *a,
         };
