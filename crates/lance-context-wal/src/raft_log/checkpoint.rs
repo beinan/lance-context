@@ -15,6 +15,77 @@ pub(super) fn validate(snapshot: &Snapshot, conf: &ConfState) -> Result<()> {
 }
 
 impl GroupLog {
+    /// Atomically persist a received Raft Ready snapshot, suffix and HardState.
+    ///
+    /// The owner must validate and fsync the complete application snapshot and
+    /// every referenced file/directory BEFORE passing it to Raft. This method
+    /// supplies only the storage transition after Raft accepts that snapshot;
+    /// it cannot authenticate a sender or validate opaque application state.
+    /// Do not release snapshot/append responses or apply the suffix before it
+    /// returns successfully. Membership must remain the bound static membership.
+    ///
+    /// A received snapshot advances beyond the previous durable commit and
+    /// replaces ALL prior entries, including a divergent uncommitted suffix.
+    /// Entries from the same Ready start immediately after its cut. HardState,
+    /// application binding, snapshot descriptor and suffix cross one shared
+    /// sync barrier. An uncertain write fences the physical engine; retain old
+    /// and new application dependencies until recovery resolves the outcome.
+    /// Repeated/stale installs are rejected; ordinary later Ready updates use
+    /// `persist`, and a local committed cut uses `checkpoint` instead.
+    pub fn install_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        entries: &[Entry],
+        hard: &HardState,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| anyhow::anyhow!("group state lock poisoned"))?;
+        self.node.check()?;
+        validate(snapshot, &state.conf)?;
+        let application = self
+            .node
+            .engine
+            .get(self.group, b"application")
+            .context("bind the application before receiving a snapshot")?;
+        ensure!(
+            !application.is_empty() && application.len() <= 4096,
+            "invalid snapshot application binding"
+        );
+        let metadata = snapshot.get_metadata();
+        ensure!(
+            metadata.index > state.hard.commit
+                && metadata.term
+                    >= state
+                        .term(state.hard.commit)
+                        .context("missing committed term")?,
+            "received snapshot does not advance the committed history"
+        );
+        let base = GroupState {
+            hard: state.hard.clone(),
+            conf: state.conf.clone(),
+            terms: Vec::new(),
+            snapshot: snapshot.clone(),
+        };
+        let next = base.appended(entries, Some(hard))?;
+        let mut batch = LogBatch::default();
+        // Clean also removes this group's key/value metadata. Restore every
+        // owned key in this SAME batch; the node/layout identity is in group 0.
+        batch.add_command(self.group, raft_engine::Command::Clean);
+        batch.put(self.group, b"application".to_vec(), application)?;
+        batch.put_message(self.group, CONF.to_vec(), &next.conf)?;
+        batch.put_message(self.group, HARD.to_vec(), &next.hard)?;
+        batch.put_message(self.group, SNAPSHOT.to_vec(), &next.snapshot)?;
+        batch.put(self.group, TERMS.to_vec(), encode_terms(&next.terms)?)?;
+        if !entries.is_empty() {
+            batch.add_entries::<EntryIndex>(self.group, entries)?;
+        }
+        self.node.write(&mut batch)?;
+        *state = next;
+        Ok(())
+    }
+
     /// Durably replace a committed prefix with an application checkpoint.
     ///
     /// The application MUST first validate the descriptor's scope and complete
