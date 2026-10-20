@@ -7,10 +7,11 @@
 //! raft-rs's message, persistence, commit and application ordering requirements.
 //! In particular, do not acknowledge a producer merely because `persist` returned.
 //!
-//! This first storage increment retains the complete log. Snapshot installation,
-//! compaction, membership changes, replica replacement, admission and transport
-//! belong to subsequent integration. Its versioned directories cannot open the
-//! earlier experimental formats. Only the owning process may modify the files.
+//! An application may checkpoint a validated, durable committed cut. The small
+//! opaque descriptor and logical compaction cross one physical sync barrier.
+//! Application snapshot files, remote installation, physical file reclamation,
+//! membership changes and replica replacement require higher-level integration.
+//! Only the owning process may modify the files.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -25,6 +26,7 @@ use raft_proto::eraftpb::{ConfState, Entry, EntryType, HardState, Snapshot};
 
 use crate::placement::Layout;
 
+mod checkpoint;
 #[cfg(test)]
 mod fault_tests;
 
@@ -37,6 +39,8 @@ const IDENTITY: &[u8] = b"identity";
 const HARD: &[u8] = b"hard";
 const CONF: &[u8] = b"conf";
 const TERMS: &[u8] = b"terms";
+const SNAPSHOT: &[u8] = b"snapshot";
+const MAX_SNAPSHOT_BYTES: usize = 4096;
 // raft-engine preallocates entry descriptors for the requested index interval,
 // before applying max_size. Never pass an unbounded interval to that API.
 const READ_CHUNK_ENTRIES: u64 = 256;
@@ -147,16 +151,23 @@ struct GroupState {
     hard: HardState,
     conf: ConfState,
     terms: Vec<TermRange>,
+    snapshot: Snapshot,
 }
 
 impl GroupState {
     fn last(&self) -> u64 {
-        self.terms.last().map_or(0, |range| range.last)
+        self.terms
+            .last()
+            .map_or(self.boundary(), |range| range.last)
+    }
+
+    fn boundary(&self) -> u64 {
+        self.snapshot.get_metadata().index
     }
 
     fn term(&self, index: u64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
+        if index == self.boundary() {
+            return Some(self.snapshot.get_metadata().term);
         }
         self.terms
             .get(self.terms.partition_point(|range| range.last < index))
@@ -165,19 +176,31 @@ impl GroupState {
     }
 
     fn validate(&self) -> Result<()> {
-        let (mut previous_last, mut previous_term) = (0, 0);
+        let metadata = self.snapshot.get_metadata();
+        if self.boundary() == 0 {
+            ensure!(
+                self.snapshot == Snapshot::default(),
+                "invalid empty checkpoint"
+            );
+        } else {
+            checkpoint::validate(&self.snapshot, &self.conf)?;
+        }
+        let (mut previous_last, mut previous_term) = (metadata.index, metadata.term);
         for range in &self.terms {
             ensure!(
                 range.first == previous_last + 1
                     && range.last >= range.first
                     && range.last < u64::MAX
-                    && range.term > previous_term,
+                    && range.term > 0
+                    && (range.term > previous_term
+                        || (previous_last == self.boundary() && range.term == previous_term)),
                 "invalid durable term index"
             );
             (previous_last, previous_term) = (range.last, range.term);
         }
         ensure!(
-            self.hard.commit <= self.last()
+            self.hard.commit >= self.boundary()
+                && self.hard.commit <= self.last()
                 && self.hard.term >= previous_term
                 && (self.hard.term > 0 || self.hard.vote == 0)
                 && (self.hard.vote == 0 || self.conf.voters.contains(&self.hard.vote)),
@@ -325,12 +348,31 @@ impl PhysicalLog {
                         .get(group, TERMS)
                         .context("missing term index")?,
                 )?,
+                snapshot: match node.engine.get(group, SNAPSHOT) {
+                    Some(bytes) => {
+                        ensure!(
+                            bytes.len() <= MAX_SNAPSHOT_BYTES,
+                            "oversized durable snapshot"
+                        );
+                        let application = node
+                            .engine
+                            .get(group, b"application")
+                            .context("unbound checkpoint")?;
+                        ensure!(
+                            !application.is_empty() && application.len() <= 4096,
+                            "invalid checkpoint application binding"
+                        );
+                        Snapshot::parse_from_bytes(&bytes)?
+                    }
+                    None => Snapshot::default(),
+                },
             };
             ensure!(state.conf == expected_conf, "static membership changed");
             state.validate()?;
             ensure!(
-                node.engine.last_index(group).unwrap_or(0) == state.last()
-                    && node.engine.first_index(group) == (state.last() > 0).then_some(1),
+                node.engine.last_index(group) == state.terms.last().map(|range| range.last)
+                    && node.engine.first_index(group)
+                        == state.terms.first().map(|range| range.first),
                 "entry bounds differ from durable term index"
             );
             groups.insert(
@@ -477,6 +519,7 @@ impl GroupLog {
             hard: next_hard.clone(),
             conf: state.conf.clone(),
             terms,
+            snapshot: state.snapshot.clone(),
         };
         next.validate()?;
         let mut batch = LogBatch::default();
@@ -516,7 +559,7 @@ impl Storage for GroupLog {
         _: GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let state = self.read().map_err(storage_error)?;
-        if low < 1 {
+        if low <= state.boundary() {
             return Err(StorageError::Compacted.into());
         }
         if low > high || high > state.last() + 1 {
@@ -559,23 +602,26 @@ impl Storage for GroupLog {
     }
 
     fn term(&self, index: u64) -> raft::Result<u64> {
-        self.read()
-            .map_err(storage_error)?
-            .term(index)
-            .ok_or(StorageError::Unavailable.into())
+        let state = self.read().map_err(storage_error)?;
+        if index < state.boundary() {
+            return Err(StorageError::Compacted.into());
+        }
+        state.term(index).ok_or(StorageError::Unavailable.into())
     }
 
     fn first_index(&self) -> raft::Result<u64> {
-        self.node.check().map_err(storage_error)?;
-        Ok(1)
+        Ok(self.read().map_err(storage_error)?.boundary() + 1)
     }
 
     fn last_index(&self) -> raft::Result<u64> {
         Ok(self.read().map_err(storage_error)?.last())
     }
 
-    fn snapshot(&self, _: u64, _: u64) -> raft::Result<Snapshot> {
-        self.node.check().map_err(storage_error)?;
-        Err(StorageError::SnapshotTemporarilyUnavailable.into())
+    fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
+        let state = self.read().map_err(storage_error)?;
+        if state.boundary() == 0 || state.boundary() < request_index {
+            return Err(StorageError::SnapshotTemporarilyUnavailable.into());
+        }
+        Ok(state.snapshot.clone())
     }
 }
