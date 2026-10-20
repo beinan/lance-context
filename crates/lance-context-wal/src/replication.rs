@@ -15,6 +15,7 @@
 pub mod checkpoint;
 mod images;
 pub mod publication;
+pub mod query;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -124,6 +125,7 @@ pub struct Completion {
 pub struct Events {
     pub messages: Vec<Packet>,
     pub completions: Vec<Completion>,
+    pub reads: Vec<query::Completion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +137,7 @@ pub struct Status {
     pub accepted_records: usize,
     pub producers: usize,
     pub pending: usize,
+    pub pending_reads: usize,
 }
 
 /// A bounded local view captured together with its next cursor. Preserve the
@@ -152,6 +155,7 @@ struct Group {
     state: State,
     // Index AND term prevents suffix replacement from completing another input.
     pending: BTreeMap<(u64, u64), (u64, BatchMeta)>,
+    reads: query::Tracker,
     image: Option<Arc<checkpoint::Image>>,
     incoming: Option<PreparedCheckpoint>,
 }
@@ -232,6 +236,7 @@ impl Node {
                 heartbeat_tick: 2,
                 check_quorum: true,
                 pre_vote: true,
+                read_only_option: raft::ReadOnlyOption::Safe,
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 16,
                 max_uncommitted_size: limits.max_uncommitted_bytes,
@@ -245,6 +250,7 @@ impl Node {
                     raw,
                     state,
                     pending: BTreeMap::new(),
+                    reads: query::Tracker::default(),
                     image,
                     incoming: None,
                 },
@@ -300,7 +306,43 @@ impl Node {
             accepted_records: g.state.accepted.len(),
             producers: g.state.producers.len(),
             pending: g.pending.len(),
+            pending_reads: g.reads.len(),
         })
+    }
+
+    fn request_pending(&self, request: u64) -> bool {
+        self.groups
+            .values()
+            .any(|g| g.pending.values().any(|p| p.0 == request) || g.reads.contains(request))
+    }
+
+    /// Queue a bounded safe read-index request at this group's leader. Only a
+    /// successful poll can return the captured application view. This neither
+    /// forwards follower reads nor treats the leader's local state as a lease.
+    /// Until an entry in the leader's current term commits, admission fails
+    /// without reserving capacity or the token; retry after driving replication.
+    pub fn query(&mut self, group: u64, request: u64, query: query::Query) -> Result<()> {
+        self.healthy()?;
+        ensure!(
+            !self.request_pending(request),
+            "request token already pending"
+        );
+        query.validate(&self.layout, group)?;
+        let g = self.groups.get_mut(&group).context("unhosted group")?;
+        ensure!(g.raw.raft.state == StateRole::Leader, "not leader");
+        // raft-rs 0.7 silently drops ReadIndex before this condition holds.
+        // Reject before tracking so a new leader cannot strand accepted reads.
+        ensure!(
+            g.raw.raft.commit_to_current_term(),
+            "leader has not committed a current-term entry; retry after replication"
+        );
+        ensure!(
+            g.pending.len() + g.reads.len() < self.limits.max_pending as usize,
+            "pending request capacity"
+        );
+        let context = g.reads.enqueue(request, g.raw.raft.term, query)?;
+        g.raw.read_index(context);
+        Ok(())
     }
 
     /// Queue a binding/epoch CAS in the one catalog group. Only a committed
@@ -328,10 +370,7 @@ impl Node {
     pub fn propose(&mut self, group: u64, request: u64, batch: Batch) -> Result<()> {
         self.healthy()?;
         ensure!(
-            !self
-                .groups
-                .values()
-                .any(|g| g.pending.values().any(|p| p.0 == request)),
+            !self.request_pending(request),
             "request token already pending"
         );
         state::validate_meta(
@@ -345,7 +384,7 @@ impl Node {
         let g = self.groups.get_mut(&group).context("unhosted group")?;
         ensure!(g.raw.raft.state == StateRole::Leader, "not leader");
         ensure!(
-            g.pending.len() < self.limits.max_pending as usize,
+            g.pending.len() + g.reads.len() < self.limits.max_pending as usize,
             "pending proposal capacity"
         );
         let index = g.raw.raft.raft_log.last_index() + 1;
@@ -452,6 +491,9 @@ impl Node {
                 }
                 outbound.extend(ready.take_messages());
                 outbound.extend(ready.take_persisted_messages());
+                for read in ready.take_read_states() {
+                    group.reads.confirm(&read.request_ctx, read.index)?;
+                }
                 apply(
                     group,
                     *id,
@@ -494,6 +536,18 @@ impl Node {
                     outcome: Outcome::Unknown,
                 });
             }
+            events.reads.extend(group.reads.finish(
+                query::Cut {
+                    cluster: self.layout.cluster,
+                    layout: self.layout_hash,
+                    group: *id,
+                    term: group.raw.raft.term,
+                    quorum_index: 0,
+                    applied: group.state.applied,
+                },
+                &group.state,
+                group.raw.raft.state == StateRole::Leader,
+            )?);
             events
                 .messages
                 .extend(outbound.into_iter().map(|message| Packet {
@@ -512,26 +566,8 @@ impl Node {
     /// read or a producer ACK and cannot be used to shortcut retry completion.
     pub fn accepted(&self, group: u64, after: u64, limit: usize) -> Result<Page> {
         self.healthy()?;
-        ensure!((1..=128).contains(&limit), "invalid accepted page limit");
         let state = &self.groups.get(&group).context("unhosted group")?.state;
-        ensure!(
-            after <= state.applied,
-            "cursor exceeds local applied position"
-        );
-        let mut remaining = state
-            .accepted
-            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded));
-        let entries: Vec<_> = remaining
-            .by_ref()
-            .take(limit)
-            .map(|(index, meta)| (*index, meta.clone()))
-            .collect();
-        let through = if remaining.next().is_some() {
-            entries.last().expect("positive page limit").0
-        } else {
-            state.applied
-        };
-        Ok(Page { entries, through })
+        state.page(after, limit)
     }
 
     pub fn read_accepted(&self, group: u64, index: u64) -> Result<Option<Batch>> {

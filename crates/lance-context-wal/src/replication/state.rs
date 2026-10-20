@@ -85,6 +85,28 @@ pub(super) struct State {
     pub producers: BTreeMap<(Uuid, u32, Uuid), (BatchMeta, u64)>,
 }
 impl State {
+    pub fn page(&self, after: u64, limit: usize) -> Result<Page> {
+        ensure!((1..=128).contains(&limit), "invalid accepted page limit");
+        ensure!(
+            after <= self.applied,
+            "cursor exceeds local applied position"
+        );
+        let mut remaining = self
+            .accepted
+            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded));
+        let entries: Vec<_> = remaining
+            .by_ref()
+            .take(limit)
+            .map(|(index, meta)| (*index, meta.clone()))
+            .collect();
+        let through = if remaining.next().is_some() {
+            entries.last().expect("positive page limit").0
+        } else {
+            self.applied
+        };
+        Ok(Page { entries, through })
+    }
+
     /// The image retains every accepted record. Producer tails must exactly
     /// match those records, including sequence continuity within each lane.
     /// Retirement will need a new format with independently retained tails.

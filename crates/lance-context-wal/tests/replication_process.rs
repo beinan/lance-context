@@ -11,6 +11,7 @@ use lance_context_wal::{
         publication::{
             Acquire, Destination, Rejection as PublisherRejection, Reply as PublisherReply, Table,
         },
+        query::{Completion as ReadCompletion, Outcome as ReadOutcome, Query, Value},
         Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
         SnapshotReceiver, Status,
     },
@@ -59,6 +60,7 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Query(u64, u64, Query),
     Acquire(u64, Acquire),
     Publisher(Uuid),
     Campaign(u64),
@@ -80,7 +82,7 @@ enum Request {
 #[derive(Serialize, Deserialize)]
 enum Response {
     Publisher(Option<Table>),
-    Events(Vec<WirePacket>, Vec<Completion>),
+    Events(Vec<WirePacket>, Vec<Completion>, Vec<ReadCompletion>),
     Status(Status),
     Record(Option<Batch>),
     Page(Page),
@@ -123,6 +125,7 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::Query(group, token, query) => node.query(group, token, query)?,
         Request::Acquire(token, acquire) => node.acquire_publisher(token, acquire)?,
         Request::Publisher(table) => {
             return Ok(Response::Publisher(node.publisher(table)?.cloned()))
@@ -198,6 +201,7 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let Events {
         messages,
         completions,
+        reads,
     } = node.poll()?;
     for packet in &messages {
         if packet.message.get_msg_type() == raft_proto::eraftpb::MessageType::MsgSnapshot {
@@ -214,6 +218,7 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
             .map(WirePacket::encode)
             .collect::<Result<_>>()?,
         completions,
+        reads,
     ))
 }
 
@@ -324,6 +329,7 @@ struct Cluster {
     incarnations: BTreeMap<u64, u64>,
     queue: VecDeque<Packet>,
     completions: Vec<Completion>,
+    reads: Vec<ReadCompletion>,
     transfers: u64,
     interrupt_next_snapshot: bool,
 }
@@ -348,6 +354,7 @@ impl Cluster {
             incarnations: BTreeMap::new(),
             queue: VecDeque::new(),
             completions: Vec::new(),
+            reads: Vec::new(),
             transfers: 0,
             interrupt_next_snapshot: false,
         };
@@ -368,7 +375,7 @@ impl Cluster {
         Ok(())
     }
     fn command(&mut self, id: u64, request: Request) -> Result<()> {
-        let Response::Events(packets, completions) = self
+        let Response::Events(packets, completions, reads) = self
             .peers
             .get_mut(&id)
             .context("missing peer")?
@@ -380,6 +387,7 @@ impl Cluster {
             self.queue.push_back(packet.decode()?);
         }
         self.completions.extend(completions);
+        self.reads.extend(reads);
         Ok(())
     }
     fn pump(&mut self, allowed: &[u64]) -> Result<()> {
@@ -486,6 +494,12 @@ impl Cluster {
             .iter()
             .position(|c| c.request == token)
             .map(|position| self.completions.remove(position).outcome)
+    }
+    fn read_outcome(&mut self, token: u64) -> Option<ReadOutcome> {
+        self.reads
+            .iter()
+            .position(|c| c.request == token)
+            .map(|position| self.reads.remove(position).outcome)
     }
     fn elect(&mut self, id: u64, group: u64, allowed: &[u64]) -> Result<u64> {
         self.command(id, Request::Campaign(group))?;
@@ -857,6 +871,28 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     assert_eq!(table.destination, acquire.destination);
     assert_eq!(table.ingest, acquire.ingest);
 
+    c.command(
+        2,
+        Request::Query(
+            10,
+            8000,
+            Query::Publisher {
+                table: acquire.table,
+            },
+        ),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        cut,
+        value: Value::Publisher(Some(captured)),
+    }) = c.read_outcome(8000)
+    else {
+        anyhow::bail!("publisher quorum view missing");
+    };
+    assert_eq!(*captured, table);
+    assert!(cut.quorum_index >= table.authority.grant_index);
+    assert!(cut.applied >= cut.quorum_index);
+
     c.command(2, Request::Acquire(703, acquire.clone()))?;
     c.pump(&[2])?;
     assert!(
@@ -908,5 +944,134 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
         Some(latest),
         "restart changed the committed grant index"
     );
+    assert_eq!(
+        captured.authority.epoch, 2,
+        "later takeover mutated a captured read"
+    );
+    Ok(())
+}
+
+#[test]
+fn quorum_queries_capture_committed_tails_without_appends_and_reject_isolated_reads() -> Result<()>
+{
+    let mut c = Cluster::new()?;
+    c.command(1, Request::Campaign(10))?;
+    c.pump(&[1, 2, 3])?;
+    let first = input(0, 1, 70);
+    c.command(1, Request::Propose(10, 900, first.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    let Some(Outcome::Committed(Applied::Accepted { index: first_index })) = c.outcome(900) else {
+        anyhow::bail!("first append did not commit");
+    };
+    let query = Query::Producer {
+        table: first.meta.stream,
+        bucket: 0,
+        producer: first.meta.producer,
+    };
+    let Response::Status(before) = c.peers.get_mut(&1).unwrap().call(Request::Status(10))? else {
+        anyhow::bail!("missing initial status");
+    };
+    c.command(1, Request::Query(10, 901, query.clone()))?;
+    assert!(
+        c.read_outcome(901).is_none(),
+        "local tail answered without quorum"
+    );
+    c.pump(&[1, 2])?;
+    let Some(ReadOutcome::Observed {
+        cut,
+        value: Value::Producer(Some((meta, index))),
+    }) = c.read_outcome(901)
+    else {
+        anyhow::bail!("missing quorum producer tail");
+    };
+    assert_eq!(meta, first.meta);
+    assert_eq!(index, first_index);
+    assert!(cut.quorum_index >= index && cut.applied >= cut.quorum_index);
+    c.command(
+        1,
+        Request::Query(
+            10,
+            902,
+            Query::Accepted {
+                after: 0,
+                limit: 128,
+            },
+        ),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        cut,
+        value: Value::Accepted(page),
+    }) = c.read_outcome(902)
+    else {
+        anyhow::bail!("missing quorum accepted page");
+    };
+    assert_eq!(page.entries, vec![(first_index, first.meta.clone())]);
+    assert_eq!(page.through, cut.applied);
+    let Response::Status(after) = c.peers.get_mut(&1).unwrap().call(Request::Status(10))? else {
+        anyhow::bail!("missing post-read status");
+    };
+    assert_eq!(
+        after.committed, before.committed,
+        "read-index queries appended log entries"
+    );
+
+    c.command(1, Request::Query(10, 903, query.clone()))?;
+    c.pump(&[1])?;
+    assert!(c.read_outcome(903).is_none());
+    let leader = c.elect(2, 10, &[2, 3])?;
+    let second = input(0, 2, 71);
+    c.command(leader, Request::Propose(10, 904, second.clone()))?;
+    c.pump(&[2, 3])?;
+    let Some(Outcome::Committed(Applied::Accepted {
+        index: second_index,
+    })) = c.outcome(904)
+    else {
+        anyhow::bail!("new leader did not append");
+    };
+    for _ in 0..25 {
+        c.command(1, Request::Tick)?;
+        c.pump(&[1])?;
+    }
+    assert_eq!(c.read_outcome(903), Some(ReadOutcome::Unknown));
+    for _ in 0..4 {
+        c.command(leader, Request::Tick)?;
+        c.pump(&[1, 2, 3])?;
+    }
+    c.command(leader, Request::Query(10, 905, query.clone()))?;
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Producer(Some((meta, index))),
+        ..
+    }) = c.read_outcome(905)
+    else {
+        anyhow::bail!("missing new leader's tail");
+    };
+    assert_eq!(meta, second.meta);
+    assert_eq!(index, second_index);
+    c.queue.clear();
+    c.peers.clear();
+    for id in 1..=3 {
+        c.start(id)?;
+    }
+    let leader = c.elect(1, 10, &[1, 2, 3])?;
+    c.command(leader, Request::Query(10, 901, query))?;
+    assert!(
+        c.read_outcome(901).is_none(),
+        "restart reused an old read result"
+    );
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Producer(Some((meta, index))),
+        ..
+    }) = c.read_outcome(901)
+    else {
+        anyhow::bail!("missing restarted tail");
+    };
+    assert_eq!(meta, second.meta);
+    assert_eq!(index, second_index);
+    for peer in c.peers.values_mut() {
+        verify_records(peer, 10, &[first.clone(), second.clone()])?;
+    }
     Ok(())
 }
