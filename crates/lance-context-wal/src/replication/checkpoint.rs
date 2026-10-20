@@ -14,8 +14,8 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 7;
-const MAGIC: &[u8; 8] = b"LCWALCP7";
+const FORMAT: u32 = 8;
+const MAGIC: &[u8; 8] = b"LCWALCP8";
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -73,6 +73,7 @@ struct Descriptor {
     producers: u64,
     tables: u64,
     pins: u64,
+    closed: u64,
     metadata_bytes: u64,
     payload_bytes: u64,
     metadata_digest: [u8; 32],
@@ -89,6 +90,7 @@ fn metadata_limit(limits: &Limits) -> u64 {
         + limits.max_tables.min(limits.max_active_plans) * (source::MAX_PIN_BYTES as u64 + 4)
         + limits.max_manifest_records * 2048
         + limits.max_tables * 256
+        + limits.max_tables * (source::MAX_CLOSED_BYTES as u64 + 4)
         + 1024
 }
 
@@ -103,6 +105,7 @@ impl Descriptor {
                 && self.producers <= self.records
                 && self.tables <= limits.max_tables
                 && self.pins <= limits.max_tables.min(limits.max_active_plans)
+                && self.closed <= limits.max_tables
                 && (group == publication::control_group(layout) || self.tables == 0)
                 && self.metadata_bytes <= metadata_limit(limits)
                 && self.payload_bytes <= self.records * limits.max_record_bytes,
@@ -449,6 +452,7 @@ pub(super) fn build(
         producers: state.producers.len() as u64,
         tables: state.catalog.tables.len() as u64,
         pins: state.pins.len() as u64,
+        closed: state.closed.len() as u64,
         metadata_bytes: 0,
         payload_bytes,
         metadata_digest: [0; 32],
@@ -462,6 +466,7 @@ pub(super) fn build(
     write_u64(&mut metadata, descriptor.producers)?;
     write_u64(&mut metadata, descriptor.tables)?;
     write_u64(&mut metadata, descriptor.pins)?;
+    write_u64(&mut metadata, descriptor.closed)?;
     for (index, meta) in &state.accepted {
         write_meta(&mut metadata, *index, meta)?;
     }
@@ -473,6 +478,9 @@ pub(super) fn build(
     }
     for pin in state.pins.values() {
         write_frame(&mut metadata, &source::encode_pin(pin)?)?;
+    }
+    for closed in state.closed.values() {
+        write_frame(&mut metadata, &source::encode_closed(closed)?)?;
     }
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
@@ -521,7 +529,8 @@ pub(super) fn load(
         read_u64(&mut metadata)? == descriptor.records
             && read_u64(&mut metadata)? == descriptor.producers
             && read_u64(&mut metadata)? == descriptor.tables
-            && read_u64(&mut metadata)? == descriptor.pins,
+            && read_u64(&mut metadata)? == descriptor.pins
+            && read_u64(&mut metadata)? == descriptor.closed,
         "image metadata count mismatch"
     );
     let mut state = State {
@@ -571,6 +580,18 @@ pub(super) fn load(
             "unordered or duplicate source pin"
         );
         state.pins.insert(table, Arc::new(pin));
+        previous = Some(table);
+    }
+    let mut previous = None;
+    for _ in 0..descriptor.closed {
+        let bytes = read_dynamic_frame(&mut metadata, source::MAX_CLOSED_BYTES)?;
+        let closed = source::decode_closed(&bytes)?;
+        let table = closed.permit.closure().table;
+        ensure!(
+            previous.is_none_or(|old| old < table),
+            "unordered or duplicate source closure"
+        );
+        state.closed.insert(table, Arc::new(closed));
         previous = Some(table);
     }
     let metadata_file = metadata.finish(descriptor.metadata_bytes, descriptor.metadata_digest)?;

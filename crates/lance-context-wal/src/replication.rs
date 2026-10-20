@@ -93,7 +93,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v7",
+            "lance-context/replicated-append/v8",
             self,
         ))?)
     }
@@ -454,6 +454,14 @@ impl Node {
     /// table prefix in its source group. Completion, never enqueue, pins it.
     pub fn pin_source(&mut self, request: u64, permit: source::Permit) -> Result<()> {
         let group = permit.selection().group;
+        let batch = permit.batch(&self.layout, &self.limits)?;
+        self.propose(group, request, batch)
+    }
+
+    /// Persist a catalog-authorized source closure and reject delayed pin
+    /// requests for the closed plan. Bodies remain retained until retirement.
+    pub fn close_source(&mut self, request: u64, permit: source::ClosurePermit) -> Result<()> {
+        let group = permit.closure().group;
         let batch = permit.batch(&self.layout, &self.limits)?;
         self.propose(group, request, batch)
     }

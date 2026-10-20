@@ -83,6 +83,7 @@ pub(super) fn validate_entry(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct State {
+    pub closed: BTreeMap<Uuid, Arc<source::Closed>>,
     pub pins: BTreeMap<Uuid, Arc<source::Pin>>,
     pub catalog: publication::Catalog,
     pub applied: u64,
@@ -177,7 +178,7 @@ impl State {
                 source::decode(&entry.data)?,
                 entry.index,
                 limits,
-            ))));
+            )?)));
         }
         if meta.kind == RecordKind::MultiPublication {
             return Ok(Some(Applied::Publisher(self.catalog.apply(

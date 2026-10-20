@@ -8,6 +8,15 @@ mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Query {
+    ClosePermit {
+        table: Uuid,
+        transaction: Uuid,
+        plan_index: u64,
+        source_group: u64,
+    },
+    SourceClosure {
+        table: Uuid,
+    },
     Manifest {
         table: Uuid,
         version: Option<u64>,
@@ -37,6 +46,8 @@ pub enum Query {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
+    ClosePermit(Option<Box<source::ClosurePermit>>),
+    SourceClosure(Option<Arc<source::Closed>>),
     Manifest(Option<Arc<publication::ManifestRecord>>),
     Publisher(Option<Box<publication::Table>>),
     Accepted(Page),
@@ -83,7 +94,13 @@ impl Query {
                     && version.is_none_or(|v| v > 0 && v < u64::MAX),
                 "invalid manifest query scope"
             ),
-            Self::Pin {
+            Self::ClosePermit {
+                table,
+                transaction,
+                plan_index,
+                source_group,
+            }
+            | Self::Pin {
                 table,
                 transaction,
                 plan_index,
@@ -97,7 +114,9 @@ impl Query {
                     && group == publication::control_group(layout),
                 "invalid catalog dependency query"
             ),
-            Self::SourcePin { table } => ensure!(!table.is_nil(), "nil source table"),
+            Self::SourceClosure { table } | Self::SourcePin { table } => {
+                ensure!(!table.is_nil(), "nil source table")
+            }
             Self::Publisher { table } => ensure!(
                 !table.is_nil() && group == publication::control_group(layout),
                 "invalid publisher query scope"
@@ -127,6 +146,37 @@ impl Query {
         signer: Option<&source::CatalogSigner>,
     ) -> Result<Value> {
         Ok(match self {
+            Self::SourceClosure { table } => Value::SourceClosure(state.closed.get(table).cloned()),
+            Self::ClosePermit {
+                table,
+                transaction,
+                plan_index,
+                source_group,
+            } => {
+                let selected = state.catalog.tables.get(table).filter(|table| {
+                    table.progress.published.is_some()
+                        && table.progress.pending.as_ref().is_some_and(|p| {
+                            p.index == *plan_index
+                                && p.plan.transaction == *transaction
+                                && p.plan.sources.contains_key(source_group)
+                        })
+                });
+                Value::ClosePermit(
+                    selected
+                        .map(|table| {
+                            source::ClosurePermit::issue(
+                                signer.context("catalog closure signer unavailable")?,
+                                cut.clone(),
+                                layout,
+                                limits,
+                                table,
+                                *source_group,
+                            )
+                            .map(Box::new)
+                        })
+                        .transpose()?,
+                )
+            }
             Self::Manifest { table, version } => Value::Manifest(
                 state
                     .catalog

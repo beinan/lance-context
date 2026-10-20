@@ -61,7 +61,7 @@ pub struct Published {
     pub manifest: Arc<ManifestRecord>,
 }
 impl Published {
-    pub(super) fn validate(&self, table: &Table, cut: u64) -> Result<()> {
+    pub(in crate::replication) fn validate(&self, table: &Table, cut: u64) -> Result<()> {
         let manifests = table
             .manifests
             .as_ref()

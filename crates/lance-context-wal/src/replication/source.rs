@@ -6,6 +6,9 @@ use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
+mod closure;
+pub(super) use closure::{decode_closed, encode_closed, MAX_CLOSED_BYTES};
+pub use closure::{Closed, Closure, ClosurePermit};
 
 #[cfg(test)]
 mod tests;
@@ -166,21 +169,25 @@ impl Permit {
 
     pub(super) fn batch(self, layout: &Layout, limits: &Limits) -> Result<Batch> {
         self.verify(layout, limits, self.selection.group)?;
-        let bytes = codec(MAX_BYTES).serialize(&self)?;
-        ensure!(bytes.len() <= MAX_BYTES, "oversized source pin command");
-        let mut batch = Batch::new(
+        let (table, transaction, plan_index) = (
             self.selection.table,
-            0,
             self.selection.transaction,
             self.selection.plan_index,
-            Bytes::from(bytes),
         );
+        let bytes = codec(MAX_BYTES).serialize(&Command::Pin(self))?;
+        ensure!(bytes.len() <= MAX_BYTES, "oversized source pin command");
+        let mut batch = Batch::new(table, 0, transaction, plan_index, Bytes::from(bytes));
         batch.meta.kind = RecordKind::Source;
         Ok(batch)
     }
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<Permit> {
+#[derive(Serialize, Deserialize)]
+pub(super) enum Command {
+    Pin(Permit),
+    Close(ClosurePermit),
+}
+pub(super) fn decode(bytes: &[u8]) -> Result<Command> {
     ensure!(bytes.len() <= MAX_BYTES, "oversized source pin command");
     let permit = codec(MAX_BYTES).deserialize(bytes)?;
     ensure!(
@@ -196,14 +203,24 @@ pub(super) fn validate_record(
     meta: &BatchMeta,
     body: &[u8],
 ) -> Result<()> {
-    let permit = decode(body)?;
-    permit.verify(layout, limits, group)?;
-    let s = permit.selection();
+    let command = decode(body)?;
+    let (table, transaction, plan_index) = match command {
+        Command::Pin(permit) => {
+            permit.verify(layout, limits, group)?;
+            let s = permit.selection();
+            (s.table, s.transaction, s.plan_index)
+        }
+        Command::Close(permit) => {
+            permit.verify(layout, limits, group)?;
+            let c = permit.closure();
+            (c.table, c.transaction, c.plan_index)
+        }
+    };
     ensure!(
         meta.kind == RecordKind::Source
-            && meta.stream == s.table
-            && meta.producer == s.transaction
-            && meta.sequence == s.plan_index
+            && meta.stream == table
+            && meta.producer == transaction
+            && meta.sequence == plan_index
             && meta.bucket == 0,
         "source pin envelope mismatch"
     );
@@ -220,20 +237,28 @@ pub enum Rejection {
     Pending,
     Prefix,
     Capacity,
+    Closed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
     Pinned { index: u64 },
     Rejected(Rejection),
+    Closed { index: u64 },
 }
 
-fn complete_prefix(accepted: &BTreeMap<u64, BatchMeta>, selection: &Selection, index: u64) -> bool {
+fn complete_prefix(state: &State, selection: &Selection, index: u64) -> bool {
     let range = &selection.range;
-    // No release/cursor advancement exists in this increment. The retained
-    // source prefix starts at zero until durable resolution is integrated.
-    range.after == 0
+    let previous = state
+        .closed
+        .get(&selection.table)
+        .map(|c| c.permit.closure());
+    range.after == previous.map_or(0, |c| c.through)
+        && previous.is_none_or(|c| {
+            selection.plan_index > c.plan_index && selection.read_version >= c.version
+        })
         && range.through < index
-        && accepted
+        && state
+            .accepted
             .range((
                 std::ops::Bound::Excluded(range.after),
                 std::ops::Bound::Included(range.through),
@@ -242,8 +267,26 @@ fn complete_prefix(accepted: &BTreeMap<u64, BatchMeta>, selection: &Selection, i
             .map(|(i, meta)| (*i, meta))
             .eq(range.records.iter().map(|(i, meta)| (*i, meta)))
 }
-pub(super) fn apply(state: &mut State, permit: Permit, index: u64, limits: &Limits) -> Reply {
+pub(super) fn apply(
+    state: &mut State,
+    command: Command,
+    index: u64,
+    limits: &Limits,
+) -> Result<Reply> {
+    match command {
+        Command::Pin(permit) => Ok(pin(state, permit, index, limits)),
+        Command::Close(permit) => closure::apply(state, permit, index, limits),
+    }
+}
+fn pin(state: &mut State, permit: Permit, index: u64, limits: &Limits) -> Reply {
     let selection = permit.selection();
+    if state
+        .closed
+        .get(&selection.table)
+        .is_some_and(|closed| selection.plan_index <= closed.permit.closure().plan_index)
+    {
+        return Reply::Rejected(Rejection::Closed);
+    }
     if let Some(old) = state.pins.get(&selection.table) {
         return if old.permit.selection() == selection {
             Reply::Pinned { index: old.index }
@@ -251,7 +294,7 @@ pub(super) fn apply(state: &mut State, permit: Permit, index: u64, limits: &Limi
             Reply::Rejected(Rejection::Pending)
         };
     }
-    if !complete_prefix(&state.accepted, selection, index) {
+    if !complete_prefix(state, selection, index) {
         return Reply::Rejected(Rejection::Prefix);
     }
     if state.pins.len() as u64 >= limits.max_tables.min(limits.max_active_plans) {
@@ -269,6 +312,7 @@ pub(super) fn validate_state(
     cut: u64,
     limits: &Limits,
 ) -> Result<()> {
+    closure::validate_state(state, layout, group, cut, limits)?;
     ensure!(
         state.pins.len() as u64 <= limits.max_tables.min(limits.max_active_plans),
         "source pin capacity"
@@ -279,7 +323,7 @@ pub(super) fn validate_state(
             *table == pin.permit.selection.table
                 && pin.index > 0
                 && pin.index <= cut
-                && complete_prefix(&state.accepted, pin.permit.selection(), pin.index),
+                && complete_prefix(state, pin.permit.selection(), pin.index),
             "invalid checkpoint source pin or prefix"
         );
     }

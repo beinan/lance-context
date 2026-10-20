@@ -2,6 +2,7 @@ use super::*;
 use crate::ingest_contract::WritePolicy;
 use publication::{Acquire, Authority, Destination, Plan, PlanRequest, SourceRange};
 use query::{Outcome as ReadOutcome, Query, Value};
+mod closed;
 
 struct Cluster {
     nodes: Vec<Node>,

@@ -18,7 +18,7 @@ Source positions and the publication checkpoint remain unchanged, and another
 plan remains blocked. In particular, a catalog index is never used as a source
 group cursor. No source pin, payload, descriptor, manifest or image is deleted.
 
-Application identity and checkpoint format advance to v7. Older identities are
+Application identity and checkpoint format advance to v8. Older identities are
 rejected without in-place migration. Images account for the bounded outcome
 metadata and verify its exact selected manifest, pending plan, prepared digest
 and catalog index ordering. Outcome metadata is bounded by active plans.
