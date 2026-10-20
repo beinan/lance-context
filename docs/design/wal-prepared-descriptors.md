@@ -25,7 +25,7 @@ Captured table views share the prepared metadata through `Arc` and `Bytes`.
 Adding descriptors does not copy the plan's selected record list. The default
 per-plan descriptor budget is 256 KiB, with a 1 MiB protocol ceiling. Commands
 have separate type bounds, and checkpoint metadata accounts for both plans and
-descriptors. The application/checkpoint format advances to v8; older identities
+descriptors. The application/checkpoint format advances to v9; older identities
 and images are rejected rather than silently migrated.
 
 The `lance-integration` feature adds real Lance qualification dependencies. It

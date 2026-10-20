@@ -1,5 +1,5 @@
 //! Catalog-authorized closure of an exact source pin. Closure persists a
-//! monotonic fence before releasing the pin. Payload retirement is separate.
+//! monotonic fence before releasing the pin and retiring its exact payload range.
 use super::*;
 
 const DOMAIN: &str = "lance-context/catalog-source-closure/v1";
@@ -217,6 +217,12 @@ pub(super) fn apply(
     if !state.closed.contains_key(&c.table) && state.closed.len() as u64 >= limits.max_tables {
         return Ok(Reply::Rejected(Rejection::Capacity));
     }
+    for (i, meta) in &selection.range.records {
+        ensure!(
+            state.accepted.get(i) == Some(meta),
+            "pinned source payload metadata missing"
+        );
+    }
     let table = c.table;
     let pin_index = pin.index;
     state.closed.insert(
@@ -227,8 +233,18 @@ pub(super) fn apply(
             permit,
         }),
     );
-    state.pins.remove(&table);
-    // Accepted bodies and producer tails remain intact in this increment.
+    let pin = state.pins.remove(&table).expect("verified source pin");
+    for (i, meta) in &pin.permit.selection().range.records {
+        state.retired.insert(
+            (meta.stream, meta.bucket, meta.producer),
+            state::Retired {
+                sequence: meta.sequence,
+                index: *i,
+            },
+        );
+        state.accepted.remove(i);
+    }
+    // Latest producer receipts survive even if their payload has been retired.
     Ok(Reply::Closed { index })
 }
 

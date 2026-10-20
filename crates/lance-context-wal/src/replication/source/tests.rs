@@ -18,6 +18,9 @@ impl Cluster {
         Self::with_plan_limit(128)
     }
     fn with_plan_limit(max_active_plans: u64) -> Result<Self> {
+        Self::with_policy(max_active_plans, 100_000)
+    }
+    fn with_policy(max_active_plans: u64, max_records: u64) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let layout = Arc::new(Layout {
             cluster: Uuid::from_u128(91),
@@ -33,6 +36,7 @@ impl Cluster {
         let limits = Limits {
             catalog_key: Some(signer.public_key()),
             max_active_plans,
+            max_records,
             ..Default::default()
         };
         let mut c = Self {
@@ -137,7 +141,14 @@ impl Cluster {
             .context("missing publisher completion")
     }
     fn plan(&mut self, mutate: impl FnOnce(&mut SourceRange)) -> Result<u64> {
-        for seq in 1..=12 {
+        self.plan_with_background(mutate, 12)
+    }
+    fn plan_with_background(
+        &mut self,
+        mutate: impl FnOnce(&mut SourceRange),
+        background: u64,
+    ) -> Result<u64> {
+        for seq in 1..=background {
             self.append(Uuid::from_u128(999), seq)?;
         }
         self.append(self.table, 1)?;

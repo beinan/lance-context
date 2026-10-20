@@ -403,6 +403,7 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
         state.catalog.tables.len(),
         state.pins.len(),
         state.closed.len(),
+        state.retired.len(),
     ] {
         assert_eq!(read_u64(&mut header)?, count as u64);
     }

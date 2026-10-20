@@ -58,10 +58,19 @@ pub(super) fn close_and_restart(
     let before = c.completions.len();
     c.completions.retain(|c| c.request != 600_002);
     assert_eq!(before - c.completions.len(), 1);
-    c.peers
+    let original_index = stale.selection().range.records.last().unwrap().0;
+    let Response::Image(_, _, payload_bytes) = c
+        .peers
         .get_mut(&source)
         .unwrap()
-        .call(Request::PrepareCheckpoint(20, Uuid::new_v4()))?;
+        .call(Request::PrepareCheckpoint(20, Uuid::new_v4()))?
+    else {
+        anyhow::bail!("source image missing")
+    };
+    assert_eq!(
+        payload_bytes, 0,
+        "retired source still occupies the new image"
+    );
     c.command(source, Request::InstallCheckpoint)?;
     c.pump(&[4, 5, 6])?;
     c.queue.clear();
@@ -110,11 +119,41 @@ pub(super) fn close_and_restart(
         })))
     );
     for id in 4..=6 {
-        verify_records(
-            c.peers.get_mut(&id).unwrap(),
-            20,
-            std::slice::from_ref(input),
-        )?;
+        assert!(matches!(
+            c.peers
+                .get_mut(&id)
+                .unwrap()
+                .call(Request::Read(20, original_index))?,
+            Response::Record(None)
+        ));
     }
+    c.command(source, Request::Propose(20, 600_007, input.clone()))?;
+    c.pump(&[4, 5, 6])?;
+    assert_eq!(
+        c.outcome(600_007),
+        Some(Outcome::Committed(Applied::Accepted {
+            index: original_index
+        }))
+    );
+    c.command(
+        source,
+        Request::Query(
+            20,
+            600_008,
+            Query::Producer {
+                table,
+                bucket: input.meta.bucket,
+                producer: input.meta.producer,
+            },
+        ),
+    )?;
+    c.pump(&[4, 5, 6])?;
+    assert!(
+        matches!(c.read_outcome(600_008), Some(ReadOutcome::Observed { value: Value::Producer(Some((meta, index))), .. })
+        if meta == input.meta && index == original_index)
+    );
+    assert!(
+        matches!(c.peers.get_mut(&source).unwrap().call(Request::Page(20))?, Response::Page(page) if page.entries.is_empty())
+    );
     Ok(())
 }
