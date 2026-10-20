@@ -32,7 +32,7 @@ lookup, rather than serializing all retained history. Captured table views share
 the index and immutable records. There are at most 128 versions per table and a
 configurable node policy bound of 4,096 records by default. Capacity refuses new
 reservations while preserving exact retries. Application identity and checkpoint
-format advance to v7 and include the index in bounds and integrity validation.
+format advance to v8 and include the index in bounds and integrity validation.
 
 The real Lance test adapter writes unique staging manifests using the public
 `ManifestWriter`, then reserves them through six persistent TCP WAL processes.

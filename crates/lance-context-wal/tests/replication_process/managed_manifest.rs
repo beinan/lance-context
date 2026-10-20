@@ -1,6 +1,8 @@
 //! Actual Lance writer/reader adapter over the six-process catalog fixture.
 //! This qualifies the durable index, not production transport or coordinated GC.
 use super::*;
+#[path = "source_closure.rs"]
+mod source_closure;
 use lance_context_wal::replication::publication::{
     Authority, BootstrapManifest, ConfirmPublication, ManifestObject, ManifestRecord, Prepared,
     ReserveManifest,
@@ -423,6 +425,12 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             )))
         );
     }
+    source_closure::close_and_restart(
+        &cluster,
+        handler.scope.authority.table,
+        &selected,
+        &attempt.input,
+    )?;
     // Both version lookup and latest lookup are strict catalog reads. A raw
     // URI reader cannot discover this unique path and is not a managed reader.
     let latest = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)
