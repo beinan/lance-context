@@ -34,6 +34,9 @@ pub(crate) async fn enqueue_recovery(
     };
     if !state.config.merge_rollout.owned(&execution.target)
         && !state.config.merge_rollout.draining(&execution.target)
+        // A recorded fenced execution needs reconciliation even if the
+        // enrollment/maintenance flag was disabled after its admission.
+        && !(execution.protocol == 2 && execution.maintenance.is_some())
     {
         return Ok(());
     }
@@ -207,11 +210,16 @@ pub(crate) async fn run<F>(
 where
     F: Future<Output = Result<String, String>>,
 {
-    if !state.config.merge_rollout.owned(&claim.task.target) {
+    if !fenced(&state.config, &claim.task.target) {
         return work.await;
     }
     let maintenance = kind(claim.task.kind).ok_or("invalid local maintenance kind")?;
     run_as(state, claim, maintenance, work).await
+}
+
+fn fenced(config: &crate::config::MasterConfig, target: &str) -> bool {
+    config.merge_rollout.owned(target)
+        || (config.maintenance.fence_legacy_maintenance && !target.starts_with("datagen:"))
 }
 
 pub(crate) async fn run_as<F>(
@@ -258,7 +266,10 @@ where
         .start(&reserved)
         .await?
         .ok_or("maintenance start lost")?;
-    let scope = MergeWriteScope::with_pinned_authorizer(Arc::new(Guard {
+    // These handles are ephemeral to this operation. Observe successful file
+    // IO as well as logical checkpoints so a long legacy compact/index scan
+    // does not look idle merely because Lance has not completed a whole phase.
+    let scope = MergeWriteScope::with_preparation_authorizer(Arc::new(Guard {
         coordinator: coordinator.clone(),
         execution: running.clone(),
         uri: uri.clone(),
@@ -380,7 +391,34 @@ mod tests {
     use clap::Parser;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn legacy_maintenance_fencing_does_not_enroll_worker_merges() {
+        let default = MasterConfig::parse_from(["master"]);
+        assert!(!fenced(&default, "new-hot-table"));
+        let enabled = MasterConfig::parse_from(["master", "--fence-legacy-maintenance"]);
+        assert!(fenced(&enabled, "new-hot-table"));
+        assert!(fenced(&enabled, "generic:new-hot-table"));
+        assert!(!fenced(&enabled, "datagen:legacy"));
+        assert!(!enabled.merge_rollout.owned("new-hot-table"));
+        assert!(!enabled.merge_rollout.owned("generic:new-hot-table"));
+    }
+
     async fn fixture() -> (tempfile::TempDir, Arc<MasterState>) {
+        configured_fixture(true, false).await
+    }
+
+    async fn configured_fixture(
+        owned: bool,
+        fence_legacy: bool,
+    ) -> (tempfile::TempDir, Arc<MasterState>) {
+        fixture_with_idle(owned, fence_legacy, 1).await
+    }
+
+    async fn fixture_with_idle(
+        owned: bool,
+        fence_legacy: bool,
+        idle: u64,
+    ) -> (tempfile::TempDir, Arc<MasterState>) {
         let dir = tempfile::tempdir().unwrap();
         let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
         let prefix = format!("/maintenance-test/{}", lance_context_core::generate_id());
@@ -393,12 +431,15 @@ mod tests {
             "--etcd-prefix",
             &prefix,
         ]);
-        config.merge_rollout.owned_targets = vec!["table".into()];
+        if owned {
+            config.merge_rollout.owned_targets = vec!["table".into()];
+        }
+        config.maintenance.fence_legacy_maintenance = fence_legacy;
         config.stats_scan_interval_secs = 0;
         config.compaction_interval_secs = 0;
         config.merge_wal_interval_secs = 0;
         config.maintenance.maintenance_timeout_secs = 60;
-        config.maintenance.maintenance_idle_timeout_secs = 1;
+        config.maintenance.maintenance_idle_timeout_secs = idle;
         config.maintenance.maintenance_drain_timeout_secs = 1;
         (dir, MasterState::new(config).await.unwrap())
     }
@@ -408,6 +449,83 @@ mod tests {
             .await
             .unwrap();
         state.task_store.claim_next().await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS; ~8 s"]
+    async fn legacy_maintenance_file_io_progress_survives_multiple_idle_windows() {
+        use lance_context_core::{
+            ColumnSpec, ColumnType, GenericStore, GenericStoreOptions, ListSource, SchemaSpec,
+        };
+        let (_dir, state) = fixture_with_idle(false, true, 3).await;
+        let uri = state.rollout_uri("table");
+        let schema = SchemaSpec::new(vec![
+            (
+                "id".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "content".into(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+        ]);
+        let mut store = GenericStore::open(
+            &uri,
+            schema,
+            GenericStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = (0..512)
+            .map(|n| {
+                serde_json::json!({"id": n.to_string(), "content": "x".repeat(4096)})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        store.add(&rows).await.unwrap();
+        store.flush().await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.close().await.unwrap();
+        let claim = claim(&state, TaskKind::IndexId).await;
+        let coordinator = state.task_store.merge_coordinator();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(&state, &claim, async {
+                // No logical checkpoint calls: only completed reads through the
+                // scoped stores may keep this operation alive. Reopen to avoid
+                // turning later scans into memory-cache hits with no IO.
+                let mut observed_io = false;
+                for step in 0..14 {
+                    let store = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let rows = store
+                        .list_from(ListSource::Fragments)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(rows.len(), 512);
+                    if step > 3 {
+                        let execution = coordinator.get("table").await?.unwrap();
+                        if let Some(report) = coordinator.work_progress(&execution).await? {
+                            observed_io |= report["sequence"].as_u64().unwrap() > 0;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                assert!(observed_io, "the watchdog must publish completed file IO");
+                Ok("file IO kept the operation alive".into())
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, result).await.unwrap();
     }
 
     #[tokio::test]
@@ -478,13 +596,23 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn stalled_local_kinds_cancel_and_release_without_stopping_other_tables() {
+        assert_stalled_local_kinds(true, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn legacy_stalled_local_kinds_cancel_and_release_without_stopping_other_tables() {
+        assert_stalled_local_kinds(false, true).await;
+    }
+
+    async fn assert_stalled_local_kinds(owned: bool, fence_legacy: bool) {
         struct Active(Arc<AtomicBool>);
         impl Drop for Active {
             fn drop(&mut self) {
                 self.0.store(false, Ordering::SeqCst);
             }
         }
-        let (_dir, state) = fixture().await;
+        let (_dir, state) = configured_fixture(owned, fence_legacy).await;
         for kind in [TaskKind::IndexId, TaskKind::Compact, TaskKind::Repair] {
             let owned = claim(&state, kind).await;
             let active = Arc::new(AtomicBool::new(true));
@@ -505,7 +633,11 @@ mod tests {
                     .await
                     .unwrap();
             };
-            let (result, ()) = tokio::join!(result, other);
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+                tokio::join!(result, other)
+            })
+            .await
+            .expect("a no-progress operation must not strand the master");
             assert!(result.as_ref().unwrap_err().contains("no-progress"));
             assert!(!active.load(Ordering::SeqCst));
             assert!(state
@@ -692,7 +824,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn lost_master_index_is_fenced_before_merge_takes_over() {
-        let (_dir, state) = fixture().await;
+        assert_lost_master_fenced(true, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn legacy_lost_master_index_is_fenced_before_merge_takes_over() {
+        assert_lost_master_fenced(false, true).await;
+    }
+
+    async fn assert_lost_master_fenced(owned: bool, fence_legacy: bool) {
+        let (_dir, state) = configured_fixture(owned, fence_legacy).await;
         let uri = state.rollout_uri("table");
         let store = lance_context_core::RolloutStore::open(&uri).await.unwrap();
         let high = store.version() + 1;
@@ -754,7 +896,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn failed_storage_barrier_keeps_ownership_and_retries_do_not_reset_budget() {
-        let (_dir, state) = fixture().await;
+        assert_failed_barrier(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn legacy_fenced_records_recover_after_flag_rollback_and_retain_failed_barriers() {
+        // A previous process admitted this record with fencing enabled; the
+        // restarted master has neither owned targets nor the legacy flag.
+        assert_failed_barrier(false).await;
+    }
+
+    async fn assert_failed_barrier(owned: bool) {
+        let (_dir, state) = configured_fixture(owned, false).await;
         let old_claim = claim(&state, TaskKind::Repair).await;
         let coordinator = state.task_store.merge_coordinator();
         let mut old = Execution::new("table", "master:repair", "old-master", 60);
