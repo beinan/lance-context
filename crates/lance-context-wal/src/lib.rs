@@ -8,6 +8,9 @@
 #[cfg(feature = "placement")]
 pub mod placement;
 
+#[cfg(feature = "raft-log")]
+pub mod raft_log;
+
 #[cfg(feature = "admission")]
 pub mod admission;
 

@@ -154,3 +154,60 @@ durability boundary from an empty batch without checking the engine's behavior.
 For comparisons, preserve the source commit, binary hash, release/debug mode,
 command, filesystem/storage placement and JSON. CI runs tiny correctness smoke
 cases; their numbers are not performance evidence.
+
+## Durable Raft log storage
+
+The optional `raft-log` feature exposes `raft_log::PhysicalLog` and its cloneable
+`GroupLog` handles. One raft-engine directory hosts all groups assigned to a node
+by the existing immutable `placement::Layout`. Opening binds the full layout,
+node identity and each group's three voters before returning a handle. A changed
+identity/layout, a foreign nonempty engine or inconsistent durable metadata is
+rejected. The directory format is separate from earlier experiment binaries.
+
+`GroupLog` implements raft-rs `Storage`. `persist(entries, hard_state)` puts the
+entries, term ranges and optional term/vote/commit state in one engine batch,
+then waits for a physical sync barrier. Different groups can append concurrently
+and share a later barrier. The barrier is a nonempty engine write: the pinned
+engine's empty `sync()` call does not sync. Syncing is isolated from concurrent
+native engine writes because that engine can panic on sync failure. A write
+error or an unwinding write panic invalidates every handle on the physical node;
+stop its driver and reopen all handles to resolve the uncertain durable state.
+Validation errors before engine submission leave the log usable.
+
+Uncommitted suffixes may be replaced. Committed entries, votes in the same term,
+and monotonic term/commit state are protected. Term lookup uses small cached
+ranges rather than reading and decoding entry bodies. Range reads request at
+most 256 engine entry descriptors at a time instead of allocating descriptors
+for an entire history before applying the byte limit. Returned entries obey the
+Raft byte limit, including its required first-entry exception. At a chunk boundary,
+one extra entry may be decoded before determining that it does not fit; callers
+still need an explicit maximum record size and memory admission. This storage
+layer does not decode Arrow, and it does not provide end-to-end zero-copy I/O.
+
+A successful local `persist` is not a quorum ACK. The subsequent Ready driver
+must order durable writes, outgoing messages, commits and state-machine apply
+correctly. This increment supports static membership and retains the complete
+log; snapshots, compaction, replacement, transport, producer deduplication and
+Lance publication are separate integration steps tracked by
+[#378](https://github.com/lance-format/lance-context/issues/378). It does not switch
+production ingestion. Storage assumes exclusive ownership of the directory and
+that successful filesystem syncs survive the supported failures.
+
+```bash
+cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity
+cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
+```
+
+Tests use actual raft-engine files for shared-group recovery, conflict replacement,
+vote/commit protection and byte-limited reads. Independent-log cases verify cache
+isolation for simultaneous engines, dropped handles and a recreated directory;
+they require the vendored engine correction described in
+`vendor/raft-engine/LANCE_CONTEXT_PATCH.md`. Linux subprocess cases exercise
+SIGKILL after a synced prefix (including segment rotation) and a real write
+failure imposed only on the child process. Unit tests use a test-only filesystem
+wrapper around real files to count sync calls and inject a blocked failing sync
+while another group writes, both at the explicit barrier and during rotation.
+That wrapper is absent from ordinary builds. A RawNode test drives persistence,
+elections, minority isolation and restart with deterministic in-process message
+delivery. These tests establish component contracts; they do not establish
+power-loss recovery or distributed quorum durability.

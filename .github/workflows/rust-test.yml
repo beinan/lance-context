@@ -72,6 +72,10 @@ jobs:
           cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
       - name: WAL experiment process lifecycle tests
         run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
+      - name: WAL durable Raft storage tests
+        run: |
+          cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity
       - name: WAL resource observation in a container cgroup namespace
         run: |
           cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
