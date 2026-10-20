@@ -1,6 +1,8 @@
 //! Real Lance files and six persistent WAL processes. Collection is disabled;
 //! this qualifies descriptor recovery, not the external commit/GC fence.
 use super::*;
+#[path = "managed_manifest.rs"]
+mod managed;
 use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
@@ -39,6 +41,9 @@ fn batch(ids: &[i64]) -> Result<RecordBatch> {
 }
 async fn verify(uri: &str, expected: &[i64]) -> Result<()> {
     let dataset = Dataset::open(uri).await?;
+    verify_dataset(dataset, expected).await
+}
+async fn verify_dataset(dataset: Dataset, expected: &[i64]) -> Result<()> {
     let batches: Vec<_> = dataset
         .scan()
         .try_into_stream()
@@ -86,7 +91,7 @@ impl CommitHandler for FixedTarget {
     }
 }
 
-async fn recovered_publication(occupied: bool) -> Result<()> {
+async fn recovered_publication(occupied: bool, managed: Option<managed::Mode>) -> Result<()> {
     let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
         .map_err(|_| anyhow::anyhow!("test key generation failed"))?;
     let layout = Layout {
@@ -160,6 +165,11 @@ async fn recovered_publication(occupied: bool) -> Result<()> {
         c.outcome(2001)
     else {
         anyhow::bail!("authority missing");
+    };
+    let bootstrap = if managed.is_some() {
+        Some(managed::bootstrap(&mut c, catalog, &base, &authority).await?)
+    } else {
+        None
     };
     let transaction = Uuid::from_u128(907);
     c.command(
@@ -313,6 +323,22 @@ async fn recovered_publication(occupied: bool) -> Result<()> {
     let decoded: Vec<Fragment> = serde_json::from_slice(&saved.descriptors.bytes)?;
     let mut tx = Transaction::new(1, Operation::Append { fragments: decoded }, None);
     tx.uuid = saved.transaction.to_string();
+    if let Some(mode) = managed {
+        return managed::publish_and_recover(
+            c,
+            managed::Attempt {
+                uri,
+                base,
+                tx,
+                prepared: saved,
+                authority: view.authority,
+                bootstrap: bootstrap.context("missing managed bootstrap")?,
+                input,
+            },
+            mode,
+        )
+        .await;
+    }
     let result = CommitBuilder::new(Arc::new(base))
         .with_commit_handler(Arc::new(FixedTarget(2)))
         .with_max_retries(0)
@@ -364,10 +390,25 @@ async fn recovered_publication(occupied: bool) -> Result<()> {
 #[tokio::test]
 async fn recovered_descriptors_publish_exact_lance_payload_after_all_process_restart() -> Result<()>
 {
-    recovered_publication(false).await
+    recovered_publication(false, None).await
 }
 
 #[tokio::test]
 async fn recovered_descriptors_do_not_retarget_an_occupied_lance_version() -> Result<()> {
-    recovered_publication(true).await
+    recovered_publication(true, None).await
+}
+
+#[tokio::test]
+async fn catalog_manifest_authority_recovers_unique_lance_path_after_full_restart() -> Result<()> {
+    recovered_publication(false, Some(managed::Mode::Normal)).await
+}
+
+#[tokio::test]
+async fn catalog_manifest_authority_resolves_lost_commit_reply_after_full_restart() -> Result<()> {
+    recovered_publication(false, Some(managed::Mode::LostReply)).await
+}
+
+#[tokio::test]
+async fn catalog_rejects_old_owner_paused_after_real_manifest_upload() -> Result<()> {
+    recovered_publication(false, Some(managed::Mode::Takeover)).await
 }

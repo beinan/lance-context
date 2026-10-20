@@ -7,8 +7,13 @@ use super::*;
 use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
+mod manifest;
 mod plan;
 mod prepared;
+pub use manifest::{
+    BootstrapManifest, ManifestIndex, ManifestObject, ManifestRecord, ReserveManifest,
+    MAX_MANIFEST_VERSIONS,
+};
 pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
 pub use prepared::{Descriptors, PrepareRequest, Prepared, MAX_DESCRIPTOR_BYTES};
 #[cfg(test)]
@@ -17,8 +22,10 @@ mod tests;
 pub(super) const MAX_ACQUIRE_BYTES: usize = 8192;
 pub(super) const MAX_COMMAND_BYTES: usize = prepared::MAX_PREPARE_BYTES;
 pub(super) const MAX_BASE_TABLE_BYTES: usize = MAX_ACQUIRE_BYTES + 2048;
-pub(super) const MAX_TABLE_BYTES: usize =
-    MAX_BASE_TABLE_BYTES + plan::MAX_PLAN_BYTES + prepared::MAX_PREPARE_BYTES;
+pub(super) const MAX_TABLE_BYTES: usize = MAX_BASE_TABLE_BYTES
+    + plan::MAX_PLAN_BYTES
+    + prepared::MAX_PREPARE_BYTES
+    + manifest::MAX_MANIFEST_INDEX_BYTES;
 fn codec(limit: usize) -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -67,6 +74,8 @@ enum Command {
     Acquire(Box<Acquire>),
     Plan(Box<PlanRequest>),
     Prepare(Box<PrepareRequest>),
+    BootstrapManifest(Box<BootstrapManifest>),
+    ReserveManifest(Box<ReserveManifest>),
 }
 impl Command {
     fn identity(&self) -> (Uuid, Uuid, u64) {
@@ -74,6 +83,8 @@ impl Command {
             Self::Acquire(a) => (a.table, a.owner, a.expected_epoch + 1),
             Self::Plan(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
             Self::Prepare(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
+            Self::BootstrapManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
+            Self::ReserveManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
         }
     }
     fn byte_limit(&self) -> usize {
@@ -81,13 +92,16 @@ impl Command {
             Self::Acquire(_) => MAX_ACQUIRE_BYTES,
             Self::Plan(_) => plan::MAX_PLAN_BYTES,
             Self::Prepare(_) => prepared::MAX_PREPARE_BYTES,
+            Self::BootstrapManifest(_) | Self::ReserveManifest(_) => {
+                manifest::MAX_MANIFEST_COMMAND_BYTES
+            }
         }
     }
     fn batch(self, layout: &Layout) -> Result<Batch> {
         let (table, owner, sequence) = self.identity();
         let limit = self.byte_limit();
         let envelope = Envelope {
-            version: 3,
+            version: 4,
             cluster: layout.cluster,
             layout: layout.fingerprint()?,
             group: control_group(layout),
@@ -132,6 +146,7 @@ impl Authority {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Table {
+    pub manifests: Option<Arc<ManifestIndex>>,
     pub destination: Destination,
     pub ingest: IngestContract,
     pub authority: Authority,
@@ -151,6 +166,8 @@ pub enum Rejection {
     SourcePosition,
     PlanIdentity,
     PreparedConflict,
+    ManifestIdentity,
+    ManifestPredecessor,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
@@ -158,6 +175,8 @@ pub enum Reply {
     Planned { index: u64 },
     Rejected(Rejection),
     Prepared { index: u64 },
+    ManifestReserved(Arc<ManifestRecord>),
+    ManifestTaken(Arc<ManifestRecord>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,7 +210,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Envelope> {
         "publisher command too large"
     );
     let envelope: Envelope = codec(MAX_COMMAND_BYTES).deserialize(bytes)?;
-    ensure!(envelope.version == 3, "unsupported publisher command");
+    ensure!(envelope.version == 4, "unsupported publisher command");
     ensure!(
         bytes.len() <= envelope.command.byte_limit(),
         "publisher command type byte limit"
@@ -234,6 +253,8 @@ pub(super) fn validate_record(
         ),
         Command::Plan(p) => p.validate(layout, limits)?,
         Command::Prepare(p) => p.validate(layout, limits)?,
+        Command::BootstrapManifest(p) => p.validate(layout)?,
+        Command::ReserveManifest(p) => p.validate(layout)?,
     }
     Ok(())
 }
@@ -247,6 +268,12 @@ impl Catalog {
         let a = match e.command {
             Command::Plan(p) => return self.plan(*p, index, limits),
             Command::Prepare(request) => return self.prepare(*request, index),
+            Command::BootstrapManifest(request) => {
+                return self.bootstrap_manifest(*request, index, limits)
+            }
+            Command::ReserveManifest(request) => {
+                return self.reserve_manifest(*request, index, limits)
+            }
             Command::Acquire(a) => *a,
         };
         let old = self.tables.get(&a.table);
@@ -286,9 +313,11 @@ impl Catalog {
             grant_index: index,
         };
         let progress = old.map(|table| table.progress.clone()).unwrap_or_default();
+        let manifests = old.and_then(|table| table.manifests.clone());
         self.tables.insert(
             a.table,
             Table {
+                manifests,
                 destination: a.destination,
                 ingest: a.ingest,
                 authority: authority.clone(),
@@ -299,6 +328,10 @@ impl Catalog {
         Reply::Acquired(authority)
     }
     pub fn validate(&self, layout: &Layout, group: u64, cut: u64, limits: &Limits) -> Result<()> {
+        ensure!(
+            self.manifest_records() as u64 <= limits.max_manifest_records,
+            "manifest record capacity"
+        );
         ensure!(
             self.tables.len() as u64 <= limits.max_tables,
             "publisher catalog exceeds limit"
@@ -320,6 +353,9 @@ impl Catalog {
         for (id, table) in &self.tables {
             validate_binding(&table.destination, &table.ingest)?;
             table.progress.validate(layout, table, cut, limits)?;
+            if let Some(manifests) = &table.manifests {
+                manifests.validate(table, cut)?;
+            }
             let a = &table.authority;
             ensure!(
                 !id.is_nil()

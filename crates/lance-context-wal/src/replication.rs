@@ -50,6 +50,7 @@ pub struct Limits {
     pub max_active_plans: u64,
     pub max_plan_source_bytes: u64,
     pub max_descriptor_bytes: u64,
+    pub max_manifest_records: u64,
     pub max_record_bytes: u64,
     pub max_records: u64,
     pub max_producers: u64,
@@ -64,6 +65,7 @@ impl Default for Limits {
             max_active_plans: 128,
             max_plan_source_bytes: 64 * 1024 * 1024,
             max_descriptor_bytes: 256 * 1024,
+            max_manifest_records: 4096,
             max_record_bytes: 8 * 1024 * 1024,
             max_records: 100_000,
             max_producers: 16_384,
@@ -81,6 +83,7 @@ impl Limits {
                 && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
                 && (1..=publication::MAX_DESCRIPTOR_BYTES as u64)
                     .contains(&self.max_descriptor_bytes)
+                && (1..=16_384).contains(&self.max_manifest_records)
                 && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
                 && (1..=500_000).contains(&self.max_records)
                 && (1..=100_000).contains(&self.max_producers)
@@ -90,7 +93,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v5",
+            "lance-context/replicated-append/v6",
             self,
         ))?)
     }
@@ -411,6 +414,28 @@ impl Node {
         prepared: publication::PrepareRequest,
     ) -> Result<()> {
         let batch = prepared.batch(&self.layout, &self.limits)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Adopt an immutable starting manifest after the caller has verified it
+    /// and excluded unmanaged writers/cleaners for this dataset incarnation.
+    pub fn bootstrap_manifest(
+        &mut self,
+        request: u64,
+        bootstrap: publication::BootstrapManifest,
+    ) -> Result<()> {
+        let batch = bootstrap.batch(&self.layout)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Select the unique manifest path for the exact immutable prepared plan.
+    /// An enqueue is not publication; wait for durable quorum completion.
+    pub fn reserve_manifest(
+        &mut self,
+        request: u64,
+        reservation: publication::ReserveManifest,
+    ) -> Result<()> {
+        let batch = reservation.batch(&self.layout)?;
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 

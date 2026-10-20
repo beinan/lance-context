@@ -8,6 +8,10 @@ mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Query {
+    Manifest {
+        table: Uuid,
+        version: Option<u64>,
+    },
     Publisher {
         table: Uuid,
     },
@@ -33,6 +37,7 @@ pub enum Query {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
+    Manifest(Option<Arc<publication::ManifestRecord>>),
     Publisher(Option<Box<publication::Table>>),
     Accepted(Page),
     Producer(Option<(BatchMeta, u64)>),
@@ -72,6 +77,12 @@ pub struct Completion {
 impl Query {
     pub(super) fn validate(&self, layout: &Layout, group: u64) -> Result<()> {
         match self {
+            Self::Manifest { table, version } => ensure!(
+                !table.is_nil()
+                    && group == publication::control_group(layout)
+                    && version.is_none_or(|v| v > 0 && v < u64::MAX),
+                "invalid manifest query scope"
+            ),
             Self::Pin {
                 table,
                 transaction,
@@ -116,6 +127,15 @@ impl Query {
         signer: Option<&source::CatalogSigner>,
     ) -> Result<Value> {
         Ok(match self {
+            Self::Manifest { table, version } => Value::Manifest(
+                state
+                    .catalog
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.manifests.as_ref())
+                    .and_then(|m| m.versions.get(&version.unwrap_or(m.head)))
+                    .cloned(),
+            ),
             Self::Pin {
                 table,
                 transaction,
