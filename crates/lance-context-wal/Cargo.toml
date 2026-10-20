@@ -7,6 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
+client-journal = ["dep:anyhow", "dep:raft-engine", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
 replication = ["raft-log", "record", "dep:bincode", "dep:slog"]
 raft-log = ["placement", "dep:raft", "dep:raft-engine", "dep:raft-proto", "dep:protobuf"]
 vectored-io = ["dep:bytes", "dep:tokio"]

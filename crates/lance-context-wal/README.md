@@ -7,6 +7,17 @@ Implementation and validation are tracked in
 [#378](https://github.com/lance-format/lance-context/issues/378). Related PRs should
 include `Refs #378`; individual steps should leave the tracking issue open.
 
+The optional `client-journal` feature stores recoverable client state in one
+local engine and shares durable barriers across writers. It returns latest
+values for a fixed set of keys, with immutable scope/settings binding, bounded
+admission, reclamation and a shared failure fence. Callers still own producer
+ordering, exact retry identity and recovery validation; a local completion does
+not establish a remote quorum ACK. See [the API and recovery contract](../../docs/design/client-journal.md).
+
+```bash
+cargo test -p lance-context-wal --features client-journal --lib client_journal
+```
+
 The independent `contract` feature defines ingestion routing keys, the schema
 fingerprint, immutable-ID policy and record byte/row limits. Validation checks
 the representation after decoding; callers must durably bind and compare the
