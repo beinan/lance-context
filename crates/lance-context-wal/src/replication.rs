@@ -93,7 +93,7 @@ impl Limits {
             "invalid replication limits"
         );
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v6",
+            "lance-context/replicated-append/v7",
             self,
         ))?)
     }
@@ -436,6 +436,17 @@ impl Node {
         reservation: publication::ReserveManifest,
     ) -> Result<()> {
         let batch = reservation.batch(&self.layout)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
+    /// Durably resolve the selected manifest against its exact pending plan.
+    /// This retains all source dependencies; it does not authorize reclamation.
+    pub fn confirm_publication(
+        &mut self,
+        request: u64,
+        confirmation: publication::ConfirmPublication,
+    ) -> Result<()> {
+        let batch = confirmation.batch(&self.layout)?;
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 

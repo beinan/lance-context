@@ -15,7 +15,9 @@ fn object(version: u64, staging: bool) -> ManifestObject {
     }
 }
 
-fn fixture(limits: &Limits) -> Result<(Catalog, BootstrapManifest, ReserveManifest)> {
+pub(in crate::replication::publication) fn fixture(
+    limits: &Limits,
+) -> Result<(Catalog, BootstrapManifest, ReserveManifest)> {
     let layout = crate::replication::tests::layout();
     let mut catalog = Catalog::default();
     let acquire = super::super::tests::input();

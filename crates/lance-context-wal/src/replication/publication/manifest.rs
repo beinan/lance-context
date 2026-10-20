@@ -3,7 +3,7 @@
 use super::*;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 pub const MAX_MANIFEST_VERSIONS: usize = 128;
 pub(super) const MAX_MANIFEST_BYTES: usize = 2048;

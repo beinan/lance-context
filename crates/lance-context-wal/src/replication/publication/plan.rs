@@ -144,6 +144,8 @@ pub struct Progress {
     pub pending: Option<Arc<PendingPlan>>,
     /// Materialization result shares ownership independently of the selection.
     pub prepared: Option<Arc<Prepared>>,
+    /// Durable selected-manifest resolution; sources remain pinned for closure.
+    pub published: Option<Arc<Published>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -152,6 +154,7 @@ impl Default for Progress {
             minimum_read_version: 1,
             pending: None,
             prepared: None,
+            published: None,
         }
     }
 }
@@ -174,6 +177,9 @@ impl Progress {
         cut: u64,
         limits: &Limits,
     ) -> Result<()> {
+        if let Some(published) = &self.published {
+            published.validate(table, cut)?;
+        }
         ensure!(
             self.minimum_read_version > 0
                 && self.checkpoint.len() <= layout.groups.len()

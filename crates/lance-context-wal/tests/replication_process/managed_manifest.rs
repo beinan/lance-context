@@ -2,7 +2,8 @@
 //! This qualifies the durable index, not production transport or coordinated GC.
 use super::*;
 use lance_context_wal::replication::publication::{
-    Authority, BootstrapManifest, ManifestObject, ManifestRecord, Prepared, ReserveManifest,
+    Authority, BootstrapManifest, ConfirmPublication, ManifestObject, ManifestRecord, Prepared,
+    ReserveManifest,
 };
 use object_store::path::Path as ObjectPath;
 use std::sync::{
@@ -330,9 +331,30 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
     }
     let selected = handler.read(Some(2))?.context("missing committed target")?;
     assert!(selected.object.path.contains(".manifest-"));
+    let confirmation = ConfirmPublication {
+        authority: handler.scope.authority.clone(),
+        incarnation: handler.scope.incarnation,
+        transaction: selected.transaction,
+        plan_index: selected.plan_index,
+        prepared_index: selected.prepared_index,
+        descriptor_digest: selected.descriptor_digest,
+        target: selected.version,
+        manifest_identity: selected.identity,
+    };
     {
         let mut c = cluster.lock().unwrap();
         let leader = c.elect(1, 10, &[1, 2, 3])?;
+        c.command(
+            leader,
+            Request::ConfirmPublication(500_000, confirmation.clone()),
+        )?;
+        c.pump(&[1, 2, 3])?;
+        // Lose the confirmation reply before any caller consumes it. Recovery
+        // must discover the outcome from durable state, including its index.
+        let before = c.completions.len();
+        c.completions
+            .retain(|completion| completion.request != 500_000);
+        assert_eq!(before - c.completions.len(), 1);
         c.peers
             .get_mut(&leader)
             .unwrap()
@@ -353,6 +375,54 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
         }
     }
     assert_eq!(handler.read(Some(2))?.as_deref(), Some(selected.as_ref()));
+    {
+        let mut c = cluster.lock().unwrap();
+        let leader = c.elect(1, 10, &[1, 2, 3])?;
+        c.command(
+            leader,
+            Request::Query(
+                10,
+                500_001,
+                Query::Publisher {
+                    table: confirmation.authority.table,
+                },
+            ),
+        )?;
+        c.pump(&[1, 2, 3])?;
+        let Some(ReadOutcome::Observed {
+            value: Value::Publisher(Some(view)),
+            ..
+        }) = c.read_outcome(500_001)
+        else {
+            anyhow::bail!("publication outcome query missing");
+        };
+        let published = view
+            .progress
+            .published
+            .context("durable outcome missing after restart")?;
+        assert_eq!(published.manifest, selected);
+        assert!(published.index > selected.index);
+        assert_eq!(
+            view.progress
+                .pending
+                .context("source selection lost")?
+                .index,
+            selected.plan_index
+        );
+        assert_eq!(
+            view.progress.prepared.context("descriptors lost")?,
+            attempt.prepared
+        );
+        assert!(view.progress.checkpoint.is_empty());
+        c.command(leader, Request::ConfirmPublication(500_002, confirmation))?;
+        c.pump(&[1, 2, 3])?;
+        assert_eq!(
+            c.outcome(500_002),
+            Some(Outcome::Committed(Applied::Publisher(
+                PublisherReply::Published(published)
+            )))
+        );
+    }
     // Both version lookup and latest lookup are strict catalog reads. A raw
     // URI reader cannot discover this unique path and is not a managed reader.
     let latest = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)
