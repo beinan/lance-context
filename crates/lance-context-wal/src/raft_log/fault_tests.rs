@@ -190,6 +190,77 @@ fn rotation_sync_panic_cannot_ack_another_group() -> Result<()> {
     sync_failure_cannot_ack_another_group(1)
 }
 
+#[test]
+fn checkpoint_sync_failure_fences_all_handles_and_recovers_one_complete_cut() -> Result<()> {
+    let layout = Layout {
+        cluster: uuid::Uuid::from_u128(3),
+        nodes: (1..=3)
+            .map(|id| (id, format!("wal-{id}.example.invalid:7800")))
+            .collect(),
+        groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![1, 2, 3])]),
+        buckets: vec![10, 20],
+    };
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("log");
+    let log = PhysicalLog::open(&path, &layout, 1)?;
+    let group = log.group(10)?;
+    group.bind_application(b"checkpoint-fault/v1")?;
+    let entries: Vec<_> = (1..=3)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            data: vec![index as u8; 4096].into(),
+            ..Default::default()
+        })
+        .collect();
+    group.persist(
+        &entries,
+        Some(&HardState {
+            term: 1,
+            vote: 1,
+            commit: 3,
+            ..Default::default()
+        }),
+    )?;
+    let mut snapshot = Snapshot::default();
+    snapshot.mut_metadata().index = 2;
+    snapshot.mut_metadata().term = 1;
+    snapshot
+        .mut_metadata()
+        .set_conf_state(group.initial_state()?.conf_state);
+    snapshot.data = vec![2; 32].into();
+    group.node.fault.fail_sync.store(true, Ordering::Release);
+    assert!(group.checkpoint(&snapshot).is_err());
+    assert!(group.snapshot(0, 2).is_err());
+    assert!(group.first_index().is_err());
+    assert!(log.group(20)?.persist(&[], None).is_err());
+    group.node.fault.fail_sync.store(false, Ordering::Release);
+    drop((group, log));
+    let log = PhysicalLog::open(&path, &layout, 1)?;
+    let group = log.group(10)?;
+    assert_eq!(group.initial_state()?.hard_state.commit, 3);
+    match group.first_index()? {
+        1 => assert_eq!(
+            group.entries(1, 4, None, GetEntriesContext::empty(false))?,
+            entries
+        ),
+        3 => {
+            assert_eq!(group.snapshot(2, 2)?, snapshot);
+            assert_eq!(group.term(2)?, 1);
+            assert_eq!(
+                group.entries(3, 4, None, GetEntriesContext::empty(false))?,
+                entries[2..]
+            );
+        }
+        index => panic!("partial checkpoint boundary {index}"),
+    }
+    assert_eq!(
+        log.group(20)?.initial_state()?.hard_state,
+        HardState::default()
+    );
+    Ok(())
+}
+
 fn sync_failure_cannot_ack_another_group(file_size: u64) -> Result<()> {
     let layout = Layout {
         cluster: uuid::Uuid::from_u128(1),
