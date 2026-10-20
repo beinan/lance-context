@@ -11,6 +11,9 @@ pub mod placement;
 #[cfg(feature = "raft-log")]
 pub mod raft_log;
 
+#[cfg(feature = "replication")]
+pub mod replication;
+
 #[cfg(feature = "admission")]
 pub mod admission;
 
