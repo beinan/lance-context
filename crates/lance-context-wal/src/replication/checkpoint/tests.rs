@@ -407,7 +407,7 @@ fn mixed_catalog_image_preserves_payloads_and_rejects_corrupt_table_frames() -> 
     let second_len = u32::from_le_bytes(original[second..second + 4].try_into()?) as usize;
     let first_table = publication::decode_table(&original[offset + 4..second])?;
     let second_table = publication::decode_table(&original[second + 4..second + 4 + second_len])?;
-    for mutation in 0..4 {
+    for mutation in 0..7 {
         let mut bytes = original[..offset].to_vec();
         let mut tables = [first_table.clone(), second_table.clone()];
         match mutation {

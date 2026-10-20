@@ -378,11 +378,19 @@ impl Cluster {
         Ok(())
     }
     fn command(&mut self, id: u64, request: Request) -> Result<()> {
+        let context = match &request {
+            Request::Propose(group, token, _) => format!("propose group {group}, token {token}"),
+            Request::Query(group, token, _) => format!("query group {group}, token {token}"),
+            Request::Acquire(token, _) => format!("acquire token {token}"),
+            Request::Plan(token, _) => format!("plan token {token}"),
+            _ => "replication control".to_string(),
+        };
         let Response::Events(packets, completions, reads) = self
             .peers
             .get_mut(&id)
             .context("missing peer")?
-            .call(request)?
+            .call(request)
+            .with_context(|| format!("peer {id}: {context}"))?
         else {
             anyhow::bail!("wrong reply");
         };
@@ -843,11 +851,12 @@ fn publisher_epochs_require_quorum_and_survive_snapshot_transfer_and_restart() -
     else {
         anyhow::bail!("missing takeover authority");
     };
-    c.command(2, Request::Campaign(20))?;
-    c.pump(&[2, 3])?;
+    // Catalog election ticks all hosted groups. The source group may already
+    // have another leader; a campaign request alone does not transfer its lease.
+    let source_leader = c.elect(2, 20, &[2, 3])?;
     let mut source = input(1, 1, 99);
     source.meta.stream = acquire.table;
-    c.command(2, Request::Propose(20, 710, source.clone()))?;
+    c.command(source_leader, Request::Propose(20, 710, source.clone()))?;
     c.pump(&[2, 3])?;
     let Some(Outcome::Committed(Applied::Accepted {
         index: source_index,
