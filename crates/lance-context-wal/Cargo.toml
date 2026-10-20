@@ -7,6 +7,7 @@ publish = false
 description = "Independent Rust WAL experiments owned by lance-context"
 
 [features]
+raft-log = ["placement", "dep:raft", "dep:raft-engine", "dep:raft-proto", "dep:protobuf"]
 vectored-io = ["dep:bytes", "dep:tokio"]
 runner = ["dep:anyhow", "dep:clap", "dep:libc", "dep:serde", "dep:serde_json", "dep:sha2"]
 contract = ["dep:serde", "dep:sha2"]
@@ -30,12 +31,16 @@ hdrhistogram = { version = "7", optional = true }
 libc = { version = "0.2", optional = true }
 raft-engine = { path = "../../vendor/raft-engine", version = "=0.4.2", default-features = false, optional = true }
 raft-proto = { version = "=0.7.0", optional = true }
+raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"], optional = true }
+protobuf = { version = "2", features = ["bytes"], optional = true }
 serde_json = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = { version = "0.10", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
 
 [dev-dependencies]
+libc = "0.2"
+slog = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 bincode = "1.3"
 arrow-ipc = { version = "58", features = ["zstd"] }
