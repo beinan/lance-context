@@ -11,8 +11,8 @@
 //! opaque descriptor and logical compaction cross one physical sync barrier.
 //! A received Ready snapshot can atomically replace the log and persist its
 //! suffix and HardState. Application snapshot files/transfer, driver integration,
-//! physical reclamation, membership changes and replica replacement remain
-//! higher-level responsibilities.
+//! maintenance scheduling, membership changes and replica replacement remain
+//! higher-level responsibilities. Physical log maintenance is explicit.
 //! Only the owning process may modify the files.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +29,8 @@ use raft_proto::eraftpb::{ConfState, Entry, EntryType, HardState, Snapshot};
 use crate::placement::Layout;
 
 mod checkpoint;
+mod maintenance;
+pub use maintenance::LogMaintenance;
 #[cfg(test)]
 mod fault_tests;
 
@@ -59,6 +61,7 @@ impl MessageExt for EntryIndex {
 struct NodeEngine {
     engine: LogEngine,
     failed: AtomicBool,
+    maintenance_gate: RwLock<()>,
     append_gate: RwLock<()>,
     sync_gate: Mutex<()>,
     synced: AtomicU64,
@@ -76,6 +79,10 @@ impl NodeEngine {
     }
 
     fn write(&self, batch: &mut LogBatch) -> Result<()> {
+        let _maintenance = self
+            .maintenance_gate
+            .read()
+            .map_err(|_| anyhow::anyhow!("maintenance gate poisoned"))?;
         let result = self.append_and_sync(batch);
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
@@ -110,17 +117,26 @@ impl NodeEngine {
                 .write()
                 .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
             self.check()?;
-            let next = observed
-                .checked_add(1)
-                .context("sync generation exhausted")?;
-            let mut marker = LogBatch::default();
-            marker.put(0, b"sync".to_vec(), next.to_le_bytes().to_vec())?;
-            // Engine::sync() is a no-op in the pinned version: its empty batch
-            // returns before sync. A nonempty marker is required here.
-            self.engine_write(&mut marker, true)?;
-            self.synced.store(next, Ordering::Release);
+            self.sync_locked()?;
         }
         self.check()
+    }
+
+    // The caller holds sync_gate and the exclusive append_gate. A maintenance
+    // barrier also covers appends waiting for their original sync generation.
+    fn sync_locked(&self) -> Result<()> {
+        let next = self
+            .synced
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .context("sync generation exhausted")?;
+        let mut marker = LogBatch::default();
+        marker.put(0, b"sync".to_vec(), next.to_le_bytes().to_vec())?;
+        // Engine::sync() is a no-op in the pinned version: its empty batch
+        // returns before sync. A nonempty marker is required here.
+        self.engine_write(&mut marker, true)?;
+        self.synced.store(next, Ordering::Release);
+        Ok(())
     }
 
     fn engine_write(&self, batch: &mut LogBatch, sync: bool) -> Result<()> {
@@ -306,17 +322,59 @@ pub struct PhysicalLog {
     groups: BTreeMap<u64, GroupLog>,
 }
 
+/// Local physical-file tuning, independent of the replicated layout and policy.
+/// Thresholds trigger explicit maintenance; they are not disk-admission quotas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogOptions {
+    pub target_file_bytes: u64,
+    /// Native file-count size estimate; oversized batches can exceed it.
+    pub purge_threshold_bytes: u64,
+}
+
+impl Default for LogOptions {
+    fn default() -> Self {
+        Self {
+            target_file_bytes: 64 * 1024 * 1024,
+            purge_threshold_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 impl PhysicalLog {
     pub fn open(directory: &Path, layout: &Layout, node: u64) -> Result<Self> {
-        Self::open_with_file_size(directory, layout, node, 64 * 1024 * 1024)
+        Self::open_with_options(directory, layout, node, LogOptions::default())
     }
 
+    #[cfg(test)]
     fn open_with_file_size(
         directory: &Path,
         layout: &Layout,
         node: u64,
         file_size: u64,
     ) -> Result<Self> {
+        Self::open_with_options(
+            directory,
+            layout,
+            node,
+            LogOptions {
+                target_file_bytes: file_size,
+                purge_threshold_bytes: file_size,
+            },
+        )
+    }
+
+    pub fn open_with_options(
+        directory: &Path,
+        layout: &Layout,
+        node: u64,
+        options: LogOptions,
+    ) -> Result<Self> {
+        ensure!(
+            options.target_file_bytes > 0
+                && options.purge_threshold_bytes >= options.target_file_bytes
+                && usize::try_from(options.purge_threshold_bytes).is_ok(),
+            "invalid physical log thresholds"
+        );
         layout.validate()?;
         ensure!(layout.nodes.contains_key(&node), "unknown local node");
         if !directory.exists() {
@@ -330,7 +388,9 @@ impl PhysicalLog {
         let config = raft_engine::Config {
             dir: directory.to_owned(),
             batch_compression_threshold: raft_engine::ReadableSize(0),
-            target_file_size: raft_engine::ReadableSize(file_size),
+            target_file_size: raft_engine::ReadableSize(options.target_file_bytes),
+            purge_threshold: raft_engine::ReadableSize(options.purge_threshold_bytes),
+            purge_rewrite_threshold: Some(raft_engine::ReadableSize(options.target_file_bytes)),
             enable_log_recycle: false,
             ..Default::default()
         };
@@ -346,6 +406,7 @@ impl PhysicalLog {
         let node = Arc::new(NodeEngine {
             engine,
             failed: AtomicBool::new(false),
+            maintenance_gate: RwLock::new(()),
             append_gate: RwLock::new(()),
             sync_gate: Mutex::new(()),
             synced: AtomicU64::new(0),
@@ -565,6 +626,14 @@ impl Storage for GroupLog {
         _: GetEntriesContext,
     ) -> raft::Result<Vec<Entry>> {
         let state = self.read().map_err(storage_error)?;
+        // Native maintenance can relocate entries and delete their old files.
+        // Keep its exclusive gate out until indexes and payloads are both read.
+        let _read = self
+            .node
+            .maintenance_gate
+            .read()
+            .map_err(|_| storage_error("maintenance gate poisoned"))?;
+        self.node.check().map_err(storage_error)?;
         if low <= state.boundary() {
             return Err(StorageError::Compacted.into());
         }

@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::{
     placement::Layout,
-    raft_log::{GroupLog, PhysicalLog},
+    raft_log::{GroupLog, LogMaintenance, LogOptions, PhysicalLog},
     record::{Batch, BatchMeta},
 };
 pub use images::{CheckpointTask, PreparedCheckpoint, SnapshotReceiver};
@@ -218,8 +218,9 @@ struct Group {
 }
 
 /// Owns all Raft groups in one shared physical engine. Do not call concurrently
-/// or retain storage handles outside it. An internal/disk error fences this node;
-/// drop it, reconcile outstanding requests and reopen the original directories.
+/// or retain raw group storage handles outside it. An internal/disk error fences
+/// this node; drop it and any maintenance handles, reconcile outstanding requests
+/// and reopen the original directories.
 pub struct Node {
     signer: Option<Arc<source::CatalogSigner>>,
     source_signers: BTreeMap<u64, Arc<source::SourceSigner>>,
@@ -263,6 +264,18 @@ impl Node {
     }
 
     pub fn open(directory: &Path, layout: Arc<Layout>, id: u64, limits: Limits) -> Result<Self> {
+        Self::open_with_storage_options(directory, layout, id, limits, LogOptions::default())
+    }
+
+    /// Open with local log rotation and maintenance thresholds. These settings
+    /// do not change the replicated layout, application policy or disk quota.
+    pub fn open_with_storage_options(
+        directory: &Path,
+        layout: Arc<Layout>,
+        id: u64,
+        limits: Limits,
+        storage: LogOptions,
+    ) -> Result<Self> {
         let layout_hash = layout.fingerprint()?;
         let identity = limits.identity()?;
         ensure!(
@@ -270,7 +283,7 @@ impl Node {
             "source signing policy must cover exactly the configured groups"
         );
         let policy = Sha256::digest(&identity).into();
-        let log = PhysicalLog::open(directory, &layout, id)?;
+        let log = PhysicalLog::open_with_options(directory, &layout, id, storage)?;
         let hosted: std::collections::BTreeSet<_> = layout
             .groups
             .iter()
@@ -357,6 +370,21 @@ impl Node {
             group.raw.store().initial_state()?;
         }
         Ok(())
+    }
+
+    /// Prepare one physical-engine maintenance handle, shared by all groups on
+    /// this node. Run it on a bounded blocking worker. A native pass excludes
+    /// payload reads and persistence and can delay polling until it completes.
+    pub fn prepare_log_maintenance(&self) -> Result<LogMaintenance> {
+        self.healthy()?;
+        Ok(self
+            .groups
+            .first_key_value()
+            .context("node has no hosted groups")?
+            .1
+            .raw
+            .store()
+            .maintenance())
     }
 
     /// Install the catalog's private dependency-attestation key. The persisted

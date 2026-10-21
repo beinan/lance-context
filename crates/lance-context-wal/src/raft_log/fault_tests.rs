@@ -16,21 +16,38 @@ type FileHandle = <DefaultFileSystem as FileSystem>::Handle;
 pub(super) struct FaultControl {
     fail_sync: AtomicBool,
     fail_once: AtomicBool,
+    fail_rewrite_sync: AtomicBool,
     sync_calls: AtomicU64,
     entered: Mutex<Option<mpsc::SyncSender<()>>>,
     release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl FaultControl {
+    pub(super) fn fail_rewrite_sync_for_test(self: &Arc<Self>) -> RewriteSyncFault {
+        self.fail_rewrite_sync.store(true, Ordering::Release);
+        RewriteSyncFault(self.clone())
+    }
+
     #[cfg(feature = "replication")]
     pub(super) fn fail_sync_for_test(&self) {
         self.fail_once.store(true, Ordering::Release);
     }
 }
 
+pub(super) struct RewriteSyncFault(Arc<FaultControl>);
+
+impl Drop for RewriteSyncFault {
+    fn drop(&mut self) {
+        // Disarm before engine destructors, including if an assertion fails
+        // before a native rewrite reaches the intended injection point.
+        self.0.fail_rewrite_sync.store(false, Ordering::Release);
+    }
+}
+
 pub(super) struct FaultHandle {
     inner: Arc<FileHandle>,
     control: Arc<FaultControl>,
+    rewrite: bool,
 }
 
 impl Handle for FaultHandle {
@@ -46,6 +63,7 @@ impl Handle for FaultHandle {
         self.control.sync_calls.fetch_add(1, Ordering::Relaxed);
         if self.control.fail_once.swap(false, Ordering::AcqRel)
             || self.control.fail_sync.load(Ordering::Acquire)
+            || (self.rewrite && self.control.fail_rewrite_sync.swap(false, Ordering::AcqRel))
         {
             if let Some(entered) = self.control.entered.lock().unwrap().take() {
                 entered.send(()).unwrap();
@@ -140,10 +158,13 @@ pub(super) struct FaultFileSystem {
 }
 
 impl FaultFileSystem {
-    fn wrap(&self, inner: FileHandle) -> FaultHandle {
+    fn wrap(&self, inner: FileHandle, path: &Path) -> FaultHandle {
         FaultHandle {
             inner: Arc::new(inner),
             control: self.control.clone(),
+            rewrite: path
+                .extension()
+                .is_some_and(|extension| extension == "rewrite"),
         }
     }
 }
@@ -154,11 +175,14 @@ impl FileSystem for FaultFileSystem {
     type Writer = <DefaultFileSystem as FileSystem>::Writer;
 
     fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<Self::Handle> {
-        Ok(self.wrap(DefaultFileSystem.create(path)?))
+        Ok(self.wrap(DefaultFileSystem.create(path.as_ref())?, path.as_ref()))
     }
 
     fn open<P: AsRef<Path>>(&self, path: P, permission: Permission) -> io::Result<Self::Handle> {
-        Ok(self.wrap(DefaultFileSystem.open(path, permission)?))
+        Ok(self.wrap(
+            DefaultFileSystem.open(path.as_ref(), permission)?,
+            path.as_ref(),
+        ))
     }
 
     fn delete<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
@@ -181,6 +205,63 @@ impl FileSystem for FaultFileSystem {
 #[test]
 fn sync_panic_cannot_ack_another_group() -> Result<()> {
     sync_failure_cannot_ack_another_group(64 * 1024 * 1024)
+}
+
+#[test]
+fn retained_payload_read_does_not_wait_for_another_groups_sync() -> Result<()> {
+    let layout = Layout {
+        cluster: uuid::Uuid::from_u128(1201),
+        nodes: (1..=3)
+            .map(|id| (id, format!("wal-{id}.example.invalid:7800")))
+            .collect(),
+        groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![1, 2, 3])]),
+        buckets: vec![10, 20],
+    };
+    let directory = tempfile::tempdir()?;
+    let log = PhysicalLog::open(&directory.path().join("log"), &layout, 1)?;
+    let retained = Entry {
+        index: 1,
+        term: 1,
+        data: vec![42; 4096].into(),
+        ..Default::default()
+    };
+    let hard = HardState {
+        term: 1,
+        vote: 1,
+        commit: 1,
+        ..Default::default()
+    };
+    let sibling = log.group(20)?;
+    sibling.persist(std::slice::from_ref(&retained), Some(&hard))?;
+    let writer = log.group(10)?;
+    let control = writer.node.fault.clone();
+    let (entered, wait_entered) = mpsc::sync_channel(1);
+    let (release, wait_release) = mpsc::channel();
+    *control.entered.lock().unwrap() = Some(entered);
+    *control.release.lock().unwrap() = Some(wait_release);
+    control.fail_once.store(true, Ordering::Release);
+    let input = retained.clone();
+    let write = std::thread::spawn(move || writer.persist(&[input], Some(&hard)));
+    wait_entered.recv_timeout(Duration::from_secs(10))?;
+
+    // The real filesystem sync is held open. A read of previously durable
+    // sibling data must finish before that sync is released or fails.
+    let (completed, wait_completed) = mpsc::sync_channel(1);
+    let read = std::thread::spawn(move || {
+        completed
+            .send(sibling.entries(1, 2, None, GetEntriesContext::empty(false)))
+            .unwrap();
+    });
+    let observed = wait_completed.recv_timeout(Duration::from_secs(2));
+    release.send(())?;
+    assert!(write.join().unwrap().is_err());
+    read.join().unwrap();
+    assert_eq!(
+        observed.context("payload read waited on an unrelated sync")??,
+        vec![retained]
+    );
+    assert!(log.group(20)?.initial_state().is_err());
+    Ok(())
 }
 
 #[test]
