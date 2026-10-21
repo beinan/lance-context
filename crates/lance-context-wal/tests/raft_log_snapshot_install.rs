@@ -11,6 +11,11 @@ use raft::{GetEntriesContext, Storage, StorageError};
 use raft_proto::eraftpb::{Entry, HardState, Message, MessageType, Snapshot};
 use uuid::Uuid;
 
+// A concurrently spawning child briefly inherits other tests' flock descriptors
+// before exec closes them. Keep these independent reopen cases out of that
+// window; this does not serialize any concurrency exercised inside a case.
+static TEST_CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn layout() -> Layout {
     Layout {
         cluster: Uuid::from_u128(23),
@@ -90,6 +95,7 @@ fn verify_installed(log: &PhysicalLog, snapshot: &Snapshot) -> Result<()> {
 
 #[test]
 fn received_ready_replaces_divergent_tail_and_recovers_committed_suffix() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("log");
     let saved;
@@ -177,6 +183,7 @@ fn received_ready_replaces_divergent_tail_and_recovers_committed_suffix() -> Res
 
 #[test]
 fn invalid_install_preserves_prior_log_and_vote() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let log = seed(&directory.path().join("log"))?;
     let group = log.group(10)?;
@@ -267,6 +274,7 @@ mod process {
     }
     #[test]
     fn install_survives_sigkill() -> Result<()> {
+        let _case = TEST_CASE.lock().unwrap();
         use std::os::unix::process::ExitStatusExt;
         for phase in ["before", "after"] {
             let directory = tempfile::tempdir()?;
@@ -306,6 +314,83 @@ mod process {
                 assert_eq!(read(&log.group(20)?, 1, 2)?, vec![entry(1, 7)]);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for the inherited directory lock regression"]
+    fn inherited_lock_child() {}
+
+    #[test]
+    fn pre_exec_child_retains_an_unrelated_directory_lock_until_exec() -> Result<()> {
+        use std::{
+            io::{Read, Write},
+            os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt},
+        };
+
+        let _case = TEST_CASE.lock().unwrap();
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("log");
+        let log = seed(&path)?;
+        let (mut parent, child) = UnixStream::pair()?;
+        parent.set_read_timeout(Some(Duration::from_secs(5)))?;
+        parent.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let executable = std::env::current_exe()?;
+        let spawn = std::thread::spawn(move || -> Result<_> {
+            let fd = child.as_raw_fd();
+            let mut command = Command::new(executable);
+            command
+                .args(["--ignored", "--exact", "process::inherited_lock_child"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // Only async-signal-safe syscalls and allocation-free error values
+            // run between fork and exec. The deadline also bounds a failed parent.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut byte = 1u8;
+                    if libc::write(fd, (&byte as *const u8).cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut poll = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut poll, 1, 10_000) != 1 {
+                        return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+                    if libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+                    }
+                    Ok(())
+                });
+            }
+            let status = command.spawn()?.wait()?;
+            drop(child);
+            Ok(status)
+        });
+        let ready = parent.read_exact(&mut [0]);
+        drop(log);
+        let blocked = ready
+            .as_ref()
+            .ok()
+            .map(|_| PhysicalLog::open(&path, &layout(), 2));
+        // Always release and join the bounded child before propagating any error.
+        let released = parent.write_all(&[1]);
+        let child = spawn
+            .join()
+            .map_err(|_| anyhow::anyhow!("spawn thread panicked"))?;
+        ready?;
+        released?;
+        assert!(child?.success());
+        let error = blocked
+            .expect("child ready")
+            .err()
+            .context("child must retain the inherited flock until exec")?;
+        assert!(format!("{error:#}").contains("Failed to lock file"));
+        let reopened = PhysicalLog::open(&path, &layout(), 2)?;
+        assert_eq!(read(&reopened.group(10)?, 1, 8)?, original());
+        assert_eq!(read(&reopened.group(20)?, 1, 2)?, vec![entry(1, 7)]);
         Ok(())
     }
 }
