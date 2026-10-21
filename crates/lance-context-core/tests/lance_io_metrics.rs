@@ -54,9 +54,30 @@ async fn real_lance_write_and_reopen_emit_storage_metrics() {
             continue;
         }
         let labels: Vec<_> = key.key().labels().collect();
-        assert!(labels.iter().all(|label| {
-            matches!(label.key(), "operation" | "base" | "status") && !label.value().contains(uri)
-        }));
+        assert_eq!(
+            labels.len(),
+            2,
+            "local I/O exposes only operation and scheme"
+        );
+        for label in &labels {
+            match label.key() {
+                "base" => assert_eq!(label.value(), "file"),
+                "operation" => assert!(matches!(
+                    label.value(),
+                    "get"
+                        | "head"
+                        | "put"
+                        | "put_part"
+                        | "complete_multipart"
+                        | "abort_multipart"
+                        | "list"
+                        | "copy"
+                        | "rename"
+                        | "delete"
+                )),
+                key => panic!("unexpected local I/O label {key}"),
+            }
+        }
         let operation = labels
             .iter()
             .find(|label| label.key() == "operation")
