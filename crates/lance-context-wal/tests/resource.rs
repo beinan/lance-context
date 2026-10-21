@@ -14,6 +14,13 @@ impl Drop for OwnedChild {
 }
 #[test]
 fn samples_the_original_process_and_finishes_when_it_exits() -> Result<()> {
+    for tcp in [false, true] {
+        sample_process(tcp)?;
+    }
+    Ok(())
+}
+
+fn sample_process(tcp: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut target = OwnedChild(Command::new("sleep").arg("10").spawn()?);
     let stat = fs::read_to_string(format!("/proc/{}/stat", target.0.id()))?;
@@ -30,14 +37,16 @@ fn samples_the_original_process_and_finishes_when_it_exits() -> Result<()> {
             "boot":fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
         }))?,
     )?;
-    let mut sampler = OwnedChild(
-        Command::new(env!("CARGO_BIN_EXE_context-wal-resource"))
-            .arg("--operation")
-            .arg(directory.path())
-            .args(["--interval-ms", "100"])
-            .stdout(Stdio::piped())
-            .spawn()?,
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_context-wal-resource"));
+    command
+        .arg("--operation")
+        .arg(directory.path())
+        .args(["--interval-ms", "100"])
+        .stdout(Stdio::piped());
+    if tcp {
+        command.args(["--tcp-port", "7800"]);
+    }
+    let mut sampler = OwnedChild(command.spawn()?);
     let mut out = BufReader::new(sampler.0.stdout.take().unwrap());
     for _ in 0..2 {
         let mut line = String::new();
@@ -46,6 +55,13 @@ fn samples_the_original_process_and_finishes_when_it_exits() -> Result<()> {
         assert_eq!(sample["kind"], "resource_sample");
         assert_eq!(sample["pid"], target.0.id());
         assert!(sample["cgroup_memory_bytes"].as_u64().unwrap() > 0);
+        if tcp {
+            assert_eq!(sample["tcp"]["port"], 7800);
+            assert_eq!(sample["tcp"]["owned_tcp_sockets"], 0);
+            assert_eq!(sample["tcp"]["remote_port_states"], serde_json::json!({}));
+        } else {
+            assert!(sample["tcp"].is_null());
+        }
     }
     target.0.kill()?;
     target.0.wait()?;

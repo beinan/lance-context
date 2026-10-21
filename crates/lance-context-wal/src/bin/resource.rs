@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[path = "resource/tcp.rs"]
+mod tcp;
 
 #[derive(Parser)]
 struct Args {
@@ -21,6 +23,10 @@ struct Args {
     interval_ms: u64,
     #[arg(long)]
     disk_directory: Option<PathBuf>,
+    /// Optional TCP socket observations, restricted to this process's own FDs.
+    /// Port counts distinguish local endpoints from remote endpoints.
+    #[arg(long)]
+    tcp_port: Option<u16>,
 }
 #[derive(Deserialize)]
 struct Identity {
@@ -140,6 +146,7 @@ fn main() -> Result<()> {
         (100..=10_000).contains(&args.interval_ms),
         "invalid sample interval"
     );
+    ensure!(args.tcp_port != Some(0), "invalid TCP observation port");
     let identity: Identity = serde_json::from_slice(&fs::read(args.operation.join("child.json"))?)?;
     ensure!(identity.pid > 0, "invalid PID");
     ensure!(
@@ -200,12 +207,16 @@ fn main() -> Result<()> {
                 .trim()
                 .parse::<u64>()?;
             let disk = args.disk_directory.as_deref().map(allocated).transpose()?;
+            let tcp = args
+                .tcp_port
+                .map(|port| tcp::observe(identity.pid, port))
+                .transpose()?;
             Ok(
                 serde_json::json!({"kind":"resource_sample", "pid":identity.pid,"start_ticks":identity.start_ticks,
                 "timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
                 "seconds":started.elapsed().as_secs_f64(),"process":initial,"ticks_per_second":ticks,
                 "io":io,"cgroup_cpu":cpu,"cgroup_memory_bytes":memory,"cgroup_memory_events":memory_events,
-                "allocated_directory_bytes":disk,"sample_wall_seconds":begin.elapsed().as_secs_f64()}),
+                "allocated_directory_bytes":disk,"tcp":tcp,"sample_wall_seconds":begin.elapsed().as_secs_f64()}),
             )
         })();
         // Ignore incomplete samples only when this exact process disappeared.
