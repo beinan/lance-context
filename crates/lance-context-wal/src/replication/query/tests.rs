@@ -39,7 +39,10 @@ fn evaluate(query: &Query, cut: &Cut, state: &State) -> Result<Value> {
         cut,
         &super::super::tests::layout(),
         &Limits::default(),
-        None,
+        source::QuerySigners {
+            catalog: None,
+            source: None,
+        },
     )
 }
 

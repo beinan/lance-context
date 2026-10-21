@@ -1,7 +1,35 @@
 //! Real quorum closure after a real Lance publication, with a lost reply and
 //! full process restart before attempting to replay the original pin request.
 use super::*;
-use lance_context_wal::replication::source::Rejection as SourceRejection;
+use lance_context_wal::replication::source::{ClosedProof, Rejection as SourceRejection};
+
+fn proof(
+    c: &mut Cluster,
+    source: u64,
+    token: u64,
+    table: Uuid,
+) -> Result<Option<Box<ClosedProof>>> {
+    c.command(
+        source,
+        Request::Query(20, token, Query::ClosedProof { table }),
+    )?;
+    c.pump(&[4, 5, 6])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::ClosedProof(proof),
+        ..
+    }) = c.read_outcome(token)
+    else {
+        anyhow::bail!("source closure proof read missing")
+    };
+    let layout: Layout =
+        serde_json::from_slice(&std::fs::read(c.root.path().join("layout.json"))?)?;
+    let limits: Limits =
+        serde_json::from_slice(&std::fs::read(c.root.path().join("limits.json"))?)?;
+    if let Some(proof) = &proof {
+        proof.verify(&layout, &limits)?;
+    }
+    Ok(proof)
+}
 
 pub(super) fn close_and_restart(
     cluster: &Arc<Mutex<Cluster>>,
@@ -12,6 +40,14 @@ pub(super) fn close_and_restart(
     let mut c = cluster.lock().unwrap();
     let catalog = c.elect(1, 10, &[1, 2, 3])?;
     let source = c.elect(4, 20, &[4, 5, 6])?;
+    for id in 4..=6 {
+        assert!(!c
+            .root
+            .path()
+            .join(format!("catalog-key-{id}.pkcs8"))
+            .exists());
+    }
+    assert!(proof(&mut c, source, 600_009, table)?.is_none());
     c.command(
         catalog,
         Request::Query(
@@ -58,6 +94,9 @@ pub(super) fn close_and_restart(
     let before = c.completions.len();
     c.completions.retain(|c| c.request != 600_002);
     assert_eq!(before - c.completions.len(), 1);
+    let original_proof =
+        proof(&mut c, source, 600_010, table)?.context("committed closure proof missing")?;
+    assert_eq!(original_proof.closed().permit.closure(), permit.closure());
     let original_index = stale.selection().range.records.last().unwrap().0;
     let Response::Image(_, _, payload_bytes) = c
         .peers
@@ -79,6 +118,10 @@ pub(super) fn close_and_restart(
         c.start(id)?;
     }
     let source = c.elect(4, 20, &[4, 5, 6])?;
+    let recovered_proof =
+        proof(&mut c, source, 600_011, table)?.context("proof lost after all peers restarted")?;
+    assert_eq!(recovered_proof.closed(), original_proof.closed());
+    assert_ne!(recovered_proof.source_cut(), original_proof.source_cut());
     c.command(
         source,
         Request::Query(20, 600_003, Query::SourceClosure { table }),

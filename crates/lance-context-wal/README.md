@@ -176,6 +176,11 @@ publication prerequisite, not a production Lance writer or a manifest lease.
 catalog, producer-tail and accepted-page views after a safe read-index barrier.
 They share pending capacity with proposals and do not fetch bulk payloads.
 
+[Source closure proofs](../../docs/design/wal-source-closure-proofs.md) attest that
+an exact catalog-authorized closure committed at its source. Optional per-group
+keys keep catalog private keys off source-only replicas; catalog checkpoint
+advancement and physical reclamation remain separate steps.
+
 [Immutable publication plans](../../docs/design/wal-publication-plans.md) retain
 the exact source vector and Lance target through takeover, snapshots and restart.
 They share bounded metadata between views. [Source pins](../../docs/design/wal-source-pins.md)

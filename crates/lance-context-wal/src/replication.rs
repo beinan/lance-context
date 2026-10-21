@@ -46,6 +46,11 @@ pub struct Limits {
     /// Public Ed25519 key for catalog dependency attestations. Key changes are
     /// application-policy migrations; private key bytes are never persisted here.
     pub catalog_key: Option<[u8; 32]>,
+    /// Optional per-group keys for quorum-confirmed source closure proofs.
+    /// A nonempty policy must cover every group with distinct keys, separate
+    /// from the catalog key. Installing it is an explicit policy migration.
+    #[serde(default)]
+    pub source_keys: BTreeMap<u64, [u8; 32]>,
     pub max_tables: u64,
     pub max_active_plans: u64,
     pub max_plan_source_bytes: u64,
@@ -61,6 +66,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             catalog_key: None,
+            source_keys: BTreeMap::new(),
             max_tables: 1024,
             max_active_plans: 128,
             max_plan_source_bytes: 64 * 1024 * 1024,
@@ -79,6 +85,17 @@ impl Limits {
         ensure!(
             (1..=16_384).contains(&self.max_tables)
                 && self.catalog_key.is_none_or(|key| key != [0; 32])
+                && self.source_keys.len() <= 64
+                && (self.source_keys.is_empty() || self.catalog_key.is_some())
+                && self.source_keys.iter().all(|(group, key)| {
+                    *group > 0 && *key != [0; 32] && Some(*key) != self.catalog_key
+                })
+                && self
+                    .source_keys
+                    .values()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == self.source_keys.len()
                 && (1..=256).contains(&self.max_active_plans)
                 && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
                 && (1..=publication::MAX_DESCRIPTOR_BYTES as u64)
@@ -92,8 +109,26 @@ impl Limits {
                 && self.max_uncommitted_bytes <= 256 * 1024 * 1024,
             "invalid replication limits"
         );
+        if self.source_keys.is_empty() {
+            // Bincode structs and tuples encode their fields in order. Keep the
+            // exact old policy bytes when source attestations are not enabled.
+            return Ok(bincode::serialize(&(
+                "lance-context/replicated-append/v9",
+                self.catalog_key,
+                self.max_tables,
+                self.max_active_plans,
+                self.max_plan_source_bytes,
+                self.max_descriptor_bytes,
+                self.max_manifest_records,
+                self.max_record_bytes,
+                self.max_records,
+                self.max_producers,
+                self.max_pending,
+                self.max_uncommitted_bytes,
+            ))?);
+        }
         Ok(bincode::serialize(&(
-            "lance-context/replicated-append/v9",
+            "lance-context/replicated-append/v10",
             self,
         ))?)
     }
@@ -185,6 +220,7 @@ struct Group {
 /// drop it, reconcile outstanding requests and reopen the original directories.
 pub struct Node {
     signer: Option<Arc<source::CatalogSigner>>,
+    source_signers: BTreeMap<u64, Arc<source::SourceSigner>>,
     layout: Arc<Layout>,
     layout_hash: [u8; 32],
     policy: [u8; 32],
@@ -208,6 +244,10 @@ impl Node {
                 } else {
                     None
                 },
+                source_signers: self
+                    .source_signers
+                    .get(&id)
+                    .map_or_else(BTreeMap::new, |s| BTreeMap::from([(id, s.clone())])),
                 layout: self.layout.clone(),
                 layout_hash: self.layout_hash,
                 policy: self.policy,
@@ -223,6 +263,10 @@ impl Node {
     pub fn open(directory: &Path, layout: Arc<Layout>, id: u64, limits: Limits) -> Result<Self> {
         let layout_hash = layout.fingerprint()?;
         let identity = limits.identity()?;
+        ensure!(
+            limits.source_keys.is_empty() || limits.source_keys.keys().eq(layout.groups.keys()),
+            "source signing policy must cover exactly the configured groups"
+        );
         let policy = Sha256::digest(&identity).into();
         let log = PhysicalLog::open(directory, &layout, id)?;
         let images = images::Owner::new(directory)?;
@@ -284,6 +328,7 @@ impl Node {
         }
         Ok(Self {
             signer: None,
+            source_signers: BTreeMap::new(),
             layout,
             layout_hash,
             policy,
@@ -315,6 +360,23 @@ impl Node {
             "catalog signer does not match hosted scope and policy"
         );
         self.signer = Some(signer);
+        Ok(())
+    }
+
+    /// Provision this source group's key without exposing the catalog's private
+    /// key to source-only replicas. The persisted policy pins the public key.
+    pub fn set_source_signer(
+        &mut self,
+        group: u64,
+        signer: Arc<source::SourceSigner>,
+    ) -> Result<()> {
+        self.healthy()?;
+        ensure!(
+            self.groups.contains_key(&group)
+                && self.limits.source_keys.get(&group) == Some(&signer.public_key()),
+            "source signer does not match hosted scope and policy"
+        );
+        self.source_signers.insert(group, signer);
         Ok(())
     }
 
@@ -369,10 +431,19 @@ impl Node {
             "request token already pending"
         );
         query.validate(&self.layout, group)?;
-        if matches!(query, query::Query::Pin { .. }) {
+        if matches!(
+            query,
+            query::Query::Pin { .. } | query::Query::ClosePermit { .. }
+        ) {
             ensure!(
                 self.signer.is_some(),
                 "catalog dependency signer unavailable"
+            );
+        }
+        if matches!(query, query::Query::ClosedProof { .. }) {
+            ensure!(
+                self.source_signers.contains_key(&group),
+                "source signer unavailable"
             );
         }
         let g = self.groups.get_mut(&group).context("unhosted group")?;
@@ -668,7 +739,10 @@ impl Node {
                         cut,
                         &self.layout,
                         &self.limits,
-                        self.signer.as_deref(),
+                        source::QuerySigners {
+                            catalog: self.signer.as_deref(),
+                            source: self.source_signers.get(id).map(Arc::as_ref),
+                        },
                     )
                 },
             )?);
