@@ -171,6 +171,23 @@ where
         .unwrap();
     }
 
+    /// Compact the rewrite queue regardless of its entry-count garbage ratio.
+    /// The caller must reserve space for a full rewrite of the live values.
+    /// Rewritten records are synced before obsolete files are removed. Unlike
+    /// the test-only `must_*` helpers, returned errors are propagated. Existing
+    /// lower-level sync panics still require the caller to fence its writer.
+    #[cfg(feature = "internals")]
+    pub fn reclaim_rewrite_queue(&self) -> Result<()> {
+        let _guard = self.force_rewrite_candidates.try_lock().ok_or_else(|| {
+            crate::Error::TryAgain("rewrite reclamation is already running".into())
+        })?;
+        self.rewrite_rewrite_queue()?;
+        self.rescan_memtables_and_purge_stale_files(
+            LogQueue::Rewrite,
+            self.pipe_log.file_span(LogQueue::Rewrite).1,
+        )
+    }
+
     pub fn must_purge_all_stale(&self) {
         let _lk = self.force_rewrite_candidates.try_lock().unwrap();
         self.pipe_log.rotate(LogQueue::Rewrite).unwrap();
