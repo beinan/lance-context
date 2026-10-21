@@ -94,6 +94,7 @@ enum Request {
     Page(u64),
     PrepareCheckpoint(u64, Uuid),
     InstallCheckpoint,
+    MaintainLog,
     ImageInfo(Vec<u8>),
     ImageChunk(Vec<u8>, bool, u64, usize),
     BeginSnapshot(WirePacket, Uuid),
@@ -113,6 +114,7 @@ enum Response {
     Image(Vec<u8>, u64, u64),
     Chunk(Bytes),
     CollectedImages(u64, u64),
+    LogMaintained(Vec<u64>),
     Ok,
 }
 fn send<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
@@ -202,6 +204,11 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
             }
             anyhow::bail!("test collection did not finish")
         }
+        Request::MaintainLog => {
+            return Ok(Response::LogMaintained(
+                node.prepare_log_maintenance()?.run()?,
+            ));
+        }
         Request::ImageInfo(snapshot) => {
             let image = worker
                 .images
@@ -283,13 +290,19 @@ fn replication_peer_fixture() -> Result<()> {
     } else {
         Limits::default()
     };
-    let mut node = Node::open(
+    let mut node = Node::open_with_storage_options(
         &root.join(format!("data-{id}")),
         Arc::new(serde_json::from_slice(&std::fs::read(
             root.join("layout.json"),
         )?)?),
         id,
         limits.clone(),
+        // Exercise actual segment rotation and physical removal with the small
+        // process fixtures; these thresholds are not benchmark configuration.
+        lance_context_wal::raft_log::LogOptions {
+            target_file_bytes: 4096,
+            purge_threshold_bytes: 4096,
+        },
     )?;
     let key_path = root.join(format!("catalog-key-{id}.pkcs8"));
     if key_path.exists() {
@@ -721,6 +734,32 @@ fn application_snapshot_transfer_interruption_and_full_process_restart() -> Resu
         second_ack,
         Outcome::Committed(Applied::Accepted { .. })
     ));
+    let directory = c.root.path().join(format!("data-{leader}"));
+    let mut old_segments = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "raftlog")
+        {
+            old_segments.push(path);
+        }
+    }
+    for _ in 0..4 {
+        assert!(matches!(
+            c.peers
+                .get_mut(&leader)
+                .unwrap()
+                .call(Request::MaintainLog)?,
+            Response::LogMaintained(_)
+        ));
+    }
+    assert!(
+        old_segments.iter().any(|path| !path.exists()),
+        "native maintenance did not remove a physical segment"
+    );
+    // The application image and suffix must still serve the lagging replica
+    // after physical removal, interrupted transfer and every process restarting.
     c.interrupt_next_snapshot = true;
     for _ in 0..30 {
         c.command(leader, Request::Tick)?;
