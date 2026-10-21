@@ -2,6 +2,9 @@
 //! select a staged path. No canonical-path repair, fallback import or GC occurs.
 use super::*;
 
+mod retention;
+pub use retention::{HistoryBoundary, RetireManifestHistory};
+
 #[cfg(test)]
 pub(super) mod tests;
 
@@ -163,14 +166,17 @@ impl ManifestIndex {
                 && self.head < u64::MAX
                 && self.head >= self.initial_version
                 && self.versions.len() <= MAX_MANIFEST_VERSIONS
-                && self.versions.len() as u64 == self.head - self.initial_version + 1,
+                && self.versions.first_key_value().map(|(v, _)| *v) == Some(self.initial_version)
+                && self.versions.last_key_value().map(|(v, _)| *v) == Some(self.head),
             "invalid manifest index bounds"
         );
         let mut previous_index = 0;
+        let mut previous_version = self.initial_version;
         for (offset, (version, record)) in self.versions.iter().enumerate() {
             record.object.validate(*version)?;
             ensure!(
-                *version == self.initial_version + offset as u64
+                (offset == 0 || *version > previous_version)
+                    && (offset <= 1 || *version == previous_version + 1)
                     && record.version == *version
                     && !record.transaction.is_nil()
                     && record.index > previous_index
@@ -198,10 +204,12 @@ impl ManifestIndex {
                 );
             }
             previous_index = record.index;
+            previous_version = *version;
         }
         if let Some(pending) = &table.progress.pending {
             ensure!(
                 pending.plan.read_version >= self.initial_version
+                    && self.versions.contains_key(&pending.plan.read_version)
                     && self.head >= pending.plan.read_version
                     && self.head <= pending.plan.target_version()?,
                 "managed plan does not name the current predecessor or target"
@@ -307,6 +315,13 @@ impl Catalog {
         };
         if manifests.incarnation != request.incarnation {
             return Reply::Rejected(Rejection::ManifestIdentity);
+        }
+        let boundary = manifests.history_boundary();
+        if boundary.is_retired(request.target) {
+            // Absence below the retained suffix is not evidence that this
+            // caller's immutable object was never selected. It cannot be deleted
+            // on the strength of this reply, including after publisher takeover.
+            return Reply::ManifestRetired(boundary);
         }
         // Resolve an already chosen path before a new authority/predecessor
         // check. A lost successful reply must never let the caller delete the
