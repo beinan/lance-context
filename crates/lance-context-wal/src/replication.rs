@@ -16,6 +16,7 @@
 pub mod checkpoint;
 mod images;
 pub use images::{ImageCollection, ImageCollectionProgress};
+pub mod producer;
 pub mod publication;
 pub mod query;
 pub mod source;
@@ -63,6 +64,10 @@ pub struct Limits {
     pub max_producers: u64,
     pub max_pending: u64,
     pub max_uncommitted_bytes: u64,
+    /// Fixed slots per group; zero retains UUID-only semantics and disk identity.
+    /// Set only on fresh groups. Changing this policy requires migration.
+    #[serde(default)]
+    pub producer_slots: u32,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -79,6 +84,7 @@ impl Default for Limits {
             max_producers: 16_384,
             max_pending: 128,
             max_uncommitted_bytes: 64 * 1024 * 1024,
+            producer_slots: 0,
         }
     }
 }
@@ -106,11 +112,22 @@ impl Limits {
                 && (1..=8 * 1024 * 1024).contains(&self.max_record_bytes)
                 && (1..=500_000).contains(&self.max_records)
                 && (1..=100_000).contains(&self.max_producers)
+                && self.producer_slots <= producer::MAX_SLOTS
+                && u64::from(self.producer_slots) <= self.max_producers
                 && (1..=4096).contains(&self.max_pending)
                 && self.max_uncommitted_bytes >= self.max_record_bytes.max(1024 * 1024)
                 && self.max_uncommitted_bytes <= 256 * 1024 * 1024,
             "invalid replication limits"
         );
+        if self.producer_slots > 0 {
+            let mut legacy = self.clone();
+            legacy.producer_slots = 0;
+            return Ok(bincode::serialize(&(
+                "lance-context/replicated-append/v11",
+                legacy.identity()?,
+                self.producer_slots,
+            ))?);
+        }
         if self.source_keys.is_empty() {
             // Bincode structs and tuples encode their fields in order. Keep the
             // exact old policy bytes when source attestations are not enabled.
@@ -131,7 +148,20 @@ impl Limits {
         }
         Ok(bincode::serialize(&(
             "lance-context/replicated-append/v10",
-            self,
+            (
+                self.catalog_key,
+                &self.source_keys,
+                self.max_tables,
+                self.max_active_plans,
+                self.max_plan_source_bytes,
+                self.max_descriptor_bytes,
+                self.max_manifest_records,
+                self.max_record_bytes,
+                self.max_records,
+                self.max_producers,
+                self.max_pending,
+                self.max_uncommitted_bytes,
+            ),
         ))?)
     }
 }
@@ -160,6 +190,9 @@ pub enum Applied {
     },
     Capacity,
     Source(source::Reply),
+    Producer(producer::Reply),
+    /// Stale generation, wrong lane binding or a closed lane attempting new data.
+    ProducerFenced,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +340,7 @@ impl Node {
                 images.installed(&loaded.image)?;
                 (loaded.state, Some(loaded.image))
             } else {
-                (State::default(), None)
+                (State::with_producer_slots(limits.producer_slots), None)
             };
             while state.applied < committed {
                 let entries = store.entries(
@@ -611,6 +644,13 @@ impl Node {
             .catalog
             .tables
             .get(&table))
+    }
+
+    /// Replicate a trusted producer lifecycle command. Completion is released
+    /// only after durable quorum commit; an ambiguous open must retry its exact CAS.
+    pub fn producer_command(&mut self, request: u64, command: producer::Command) -> Result<()> {
+        let group = command.group;
+        self.propose(group, request, command.batch(&self.layout, &self.limits)?)
     }
 
     /// Ok means queued locally, NOT durable or committed. A token may have only

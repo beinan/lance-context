@@ -62,6 +62,7 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Producer(u64, lance_context_wal::replication::producer::Command),
     RetireManifestHistory(
         u64,
         lance_context_wal::replication::publication::RetireManifestHistory,
@@ -158,6 +159,7 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
         Request::RetireManifestHistory(token, request) => {
             node.retire_manifest_history(token, request)?
         }
+        Request::Producer(token, command) => node.producer_command(token, command)?,
         Request::CloseSource(token, permit) => node.close_source(token, permit)?,
         Request::ConfirmPublication(token, request) => node.confirm_publication(token, request)?,
         Request::AdvancePublication(token, request) => node.advance_publication(token, request)?,
@@ -433,6 +435,13 @@ impl Cluster {
         Self::with_layout(layout, None)
     }
     fn with_layout(layout: Layout, catalog_key: Option<&[u8]>) -> Result<Self> {
+        Self::with_producer_slots(layout, catalog_key, 0)
+    }
+    fn with_producer_slots(
+        layout: Layout,
+        catalog_key: Option<&[u8]>,
+        producer_slots: u32,
+    ) -> Result<Self> {
         let root = tempfile::tempdir()?;
         if let Some(key) = catalog_key {
             let signer = CatalogSigner::from_pkcs8(key)?;
@@ -456,12 +465,22 @@ impl Cluster {
                 serde_json::to_vec(&Limits {
                     catalog_key: Some(signer.public_key()),
                     source_keys,
+                    producer_slots,
                     ..Default::default()
                 })?,
             )?;
             for id in &layout.groups[layout.groups.first_key_value().unwrap().0] {
                 std::fs::write(root.path().join(format!("catalog-key-{id}.pkcs8")), key)?;
             }
+        }
+        if catalog_key.is_none() && producer_slots > 0 {
+            std::fs::write(
+                root.path().join("limits.json"),
+                serde_json::to_vec(&Limits {
+                    producer_slots,
+                    ..Default::default()
+                })?,
+            )?;
         }
         std::fs::write(
             root.path().join("layout.json"),
@@ -1691,3 +1710,6 @@ fn disjoint_source_pins_survive_transfer_takeover_and_all_process_restart() -> R
 #[cfg(feature = "lance-integration")]
 #[path = "replication_process/lance_publication.rs"]
 mod lance_publication;
+
+#[path = "replication_process/producer_slots.rs"]
+mod producer_slots;
