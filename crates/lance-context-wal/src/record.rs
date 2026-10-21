@@ -49,6 +49,8 @@ pub enum RecordKind {
     MultiPublication,
     /// Per-group source pins, release and retention commands.
     Source,
+    /// Generation-fenced producer allocation, closure and revocation.
+    Producer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

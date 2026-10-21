@@ -3,6 +3,8 @@
 use super::*;
 #[path = "manifest_retention.rs"]
 mod manifest_retention;
+#[path = "producer_lifecycle.rs"]
+pub(super) mod producer_lifecycle;
 #[path = "source_closure.rs"]
 mod source_closure;
 use lance_context_wal::replication::publication::{
@@ -71,6 +73,7 @@ pub(super) enum Mode {
     LostReply,
     Takeover,
     Retention,
+    ProducerSlots,
 }
 
 #[derive(Default)]
@@ -434,6 +437,9 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
         &selected,
         &attempt.input,
     )?;
+    if mode == Mode::ProducerSlots {
+        producer_lifecycle::reuse_after_retirement(&cluster, &attempt.input)?;
+    }
     // Both version lookup and latest lookup are strict catalog reads. A raw
     // URI reader cannot discover this unique path and is not a managed reader.
     let latest = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)

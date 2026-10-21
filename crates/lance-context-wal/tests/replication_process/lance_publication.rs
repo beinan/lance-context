@@ -102,7 +102,8 @@ async fn recovered_publication(occupied: bool, managed: Option<managed::Mode>) -
         groups: BTreeMap::from([(10, vec![1, 2, 3]), (20, vec![4, 5, 6])]),
         buckets: vec![10, 20],
     };
-    let mut c = Cluster::with_layout(layout, Some(key.as_ref()))?;
+    let slots = u32::from(managed == Some(managed::Mode::ProducerSlots));
+    let mut c = Cluster::with_producer_slots(layout, Some(key.as_ref()), slots)?;
     let uri = c
         .root
         .path()
@@ -130,7 +131,12 @@ async fn recovered_publication(occupied: bool, managed: Option<managed::Mode>) -
         encoder.finish()?;
     }
     let table = Uuid::from_u128(902);
-    let input = Batch::new(table, 1, Uuid::from_u128(903), 1, Bytes::from(wire));
+    let producer = if slots > 0 {
+        managed::producer_lifecycle::open(&mut c, source, table)?
+    } else {
+        Uuid::from_u128(903)
+    };
+    let input = Batch::new(table, 1, producer, 1, Bytes::from(wire));
     c.command(source, Request::Propose(20, 2000, input.clone()))?;
     c.pump(&[4, 5, 6])?;
     let Some(Outcome::Committed(Applied::Accepted {
@@ -139,6 +145,14 @@ async fn recovered_publication(occupied: bool, managed: Option<managed::Mode>) -
     else {
         anyhow::bail!("WAL append missing");
     };
+    if slots > 0 {
+        managed::producer_lifecycle::close_before_publication(
+            &mut c,
+            source,
+            &input,
+            source_index,
+        )?;
+    }
     let mut acquire = Acquire {
         table,
         destination: Destination {
@@ -417,4 +431,10 @@ async fn catalog_rejects_old_owner_paused_after_real_manifest_upload() -> Result
 async fn catalog_manifest_retention_preserves_real_lance_after_history_limit_and_restart(
 ) -> Result<()> {
     recovered_publication(false, Some(managed::Mode::Retention)).await
+}
+
+#[tokio::test]
+async fn producer_slot_reuse_preserves_real_lance_and_fences_old_writes_after_restart() -> Result<()>
+{
+    recovered_publication(false, Some(managed::Mode::ProducerSlots)).await
 }

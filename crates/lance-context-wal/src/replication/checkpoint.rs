@@ -14,8 +14,20 @@ use std::{
     path::PathBuf,
 };
 
-const FORMAT: u32 = 9;
-const MAGIC: &[u8; 8] = b"LCWALCP9";
+fn format(limits: &Limits) -> u32 {
+    if limits.producer_slots == 0 {
+        9
+    } else {
+        10
+    }
+}
+fn magic(limits: &Limits) -> &'static [u8; 8] {
+    if limits.producer_slots == 0 {
+        b"LCWALCP9"
+    } else {
+        b"LCWALCPA"
+    }
+}
 pub const CHUNK_BYTES: usize = 1024 * 1024;
 
 fn codec() -> impl Options {
@@ -93,6 +105,7 @@ fn metadata_limit(limits: &Limits) -> u64 {
         + limits.max_tables * (256 + publication::advance_metadata_bytes())
         + limits.max_tables * (source::MAX_CLOSED_BYTES as u64 + 4)
         + limits.max_producers * (state::MAX_RETIRED_BYTES as u64 + 4)
+        + u64::from(limits.producer_slots) * (producer::MAX_CELL_BYTES as u64 + 4)
         + 1024
 }
 
@@ -100,7 +113,7 @@ impl Descriptor {
     fn validate(&self, layout: &Layout, limits: &Limits, group: u64) -> Result<()> {
         self.binding.validate(layout, limits, group)?;
         ensure!(
-            self.format == FORMAT
+            self.format == format(limits)
                 && !self.id.is_nil()
                 && self.records <= limits.max_records
                 && self.producers <= limits.max_producers
@@ -460,7 +473,7 @@ pub(super) fn build(
     ensure!(!id.is_nil(), "nil application image id");
     let (locations, payload_bytes) = locations(&state)?;
     let mut descriptor = Descriptor {
-        format: FORMAT,
+        format: format(limits),
         binding,
         id,
         records: state.accepted.len() as u64,
@@ -476,7 +489,7 @@ pub(super) fn build(
     };
     let paths = descriptor.paths(directory);
     let mut metadata = Writer::new(&paths[0], metadata_limit(limits))?;
-    metadata.write_all(MAGIC)?;
+    metadata.write_all(magic(limits))?;
     write_frame(&mut metadata, &codec().serialize(&descriptor.binding)?)?;
     write_u64(&mut metadata, descriptor.records)?;
     write_u64(&mut metadata, descriptor.producers)?;
@@ -501,6 +514,14 @@ pub(super) fn build(
     }
     for (key, retired) in &state.retired {
         write_frame(&mut metadata, &state::encode_retired(*key, *retired)?)?;
+    }
+    // A flat, policy-sized cell table; decoding never trusts an allocation count
+    // supplied by the file. Zero-slot groups retain the exact legacy layout.
+    if limits.producer_slots > 0 {
+        write_u64(&mut metadata, u64::from(limits.producer_slots))?;
+        for cell in &state.producer_slots {
+            write_frame(&mut metadata, &producer::encode_cell(cell)?)?;
+        }
     }
     (descriptor.metadata_bytes, descriptor.metadata_digest) = metadata.finish()?;
     let mut pack = Writer::new(&paths[1], payload_bytes)?;
@@ -538,9 +559,12 @@ pub(super) fn load(
     let descriptor = Descriptor::decode(snapshot, layout, limits, group)?;
     let paths = descriptor.paths(directory);
     let mut metadata = Reader::new(&paths[0], descriptor.metadata_bytes)?;
-    let mut magic = [0; 8];
-    metadata.read_exact(&mut magic)?;
-    ensure!(&magic == MAGIC, "unsupported application image format");
+    let mut actual_magic = [0; 8];
+    metadata.read_exact(&mut actual_magic)?;
+    ensure!(
+        &actual_magic == magic(limits),
+        "unsupported application image format"
+    );
     let (binding, n) = read_frame::<512>(&mut metadata)?;
     ensure!(
         codec().deserialize::<Binding>(&binding[..n])? == descriptor.binding,
@@ -626,6 +650,18 @@ pub(super) fn load(
         );
         state.retired.insert(key, retired);
         previous = Some(key);
+    }
+    if limits.producer_slots > 0 {
+        ensure!(
+            read_u64(&mut metadata)? == u64::from(limits.producer_slots),
+            "image producer slot count mismatch"
+        );
+        for _ in 0..limits.producer_slots {
+            let (bytes, n) = read_frame::<{ producer::MAX_CELL_BYTES }>(&mut metadata)?;
+            state
+                .producer_slots
+                .push(producer::decode_cell(&bytes[..n])?);
+        }
     }
     let metadata_file = metadata.finish(descriptor.metadata_bytes, descriptor.metadata_digest)?;
     state.validate_checkpoint(layout, group, limits, descriptor.binding.index)?;

@@ -45,6 +45,9 @@ pub enum Query {
     ClosedProof {
         table: Uuid,
     },
+    ProducerSlot {
+        slot: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +67,7 @@ pub enum Value {
     /// A historical position is outside catalog retention. This is neither a
     /// missing-object result nor proof that a supplied staging object lost.
     ManifestRetired(publication::HistoryBoundary),
+    ProducerSlot(Option<producer::View>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +101,10 @@ pub struct Completion {
 impl Query {
     pub(super) fn validate(&self, layout: &Layout, group: u64) -> Result<()> {
         match self {
+            Self::ProducerSlot { slot } => ensure!(
+                *slot < producer::MAX_SLOTS,
+                "producer slot query out of bounds"
+            ),
             Self::Manifest { table, version } => ensure!(
                 !table.is_nil()
                     && group == publication::control_group(layout)
@@ -157,6 +165,7 @@ impl Query {
         signers: source::QuerySigners<'_>,
     ) -> Result<Value> {
         Ok(match self {
+            Self::ProducerSlot { slot } => Value::ProducerSlot(state.producer_view(*slot)),
             Self::ClosedProof { table } => Value::ClosedProof(
                 state
                     .closed

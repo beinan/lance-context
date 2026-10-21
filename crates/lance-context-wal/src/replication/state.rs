@@ -25,6 +25,10 @@ pub(super) fn validate_meta(
     body: &[u8],
     digest: bool,
 ) -> Result<()> {
+    if meta.kind == RecordKind::Producer {
+        meta.validate_payload(body, producer::MAX_COMMAND_BYTES)?;
+        return producer::validate_record(layout, group, limits, meta, body);
+    }
     if meta.kind == RecordKind::Source {
         meta.validate_payload(body, source::MAX_BYTES)?;
         return source::validate_record(layout, group, limits, meta, body);
@@ -147,6 +151,7 @@ pub(super) fn validate_entry(
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct State {
+    pub producer_slots: Vec<producer::Cell>,
     pub retired: BTreeMap<ProducerKey, Retired>,
     pub closed: BTreeMap<Uuid, Arc<source::Closed>>,
     pub pins: BTreeMap<Uuid, Arc<source::Pin>>,
@@ -197,6 +202,7 @@ impl State {
                 && self.retired.len() <= self.producers.len(),
             "application checkpoint exceeds state limits"
         );
+        self.validate_producers(layout, group, limits)?;
         self.catalog.validate(layout, group, cut, limits)?;
         source::validate_state(self, layout, group, cut, limits)?;
         for (key, (meta, index)) in &self.producers {
@@ -303,12 +309,23 @@ impl State {
                 limits,
             ))));
         }
+        if meta.kind == RecordKind::Producer {
+            return Ok(Some(Applied::Producer(
+                self.apply_producer(producer::decode(&entry.data)?),
+            )));
+        }
+        if !self.producer_admission(&meta, true) {
+            return Ok(Some(Applied::ProducerFenced));
+        }
         let key = (meta.stream, meta.bucket, meta.producer);
         let previous = self.producers.get(&key);
         if let Some((old, index)) = previous {
             if *old == meta {
                 return Ok(Some(Applied::Accepted { index: *index }));
             }
+        }
+        if !self.producer_admission(&meta, false) {
+            return Ok(Some(Applied::ProducerFenced));
         }
         let expected_sequence = previous.map_or(1, |(old, _)| old.sequence + 1);
         if meta.sequence != expected_sequence {

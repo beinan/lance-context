@@ -176,6 +176,10 @@ publication prerequisite, not a production Lance writer or a manifest lease.
 catalog, producer-tail and accepted-page views after a safe read-index barrier.
 They share pending capacity with proposals and do not fetch bulk payloads.
 
+[Producer slots](../../docs/design/wal-producer-slots.md) provide opt-in bounded
+writer state on fresh groups. Durable generations fence old requests after a
+closed lane's published source has been retired and its slot reused.
+
 [Source closure proofs](../../docs/design/wal-source-closure-proofs.md) attest that
 an exact catalog-authorized closure committed at its source. Optional per-group
 keys keep catalog private keys off source-only replicas; catalog checkpoint
