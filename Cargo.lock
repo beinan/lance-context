@@ -4531,6 +4531,7 @@ dependencies = [
  "lance-core",
  "lance-namespace",
  "log",
+ "metrics",
  "moka",
  "object_store 0.14.2",
  "object_store_opendal",

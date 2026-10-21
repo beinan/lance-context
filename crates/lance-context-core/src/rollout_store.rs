@@ -7081,10 +7081,37 @@ mod tests {
             ),
         ];
 
+        // Enabling Lance I/O metrics adds its own histogram to this recorder.
+        // Keep its label policy separate: application histograms must not gain
+        // operation/base labels just because a dependency uses them.
+        let lance_io_allowed: &[(&str, &[&str])] = &[
+            ("base", &["file"]),
+            (
+                "operation",
+                &[
+                    "get",
+                    "head",
+                    "put",
+                    "put_part",
+                    "complete_multipart",
+                    "abort_multipart",
+                    "list",
+                    "copy",
+                    "rename",
+                    "delete",
+                ],
+            ),
+        ];
+
         for (key, _, _, _) in snapshotter.snapshot().into_vec() {
             if key.kind() != MetricKind::Histogram {
                 continue;
             }
+            let allowed = if key.key().name() == "lance_object_store_request_duration_seconds" {
+                lance_io_allowed
+            } else {
+                allowed
+            };
             for label in key.key().labels() {
                 let (k, v) = (label.key(), label.value());
                 let allowed_values = allowed

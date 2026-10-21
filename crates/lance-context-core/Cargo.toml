@@ -16,6 +16,8 @@ default = ["metrics"]
 # Optional so downstream consumers embedding this library are not forced to take
 # the `metrics` dependency; call sites compile to nothing when disabled.
 metrics = ["dep:metrics"]
+# Opt-in storage diagnostics; share the application's existing metrics recorder.
+lance-io-metrics = ["metrics", "lance/metrics"]
 
 [dependencies]
 async-trait = "0.1.92"

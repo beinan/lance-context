@@ -23,6 +23,13 @@
 //!    rate, so errors get a flat counter (1 series) and histograms measure the
 //!    success path only.
 
+/// Register Lance's object-store metric descriptions on the current recorder.
+/// Call after installing the application's recorder when `lance-io-metrics` is
+/// enabled. This does not install or replace a recorder. Lance's storage metrics
+/// use their own outcome and label conventions; scheme labels are the default.
+#[cfg(feature = "lance-io-metrics")]
+pub use lance_io::object_store::metrics::describe_metrics as describe_lance_io_metrics;
+
 /// Latency of one [`crate::RolloutStore::add`] — the durable WAL append only.
 /// Unlabelled: failures are counted by [`ROLLOUT_ADD_ERRORS`] instead.
 pub const ROLLOUT_ADD_DURATION: &str = "rollout_add_duration_seconds";

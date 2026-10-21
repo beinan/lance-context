@@ -747,16 +747,15 @@ impl StorageBase {
         // magnitude, and `noop` is by far the most common, so a blended histogram
         // would be dominated by near-zero samples. Failures are counted, not timed.
         match &result {
-            Ok(outcome) => {
-                let label = match outcome {
-                    FlushOutcome::Sealed => "sealed",
-                    FlushOutcome::Noop => "noop",
-                    FlushOutcome::Fenced => "fenced",
-                };
+            Ok(_outcome) => {
                 observe_duration!(
                     crate::metrics::ROLLOUT_FLUSH_DURATION,
                     timer_elapsed!(started),
-                    "outcome" => label,
+                    "outcome" => match _outcome {
+                        FlushOutcome::Sealed => "sealed",
+                        FlushOutcome::Noop => "noop",
+                        FlushOutcome::Fenced => "fenced",
+                    },
                 );
             }
             Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
@@ -2718,14 +2717,16 @@ pub(crate) fn align_batch_to_schema(
 /// is: a single store answered 503 for five hours today before anyone
 /// noticed. The label is the dataset directory name, bounded by the number
 /// of stores a worker touches.
-fn note_read_refused(uri: &str) {
-    let store = uri
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-    metrics::counter!("rollout_reads_refused_pending_total", "store" => store).increment(1);
+fn note_read_refused(_uri: &str) {
+    count!(
+        "rollout_reads_refused_pending_total",
+        "store" => _uri
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    );
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
