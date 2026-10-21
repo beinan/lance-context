@@ -17,8 +17,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+#[cfg(any(test, feature = "replication"))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 use anyhow::{ensure, Context, Result};
 use protobuf::Message;
@@ -28,7 +30,9 @@ use raft_proto::eraftpb::{ConfState, Entry, EntryType, HardState, Snapshot};
 
 use crate::placement::Layout;
 
+mod budget;
 mod checkpoint;
+pub use budget::{DiskMeasurement, DiskOptions};
 mod maintenance;
 pub use maintenance::LogMaintenance;
 #[cfg(test)]
@@ -60,8 +64,15 @@ impl MessageExt for EntryIndex {
 
 struct NodeEngine {
     engine: LogEngine,
+    #[cfg(any(test, feature = "replication"))]
+    directory: PathBuf,
+    #[cfg(feature = "replication")]
+    target_file_bytes: u64,
+    written: Arc<AtomicU64>,
+    budget: OnceLock<Arc<crate::admission::Budget>>,
     failed: AtomicBool,
-    maintenance_gate: RwLock<()>,
+    maintenance_gate: Arc<RwLock<()>>,
+    filesystem: Arc<RwLock<()>>,
     append_gate: RwLock<()>,
     sync_gate: Mutex<()>,
     synced: AtomicU64,
@@ -145,7 +156,19 @@ impl NodeEngine {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.engine.write(batch, sync)
         })) {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(bytes)) => {
+                if self
+                    .written
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                        n.checked_add(bytes as u64)
+                    })
+                    .is_err()
+                {
+                    self.failed.store(true, Ordering::Release);
+                    anyhow::bail!("physical write counter exhausted; reopen the node log");
+                }
+                Ok(())
+            }
             Ok(Err(error)) => {
                 self.failed.store(true, Ordering::Release);
                 Err(error).context("uncertain engine write; node log must be reopened")
@@ -405,8 +428,15 @@ impl PhysicalLog {
         let node_id = node;
         let node = Arc::new(NodeEngine {
             engine,
+            #[cfg(any(test, feature = "replication"))]
+            directory: PathBuf::from(directory),
+            #[cfg(feature = "replication")]
+            target_file_bytes: options.target_file_bytes,
+            written: Arc::new(AtomicU64::new(0)),
+            budget: OnceLock::new(),
             failed: AtomicBool::new(false),
-            maintenance_gate: RwLock::new(()),
+            maintenance_gate: Arc::new(RwLock::new(())),
+            filesystem: Arc::new(RwLock::new(())),
             append_gate: RwLock::new(()),
             sync_gate: Mutex::new(()),
             synced: AtomicU64::new(0),
