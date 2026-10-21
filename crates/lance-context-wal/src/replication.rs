@@ -548,6 +548,18 @@ impl Node {
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 
+    /// Retire old catalog directory records while preserving the bootstrap,
+    /// current head and active publication dependencies. Wait for a committed
+    /// result. This is not permission to delete immutable Lance objects.
+    pub fn retire_manifest_history(
+        &mut self,
+        request: u64,
+        retirement: publication::RetireManifestHistory,
+    ) -> Result<()> {
+        let batch = retirement.batch(&self.layout)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
     /// Durably resolve the selected manifest against its exact pending plan.
     /// This retains all source dependencies; it does not authorize reclamation.
     pub fn confirm_publication(

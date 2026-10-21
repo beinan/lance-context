@@ -62,6 +62,10 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    RetireManifestHistory(
+        u64,
+        lance_context_wal::replication::publication::RetireManifestHistory,
+    ),
     AdvancePublication(
         u64,
         lance_context_wal::replication::publication::AdvancePublication,
@@ -151,6 +155,9 @@ fn part(payload: bool) -> Part {
 fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     let node = &mut worker.node;
     match request {
+        Request::RetireManifestHistory(token, request) => {
+            node.retire_manifest_history(token, request)?
+        }
         Request::CloseSource(token, permit) => node.close_source(token, permit)?,
         Request::ConfirmPublication(token, request) => node.confirm_publication(token, request)?,
         Request::AdvancePublication(token, request) => node.advance_publication(token, request)?,

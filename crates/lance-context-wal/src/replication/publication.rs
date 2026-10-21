@@ -15,8 +15,8 @@ mod prepared;
 mod table_codec;
 pub use advance::{AdvancePublication, Advanced};
 pub use manifest::{
-    BootstrapManifest, ManifestIndex, ManifestObject, ManifestRecord, ReserveManifest,
-    MAX_MANIFEST_VERSIONS,
+    BootstrapManifest, HistoryBoundary, ManifestIndex, ManifestObject, ManifestRecord,
+    ReserveManifest, RetireManifestHistory, MAX_MANIFEST_VERSIONS,
 };
 pub use outcome::{ConfirmPublication, Published};
 pub use plan::{PendingPlan, Plan, PlanRequest, Progress, SourceRange, MAX_INPUTS};
@@ -88,6 +88,7 @@ enum Command {
     ReserveManifest(Box<ReserveManifest>),
     ConfirmPublication(Box<ConfirmPublication>),
     AdvancePublication(Box<AdvancePublication>),
+    RetireManifestHistory(Box<RetireManifestHistory>),
 }
 impl Command {
     fn identity(&self) -> (Uuid, Uuid, u64) {
@@ -103,6 +104,9 @@ impl Command {
             Self::AdvancePublication(p) => {
                 (p.authority.table, p.authority.owner, p.authority.epoch)
             }
+            Self::RetireManifestHistory(p) => {
+                (p.authority.table, p.authority.owner, p.authority.epoch)
+            }
         }
     }
     fn byte_limit(&self) -> usize {
@@ -110,9 +114,9 @@ impl Command {
             Self::Acquire(_) => MAX_ACQUIRE_BYTES,
             Self::Plan(_) => plan::MAX_PLAN_BYTES,
             Self::Prepare(_) => prepared::MAX_PREPARE_BYTES,
-            Self::BootstrapManifest(_) | Self::ReserveManifest(_) => {
-                manifest::MAX_MANIFEST_COMMAND_BYTES
-            }
+            Self::BootstrapManifest(_)
+            | Self::ReserveManifest(_)
+            | Self::RetireManifestHistory(_) => manifest::MAX_MANIFEST_COMMAND_BYTES,
             Self::ConfirmPublication(_) => outcome::MAX_OUTCOME_BYTES,
             Self::AdvancePublication(_) => advance::MAX_ADVANCE_BYTES,
         }
@@ -190,6 +194,7 @@ pub enum Rejection {
     ManifestPredecessor,
     PublicationIdentity,
     SourceClosure,
+    ManifestHistoryBoundary,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
@@ -201,6 +206,8 @@ pub enum Reply {
     ManifestTaken(Arc<ManifestRecord>),
     Published(Arc<Published>),
     Advanced(Arc<Advanced>),
+    ManifestHistory(HistoryBoundary),
+    ManifestRetired(HistoryBoundary),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -279,6 +286,7 @@ pub(super) fn validate_record(
         Command::Prepare(p) => p.validate(layout, limits)?,
         Command::BootstrapManifest(p) => p.validate(layout)?,
         Command::ReserveManifest(p) => p.validate(layout)?,
+        Command::RetireManifestHistory(p) => p.validate(layout)?,
         Command::ConfirmPublication(p) => p.validate(layout)?,
         Command::AdvancePublication(p) => p.validate(layout, limits)?,
     }
@@ -305,6 +313,9 @@ impl Catalog {
             }
             Command::AdvancePublication(request) => {
                 return self.advance_publication(*request, index)
+            }
+            Command::RetireManifestHistory(request) => {
+                return self.retire_manifest_history(*request)
             }
             Command::Acquire(a) => *a,
         };

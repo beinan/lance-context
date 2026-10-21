@@ -55,10 +55,15 @@ pub enum Value {
     Publisher(Option<Box<publication::Table>>),
     Accepted(Page),
     Producer(Option<(BatchMeta, u64)>),
-    CursorAhead { applied: u64 },
+    CursorAhead {
+        applied: u64,
+    },
     Pin(Option<Box<source::Permit>>),
     SourcePin(Option<Arc<source::Pin>>),
     ClosedProof(Option<Box<source::ClosedProof>>),
+    /// A historical position is outside catalog retention. This is neither a
+    /// missing-object result nor proof that a supplied staging object lost.
+    ManifestRetired(publication::HistoryBoundary),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,15 +206,23 @@ impl Query {
                         .transpose()?,
                 )
             }
-            Self::Manifest { table, version } => Value::Manifest(
-                state
+            Self::Manifest { table, version } => {
+                let manifests = state
                     .catalog
                     .tables
                     .get(table)
-                    .and_then(|t| t.manifests.as_ref())
-                    .and_then(|m| m.versions.get(&version.unwrap_or(m.head)))
-                    .cloned(),
-            ),
+                    .and_then(|t| t.manifests.as_ref());
+                match manifests {
+                    Some(m) if version.is_some_and(|v| m.history_boundary().is_retired(v)) => {
+                        Value::ManifestRetired(m.history_boundary())
+                    }
+                    _ => Value::Manifest(
+                        manifests
+                            .and_then(|m| m.versions.get(&version.unwrap_or(m.head)))
+                            .cloned(),
+                    ),
+                }
+            }
             Self::Pin {
                 table,
                 transaction,

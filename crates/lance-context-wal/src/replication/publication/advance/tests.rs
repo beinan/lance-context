@@ -5,6 +5,8 @@ use crate::replication::{
 };
 use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
 
+mod manifest_retention;
+
 struct Fixture {
     layout: Arc<Layout>,
     limits: Limits,

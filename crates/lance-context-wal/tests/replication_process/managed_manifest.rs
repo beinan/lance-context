@@ -1,6 +1,8 @@
 //! Actual Lance writer/reader adapter over the six-process catalog fixture.
 //! This qualifies the durable index, not production transport or coordinated GC.
 use super::*;
+#[path = "manifest_retention.rs"]
+mod manifest_retention;
 #[path = "source_closure.rs"]
 mod source_closure;
 use lance_context_wal::replication::publication::{
@@ -68,6 +70,7 @@ pub(super) enum Mode {
     Normal,
     LostReply,
     Takeover,
+    Retention,
 }
 
 #[derive(Default)]
@@ -450,6 +453,9 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
     verify_dataset(latest, &[0, 1, 2, 3, 4]).await?;
     assert!(handler.read(Some(3))?.is_none());
     assert_eq!(handler.read(None)?.unwrap().version, 2);
+    if mode == Mode::Retention {
+        manifest_retention::qualify(&attempt.uri, handler).await?;
+    }
     Ok(())
 }
 

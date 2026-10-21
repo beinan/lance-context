@@ -412,3 +412,9 @@ async fn catalog_manifest_authority_resolves_lost_commit_reply_after_full_restar
 async fn catalog_rejects_old_owner_paused_after_real_manifest_upload() -> Result<()> {
     recovered_publication(false, Some(managed::Mode::Takeover)).await
 }
+
+#[tokio::test]
+async fn catalog_manifest_retention_preserves_real_lance_after_history_limit_and_restart(
+) -> Result<()> {
+    recovered_publication(false, Some(managed::Mode::Retention)).await
+}
