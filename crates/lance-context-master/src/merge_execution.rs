@@ -25,18 +25,14 @@ struct Capabilities {
     idle_timeout_secs: u64,
     progress_protocol: u32,
     owned_targets: Vec<String>,
+    #[serde(default)]
+    fenced_legacy_merges: bool,
 }
 
 pub(crate) async fn run_merge_wal(
     state: &Arc<MasterState>,
     claim: &TaskClaim,
 ) -> Result<String, String> {
-    if state.config.worker_endpoints.is_empty()
-        && !state.config.merge_rollout.draining(&claim.task.target)
-        && !crate::local_merge::selected(&state.config, &claim.task.target)
-    {
-        return Err("no worker endpoints configured".into());
-    }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
     let target = &claim.task.target;
@@ -56,23 +52,59 @@ pub(crate) async fn run_merge_wal(
         }
         return Err("merge target draining for protocol transition".into());
     }
-    if !state.config.merge_rollout.owned(target) {
-        if coordinator.get(target).await?.is_some() {
-            return Err("owned execution still present; refusing legacy downgrade".into());
+    if !state.config.merge_rollout.owned(target) && !state.config.merge_rollout.fence_legacy {
+        if let Some(old) = coordinator.get(target).await? {
+            // Turning off new admission must never disable recovery of durable
+            // worker records. Observe useful progress before considering cancel.
+            if old.maintenance.is_some() || old.protocol != 2 {
+                return Err("owned execution still present; refusing legacy downgrade".into());
+            }
+            ensure_recovery_due(&coordinator, &old).await?;
+            if reconcile(&state.http, &coordinator, &proof, old, false)
+                .await
+                .is_err()
+            {
+                if let Some(current) = coordinator.get(target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                }
+            }
+            return Ok("reconciled recorded worker merge; new fenced admission disabled".into());
         }
         return run_legacy(state, target).await;
     }
-    if state.config.append.enabled(target) || crate::local_merge::selected(&state.config, target) {
+    if state.config.worker_endpoints.is_empty()
+        && !crate::local_merge::selected(&state.config, target)
+        && coordinator.get(target).await?.is_none()
+    {
+        return Err("no worker endpoints configured".into());
+    }
+    if (state.config.merge_rollout.owned(target) && state.config.append.enabled(target))
+        || crate::local_merge::selected(&state.config, target)
+    {
         if let Some(old) = coordinator.get(target).await? {
             ensure_recovery_due(&coordinator, &old).await?;
-            recover_execution(state, &coordinator, &proof, old).await?;
+            if old.maintenance.is_none() {
+                // A newly selected resident target may still have useful
+                // background work. Wait for its real progress and terminal
+                // acknowledgement before considering storage recovery.
+                if reconcile(&state.http, &coordinator, &proof, old, false)
+                    .await
+                    .is_err()
+                {
+                    if let Some(current) = coordinator.get(target).await? {
+                        recover_execution(state, &coordinator, &proof, current).await?;
+                    }
+                }
+            } else {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            }
         }
         return crate::maintenance_execution::run_as(
             state,
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
             async {
-                if state.config.append.enabled(target) {
+                if state.config.merge_rollout.owned(target) && state.config.append.enabled(target) {
                     crate::rollout_append::run(state, target).await
                 } else {
                     crate::local_merge::run(state, target).await
@@ -88,7 +120,8 @@ pub(crate) async fn run_merge_wal(
             ensure_recovery_due(&coordinator, &old).await?;
             if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
                 recover_execution(state, &coordinator, &proof, old).await?;
-            } else if let Err(error) = reconcile(&state.http, &coordinator, &proof, old, true).await
+            } else if let Err(error) =
+                reconcile(&state.http, &coordinator, &proof, old, false).await
             {
                 if let Some(current) = coordinator.get(&claim.task.target).await? {
                     recover_execution(state, &coordinator, &proof, current).await?;
@@ -118,6 +151,9 @@ pub(crate) async fn run_merge_wal(
 // Compatibility path is chosen only by explicit configuration, never after a
 // failed owned RPC. It retains legacy limitations until that table is drained.
 async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
+    if state.config.worker_endpoints.is_empty() {
+        return Err("no worker endpoints configured".into());
+    }
     run_legacy_workers(&state.http, &state.config.worker_endpoints, target).await
 }
 
@@ -373,6 +409,9 @@ async fn run_workers(
     target: &str,
     endpoints: &[String],
 ) -> Result<String, String> {
+    if endpoints.is_empty() {
+        return Err("no worker endpoints configured after reconciling recorded execution".into());
+    }
     let mut pending = Vec::new();
     let mut deferred = Vec::new();
     for endpoint in endpoints {
@@ -481,7 +520,8 @@ async fn one(
         .map_err(|e| e.to_string())?;
     if capabilities.protocol != 2
         || capabilities.progress_protocol != 1
-        || !capabilities.owned_targets.iter().any(|t| t == target)
+        || (!capabilities.owned_targets.iter().any(|t| t == target)
+            && !capabilities.fenced_legacy_merges)
         || capabilities.timeout_secs == 0
         || capabilities.queue_timeout_secs == 0
         || capabilities.idle_timeout_secs == 0
@@ -814,6 +854,55 @@ mod tests {
             .await
             .unwrap();
         (Coordinator::new(client, prefix), proof)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn append_wildcard_does_not_adopt_new_tables_before_native_routing() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()];
+        cfg.etcd.etcd_prefix = format!(
+            "/merge-fenced-routing/{}",
+            lance_context_core::generate_id()
+        );
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        assert!(cfg.merge_rollout.owned_targets.is_empty());
+        assert!(!crate::local_merge::selected(&cfg, "table"));
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "fenced-worker",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![endpoint];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = run_merge_wal(&state, &claim).await;
+        server.abort();
+        assert!(outcome.as_ref().unwrap().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, outcome).await.unwrap();
     }
 
     #[tokio::test]

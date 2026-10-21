@@ -66,7 +66,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use lance::dataset::mem_wal::{LsmScanner, ShardManifestStore, ShardSnapshot};
 use lance::dataset::optimize::CompactionMetrics;
 use lance::dataset::scanner::MaterializationStyle;
@@ -1555,21 +1555,37 @@ impl RolloutStore {
         id: &str,
         source: ListSource,
     ) -> LanceResult<Option<RolloutRecord>> {
-        let shard_snapshots = match source {
-            ListSource::Fragments => Vec::new(),
-            ListSource::Wal | ListSource::All => self.wal_shard_snapshots().await?,
-        };
+        if source == ListSource::Fragments {
+            // Keep the cached base hit cheap. A WAL-only miss still reaches
+            // the server's existing refresh-on-miss path, updating its cache.
+            return self
+                .scan_one_by_id_snapshot(id, source, self.base.dataset.clone(), Vec::new())
+                .await;
+        }
+        self.base
+            .read_consistent(source, |dataset, snapshots| {
+                self.scan_one_by_id_snapshot(id, source, dataset, snapshots)
+            })
+            .boxed()
+            .await
+    }
+
+    async fn scan_one_by_id_snapshot(
+        &self,
+        id: &str,
+        source: ListSource,
+        dataset: Dataset,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<Option<RolloutRecord>> {
         let escaped_id = id.replace('\'', "''");
-        let columns = self
-            .non_blob_columns()
+        let columns = Self::non_blob_columns_for(&dataset)
             .into_iter()
             .filter(|column| {
                 source == ListSource::Fragments || !CLAIM_CHECK_COLUMNS.contains(&column.as_str())
             })
             .collect::<Vec<_>>();
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let scanner = self
-            .lsm_scanner_for_source(source, shard_snapshots)
+        let scanner = StorageBase::lsm_scanner_for_dataset(&dataset, "id", source, shard_snapshots)
             .project(&refs)?
             .filter(&format!("id = '{}'", escaped_id))?;
         let mut stream = scanner.try_into_stream().await?;
@@ -2526,6 +2542,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn point_snapshot_recovers_peer_gc_without_changing_wal_only_semantics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for source in [ListSource::All, ListSource::Wal] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let writer = RolloutStore::open(uri).await.unwrap();
+            writer.add(&[assistant_record("point")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let writer = tokio::sync::Mutex::new(writer);
+            let attempts = AtomicUsize::new(0);
+            let record = reader
+                .base
+                .read_consistent(source, |dataset, snapshots| {
+                    let reader = &reader;
+                    let writer = &writer;
+                    let attempts = &attempts;
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            writer.lock().await.cleanup_own_shard().await.unwrap();
+                            for snapshot in &snapshots {
+                                for generation in &snapshot.sstables {
+                                    let path = reader.flushed_generation_uri(
+                                        snapshot.shard_id,
+                                        &generation.path,
+                                    );
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(2),
+                                        async {
+                                            while std::path::Path::new(&path).exists() {
+                                                tokio::task::yield_now().await;
+                                            }
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                            }
+                        }
+                        reader
+                            .scan_one_by_id_snapshot("point", source, dataset, snapshots)
+                            .await
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            if source == ListSource::All {
+                assert_eq!(record.unwrap().id, "point");
+            } else {
+                assert!(
+                    record.is_none(),
+                    "WAL-only must not return the merged base row"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn completed_list_snapshot_survives_later_merge_commits() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2690,6 +2765,71 @@ mod tests {
         );
         assert_eq!(result.unwrap().len(), 1);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn list_survives_several_progressing_peer_merges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("continuous-merge-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("row-0")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let writer = &writer;
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 4 {
+                        // Each failed snapshot loses a DIFFERENT generation to
+                        // a real successful merge. This is useful progress, not
+                        // a permanently missing file to retry indefinitely.
+                        let mut writer = writer.lock().await;
+                        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::time::sleep(std::time::Duration::from_millis(1))
+                                            .await;
+                                    }
+                                })
+                                .await
+                                .expect("the actual merge GC must invalidate this snapshot");
+                            }
+                        }
+                        writer
+                            .add(&[assistant_record(&format!("row-{}", attempt + 1))])
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .expect("healthy merge progress must not exhaust a three-attempt read limit");
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        let ids: HashSet<_> = rows.into_iter().map(|row| row.id).collect();
+        assert_eq!(ids, (0..5).map(|i| format!("row-{i}")).collect());
     }
 
     #[tokio::test]

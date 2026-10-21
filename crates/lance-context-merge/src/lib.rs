@@ -4,9 +4,11 @@
 //! Only the executor can publish its terminal outcome. Recovery first cancels
 //! and reconciles the old execution; it never clears a running fence on timeout.
 
+pub mod background;
 pub mod demand;
 pub mod failure;
 pub mod fencing;
+mod mode;
 pub mod progress;
 pub mod rollout;
 
@@ -66,6 +68,10 @@ impl MaintenanceKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Execution {
+    /// Count/timer-triggered worker execution, admitted without a scheduler
+    /// claim. Its persistent owner and commit permits are otherwise identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<MaintenanceKind>,
     pub id: String,
@@ -88,6 +94,10 @@ fn protocol_absent(protocol: &u32) -> bool {
     *protocol == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 fn default_queue_timeout() -> u64 {
     600
 }
@@ -95,6 +105,7 @@ fn default_queue_timeout() -> u64 {
 impl Execution {
     pub fn new(target: &str, endpoint: &str, instance: &str, timeout_secs: u64) -> Self {
         Self {
+            background: false,
             maintenance: None,
             id: uuid::Uuid::new_v4().to_string(),
             target: target.into(),
@@ -220,6 +231,7 @@ impl Coordinator {
     /// Atomic claim check and admission close the delayed-request/lease-loss race.
     pub async fn reserve(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
         if execution.phase != Phase::Reserved
+            || execution.background
             || execution.timeout_secs == 0
             || execution.protocol != 2
         {
