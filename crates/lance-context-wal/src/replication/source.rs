@@ -7,8 +7,15 @@ use bincode::Options;
 use bytes::Bytes;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 mod closure;
+mod proof;
 pub(super) use closure::{decode_closed, encode_closed, MAX_CLOSED_BYTES};
 pub use closure::{Closed, Closure, ClosurePermit};
+pub use proof::{ClosedProof, SourceSigner};
+
+pub(super) struct QuerySigners<'a> {
+    pub catalog: Option<&'a CatalogSigner>,
+    pub source: Option<&'a SourceSigner>,
+}
 
 #[cfg(test)]
 mod tests;

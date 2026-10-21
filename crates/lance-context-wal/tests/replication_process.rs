@@ -13,7 +13,7 @@ use lance_context_wal::{
             Rejection as PublisherRejection, Reply as PublisherReply, SourceRange, Table,
         },
         query::{Completion as ReadCompletion, Outcome as ReadOutcome, Query, Value},
-        source::{CatalogSigner, Permit, Reply as SourceReply},
+        source::{CatalogSigner, Permit, Reply as SourceReply, SourceSigner},
         Applied, Completion, Events, Limits, Node, Outcome, Packet, Page, PreparedCheckpoint,
         SnapshotReceiver, Status,
     },
@@ -257,7 +257,7 @@ fn replication_peer_fixture() -> Result<()> {
     let id = std::env::var("CONTEXT_REPLICATION_NODE")?.parse()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let limits_path = root.join("limits.json");
-    let limits = if limits_path.exists() {
+    let limits: Limits = if limits_path.exists() {
         serde_json::from_slice(&std::fs::read(limits_path)?)?
     } else {
         Limits::default()
@@ -268,13 +268,22 @@ fn replication_peer_fixture() -> Result<()> {
             root.join("layout.json"),
         )?)?),
         id,
-        limits,
+        limits.clone(),
     )?;
     let key_path = root.join(format!("catalog-key-{id}.pkcs8"));
     if key_path.exists() {
         node.set_catalog_signer(Arc::new(CatalogSigner::from_pkcs8(&std::fs::read(
             key_path,
         )?)?))?;
+    }
+    for group in limits.source_keys.keys() {
+        let key_path = root.join(format!("source-key-{group}-{id}.pkcs8"));
+        if key_path.exists() {
+            node.set_source_signer(
+                *group,
+                Arc::new(SourceSigner::from_pkcs8(&std::fs::read(key_path)?)?),
+            )?;
+        }
     }
     let mut worker = Worker {
         node,
@@ -386,10 +395,26 @@ impl Cluster {
         let root = tempfile::tempdir()?;
         if let Some(key) = catalog_key {
             let signer = CatalogSigner::from_pkcs8(key)?;
+            let mut source_keys = BTreeMap::new();
+            for (group, members) in &layout.groups {
+                let source_key = ring::signature::Ed25519KeyPair::generate_pkcs8(
+                    &ring::rand::SystemRandom::new(),
+                )
+                .map_err(|_| anyhow::anyhow!("test source key generation failed"))?;
+                let source_signer = SourceSigner::from_pkcs8(source_key.as_ref())?;
+                source_keys.insert(*group, source_signer.public_key());
+                for id in members {
+                    std::fs::write(
+                        root.path().join(format!("source-key-{group}-{id}.pkcs8")),
+                        source_key.as_ref(),
+                    )?;
+                }
+            }
             std::fs::write(
                 root.path().join("limits.json"),
                 serde_json::to_vec(&Limits {
                     catalog_key: Some(signer.public_key()),
+                    source_keys,
                     ..Default::default()
                 })?,
             )?;

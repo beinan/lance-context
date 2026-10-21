@@ -10,6 +10,7 @@ struct Cluster {
     layout: Arc<Layout>,
     limits: Limits,
     signer: Arc<CatalogSigner>,
+    source_signers: BTreeMap<u64, Arc<SourceSigner>>,
     table: Uuid,
     transaction: Uuid,
 }
@@ -21,6 +22,9 @@ impl Cluster {
         Self::with_policy(max_active_plans, 100_000)
     }
     fn with_policy(max_active_plans: u64, max_records: u64) -> Result<Self> {
+        Self::with_source_policy(max_active_plans, max_records, false)
+    }
+    fn with_source_policy(max_active_plans: u64, max_records: u64, proofs: bool) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let layout = Arc::new(Layout {
             cluster: Uuid::from_u128(91),
@@ -33,8 +37,20 @@ impl Cluster {
         let key = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
             .map_err(|_| anyhow::anyhow!("test key generation"))?;
         let signer = Arc::new(CatalogSigner::from_pkcs8(key.as_ref())?);
+        let mut source_signers = BTreeMap::new();
+        if proofs {
+            for group in layout.groups.keys() {
+                let key = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .map_err(|_| anyhow::anyhow!("test source key generation"))?;
+                source_signers.insert(*group, Arc::new(SourceSigner::from_pkcs8(key.as_ref())?));
+            }
+        }
         let limits = Limits {
             catalog_key: Some(signer.public_key()),
+            source_keys: source_signers
+                .iter()
+                .map(|(g, s)| (*g, s.public_key()))
+                .collect(),
             max_active_plans,
             max_records,
             ..Default::default()
@@ -45,6 +61,7 @@ impl Cluster {
             layout,
             limits,
             signer,
+            source_signers,
             table: Uuid::from_u128(92),
             transaction: Uuid::from_u128(93),
         };
@@ -62,6 +79,11 @@ impl Cluster {
             )?;
             if id <= 3 {
                 node.set_catalog_signer(self.signer.clone())?;
+            }
+            for (group, signer) in &self.source_signers {
+                if self.layout.groups[group].contains(&id) {
+                    node.set_source_signer(*group, signer.clone())?;
+                }
             }
             self.nodes.push(node);
         }

@@ -42,6 +42,9 @@ pub enum Query {
     SourcePin {
         table: Uuid,
     },
+    ClosedProof {
+        table: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +58,7 @@ pub enum Value {
     CursorAhead { applied: u64 },
     Pin(Option<Box<source::Permit>>),
     SourcePin(Option<Arc<source::Pin>>),
+    ClosedProof(Option<Box<source::ClosedProof>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +118,9 @@ impl Query {
                     && group == publication::control_group(layout),
                 "invalid catalog dependency query"
             ),
-            Self::SourceClosure { table } | Self::SourcePin { table } => {
+            Self::SourceClosure { table }
+            | Self::SourcePin { table }
+            | Self::ClosedProof { table } => {
                 ensure!(!table.is_nil(), "nil source table")
             }
             Self::Publisher { table } => ensure!(
@@ -143,9 +149,25 @@ impl Query {
         cut: &Cut,
         layout: &Layout,
         limits: &Limits,
-        signer: Option<&source::CatalogSigner>,
+        signers: source::QuerySigners<'_>,
     ) -> Result<Value> {
         Ok(match self {
+            Self::ClosedProof { table } => Value::ClosedProof(
+                state
+                    .closed
+                    .get(table)
+                    .map(|closed| {
+                        source::ClosedProof::issue(
+                            signers.source.context("source signer unavailable")?,
+                            cut.clone(),
+                            layout,
+                            limits,
+                            closed.clone(),
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?,
+            ),
             Self::SourceClosure { table } => Value::SourceClosure(state.closed.get(table).cloned()),
             Self::ClosePermit {
                 table,
@@ -165,7 +187,9 @@ impl Query {
                     selected
                         .map(|table| {
                             source::ClosurePermit::issue(
-                                signer.context("catalog closure signer unavailable")?,
+                                signers
+                                    .catalog
+                                    .context("catalog closure signer unavailable")?,
                                 cut.clone(),
                                 layout,
                                 limits,
@@ -203,7 +227,9 @@ impl Query {
                     selected
                         .map(|table| {
                             source::Permit::issue(
-                                signer.context("catalog dependency signer unavailable")?,
+                                signers
+                                    .catalog
+                                    .context("catalog dependency signer unavailable")?,
                                 cut.clone(),
                                 layout,
                                 limits,

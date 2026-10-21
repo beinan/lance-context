@@ -3,6 +3,7 @@ use publication::{
     BootstrapManifest, ConfirmPublication, Descriptors, ManifestObject, PrepareRequest,
     ReserveManifest,
 };
+mod proof;
 
 fn publisher(events: Events) -> Result<publication::Reply> {
     events
@@ -22,7 +23,10 @@ fn fixture_with_background(
     max_records: u64,
     background: u64,
 ) -> Result<(Cluster, Permit, Uuid, Uuid)> {
-    let mut c = Cluster::with_policy(128, max_records)?;
+    fixture_from(Cluster::with_policy(128, max_records)?, background)
+}
+
+fn fixture_from(mut c: Cluster, background: u64) -> Result<(Cluster, Permit, Uuid, Uuid)> {
     let authority = c.acquire(0)?;
     let incarnation = Uuid::from_u128(800);
     c.nodes[0].bootstrap_manifest(
