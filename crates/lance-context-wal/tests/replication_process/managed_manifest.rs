@@ -83,12 +83,13 @@ struct Pause {
     path: Mutex<Option<ObjectPath>>,
 }
 
+#[derive(Clone)]
 struct Managed {
     cluster: Arc<Mutex<Cluster>>,
     base: ObjectPath,
     scope: ReserveManifest,
-    tokens: AtomicU64,
-    lose_reply: AtomicBool,
+    tokens: Arc<AtomicU64>,
+    lose_reply: Arc<AtomicBool>,
     pause: Option<Arc<Pause>>,
 }
 impl std::fmt::Debug for Managed {
@@ -100,12 +101,6 @@ fn error(error: impl std::fmt::Display) -> lance::Error {
     lance::Error::io(error.to_string())
 }
 impl Managed {
-    fn check_base(&self, base: &ObjectPath) -> lance::Result<()> {
-        if *base != self.base {
-            return Err(lance::Error::invalid_input("foreign managed dataset"));
-        }
-        Ok(())
-    }
     fn read(&self, version: Option<u64>) -> lance::Result<Option<Arc<ManifestRecord>>> {
         let mut c = self.cluster.lock().unwrap();
         let leader = c.elect(1, 10, &[1, 2, 3]).map_err(error)?;
@@ -150,39 +145,97 @@ impl Managed {
     }
 }
 
+impl Managed {
+    fn adapter(
+        &self,
+    ) -> lance::Result<lance_context_wal::replication::publication::lance::ManagedManifest> {
+        let layout: Layout = {
+            let c = self.cluster.lock().unwrap();
+            serde_json::from_slice(
+                &std::fs::read(c.root.path().join("layout.json")).map_err(error)?,
+            )
+            .map_err(error)?
+        };
+        lance_context_wal::replication::publication::lance::ManagedManifest::new(
+            Arc::new(self.clone()),
+            self.base.clone(),
+            &layout,
+            (&self.scope).into(),
+        )
+        .map_err(error)
+    }
+}
+#[async_trait::async_trait]
+impl lance_context_wal::replication::publication::lance::ManifestCatalog for Managed {
+    async fn read_manifest(&self, table: Uuid, version: Option<u64>) -> Result<ReadOutcome> {
+        ensure!(table == self.scope.authority.table, "foreign fixture table");
+        let mut c = self.cluster.lock().unwrap();
+        let leader = c.elect(1, 10, &[1, 2, 3])?;
+        let token = self.tokens.fetch_add(1, Ordering::Relaxed);
+        c.command(
+            leader,
+            Request::Query(10, token, Query::Manifest { table, version }),
+        )?;
+        c.pump(&[1, 2, 3])?;
+        c.read_outcome(token)
+            .context("manifest quorum read unavailable")
+    }
+    async fn reserve_manifest(&self, request: ReserveManifest) -> Result<Outcome> {
+        if let Some(pause) = &self.pause {
+            *pause.path.lock().unwrap() = Some(ObjectPath::parse(format!(
+                "{}/{}",
+                self.base, request.object.path
+            ))?);
+            pause.uploaded.notify_one();
+            pause.resume.notified().await;
+        }
+        let outcome = {
+            let mut c = self.cluster.lock().unwrap();
+            let leader = c.elect(1, 10, &[1, 2, 3])?;
+            let token = self.tokens.fetch_add(1, Ordering::Relaxed);
+            c.command(leader, Request::ReserveManifest(token, request))?;
+            c.pump(&[1, 2, 3])?;
+            c.outcome(token).context("reservation completion missing")?
+        };
+        if self.lose_reply.swap(false, Ordering::SeqCst) {
+            anyhow::bail!("injected lost reply after durable catalog commit");
+        }
+        Ok(outcome)
+    }
+}
+
+// The fixture supplies transport/faults; all Lance behavior delegates to the
+// reusable library implementation exercised by the real-process qualifications.
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 impl CommitHandler for Managed {
     async fn resolve_latest_location(
         &self,
         base: &ObjectPath,
-        _: &lance_io::object_store::ObjectStore,
+        store: &lance_io::object_store::ObjectStore,
     ) -> lance::Result<ManifestLocation> {
-        self.check_base(base)?;
-        self.read(None)?
-            .map(|r| self.location(&r))
-            .ok_or_else(|| lance::Error::not_found("managed head"))
+        self.adapter()?.resolve_latest_location(base, store).await
     }
     async fn resolve_version_location(
         &self,
         base: &ObjectPath,
         version: u64,
-        _: &dyn object_store::ObjectStore,
+        store: &dyn object_store::ObjectStore,
     ) -> lance::Result<ManifestLocation> {
-        self.check_base(base)?;
-        self.read(Some(version))?
-            .map(|r| self.location(&r))
-            .ok_or_else(|| lance::Error::not_found(format!("managed version {version}")))
+        self.adapter()?
+            .resolve_version_location(base, version, store)
+            .await
     }
     async fn version_exists(
         &self,
         base: &ObjectPath,
         version: u64,
-        _: &dyn object_store::ObjectStore,
-        _: ManifestNamingScheme,
+        store: &dyn object_store::ObjectStore,
+        naming: ManifestNamingScheme,
     ) -> lance::Result<bool> {
-        self.check_base(base)?;
-        Ok(self.read(Some(version))?.is_some())
+        self.adapter()?
+            .version_exists(base, version, store, naming)
+            .await
     }
     async fn commit(
         &self,
@@ -194,60 +247,54 @@ impl CommitHandler for Managed {
         naming: ManifestNamingScheme,
         transaction: Option<ManifestTransaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
-        self.check_base(base)?;
-        if manifest.version != self.scope.target
-            || transaction
-                .as_ref()
-                .is_none_or(|tx| tx.as_pb().uuid != self.scope.transaction.to_string())
-        {
-            return Err(CommitError::CommitConflict);
-        }
-        let path = ObjectPath::parse(format!(
-            "{}-{}",
-            naming.manifest_path(base, manifest.version),
-            Uuid::new_v4()
-        ))
-        .map_err(error)?;
-        let written = writer(store, manifest, indices, &path, transaction).await?;
-        if let Some(pause) = &self.pause {
-            *pause.path.lock().unwrap() = Some(path.clone());
-            pause.uploaded.notify_one();
-            pause.resume.notified().await;
-        }
-        let mut request = self.scope.clone();
-        request.object = ManifestObject {
-            path: format!("_versions/{}", path.filename().expect("staging filename")),
-            bytes: written.size as u64,
-            v2_names: naming == ManifestNamingScheme::V2,
-        };
-        let outcome = {
-            let mut c = self.cluster.lock().unwrap();
-            let leader = c.elect(1, 10, &[1, 2, 3]).map_err(error)?;
-            let token = self.tokens.fetch_add(1, Ordering::Relaxed);
-            c.command(leader, Request::ReserveManifest(token, request))
-                .map_err(error)?;
-            c.pump(&[1, 2, 3]).map_err(error)?;
-            c.outcome(token)
-        };
-        let Some(Outcome::Committed(Applied::Publisher(PublisherReply::ManifestReserved(record)))) =
-            outcome
-        else {
-            // Keep staging on every unresolved/error outcome in this test.
-            return Err(CommitError::OtherError(error(format!(
-                "reservation unavailable: {outcome:?}"
-            ))));
-        };
-        if self.lose_reply.swap(false, Ordering::SeqCst) {
-            return Err(CommitError::OtherError(error(
-                "injected lost reply after durable catalog commit",
-            )));
-        }
-        Ok(self.location(&record))
+        self.adapter()?
+            .commit(manifest, indices, base, store, writer, naming, transaction)
+            .await
     }
-    async fn forget_version(&self, _: &ObjectPath, _: u64, _: &str) -> lance::Result<()> {
-        Err(lance::Error::not_supported(
-            "coordinated collection is not enabled",
-        ))
+    fn list_detached_manifest_locations<'a>(
+        &self,
+        base: &ObjectPath,
+        store: &'a lance_io::object_store::ObjectStore,
+    ) -> futures::stream::BoxStream<'a, lance::Result<ManifestLocation>> {
+        match self.adapter() {
+            Ok(h) => h.list_detached_manifest_locations(base, store),
+            Err(e) => Box::pin(futures::stream::once(async { Err(e) })),
+        }
+    }
+    fn list_manifest_locations<'a>(
+        &self,
+        base: &ObjectPath,
+        store: &'a lance_io::object_store::ObjectStore,
+        sorted: bool,
+    ) -> futures::stream::BoxStream<'a, lance::Result<ManifestLocation>> {
+        match self.adapter() {
+            Ok(h) => h.list_manifest_locations(base, store, sorted),
+            Err(e) => Box::pin(futures::stream::once(async { Err(e) })),
+        }
+    }
+    fn list_manifest_locations_since<'a>(
+        &self,
+        base: &ObjectPath,
+        store: &'a lance_io::object_store::ObjectStore,
+        version: u64,
+    ) -> futures::stream::BoxStream<'a, lance::Result<ManifestLocation>> {
+        match self.adapter() {
+            Ok(h) => h.list_manifest_locations_since(base, store, version),
+            Err(e) => Box::pin(futures::stream::once(async { Err(e) })),
+        }
+    }
+    async fn forget_version(
+        &self,
+        base: &ObjectPath,
+        version: u64,
+        identity: &str,
+    ) -> lance::Result<()> {
+        self.adapter()?
+            .forget_version(base, version, identity)
+            .await
+    }
+    async fn delete(&self, base: &ObjectPath) -> lance::Result<()> {
+        self.adapter()?.delete(base).await
     }
 }
 
@@ -277,8 +324,8 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             target: 2,
             object: attempt.bootstrap.1.object.clone(),
         },
-        tokens: AtomicU64::new(6000),
-        lose_reply: AtomicBool::new(mode == Mode::LostReply),
+        tokens: Arc::new(AtomicU64::new(6000)),
+        lose_reply: Arc::new(AtomicBool::new(mode == Mode::LostReply)),
         pause: pause.clone(),
     });
     if let Some(pause) = pause {
@@ -313,8 +360,8 @@ pub(super) async fn publish_and_recover(c: Cluster, attempt: Attempt, mode: Mode
             cluster: cluster.clone(),
             base: handler.base.clone(),
             scope,
-            tokens: AtomicU64::new(10000),
-            lose_reply: AtomicBool::new(false),
+            tokens: Arc::new(AtomicU64::new(10000)),
+            lose_reply: Arc::new(AtomicBool::new(false)),
             pause: None,
         });
         let base = lance::dataset::builder::DatasetBuilder::from_uri(&attempt.uri)

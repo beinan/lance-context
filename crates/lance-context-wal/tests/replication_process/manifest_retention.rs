@@ -134,8 +134,8 @@ pub(super) async fn qualify(uri: &str, handler: Arc<Managed>) -> Result<()> {
                 cluster: run.handler.cluster.clone(),
                 base: run.handler.base.clone(),
                 scope,
-                tokens: AtomicU64::new(9_000_000),
-                lose_reply: AtomicBool::new(false),
+                tokens: Arc::new(AtomicU64::new(9_000_000)),
+                lose_reply: Arc::new(AtomicBool::new(false)),
                 pause: None,
             });
         }
@@ -262,8 +262,8 @@ pub(super) async fn qualify(uri: &str, handler: Arc<Managed>) -> Result<()> {
                 target: version,
                 object: predecessor.object.clone(),
             },
-            tokens: AtomicU64::new(10_000_000 + version * 1000),
-            lose_reply: AtomicBool::new(version == 64),
+            tokens: Arc::new(AtomicU64::new(10_000_000 + version * 1000)),
+            lose_reply: Arc::new(AtomicBool::new(version == 64)),
             pause: None,
         });
         let committed = commit(base, tx, run.handler.clone()).await;
