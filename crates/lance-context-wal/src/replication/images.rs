@@ -2,20 +2,75 @@ use super::*;
 use checkpoint::{Cut, Image, Loaded, Part};
 use raft_proto::eraftpb::Snapshot;
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, Weak,
+    },
 };
+
+mod collection;
+pub use collection::{ImageCollection, ImageCollectionProgress};
 
 pub(super) struct Owner {
     directory: PathBuf,
     busy: AtomicBool,
+    groups: BTreeSet<u64>,
+    registry: Mutex<Registry>,
+    // Images keep this owner alive. Its engine lock excludes a new incarnation
+    // until readers and transfers from the old incarnation have released them.
+    store: GroupLog,
+}
+
+#[derive(Default)]
+struct Registry {
+    live: BTreeMap<(u64, Uuid), Weak<Image>>,
+    // A split group owner may be dropped while its siblings keep running.
+    // Its durable recovery image remains required even without a live Arc.
+    installed: BTreeMap<u64, (u64, Uuid)>,
 }
 impl Owner {
-    pub fn new(directory: &Path) -> Result<Arc<Self>> {
+    pub fn new(directory: &Path, groups: BTreeSet<u64>, store: GroupLog) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             directory: directory.canonicalize()?,
             busy: AtomicBool::new(false),
+            groups,
+            registry: Mutex::new(Registry::default()),
+            store,
         }))
+    }
+
+    pub fn track(self: &Arc<Self>, image: &Arc<Image>) -> Result<()> {
+        let key = image.identity();
+        ensure!(self.groups.contains(&key.0), "unhosted application image");
+        image.keep_owner(self)?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image registry poisoned"))?;
+        let live = &mut registry.live;
+        live.retain(|_, image| image.strong_count() > 0);
+        if let Some(previous) = live.get(&key).and_then(Weak::upgrade) {
+            ensure!(
+                Arc::ptr_eq(&previous, image),
+                "duplicate live image identity"
+            );
+        } else {
+            live.insert(key, Arc::downgrade(image));
+        }
+        Ok(())
+    }
+
+    pub fn installed(self: &Arc<Self>, image: &Arc<Image>) -> Result<()> {
+        self.track(image)?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image registry poisoned"))?;
+        let key = image.identity();
+        registry.installed.insert(key.0, key);
+        Ok(())
     }
     fn acquire(self: &Arc<Self>) -> Result<Permit> {
         self.busy
@@ -64,6 +119,7 @@ impl CheckpointTask {
             state,
             |index, meta| read_body(&store, previous.as_deref(), index, meta),
         )?;
+        permit.0.track(&loaded.image)?;
         Ok(PreparedCheckpoint {
             permit,
             group,
@@ -100,10 +156,12 @@ impl SnapshotReceiver {
         self.receiver.write(part, offset, bytes)
     }
     pub fn finish(self) -> Result<PreparedCheckpoint> {
+        let loaded = self.receiver.finish()?;
+        self.permit.0.track(&loaded.image)?;
         Ok(PreparedCheckpoint {
             permit: self.permit,
             group: self.packet.group,
-            loaded: self.receiver.finish()?,
+            loaded,
             received: Some(self.packet),
         })
     }
@@ -184,7 +242,12 @@ impl Node {
             prepared.loaded.state.applied <= g.state.applied,
             "checkpoint exceeds applied state"
         );
-        if let Err(error) = g.raw.store().checkpoint(&snapshot) {
+        if let Err(error) = g
+            .raw
+            .store()
+            .checkpoint(&snapshot)
+            .and_then(|_| self.images.installed(&prepared.loaded.image))
+        {
             self.failed = true;
             return Err(error);
         }
@@ -315,6 +378,7 @@ pub(super) fn install_received(
         ready.entries(),
         ready.hs().context("received snapshot has no HardState")?,
     )?;
+    prepared.permit.0.installed(&prepared.loaded.image)?;
     g.state = prepared.loaded.state;
     g.image = Some(prepared.loaded.image);
     for (_, (request, _)) in std::mem::take(&mut g.pending) {

@@ -7,13 +7,15 @@
 //!
 //! The owner schedules ticks, bounded network I/O and calls on one thread. This
 //! component supports explicit application checkpoints and prepared snapshot
-//! transfer. It retains bounded metadata and all image files: it is not the
-//! production service, a physical retention policy, or a bounded disk allocator.
+//! transfer and explicit collection of unreferenced application images. Raft
+//! segment reclamation, production scheduling and bounded disk admission remain
+//! separate responsibilities.
 //! Message scope checks are not authentication. Do not expose it to untrusted
 //! transport or enable ingestion without the remaining admission/lifecycle work.
 
 pub mod checkpoint;
 mod images;
+pub use images::{ImageCollection, ImageCollectionProgress};
 pub mod publication;
 pub mod query;
 pub mod source;
@@ -269,7 +271,14 @@ impl Node {
         );
         let policy = Sha256::digest(&identity).into();
         let log = PhysicalLog::open(directory, &layout, id)?;
-        let images = images::Owner::new(directory)?;
+        let hosted: std::collections::BTreeSet<_> = layout
+            .groups
+            .iter()
+            .filter(|(_, voters)| voters.contains(&id))
+            .map(|(group, _)| *group)
+            .collect();
+        let image_store = log.group(*hosted.iter().next().context("node has no hosted group")?)?;
+        let images = images::Owner::new(directory, hosted, image_store)?;
         let mut groups = BTreeMap::new();
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         for (group, voters) in &layout.groups {
@@ -282,6 +291,7 @@ impl Node {
             let (mut state, image) = if store.first_index()? > 1 {
                 let snapshot = store.snapshot(store.first_index()? - 1, id)?;
                 let loaded = checkpoint::load(directory, &snapshot, &layout, &limits, *group)?;
+                images.installed(&loaded.image)?;
                 (loaded.state, Some(loaded.image))
             } else {
                 (State::default(), None)

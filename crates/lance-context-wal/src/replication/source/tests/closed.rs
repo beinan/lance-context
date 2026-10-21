@@ -232,11 +232,15 @@ fn empty_payload_images_preserve_latest_retry_and_captured_old_images() -> Resul
         assert_eq!(prepared.image().bytes(Part::Payload), 0);
         node.install_checkpoint(prepared)?;
     }
-    c.reopen()?;
+    // A captured image remains readable after its node is dropped, and keeps
+    // the directory locked until its last reader releases it.
+    c.nodes.clear();
     assert_eq!(
         old_image.chunk(Part::Payload, 4096, 4096)?,
         Bytes::from(vec![2; 4096])
     );
+    drop(old_image);
+    c.reopen()?;
     let retry = Batch::new(
         c.table,
         1,

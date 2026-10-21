@@ -100,6 +100,7 @@ enum Request {
     ReceiveChunk(bool, u64, Bytes),
     FinishSnapshot,
     ReportSnapshot(u64, u64, bool),
+    CollectImages,
 }
 #[derive(Serialize, Deserialize)]
 enum Response {
@@ -111,6 +112,7 @@ enum Response {
     Error(String),
     Image(Vec<u8>, u64, u64),
     Chunk(Bytes),
+    CollectedImages(u64, u64),
     Ok,
 }
 fn send<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
@@ -185,6 +187,20 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
         }
         Request::InstallCheckpoint => {
             node.install_checkpoint(worker.prepared.take().context("no prepared image")?)?
+        }
+        Request::CollectImages => {
+            let mut task = node.prepare_image_collection()?;
+            let mut files = 0;
+            let mut bytes = 0;
+            for _ in 0..4096 {
+                let batch = task.run_batch(1)?;
+                files += batch.removed_files;
+                bytes += batch.removed_bytes;
+                if batch.finished {
+                    return Ok(Response::CollectedImages(files, bytes));
+                }
+            }
+            anyhow::bail!("test collection did not finish")
         }
         Request::ImageInfo(snapshot) => {
             let image = worker
@@ -680,6 +696,9 @@ fn application_snapshot_transfer_interruption_and_full_process_restart() -> Resu
     // Kill after complete file sync but BEFORE the Raft descriptor transition.
     drop(c.peers.remove(&1));
     c.start(1)?;
+    assert!(
+        matches!(c.peers.get_mut(&1).unwrap().call(Request::CollectImages)?, Response::CollectedImages(2, bytes) if bytes > 0)
+    );
     verify_records(
         c.peers.get_mut(&1).unwrap(),
         10,
@@ -715,7 +734,27 @@ fn application_snapshot_transfer_interruption_and_full_process_restart() -> Resu
         "partial snapshot kill was not reached"
     );
     assert_eq!(c.transfers, 1);
+    // The first chunk can still be buffered when SIGKILL arrives. Check the
+    // actual orphan lengths, including zero-byte files, rather than assuming
+    // received bytes were flushed to storage.
+    let abandoned: Vec<_> = ["state", "pack"]
+        .into_iter()
+        .map(|part| {
+            c.root.path().join("data-3").join(format!(
+                "context-application-10-{}.{part}",
+                Uuid::from_u128(10_001)
+            ))
+        })
+        .collect();
+    let mut abandoned_bytes = 0;
+    for path in &abandoned {
+        abandoned_bytes += std::fs::metadata(path)?.len();
+    }
     c.start(3)?;
+    assert!(
+        matches!(c.peers.get_mut(&3).unwrap().call(Request::CollectImages)?, Response::CollectedImages(2, bytes) if bytes == abandoned_bytes)
+    );
+    assert!(abandoned.iter().all(|path| !path.exists()));
     verify_records(c.peers.get_mut(&3).unwrap(), 10, &[])?;
     verify_records(
         c.peers.get_mut(&3).unwrap(),
@@ -745,6 +784,10 @@ fn application_snapshot_transfer_interruption_and_full_process_restart() -> Resu
         c.start(id)?;
     }
     for peer in c.peers.values_mut() {
+        assert!(matches!(
+            peer.call(Request::CollectImages)?,
+            Response::CollectedImages(0, 0)
+        ));
         verify_records(peer, 10, &[first.clone(), second.clone()])?;
         verify_records(peer, 20, std::slice::from_ref(&sibling))?;
     }

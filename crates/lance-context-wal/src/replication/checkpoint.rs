@@ -178,10 +178,11 @@ struct Location {
 }
 
 /// Open immutable files keep an outgoing transfer or reader attached to its
-/// captured image. The current increment does not delete any image files.
+/// captured image. Collection retains its files while any image owner is alive.
 pub struct Image {
     descriptor: Descriptor,
     files: [File; 2],
+    owner: std::sync::OnceLock<Arc<super::images::Owner>>,
     #[cfg(not(unix))]
     paths: [PathBuf; 2],
     locations: BTreeMap<u64, Location>,
@@ -195,6 +196,18 @@ impl std::fmt::Debug for Image {
 }
 
 impl Image {
+    pub(super) fn identity(&self) -> (u64, Uuid) {
+        (self.descriptor.binding.group, self.descriptor.id)
+    }
+
+    pub(super) fn keep_owner(&self, owner: &Arc<super::images::Owner>) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(self.owner.get_or_init(|| owner.clone()), owner),
+            "foreign application image owner"
+        );
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.descriptor.snapshot()
     }
@@ -506,6 +519,7 @@ pub(super) fn build(
         image: Arc::new(Image {
             descriptor,
             files,
+            owner: std::sync::OnceLock::new(),
             locations,
             #[cfg(not(unix))]
             paths,
@@ -641,6 +655,7 @@ pub(super) fn load(
         image: Arc::new(Image {
             descriptor,
             files: [metadata_file, pack_file],
+            owner: std::sync::OnceLock::new(),
             locations,
             #[cfg(not(unix))]
             paths,

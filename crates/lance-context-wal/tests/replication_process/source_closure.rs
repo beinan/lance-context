@@ -41,6 +41,18 @@ pub(super) fn close_and_restart(
     let mut c = cluster.lock().unwrap();
     let catalog = c.elect(1, 10, &[1, 2, 3])?;
     let source = c.elect(4, 20, &[4, 5, 6])?;
+    let old_image_source = source;
+    let Response::Image(_, _, old_payload_bytes) = c
+        .peers
+        .get_mut(&source)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(20, Uuid::new_v4()))?
+    else {
+        anyhow::bail!("source input image missing")
+    };
+    assert!(old_payload_bytes > 0);
+    c.command(source, Request::InstallCheckpoint)?;
+    c.pump(&[4, 5, 6])?;
     for id in 4..=6 {
         assert!(!c
             .root
@@ -118,6 +130,17 @@ pub(super) fn close_and_restart(
     for id in 1..=6 {
         c.start(id)?;
     }
+    // Old source packs no longer have a live reader after all processes die.
+    // The installed retirement image still protects its metadata and empty pack.
+    let Response::CollectedImages(files, bytes) = c
+        .peers
+        .get_mut(&old_image_source)
+        .unwrap()
+        .call(Request::CollectImages)?
+    else {
+        anyhow::bail!("source image collection missing")
+    };
+    assert!(files >= 2 && bytes >= old_payload_bytes);
     let source = c.elect(4, 20, &[4, 5, 6])?;
     let recovered_proof =
         proof(&mut c, source, 600_011, table)?.context("proof lost after all peers restarted")?;

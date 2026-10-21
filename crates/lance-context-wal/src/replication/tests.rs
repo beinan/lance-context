@@ -1,6 +1,9 @@
 use super::*;
 use bytes::Bytes;
 
+#[path = "tests/image_collection.rs"]
+mod image_collection;
+
 pub(super) fn layout() -> Arc<Layout> {
     Arc::new(Layout {
         cluster: Uuid::from_u128(1),
@@ -176,6 +179,11 @@ fn application_images_keep_payloads_tails_suffix_and_lagging_peer_recovery() -> 
     assert!(nodes[2].groups[&10].raw.store().first_index()? > 1);
     assert_eq!(nodes[2].groups[&10].state, nodes[0].groups[&10].state);
     drop(nodes);
+    assert!(
+        open().is_err(),
+        "captured transfer must retain the engine lock"
+    );
+    drop(old_image);
     let mut nodes = open()?;
     for node in &nodes {
         for ((index, _), sequence) in node.accepted(10, 0, 128)?.entries.into_iter().zip(1..=2) {
