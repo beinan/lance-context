@@ -353,8 +353,17 @@ fn wire_and_checkpoint_maps_cannot_hide_duplicate_source_groups() -> Result<()> 
     assert!(decode(&bad).is_err());
     apply(&mut catalog, request.clone(), 5, &limits)?;
     let table = &catalog.tables[&request.authority.table];
-    let bad = replace_once(&encode_table(table)?, &original, &duplicate);
-    assert_eq!(codec(MAX_TABLE_BYTES).deserialize::<Table>(&bad)?, *table);
-    assert!(decode_table(&bad).is_err());
+    // Public query tables include the advancement field; checkpoint frames
+    // preserve the legacy prefix and carry advancement in a tagged suffix.
+    let query = codec(MAX_TABLE_BYTES).serialize(table)?;
+    let bad_query = replace_once(&query, &original, &duplicate);
+    assert_eq!(
+        codec(MAX_TABLE_BYTES).deserialize::<Table>(&bad_query)?,
+        *table
+    );
+    let checkpoint = encode_table(table)?;
+    assert_eq!(decode_table(&checkpoint)?, *table);
+    let bad_checkpoint = replace_once(&checkpoint, &original, &duplicate);
+    assert!(decode_table(&bad_checkpoint).is_err());
     Ok(())
 }

@@ -7,10 +7,13 @@ use super::*;
 use crate::{ingest_contract::IngestContract, record::RecordKind};
 use bincode::Options;
 use bytes::Bytes;
+mod advance;
 mod manifest;
 mod outcome;
 mod plan;
 mod prepared;
+mod table_codec;
+pub use advance::{AdvancePublication, Advanced};
 pub use manifest::{
     BootstrapManifest, ManifestIndex, ManifestObject, ManifestRecord, ReserveManifest,
     MAX_MANIFEST_VERSIONS,
@@ -28,7 +31,11 @@ pub(super) const MAX_TABLE_BYTES: usize = MAX_BASE_TABLE_BYTES
     + plan::MAX_PLAN_BYTES
     + prepared::MAX_PREPARE_BYTES
     + manifest::MAX_MANIFEST_INDEX_BYTES
-    + outcome::MAX_OUTCOME_BYTES;
+    + outcome::MAX_OUTCOME_BYTES
+    + advance::MAX_ADVANCED_BYTES;
+pub(super) const fn advance_metadata_bytes() -> u64 {
+    advance::MAX_ADVANCED_BYTES as u64
+}
 fn codec(limit: usize) -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -80,6 +87,7 @@ enum Command {
     BootstrapManifest(Box<BootstrapManifest>),
     ReserveManifest(Box<ReserveManifest>),
     ConfirmPublication(Box<ConfirmPublication>),
+    AdvancePublication(Box<AdvancePublication>),
 }
 impl Command {
     fn identity(&self) -> (Uuid, Uuid, u64) {
@@ -90,6 +98,9 @@ impl Command {
             Self::BootstrapManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
             Self::ReserveManifest(p) => (p.authority.table, p.authority.owner, p.authority.epoch),
             Self::ConfirmPublication(p) => {
+                (p.authority.table, p.authority.owner, p.authority.epoch)
+            }
+            Self::AdvancePublication(p) => {
                 (p.authority.table, p.authority.owner, p.authority.epoch)
             }
         }
@@ -103,6 +114,7 @@ impl Command {
                 manifest::MAX_MANIFEST_COMMAND_BYTES
             }
             Self::ConfirmPublication(_) => outcome::MAX_OUTCOME_BYTES,
+            Self::AdvancePublication(_) => advance::MAX_ADVANCE_BYTES,
         }
     }
     fn batch(self, layout: &Layout) -> Result<Batch> {
@@ -177,6 +189,7 @@ pub enum Rejection {
     ManifestIdentity,
     ManifestPredecessor,
     PublicationIdentity,
+    SourceClosure,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
@@ -187,6 +200,7 @@ pub enum Reply {
     ManifestReserved(Arc<ManifestRecord>),
     ManifestTaken(Arc<ManifestRecord>),
     Published(Arc<Published>),
+    Advanced(Arc<Advanced>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -266,6 +280,7 @@ pub(super) fn validate_record(
         Command::BootstrapManifest(p) => p.validate(layout)?,
         Command::ReserveManifest(p) => p.validate(layout)?,
         Command::ConfirmPublication(p) => p.validate(layout)?,
+        Command::AdvancePublication(p) => p.validate(layout, limits)?,
     }
     Ok(())
 }
@@ -287,6 +302,9 @@ impl Catalog {
             }
             Command::ConfirmPublication(request) => {
                 return self.confirm_publication(*request, index)
+            }
+            Command::AdvancePublication(request) => {
+                return self.advance_publication(*request, index)
             }
             Command::Acquire(a) => *a,
         };
@@ -392,14 +410,8 @@ impl Catalog {
     }
 }
 pub(super) fn encode_table(table: &Table) -> Result<Vec<u8>> {
-    Ok(codec(MAX_TABLE_BYTES).serialize(table)?)
+    table_codec::encode(table)
 }
 pub(super) fn decode_table(bytes: &[u8]) -> Result<Table> {
-    ensure!(bytes.len() <= MAX_TABLE_BYTES, "publisher table byte limit");
-    let table = codec(MAX_TABLE_BYTES).deserialize(bytes)?;
-    ensure!(
-        encode_table(&table)? == bytes,
-        "noncanonical publisher table"
-    );
-    Ok(table)
+    table_codec::decode(bytes)
 }

@@ -62,6 +62,10 @@ impl WirePacket {
 }
 #[derive(Serialize, Deserialize)]
 enum Request {
+    AdvancePublication(
+        u64,
+        lance_context_wal::replication::publication::AdvancePublication,
+    ),
     CloseSource(u64, lance_context_wal::replication::source::ClosurePermit),
     ConfirmPublication(
         u64,
@@ -145,6 +149,7 @@ fn run(worker: &mut Worker, request: Request) -> Result<Response> {
     match request {
         Request::CloseSource(token, permit) => node.close_source(token, permit)?,
         Request::ConfirmPublication(token, request) => node.confirm_publication(token, request)?,
+        Request::AdvancePublication(token, request) => node.advance_publication(token, request)?,
         Request::BootstrapManifest(token, request) => node.bootstrap_manifest(token, request)?,
         Request::ReserveManifest(token, request) => node.reserve_manifest(token, request)?,
         Request::Prepare(token, prepared) => node.prepare_publication(token, prepared)?,

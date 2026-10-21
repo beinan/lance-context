@@ -146,6 +146,8 @@ pub struct Progress {
     pub prepared: Option<Arc<Prepared>>,
     /// Durable selected-manifest resolution; sources remain pinned for closure.
     pub published: Option<Arc<Published>>,
+    /// Latest completed advancement, retained for ambiguous exact retries.
+    pub advanced: Option<Arc<Advanced>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -155,6 +157,7 @@ impl Default for Progress {
             pending: None,
             prepared: None,
             published: None,
+            advanced: None,
         }
     }
 }
@@ -177,6 +180,9 @@ impl Progress {
         cut: u64,
         limits: &Limits,
     ) -> Result<()> {
+        if let Some(advanced) = &self.advanced {
+            advanced.validate(table, cut)?;
+        }
         if let Some(published) = &self.published {
             published.validate(table, cut)?;
         }

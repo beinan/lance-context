@@ -21,6 +21,27 @@ pub struct Closure {
     pub published_index: u64,
 }
 
+impl Closure {
+    pub(in crate::replication) fn matches_publication(
+        &self,
+        selection: &Selection,
+        published: &publication::Published,
+    ) -> Result<bool> {
+        Ok(self.table == selection.table
+            && self.transaction == selection.transaction
+            && self.plan_index == selection.plan_index
+            && self.group == selection.group
+            && self.after == selection.range.after
+            && self.through == selection.range.through
+            && self.selection_digest == selection_digest(selection)?
+            && self.incarnation == published.incarnation
+            && self.manifest_identity == published.manifest.identity
+            && self.version == published.manifest.version
+            && self.manifest_index == published.manifest.index
+            && self.published_index == published.index)
+    }
+}
+
 fn selection_digest(selection: &Selection) -> Result<[u8; 32]> {
     Ok(Sha256::digest(
         codec(MAX_BYTES).serialize(&("lance-context/source-selection/v1", selection))?,

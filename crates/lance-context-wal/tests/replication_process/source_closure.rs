@@ -1,6 +1,7 @@
 //! Real quorum closure after a real Lance publication, with a lost reply and
 //! full process restart before attempting to replay the original pin request.
 use super::*;
+use lance_context_wal::replication::publication::AdvancePublication;
 use lance_context_wal::replication::source::{ClosedProof, Rejection as SourceRejection};
 
 fn proof(
@@ -197,6 +198,93 @@ pub(super) fn close_and_restart(
     );
     assert!(
         matches!(c.peers.get_mut(&source).unwrap().call(Request::Page(20))?, Response::Page(page) if page.entries.is_empty())
+    );
+    advance_and_restart(&mut c, table, *recovered_proof)?;
+    Ok(())
+}
+
+fn advance_and_restart(c: &mut Cluster, table: Uuid, proof: ClosedProof) -> Result<()> {
+    let catalog = c.elect(1, 10, &[1, 2, 3])?;
+    c.command(
+        catalog,
+        Request::Query(10, 610_000, Query::Publisher { table }),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    let Some(ReadOutcome::Observed {
+        value: Value::Publisher(Some(view)),
+        ..
+    }) = c.read_outcome(610_000)
+    else {
+        anyhow::bail!("catalog before advancement missing")
+    };
+    let published = view.progress.published.context("publication missing")?;
+    let through = proof.closed().permit.closure().through;
+    let request = AdvancePublication {
+        authority: view.authority,
+        published_index: published.index,
+        proofs: BTreeMap::from([(20, proof)]),
+    };
+    c.command(
+        catalog,
+        Request::AdvancePublication(610_001, request.clone()),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    let Some(Outcome::Committed(Applied::Publisher(PublisherReply::Advanced(advanced)))) = c
+        .completions
+        .iter()
+        .find(|completion| completion.request == 610_001)
+        .map(|completion| completion.outcome.clone())
+    else {
+        anyhow::bail!("catalog advancement missing")
+    };
+    assert_eq!(advanced.publication, published);
+    assert_eq!(advanced.sources, BTreeMap::from([(20, through)]));
+    // Lose the completion, checkpoint the catalog, then restart every process.
+    let before = c.completions.len();
+    c.completions
+        .retain(|completion| completion.request != 610_001);
+    assert_eq!(before - c.completions.len(), 1);
+    c.peers
+        .get_mut(&catalog)
+        .unwrap()
+        .call(Request::PrepareCheckpoint(10, Uuid::new_v4()))?;
+    c.command(catalog, Request::InstallCheckpoint)?;
+    c.pump(&[1, 2, 3])?;
+    c.queue.clear();
+    c.peers.clear();
+    for id in 1..=6 {
+        c.start(id)?;
+    }
+    let catalog = c.elect(1, 10, &[1, 2, 3])?;
+    c.command(catalog, Request::AdvancePublication(610_002, request))?;
+    c.command(
+        catalog,
+        Request::Query(10, 610_003, Query::Publisher { table }),
+    )?;
+    c.pump(&[1, 2, 3])?;
+    assert_eq!(
+        c.outcome(610_002),
+        Some(Outcome::Committed(Applied::Publisher(
+            PublisherReply::Advanced(advanced.clone())
+        )))
+    );
+    let Some(ReadOutcome::Observed {
+        value: Value::Publisher(Some(view)),
+        ..
+    }) = c.read_outcome(610_003)
+    else {
+        anyhow::bail!("catalog advancement lost after restart")
+    };
+    assert_eq!(view.progress.advanced, Some(advanced));
+    assert_eq!(
+        view.progress.minimum_read_version,
+        published.manifest.version
+    );
+    assert_eq!(view.progress.checkpoint, BTreeMap::from([(20, through)]));
+    assert!(
+        view.progress.pending.is_none()
+            && view.progress.prepared.is_none()
+            && view.progress.published.is_none()
     );
     Ok(())
 }

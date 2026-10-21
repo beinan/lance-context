@@ -90,7 +90,7 @@ fn metadata_limit(limits: &Limits) -> u64 {
             * (128 * 1024 + limits.max_descriptor_bytes + 4096)
         + limits.max_tables.min(limits.max_active_plans) * (source::MAX_PIN_BYTES as u64 + 4)
         + limits.max_manifest_records * 2048
-        + limits.max_tables * 256
+        + limits.max_tables * (256 + publication::advance_metadata_bytes())
         + limits.max_tables * (source::MAX_CLOSED_BYTES as u64 + 4)
         + limits.max_producers * (state::MAX_RETIRED_BYTES as u64 + 4)
         + 1024

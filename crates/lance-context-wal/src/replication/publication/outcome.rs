@@ -103,6 +103,12 @@ impl Catalog {
         let Some(table) = self.tables.get(&request.authority.table) else {
             return Reply::Rejected(Rejection::Authority);
         };
+        if let Some(advanced) = &table.progress.advanced {
+            let published = &advanced.publication;
+            if request.matches(published.incarnation, &published.manifest) {
+                return Reply::Published(published.clone());
+            }
+        }
         // Exact resolution remains available after publisher takeover. It
         // reports an existing outcome and grants no authority to change state.
         if let Some(published) = &table.progress.published {
