@@ -24,6 +24,9 @@ pub use prepared::{Descriptors, PrepareRequest, Prepared, MAX_DESCRIPTOR_BYTES};
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "lance-integration")]
+pub mod lance;
+
 pub(super) const MAX_ACQUIRE_BYTES: usize = 8192;
 pub(super) const MAX_COMMAND_BYTES: usize = prepared::MAX_PREPARE_BYTES;
 pub(super) const MAX_BASE_TABLE_BYTES: usize = MAX_ACQUIRE_BYTES + 2048;

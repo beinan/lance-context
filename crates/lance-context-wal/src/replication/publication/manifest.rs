@@ -145,7 +145,7 @@ impl ReserveManifest {
     }
 }
 
-fn identity(authority: &Authority, incarnation: Uuid, version: u64, index: u64) -> Uuid {
+pub(super) fn identity(authority: &Authority, incarnation: Uuid, version: u64, index: u64) -> Uuid {
     let mut hash = Sha256::new();
     hash.update(b"lance-context/manifest-identity/v1");
     hash.update(authority.cluster.as_bytes());
