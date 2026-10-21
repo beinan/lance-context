@@ -2,7 +2,9 @@ use super::*;
 use raft_engine::env::{DefaultFileSystem, Handle, Permission};
 use std::io;
 use std::sync::{mpsc as blocking, Mutex};
+mod pressure_faults;
 mod rewrite;
+mod skew;
 
 fn settings() -> Settings {
     Settings {
@@ -91,6 +93,10 @@ type RealHandle = <DefaultFileSystem as FileSystem>::Handle;
 #[derive(Default)]
 struct Control {
     fail: AtomicBool,
+    fail_rewrite: AtomicBool,
+    rewrite_failures: AtomicU64,
+    rewrite_skip_syncs: AtomicU64,
+    rewrite_sync_calls: AtomicU64,
     calls: AtomicU64,
     entered: Mutex<Option<blocking::SyncSender<()>>>,
     release: Mutex<Option<blocking::Receiver<()>>>,
@@ -110,15 +116,43 @@ impl Handle for FaultHandle {
     }
     fn sync(&self) -> io::Result<()> {
         if self.rewrite {
+            let call = self
+                .control
+                .rewrite_sync_calls
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let mut skip = self.control.rewrite_skip_syncs.load(Ordering::Acquire);
+            while skip > 0 {
+                match self.control.rewrite_skip_syncs.compare_exchange_weak(
+                    skip,
+                    skip - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return self.inner.sync(),
+                    Err(actual) => skip = actual,
+                }
+            }
             let pause = self.control.rewrite_pause.lock().unwrap().take();
             if let Some((marker, after_sync)) = pause {
                 if after_sync {
                     self.inner.sync()?;
                 }
-                std::fs::write(marker, b"actual rewrite sync reached")?;
+                std::fs::write(
+                    marker,
+                    serde_json::to_vec(
+                        &serde_json::json!({"rewrite_sync":call,"file_bytes":self.inner.file_size()?}),
+                    )?,
+                )?;
                 loop {
                     std::thread::park();
                 }
+            }
+            if self.control.fail_rewrite.load(Ordering::Acquire) {
+                self.control
+                    .rewrite_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(io::Error::other("injected pressure rewrite sync failure"));
             }
         }
         self.control.calls.fetch_add(1, Ordering::Relaxed);

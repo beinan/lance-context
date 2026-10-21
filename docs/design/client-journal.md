@@ -57,6 +57,16 @@ metadata, allocator overhead and filesystem behavior need separate measurement.
 Caller-owned buffers waiting to enter admission are also outside this bound;
 applications should bound producers before constructing those buffers.
 
+Ordinary rewrite reclamation uses the engine's stale-entry count ratio. With
+many tiny cold values and a few large replaced values, obsolete bytes can exceed
+the admission budget before that ratio triggers. After ordinary maintenance, a
+batch that still lacks physical headroom attempts one synchronized rewrite-queue
+reclamation using the existing reserve, then measures the directory again.
+Insufficient space or a maintenance failure still fences the journal. Settings,
+binding, budgets and the completion barrier are unchanged. This synchronous
+fallback can add latency to the triggering batch; it is not an unbounded retry
+loop or a background capacity guarantee.
+
 Mutation errors and unwinding dependency panics permanently fence the journal
 before successful completion can escape. All handles must be dropped and recovery
 performed on a fresh engine; a fence cannot be reset. The owner retains the engine
@@ -65,7 +75,7 @@ Dependency destructor failures or panic-abort builds can still terminate the
 process. Process restart and storage power-loss guarantees are distinct.
 
 Statistics report successful groups/requests/bytes, maximum group size, engine
-write time, maintenance and admission wait. Write time includes engine encoding,
+write time, maintenance, pressure rewrites and admission wait. Write time includes engine encoding,
 append and synchronization; admission wait excludes subsequent worker/linger
 waits. These counters do not establish end-to-end ingestion throughput.
 
@@ -77,6 +87,9 @@ admission limits, cancellation during actual sync, and injected sync failure wit
 no premature successful waiter. A parent test invokes the ignored Rust child
 fixture, kills it immediately before and after Rewrite-queue sync, then reopens
 the files and compares every acknowledged value, including cold retained state.
+Skewed-value tests retain 128 keys through 40 replacement rounds without reopening;
+additional failure and SIGKILL cases exercise the byte-pressure fallback and
+compare all prior acknowledged values after recovery.
 
 CI runs the optional feature explicitly. Run it locally with:
 

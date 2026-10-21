@@ -88,6 +88,7 @@ struct Counters {
     write_ns: AtomicU64,
     maintenance_calls: AtomicU64,
     maintenance_ns: AtomicU64,
+    pressure_rewrites: AtomicU64,
     queue_ns: AtomicU64,
     fenced: AtomicBool,
 }
@@ -100,6 +101,7 @@ pub struct Statistics {
     pub write_seconds: f64,
     pub maintenance_calls: u64,
     pub maintenance_seconds: f64,
+    pub pressure_rewrites: u64,
     pub queue_seconds: f64,
     pub fenced: bool,
 }
@@ -292,6 +294,7 @@ impl Journal {
             write_seconds: get(&c.write_ns) as f64 / 1e9,
             maintenance_calls: get(&c.maintenance_calls),
             maintenance_seconds: get(&c.maintenance_ns) as f64 / 1e9,
+            pressure_rewrites: get(&c.pressure_rewrites),
             queue_seconds: get(&c.queue_ns) as f64 / 1e9,
             fenced: c.fenced.load(Ordering::Acquire),
         }
@@ -353,9 +356,24 @@ fn worker<F: FileSystem>(
                     .fetch_add(nanos(start), Ordering::Relaxed);
                 counters.maintenance_calls.fetch_add(1, Ordering::Relaxed);
             }
+            let ceiling = settings.log_bytes - settings.reserve();
+            if footprint(Path::new(engine.path()))? + bytes as u64 > ceiling {
+                // The engine's ordinary rewrite heuristic counts stale keys,
+                // not their bytes. A few replaced payloads can fill the budget
+                // while many tiny cold values keep that ratio below its gate.
+                // Spend the already reserved rewrite headroom once, then check
+                // actual physical bytes again. Never raise the budget or retry
+                // indefinitely; any failed maintenance fences this worker.
+                let start = Instant::now();
+                engine.purge_manager().reclaim_rewrite_queue()?;
+                counters
+                    .maintenance_ns
+                    .fetch_add(nanos(start), Ordering::Relaxed);
+                counters.maintenance_calls.fetch_add(1, Ordering::Relaxed);
+                counters.pressure_rewrites.fetch_add(1, Ordering::Relaxed);
+            }
             ensure!(
-                footprint(Path::new(engine.path()))? + bytes as u64
-                    <= settings.log_bytes - settings.reserve(),
+                footprint(Path::new(engine.path()))? + bytes as u64 <= ceiling,
                 "client journal disk admission closed"
             );
             let mut total: usize = lengths.iter().sum();

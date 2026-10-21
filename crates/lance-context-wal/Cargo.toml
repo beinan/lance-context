@@ -9,7 +9,7 @@ description = "Independent Rust WAL experiments owned by lance-context"
 [features]
 # Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
 lance-integration = ["replication", "ipc", "arrow-contract", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:async-trait", "dep:futures", "dep:serde_json"]
-client-journal = ["dep:anyhow", "dep:raft-engine", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
+client-journal = ["dep:anyhow", "dep:raft-engine", "raft-engine/internals", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
 replication = ["raft-log", "record", "contract", "dep:bincode", "dep:slog", "dep:ring", "uuid/v4", "serde/rc"]
 raft-log = ["placement", "dep:raft", "dep:raft-engine", "dep:raft-proto", "dep:protobuf"]
 vectored-io = ["dep:bytes", "dep:tokio"]
