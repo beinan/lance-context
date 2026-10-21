@@ -521,6 +521,18 @@ impl Node {
         self.propose(publication::control_group(&self.layout), request, batch)
     }
 
+    /// Advance independent source cursors only after every selected source
+    /// proves the exact durable closure. Completion permits the next plan;
+    /// physical file reclamation still requires a durable application image.
+    pub fn advance_publication(
+        &mut self,
+        request: u64,
+        advancement: publication::AdvancePublication,
+    ) -> Result<()> {
+        let batch = advancement.batch(&self.layout, &self.limits)?;
+        self.propose(publication::control_group(&self.layout), request, batch)
+    }
+
     /// Verify a catalog quorum-read attestation and persist the exact complete
     /// table prefix in its source group. Completion, never enqueue, pins it.
     pub fn pin_source(&mut self, request: u64, permit: source::Permit) -> Result<()> {
