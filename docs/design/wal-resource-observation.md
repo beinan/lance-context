@@ -25,6 +25,22 @@ duration. An optional `--disk-directory /tmp/example-wal` counts allocated block
 in a flat directory, deduplicates hard links and rejects symlinks or subdirectories.
 Files removed concurrently by collection may disappear during the scan.
 
+`--tcp-port 7800` adds an optional `tcp` object. The sampler intersects socket
+inodes from the target's open file descriptors with its network namespace's
+IPv4/IPv6 TCP tables. Namespace neighbors are excluded and duplicated descriptors
+count as one TCP socket. `socket_descriptors` can also include non-TCP sockets;
+`owned_tcp_sockets` and the state maps include only matching TCP entries.
+Without the option, `tcp` is null and no socket scan is performed.
+
+`states` counts all owned TCP sockets. `local_port_states` and
+`remote_port_states` select endpoints matching the configured port, aggregating
+all addresses for that process. These two maps can overlap and must not be added.
+Keys are Linux state codes: `01` is ESTABLISHED, `08` is CLOSE_WAIT and `0A` is
+LISTEN. A peer-closed socket can remain owned by the process and consume a
+connection slot; counting only ESTABLISHED can hide it. Separate LISTEN entries
+when counting accepted connections. Socket scans contribute to the existing
+`sample_wall_seconds` overhead and can miss connections between samples.
+
 The target can lose procfs I/O access during exit before its process state shows
 a zombie. On a permission-denied sample, the observer waits at most 100 ms for
 positive evidence that the exact incarnation ended. Only then may it discard the
@@ -40,10 +56,13 @@ Record the actual observation interval; its CPU total is not an ingestion-only
 cost unless that interval has independently been aligned to ingestion. Observer
 overhead is included and needs a separate comparison to quantify.
 
-Five unit tests cover stat parsing, PID reuse, directory accounting and real
-procfs permission transitions for exiting versus still-live targets. A separate
-process test verifies sampling and completion after target exit. CI explicitly
+Unit tests cover stat parsing, PID reuse, directory accounting and real procfs
+permission transitions for exiting versus still-live targets. TCP tests use a
+real child process, namespace neighbors, duplicated descriptors, a listener and
+a peer FIN to verify CLOSE_WAIT accounting; parsing tests cover IPv6. A separate
+process test verifies sampling with and without TCP enabled and completion after
+target exit. CI explicitly
 enables these optional-feature tests; the integration test runs unprivileged in
 private mount/cgroup namespaces with a namespace-rooted cgroup2 mount. The
-ignored test fixture is invoked by the
-permission regressions. The tool does not change production ingestion semantics.
+ignored subprocess fixtures are invoked by their parent tests.
+The tool does not change production ingestion semantics.
