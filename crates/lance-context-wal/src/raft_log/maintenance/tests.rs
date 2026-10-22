@@ -78,6 +78,79 @@ fn verify(group: &GroupLog, first: u64, last: u64) -> Result<()> {
 }
 
 #[test]
+fn dead_segments_do_not_require_a_second_directory_of_headroom() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
+    let group = log.group(10)?;
+    let sibling = log.group(20)?;
+    group.bind_application(b"maintenance-test/v1")?;
+    append(&sibling, 1, 4)?;
+    for round in 0..12 {
+        append(&group, round * 64 + 1, (round + 1) * 64)?;
+    }
+    let snapshot = checkpoint(&group, 768)?;
+    group.configure_disk(DiskOptions {
+        max_bytes: 20 << 20,
+        data_bytes: 12 << 20,
+        headroom_bytes: 4 << 20,
+    })?;
+    let budget = group.disk_budget().unwrap();
+    let before = budget.snapshot().accounted_disk_bytes;
+    assert!(before > 12 << 20 && before < 16 << 20);
+    assert!(budget.reserve(4096, true).is_err());
+    let maintenance = group.maintenance();
+    for _ in 0..4 {
+        maintenance.run()?;
+    }
+    assert!(budget.snapshot().accounted_disk_bytes < 2 << 20);
+    assert!(budget.reserve(4096, true).is_ok());
+    verify(&sibling, 1, 4)?;
+    drop((maintenance, group, sibling, log));
+    let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
+    let group = reopened.group(10)?;
+    assert_eq!(group.snapshot(768, 2)?, snapshot);
+    assert_eq!(group.first_index()?, 769);
+    assert_eq!(group.last_index()?, 768);
+    verify(&reopened.group(20)?, 1, 4)?;
+    Ok(())
+}
+
+#[test]
+fn insufficient_live_rewrite_space_rejects_before_mutation_without_fencing() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
+    let group = log.group(10)?;
+    group.bind_application(b"maintenance-test/v1")?;
+    for round in 0..8 {
+        append(&group, round * 64 + 1, (round + 1) * 64)?;
+    }
+    group.configure_disk(DiskOptions {
+        max_bytes: 12 << 20,
+        data_bytes: 4 << 20,
+        headroom_bytes: 4 << 20,
+    })?;
+    let before = files(root.path())?;
+    let maintenance = group.maintenance();
+    let error = maintenance.run().unwrap_err();
+    assert!(error.is::<crate::admission::DiskBudgetExhausted>());
+    assert_eq!(
+        files(root.path())?,
+        before,
+        "rejection changed native files"
+    );
+    verify(&group, 1, 512)?;
+    checkpoint(&group, 508)?;
+    for _ in 0..4 {
+        maintenance.run()?;
+    }
+    verify(&group, 509, 512)?;
+    assert!(group.disk_budget().unwrap().snapshot().accounted_disk_bytes < 2 << 20);
+    Ok(())
+}
+
+#[test]
 fn repeated_physical_collection_preserves_suffix_sibling_and_recovery() -> Result<()> {
     let root = tempfile::tempdir()?;
     let directory = root.path().join("log");

@@ -21,27 +21,6 @@ impl LogMaintenance {
     /// per-call byte/time bound, so callers must measure its latency and reserve
     /// rewrite headroom. This API alone does not impose a disk quota.
     pub fn run(&self) -> Result<Vec<u64>> {
-        // Admission failure occurs before touching native storage and must not
-        // fence a healthy node. Existing accepted traffic still owns its window.
-        let _reservation = self
-            .node
-            .budget
-            .get()
-            .map(|budget| {
-                budget.reserve(
-                    usize::try_from(budget.snapshot().accounted_disk_bytes)?,
-                    false,
-                )
-            })
-            .transpose()?;
-        let result = self.run_locked();
-        if result.is_err() {
-            self.node.failed.store(true, Ordering::Release);
-        }
-        result
-    }
-
-    fn run_locked(&self) -> Result<Vec<u64>> {
         let _maintenance = self
             .node
             .maintenance_gate
@@ -58,6 +37,37 @@ impl LogMaintenance {
             .write()
             .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
         self.node.check()?;
+        // Admission failure occurs before touching native storage and must not
+        // fence a healthy node. Existing accepted traffic still owns its window.
+        // Exclude writes while sizing live entries. Dead segments need deletion,
+        // not another directory-sized reservation that can prevent their cleanup.
+        let _reservation = self
+            .node
+            .budget
+            .get()
+            .map(|budget| {
+                let bytes = self
+                    .node
+                    .engine
+                    .estimated_rewrite_bytes()
+                    .and_then(|live| {
+                        usize::try_from(self.node.target_file_bytes)
+                            .ok()?
+                            .checked_mul(2)?
+                            .checked_add(live)
+                    })
+                    .context("native rewrite reservation overflow")?;
+                budget.reserve(bytes, false)
+            })
+            .transpose()?;
+        let result = self.run_locked();
+        if result.is_err() {
+            self.node.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn run_locked(&self) -> Result<Vec<u64>> {
         // The maintenance gate drained pending appends and checkpoint writes.
         // Establish an explicit durable marker before the native rewrite too.
         self.node.sync_locked()?;
