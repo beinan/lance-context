@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use lance_context_wal::{
     placement::Layout,
-    raft_log::{GroupLog, PhysicalLog},
+    raft_log::{GroupLog, LogOptions, PhysicalLog},
 };
 use protobuf::Message;
 use raft::{GetEntriesContext, Storage, StorageError};
@@ -148,6 +148,68 @@ fn checkpoint_preserves_suffix_vote_and_other_group_across_reopen() -> Result<()
 }
 
 #[test]
+fn checkpoint_stays_compacted_after_native_rewrite_and_purge() -> Result<()> {
+    let _case = TEST_CASE.lock().unwrap();
+    // Keep a large live neighboring group in the rewrite queue. Its live entries
+    // prevent the tiny compacted group's old rewrite file from being removed.
+    for suffix in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("log");
+        let options = LogOptions {
+            target_file_bytes: 4096,
+            purge_threshold_bytes: 8192,
+        };
+        let saved;
+        {
+            let log = PhysicalLog::open_with_options(&path, &layout(), 1, options)?;
+            let group = log.group(10)?;
+            group.bind_application(b"checkpoint-purge-test/v1")?;
+            let entries = if suffix {
+                vec![entry(1, 1), entry(2, 1)]
+            } else {
+                vec![entry(1, 1)]
+            };
+            group.persist(&entries, Some(&hard(1, entries.len() as u64)))?;
+            let other = log.group(20)?;
+            for index in 1..=96 {
+                other.persist(&[entry(index, 1)], Some(&hard(1, index)))?;
+                if index % 16 == 0 {
+                    group.maintenance().run()?;
+                }
+            }
+            saved = snapshot(&group, 1, 1)?;
+            group.checkpoint(&saved)?;
+            for index in 97..=192 {
+                other.persist(&[entry(index, 1)], Some(&hard(1, index)))?;
+                if index % 16 == 0 {
+                    group.maintenance().run()?;
+                }
+            }
+        }
+        // Repeated reopen must retain the logical cut and complete suffix.
+        for _ in 0..2 {
+            let log = PhysicalLog::open_with_options(&path, &layout(), 1, options)?;
+            let group = log.group(10)?;
+            assert_eq!(group.first_index()?, 2);
+            assert_eq!(group.last_index()?, if suffix { 2 } else { 1 });
+            assert_eq!(group.snapshot(0, 1)?, saved);
+            assert_eq!(
+                group.initial_state()?.hard_state,
+                hard(1, if suffix { 2 } else { 1 })
+            );
+            assert_eq!(
+                read(&log.group(20)?, 1, 193)?,
+                (1..=192).map(|i| entry(i, 1)).collect::<Vec<_>>()
+            );
+            if suffix {
+                assert_eq!(read(&group, 2, 3)?, vec![entry(2, 1)]);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn invalid_or_changed_checkpoint_never_changes_usable_log() -> Result<()> {
     let _case = TEST_CASE.lock().unwrap();
     let directory = tempfile::tempdir()?;
@@ -201,7 +263,7 @@ fn invalid_or_changed_checkpoint_never_changes_usable_log() -> Result<()> {
 #[test]
 fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
     let _case = TEST_CASE.lock().unwrap();
-    for corruption in 0..5 {
+    for corruption in 0..7 {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("log");
         let saved;
@@ -229,6 +291,17 @@ fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
                 }
                 3 => batch.put(10, b"snapshot".to_vec(), vec![0; 4097])?,
                 4 => batch.delete(10, b"application".to_vec()),
+                5 => batch.add_command(10, raft_engine::Command::Compact { index: 4 }),
+                6 => {
+                    struct Indexed;
+                    impl raft_engine::MessageExt for Indexed {
+                        type Entry = Entry;
+                        fn index(entry: &Entry) -> u64 {
+                            entry.index
+                        }
+                    }
+                    batch.add_entries::<Indexed>(10, &[entry(4, 2)])?;
+                }
                 _ => unreachable!(),
             }
             engine.write(&mut batch, true)?;

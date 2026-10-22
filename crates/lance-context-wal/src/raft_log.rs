@@ -483,6 +483,7 @@ impl PhysicalLog {
             "durable group inventory differs from the layout"
         );
         let mut groups = BTreeMap::new();
+        let mut compacted_prefixes = LogBatch::default();
         for (group, voters) in assigned {
             let mut expected_conf = ConfState::default();
             expected_conf.set_voters(voters.clone());
@@ -522,12 +523,30 @@ impl PhysicalLog {
             };
             ensure!(state.conf == expected_conf, "static membership changed");
             state.validate()?;
+            let first = node.engine.first_index(group);
+            let last = node.engine.last_index(group);
+            let retained_last = last.filter(|&index| index > state.boundary());
+            let retained_first = retained_last
+                .and(first)
+                .map(|index| index.max(state.boundary() + 1));
             ensure!(
-                node.engine.last_index(group) == state.terms.last().map(|range| range.last)
-                    && node.engine.first_index(group)
-                        == state.terms.first().map(|range| range.first),
-                "entry bounds differ from durable term index"
+                retained_last == state.terms.last().map(|range| range.last)
+                    && retained_first == state.terms.first().map(|range| range.first),
+                "entry bounds differ from durable term index: group {group}, engine {first:?}..={last:?}, checkpoint {}",
+                state.boundary(),
             );
+            // Native purge can discard an append-queue Compact command while
+            // its old entries still exist in a shared rewrite file. The durable
+            // checkpoint remains authoritative: replay only its covered prefix.
+            // Missing or extra suffix entries still fail the check above.
+            if first.is_some_and(|index| index <= state.boundary()) {
+                compacted_prefixes.add_command(
+                    group,
+                    raft_engine::Command::Compact {
+                        index: state.boundary() + 1,
+                    },
+                );
+            }
             groups.insert(
                 group,
                 GroupLog {
@@ -536,6 +555,11 @@ impl PhysicalLog {
                     state: Arc::new(RwLock::new(state)),
                 },
             );
+        }
+        // Validate every group's metadata and suffix before changing any file.
+        // Reuse the normal physical sync barrier and uncertain-write fence.
+        if !compacted_prefixes.is_empty() {
+            node.write(&mut compacted_prefixes)?;
         }
         Ok(Self { groups })
     }
