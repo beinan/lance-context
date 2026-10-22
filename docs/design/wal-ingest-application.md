@@ -31,6 +31,23 @@ The same immutable layout and complete WAL limits must be used by replicas and
 clients. Explicit memory budgets account for the logical data path; they are not
 an operating-system RSS cap.
 
+`GET /api/v1/ingest/{table}/sessions/{session}` returns an Arrow IPC stream of
+the session's committed WAL rows and published Lance rows. It uses the same bearer
+authorization as ingestion. A successful read includes appends acknowledged before
+the read began, without waiting for a worker to publish them. Rust callers use
+`Registry::read_session`. `Registry::read` remains a published-dataset snapshot.
+
+The reader streams committed WAL data before opening Lance, checks source
+closures for any payload retired during capture, and deduplicates overlap by
+immutable row ID. Missing unpublished payload is an error. This is a session
+read with unspecified row order, not arbitrary SQL or a global snapshot. It
+currently scans the session's bucket. Payload workspace is reserved per record;
+captured metadata and row IDs grow with the WAL tail, but payloads are not retained
+for the whole query. Consumers must read to EOF and propagate stream errors.
+Arrow filtering shares existing
+binary buffers. HTTP output is encoded once into an IPC stream, one batch at a
+time; the complete network path is not claimed to be zero-copy.
+
 WAL RPCs use mutual TLS, root verification and per-endpoint certificate pins.
 The HTTP listener expects TLS termination and connection limits at the edge proxy;
 the workload token authorizes the complete configured table set. Configure the

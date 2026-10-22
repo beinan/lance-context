@@ -121,6 +121,18 @@ impl Registry {
             .context("table outside authorized registry")?;
         materializer::read_dataset(&assignment.ingress, &assignment.storage, version).await
     }
+    /// Read committed session rows from both the WAL and the published table.
+    pub async fn read_session(
+        &self,
+        table: &str,
+        session: &str,
+    ) -> Result<crate::reader::SessionRead> {
+        let assignment = self
+            .tables
+            .get(table)
+            .context("table outside authorized registry")?;
+        crate::reader::read_session(&assignment.ingress, &assignment.storage, session).await
+    }
 }
 /// Run explicitly during provisioning, using the SAME persisted operation IDs
 /// after an ambiguous result. Normal ingress/worker startup never bootstraps.
@@ -200,7 +212,13 @@ pub async fn serve_http(
     let auth = Arc::new(Authorization::load(&config.bearer_token_file)?);
     let gateway = registry.gateway(config)?;
     let app = gateway
-        .router()
+        .router_with_reads(
+            registry
+                .tables
+                .iter()
+                .map(|(name, a)| (name.clone(), a.storage.clone()))
+                .collect(),
+        )
         .layer(middleware::from_fn_with_state(auth, authorize));
     let draining = gateway.clone();
     let result = axum::serve(listener, app)

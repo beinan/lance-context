@@ -16,6 +16,8 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 mod body;
 #[cfg(feature = "http-client")]
 pub mod journal;
+#[cfg(feature = "materializer")]
+mod read;
 
 pub const ARROW_FILE: &str = "application/vnd.apache.arrow.file";
 pub const PRODUCER: &str = "x-lance-producer";
@@ -124,6 +126,14 @@ impl Gateway {
             .route("/api/v1/ingest/{table}/publication", post(publication))
             .route("/api/v1/ingest/{table}/close", post(close))
             .with_state(self.clone())
+    }
+    /// Add session reads using the application's resolved table storage.
+    #[cfg(feature = "materializer")]
+    pub fn router_with_reads(
+        &self,
+        storage: BTreeMap<String, crate::materializer::Storage>,
+    ) -> Router {
+        self.router().merge(read::router(self.clone(), storage))
     }
     pub fn observation(&self) -> Observation {
         Observation {
