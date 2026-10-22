@@ -59,6 +59,9 @@ pub struct Limits {
     pub source_keys: BTreeMap<u64, [u8; 32]>,
     pub max_tables: u64,
     pub max_active_plans: u64,
+    /// Total source payload in one immutable publication, at most 1 GiB.
+    /// The default remains 64 MiB. Materializers separately reserve their
+    /// configured workspace; changing this bound changes the group policy.
     pub max_plan_source_bytes: u64,
     pub max_descriptor_bytes: u64,
     pub max_manifest_records: u64,
@@ -108,7 +111,7 @@ impl Limits {
                     .len()
                     == self.source_keys.len()
                 && (1..=256).contains(&self.max_active_plans)
-                && (1..=256 * 1024 * 1024).contains(&self.max_plan_source_bytes)
+                && (1..=1024 * 1024 * 1024).contains(&self.max_plan_source_bytes)
                 && (1..=publication::MAX_DESCRIPTOR_BYTES as u64)
                     .contains(&self.max_descriptor_bytes)
                 && (1..=16_384).contains(&self.max_manifest_records)
