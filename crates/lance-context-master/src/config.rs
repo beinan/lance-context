@@ -203,6 +203,15 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
+    /// Additional legacy HTTP waits allowed outside the scheduler execution
+    /// slots. Zero disables yielding. Requests/tasks/claims stay alive.
+    #[arg(long, env = "LEGACY_MERGE_WAIT_CONCURRENCY", default_value_t = 32)]
+    pub legacy_merge_wait_concurrency: usize,
+
+    /// Scheduler observation interval, not a worker execution timeout.
+    #[arg(long, env = "LEGACY_MERGE_FOREGROUND_SECS", default_value_t = 30)]
+    pub legacy_merge_foreground_secs: u64,
+
     /// etcd connection. Scheduler state (task queue, lease-based claims,
     /// per-experiment write locks) lives in etcd so several stateless master
     /// replicas can share one queue. `ETCD_ENDPOINTS` is required.

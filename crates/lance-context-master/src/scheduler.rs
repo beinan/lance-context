@@ -1309,16 +1309,18 @@ fn spawn_filtered_pool_poller(
                             permit_wait: Duration::ZERO,
                         };
                         let st = state.clone();
-                        let running = running.clone();
-                        running.increment(1.0);
+                        let operation = Arc::new(operation);
+                        let capacity = crate::merge_capacity::Capacity::new(
+                            permit,
+                            pool.clone(),
+                            state.legacy_response_waiters.clone(),
+                            Duration::from_secs(state.config.legacy_merge_foreground_secs),
+                            running.clone(),
+                            operation.clone(),
+                        );
                         tokio::spawn(async move {
-                            // Decrement on every exit, including a panic in
-                            // run_task: the permits are dropped by unwinding,
-                            // so the gauge must be too, or capacity reads as
-                            // consumed forever.
-                            let _held = GaugeHold(running);
-                            run_task(&st, claim, timing).await;
-                            drop(permit);
+                            crate::merge_capacity::scope(capacity, run_task(&st, claim, timing))
+                                .await;
                             drop(compact_permit);
                             drop(operation);
                         });
@@ -1386,6 +1388,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             task_cooldown_after_failures: 3,
             task_cooldown_base_secs: 600,
             task_cooldown_max_secs: 21_600,
@@ -3459,6 +3463,120 @@ mod tests {
                     }
                 }),
             )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_response_wait_preserves_dependencies_and_frees_the_only_slot() {
+        use axum::{extract::Path, routing::post, Json, Router};
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(
+            endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:")
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move |Path(name): Path<String>| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        if name == "slow" {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        Json(serde_json::json!({"reclaimed": 3}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_wal_concurrency = 1;
+        cfg.legacy_merge_foreground_secs = 1;
+        cfg.legacy_merge_wait_concurrency = 2;
+        cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = MasterState::new(cfg).await.unwrap();
+        let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
+        let pool = Arc::new(Semaphore::new(1));
+        let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::MERGE_WAL, false);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let dependent = enqueue_with_deps(
+            &state,
+            TaskKind::MergeWal,
+            "dependent",
+            vec![slow.id.clone()],
+        )
+        .await
+        .unwrap();
+        let fast = enqueue(&state, TaskKind::MergeWal, "fast").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.task_store.get(&fast.id).await.unwrap().unwrap().state == TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("another table must complete before the slow response is released");
+        let coordinator = state.task_store.merge_coordinator();
+        assert_eq!(
+            coordinator.get("slow").await.unwrap().unwrap().phase,
+            lance_context_merge::Phase::Running
+        );
+        assert_eq!(
+            state.task_store.get(&slow.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(
+            state
+                .task_store
+                .get(&dependent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        assert!(state.admission.status().active_operations > 0);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state
+                .task_store
+                .get(&dependent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                != TaskState::Done
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("dependent work must wait for, and then follow, the original merge task");
+        assert_eq!(
+            state.task_store.get(&slow.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert!(coordinator.get("slow").await.unwrap().is_none());
+        state.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), state.admission.wait_drained())
+            .await
+            .unwrap();
+        assert_eq!(pool.available_permits(), 1);
+        poller.abort();
+        let _ = poller.await;
+        server.abort();
     }
 
     #[tokio::test]

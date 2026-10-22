@@ -272,7 +272,7 @@ async fn run_legacy_workers_inner(
         };
         let execution = ownership.admit(target, endpoint).await?;
         let started = std::time::Instant::now();
-        let result = async {
+        let result = crate::merge_capacity::observe(async {
             let response = http.post(url).send().await.map_err(|error| {
                 // The shared worker client must disable redirects: a failed
                 // connection AFTER a redirected POST could hide an execution.
@@ -298,7 +298,7 @@ async fn run_legacy_workers_inner(
             reply["reclaimed"]
                 .as_u64()
                 .ok_or_else(|| (false, "invalid legacy merge response".to_string()))
-        }
+        })
         .await;
         metrics::histogram!("master_merge_wal_worker_duration_seconds")
             .record(started.elapsed().as_secs_f64());
