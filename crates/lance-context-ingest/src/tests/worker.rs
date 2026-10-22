@@ -67,6 +67,75 @@ async fn append(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires ETCD_TEST_ENDPOINTS; executed by the etcd CI suite"]
+async fn competing_workers_flush_a_small_tail_after_its_batch_wait() -> Result<()> {
+    let (mut etcd, claims, prefix) = fixture().await?;
+    let root = tempfile::tempdir()?;
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    let path = root.path().join("timed-tail.lance");
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding()).await?;
+    let storage = storage(&path).await?;
+    let producer = ingress
+        .open_producer(ProducerOpen {
+            bucket: 0,
+            slot: 0,
+            expected_generation: 0,
+            operation: Uuid::new_v4(),
+        })
+        .await?;
+    let (body, receipt) = append(&ingress, &producer, 1, "timed-tail").await?;
+    let mut options = options();
+    options.publication.min_source_bytes = 1 << 20;
+    options.publication.max_batch_wait = Duration::from_millis(250);
+    let assignment = Assignment {
+        ingress: ingress.clone(),
+        storage: storage.clone(),
+    };
+    let started = tokio::time::Instant::now();
+    let one = Worker::start(
+        claims.clone(),
+        vec![assignment.clone()],
+        options.clone(),
+        MergeMemoryBudget::new(32 << 20),
+    )?;
+    let two = Worker::start(
+        claims,
+        vec![assignment],
+        options,
+        MergeMemoryBudget::new(32 << 20),
+    )?;
+    assert_eq!(
+        ingress
+            .wait_published(&receipt, Duration::from_secs(10))
+            .await?,
+        2
+    );
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    one.shutdown().await?;
+    two.shutdown().await?;
+    let dataset = publication::read_dataset(&ingress, &storage, None).await?;
+    let batches = dataset
+        .scan()
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    let actual = batches
+        .into_iter()
+        .filter(|b| b.num_rows() > 0)
+        .collect::<Vec<_>>();
+    let expected = ipc::decode(body, Arc::new(rollout_schema()))?.remove(0);
+    assert_eq!(actual, vec![expected]);
+    etcd.delete(
+        prefix,
+        Some(etcd_client::DeleteOptions::new().with_prefix()),
+    )
+    .await?;
+    cluster.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ETCD_TEST_ENDPOINTS; executed by the etcd CI suite"]
 async fn worker_releases_claims_without_losing_progress_past_other_tables() -> Result<()> {
     let (mut etcd, claims, prefix) = fixture().await?;
     let root = tempfile::tempdir()?;
