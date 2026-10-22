@@ -329,6 +329,12 @@ fn missing_corrupt_or_inconsistent_checkpoint_fails_reopen() -> Result<()> {
                 error.to_string().contains("unbound checkpoint"),
                 "{error:#}"
             ),
+            5 | 6 => assert!(
+                error
+                    .to_string()
+                    .contains("entry bounds differ from durable term index"),
+                "{error:#}"
+            ),
             _ => unreachable!(),
         }
     }
