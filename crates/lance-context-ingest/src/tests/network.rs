@@ -251,6 +251,7 @@ impl Cluster {
             rpc: Default::default(),
             tables: vec![],
             ingress_memory_bytes: 32 << 20,
+            session_read_concurrency: 1,
             materializer_memory_bytes: 64 << 20,
             http: None,
             etcd: None,

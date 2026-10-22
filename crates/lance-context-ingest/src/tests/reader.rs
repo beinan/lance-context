@@ -2,6 +2,9 @@ use super::*;
 use crate::{materializer::Storage, reader};
 use futures::TryStreamExt;
 
+#[cfg(feature = "service")]
+mod perf;
+
 async fn storage(path: &std::path::Path) -> Result<Storage> {
     Storage::resolve(
         path.to_str().unwrap().into(),
@@ -86,7 +89,9 @@ async fn ack_visible_before_publication_after_restart_and_during_handoff() -> Re
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&c, &path, &binding()).await?;
     let storage = storage(&path).await?;
-    let ingress = connect(&c, binding()).await?;
+    let ingress = connect(&c, binding())
+        .await?
+        .with_session_read_concurrency(4)?;
     let s = (0..1000)
         .map(|i| format!("quoted'session-{i}"))
         .find(|s| ingress.bucket_for_session(s).unwrap() == 0)
@@ -113,7 +118,9 @@ async fn ack_visible_before_publication_after_restart_and_during_handoff() -> Re
     c.shutdown().await?;
 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
-    let ingress = connect(&c, binding()).await?;
+    let ingress = connect(&c, binding())
+        .await?
+        .with_session_read_concurrency(4)?;
     verify(
         reader::read_session(&ingress, &storage, &s).await?,
         &expected,
@@ -158,7 +165,9 @@ async fn publication_between_read_phases_neither_loses_nor_duplicates_rows() -> 
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&c, &path, &binding()).await?;
     let storage = storage(&path).await?;
-    let ingress = connect(&c, binding()).await?;
+    let ingress = connect(&c, binding())
+        .await?
+        .with_session_read_concurrency(4)?;
     let s = session(0);
     let producer = producer(&ingress, 0).await?;
     let mut publisher =
@@ -240,6 +249,7 @@ async fn read_streams_a_tail_larger_than_its_payload_budget() -> Result<()> {
     .await?;
     let mut limited = ingress.clone();
     limited.budget = MergeMemoryBudget::new(256 << 10);
+    limited = limited.with_session_read_concurrency(4)?;
     let mut cancelled = reader::read_session(&limited, &storage, &s).await?;
     cancelled
         .batches
@@ -248,16 +258,125 @@ async fn read_streams_a_tail_larger_than_its_payload_budget() -> Result<()> {
         .context("missing first row")?;
     assert!(limited.budget.reserved() > 0);
     drop(cancelled);
-    assert_eq!(limited.budget.reserved(), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while limited.budget.reserved() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    // Two readers share a budget that admits only one record at a time.
+    // Unordered completion must allow each holder to drain before waiting.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(
+            async {
+                verify(
+                    reader::read_session(&limited, &storage, &s).await?,
+                    &expected,
+                )
+                .await
+            },
+            async {
+                verify(
+                    reader::read_session(&limited, &storage, &s).await?,
+                    &expected,
+                )
+                .await
+            },
+        )
+    })
+    .await??;
     let mut read = reader::read_session(&limited, &storage, &s).await?;
     let mut actual = Vec::new();
     while let Some(batch) = read.batches.try_next().await? {
-        assert!(limited.budget.reserved() <= 256 << 10);
+        assert!(limited.budget.reserved() <= limited.budget.limit());
         actual.push(batch);
     }
     drop(read);
     verify_batches(actual, &expected)?;
     assert_eq!(limited.budget.reserved(), 0);
+    c.shutdown().await
+}
+
+#[cfg(feature = "service")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_replica_does_not_block_other_prefetched_records() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("rollouts.lance");
+    let c = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&c, &path, &binding()).await?;
+    let storage = storage(&path).await?;
+    let ingress = connect(&c, binding()).await?;
+    let s = session(0);
+    let producer = producer(&ingress, 0).await?;
+    let expected = vec![
+        batch(&["first"], &[&s])?,
+        batch(&["second"], &[&s])?,
+        batch(&["third"], &[&s])?,
+    ];
+    for (i, batch) in expected.iter().enumerate() {
+        append(&ingress, &producer, i as u64 + 1, batch.clone()).await?;
+    }
+    // The first replica accepts TCP but cannot finish TLS. Other replicas stay
+    // healthy. Release it only after another record has reached the consumer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?.to_string();
+    let stalled = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (observed, resume) = (stalled.clone(), release.clone());
+    let trap = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await?;
+        observed.notify_one();
+        resume.notified().await;
+        drop(socket);
+        Ok::<_, anyhow::Error>(())
+    });
+    let mut config = c.application.clone();
+    config.tables.push(crate::application::config::Table {
+        binding: binding(),
+        uri: path.to_str().unwrap().into(),
+        storage_options: Default::default(),
+        bootstrap: bootstrap::identity(),
+    });
+    config.endpoints.get_mut(&1).unwrap().data_address = address;
+    config.rpc.timeout = Duration::from_secs(60);
+    let concurrent = Ingress::connect(
+        config.client()?,
+        layout(),
+        binding(),
+        MergeMemoryBudget::new(8 << 20),
+    )
+    .await?
+    .with_session_read_concurrency(3)?;
+    let mut read = reader::read_session(&concurrent, &storage, &s).await?;
+    let first = tokio::time::timeout(Duration::from_secs(10), async {
+        let (first, ()) = tokio::try_join!(
+            async {
+                read.batches
+                    .try_next()
+                    .await?
+                    .context("missing concurrent result")
+            },
+            async {
+                stalled.notified().await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )?;
+        Ok::<_, anyhow::Error>(first)
+    })
+    .await??;
+    let ids = first
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_ne!(ids.value(0), "first");
+    release.notify_one();
+    trap.await??;
+    let mut actual = vec![first];
+    actual.extend(read.batches.try_collect::<Vec<_>>().await?);
+    verify_batches(actual, &expected)?;
+    assert_eq!(concurrent.budget.reserved(), 0);
     c.shutdown().await
 }
 
@@ -269,7 +388,9 @@ async fn unavailable_unpublished_payload_is_an_error() -> Result<()> {
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&c, &path, &binding()).await?;
     let storage = storage(&path).await?;
-    let ingress = connect(&c, binding()).await?;
+    let ingress = connect(&c, binding())
+        .await?
+        .with_session_read_concurrency(4)?;
     let s = session(0);
     append(
         &ingress,
@@ -286,6 +407,7 @@ async fn unavailable_unpublished_payload_is_an_error() -> Result<()> {
         }
     });
     let mut config = c.application.clone();
+    config.session_read_concurrency = 4;
     config.tables.push(crate::application::config::Table {
         binding: binding(),
         uri: path.to_str().unwrap().into(),
@@ -415,7 +537,9 @@ async fn http_ack_is_queryable_without_a_worker_then_merges_base_and_tail() -> R
     .collect::<std::result::Result<Vec<_>, _>>()?;
     verify_batches(batches, std::slice::from_ref(&first))?;
     let storage = storage(&path).await?;
-    let ingress = connect(&c, binding()).await?;
+    let ingress = connect(&c, binding())
+        .await?
+        .with_session_read_concurrency(4)?;
     let mut publisher =
         materializer::publisher(&ingress, &storage, &MergeMemoryBudget::new(32 << 20), 1).await?;
     publisher.run_once().await?.context("publication missing")?;

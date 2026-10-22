@@ -116,6 +116,8 @@ pub struct Config {
     /// Deployment-controlled authorized registry, never supplied by an upload.
     pub tables: Vec<Table>,
     pub ingress_memory_bytes: usize,
+    #[serde(default = "crate::reader::default_concurrency")]
+    pub session_read_concurrency: usize,
     pub materializer_memory_bytes: usize,
     pub http: Option<Http>,
     pub etcd: Option<Etcd>,
@@ -158,6 +160,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         self.layout.validate()?;
+        crate::reader::validate_concurrency(self.session_read_concurrency)?;
         // Client::new validates the complete WAL policy before any RPC.
         ensure!(
             (1..=4096).contains(&self.tables.len()),
