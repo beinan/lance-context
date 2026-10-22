@@ -47,12 +47,19 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
     }
 }
 
+#[derive(Default)]
+pub(crate) struct WorkerAdmission {
+    pub writer_id: Option<String>,
+    pub enable_fencing: bool,
+}
+
 pub struct Executions {
     pub(crate) legacy: crate::legacy_merge::LegacyMerges,
     coordinator: OnceCell<Coordinator>,
     etcd: Option<lance_context_merge::EtcdConfig>,
     pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
     endpoint: Option<String>,
+    worker_admission: WorkerAdmission,
     fencing_mode: OnceCell<bool>,
     mode_pending: std::sync::atomic::AtomicBool,
     background_targets: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -74,6 +81,7 @@ impl Executions {
             etcd: None,
             rollout: Default::default(),
             endpoint: None,
+            worker_admission: WorkerAdmission::default(),
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
@@ -86,13 +94,14 @@ impl Executions {
             running: Mutex::new(HashMap::new()),
         }
     }
-    pub fn configured(
+    pub(crate) fn configured(
         etcd: lance_context_merge::EtcdConfig,
         rollout: lance_context_merge::rollout::MergeRollout,
         endpoint: Option<String>,
         timeout_secs: u64,
         queue_timeout_secs: u64,
         idle_timeout_secs: u64,
+        worker_admission: WorkerAdmission,
     ) -> Self {
         Self {
             legacy: Default::default(),
@@ -100,6 +109,7 @@ impl Executions {
             etcd: Some(etcd),
             rollout,
             endpoint,
+            worker_admission,
             fencing_mode: OnceCell::new(),
             mode_pending: std::sync::atomic::AtomicBool::new(false),
             background_targets: Default::default(),
@@ -117,6 +127,7 @@ impl Executions {
     /// is persisted so a configuration rollback cannot reopen untracked writes.
     pub(crate) fn fencing_mode_known(&self) -> Option<bool> {
         if !self.rollout.fence_legacy
+            && !self.worker_admission.enable_fencing
             && self.coordinator.get().is_none()
             && self
                 .etcd
@@ -133,8 +144,15 @@ impl Executions {
             return Ok(mode);
         }
         self.fencing_mode.get_or_try_init(|| async {
-            let mode = self.coordinator().await?.legacy_fencing_mode(self.rollout.fence_legacy)
+            let coordinator = self.coordinator().await?;
+            let cluster_mode = coordinator.legacy_fencing_mode(self.rollout.fence_legacy)
                 .await.map_err(AppError::Internal)?;
+            let mode = match self.worker_admission.writer_id.as_deref() {
+                Some(writer) => coordinator.worker_fencing_mode(writer, self.worker_admission.enable_fencing)
+                    .await.map_err(AppError::Internal)?,
+                None if self.worker_admission.enable_fencing => return Err(AppError::InvalidRequest("worker fencing requires a stable writer identity".into())),
+                None => cluster_mode,
+            };
             if mode && self.endpoint.is_none() {
                 return Err(AppError::InvalidRequest("persisted merge protocol requires MERGE_EXECUTOR_ENDPOINT; refusing legacy rollback".into()));
             }
@@ -238,12 +256,50 @@ pub async fn capabilities(
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
         "legacy_progress_protocol": 1,
+        "merge_admission_ready": state.merge_executions.fencing_mode_known().is_some(),
         "fenced_legacy_merges": state.merge_executions.fencing_mode_known() == Some(true),
         "rollout_append_protocol": 1,
         "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
         "drain_targets": state.merge_executions.rollout.drain_targets}),
     ))
+}
+
+/// A replacement must resolve both the persisted admission mode and the exact
+/// old execution from its own coordinator before legacy retirement can proceed.
+#[derive(serde::Deserialize)]
+pub struct RetirementQuery {
+    target: String,
+}
+
+pub async fn retirement_status(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<RetirementQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.target.is_empty() || query.target.len() > 512 {
+        return Err(AppError::InvalidRequest(
+            "one explicit retirement target is required".into(),
+        ));
+    }
+    if !state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "replacement must fence all legacy merge admission".into(),
+        ));
+    }
+    let execution = state
+        .merge_executions
+        .coordinator()
+        .await?
+        .get(&query.target)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::json!({
+        "instance": state.merge_executions.instance,
+        "base_uri": state.base_uri,
+        "shard_name": state.instance_id,
+        "fenced_legacy_merges": true,
+        "execution": execution,
+    })))
 }
 
 pub async fn start(
@@ -647,6 +703,68 @@ mod tests {
         .await
         .unwrap();
         (state, coordinator, proof, dir)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_resolves_mode_and_returns_exact_coordinator_record() {
+        let (mut state, coordinator, proof, _dir) = deadline_fixture().await;
+        let local = Arc::get_mut(&mut state).unwrap();
+        local.merge_executions.worker_admission = WorkerAdmission {
+            writer_id: Some("worker-9".into()),
+            enable_fencing: true,
+        };
+        local.merge_executions.endpoint = Some("http://replacement:3000".into());
+        local.instance_id = Some("worker-9".into());
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        let Json(reply) = retirement_status(
+            State(state.clone()),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["fenced_legacy_merges"], true);
+        assert_eq!(
+            reply["execution"],
+            serde_json::to_value(&execution).unwrap()
+        );
+        assert_eq!(reply["base_uri"], state.base_uri);
+        assert_eq!(reply["shard_name"], "worker-9");
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(coordinator
+            .worker_fencing_mode("worker-9", false)
+            .await
+            .unwrap());
+        assert!(!coordinator
+            .worker_fencing_mode("worker-8", false)
+            .await
+            .unwrap());
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_rejects_unfenced_replacement() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        assert!(retirement_status(
+            State(state),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into()
+            })
+        )
+        .await
+        .is_err());
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
     }
 
     async fn terminal(coordinator: &Coordinator) -> Execution {
