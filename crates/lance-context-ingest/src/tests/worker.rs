@@ -42,6 +42,8 @@ fn options() -> Options {
             retained_manifest_versions: 2,
             ..Default::default()
         },
+        #[cfg(feature = "service")]
+        preparers: None,
     }
 }
 async fn append(
