@@ -4,7 +4,6 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
-#[cfg(any(feature = "http-client", feature = "service"))]
 pub(super) async fn publisher(
     ingress: &Ingress,
     storage: &Storage,

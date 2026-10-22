@@ -9,9 +9,9 @@ description = "Durable rollout ingress over the independent lance-context WAL"
 [features]
 service = ["worker", "http", "dep:reqwest", "dep:tokio-rustls", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "tokio/signal"]
 worker = ["materializer", "dep:etcd-client"]
-http = ["dep:axum", "dep:http-body-util"]
+http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
-materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:futures"]
+materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:futures", "dep:async-stream"]
 
 [dependencies]
 tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["ring", "tls12"] }
@@ -24,9 +24,11 @@ lance-table = { version = "13.0.0", optional = true }
 lance-io = { version = "13.0.0", optional = true }
 object_store = { version = "0.14.2", optional = true }
 futures = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
 anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
+arrow-ipc = { version = "58", optional = true }
 base64 = "0.22"
 bytes = "1"
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
