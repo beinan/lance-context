@@ -209,6 +209,21 @@ pub enum Outcome {
     Unknown,
 }
 
+#[derive(Debug)]
+pub(crate) enum ProposalRejection {
+    NotLeader,
+    PendingCapacity,
+}
+impl std::fmt::Display for ProposalRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotLeader => "not leader",
+            Self::PendingCapacity => "pending proposal capacity",
+        })
+    }
+}
+impl std::error::Error for ProposalRejection {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Completion {
     pub group: u64,
@@ -726,10 +741,13 @@ impl Node {
             true,
         )?;
         let g = self.groups.get_mut(&group).context("unhosted group")?;
-        ensure!(g.raw.raft.state == StateRole::Leader, "not leader");
+        ensure!(
+            g.raw.raft.state == StateRole::Leader,
+            ProposalRejection::NotLeader
+        );
         ensure!(
             g.pending.len() + g.reads.len() < self.limits.max_pending as usize,
-            "pending proposal capacity"
+            ProposalRejection::PendingCapacity
         );
         let index = g.raw.raft.raft_log.last_index() + 1;
         let term = g.raw.raft.term;

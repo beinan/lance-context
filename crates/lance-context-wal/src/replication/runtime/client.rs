@@ -40,6 +40,8 @@ const MAGIC: &[u8; 8] = b"LCWCLNT1";
 const MAX_META: usize = 2 << 20;
 const PREFIX: usize = 24;
 
+pub(super) mod observation;
+
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     pub data_address: String,
@@ -240,6 +242,11 @@ async fn send<W: AsyncWrite + Unpin>(
 }
 
 impl Handle {
+    /// Node-local append execution counters. See the status endpoint's `appends`
+    /// field. These are not commit receipts or proof that an ACK was delivered.
+    pub fn append_observation(&self) -> BTreeMap<&'static str, u64> {
+        self.shared.appends.snapshot()
+    }
     /// Read on the owner thread with data-lane credit, separate from small
     /// control replies. Returned bytes describe local committed state only.
     /// Complete after validating that already durable payload, without waiting
@@ -404,7 +411,12 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         ensure!(body_len == 0, "unexpected request payload");
     }
     let body = receive(io, body_len).await?;
+    let observation =
+        matches!(request, WireRequest::Append { .. }).then(|| handle.shared.appends.start());
     let executed = execute(handle, request, body).await;
+    if let Some(observation) = observation {
+        observation.finish(&executed);
+    }
     let (reply, body) = executed.unwrap_or((Reply::Unknown, Bytes::new()));
     let metadata = codec().serialize(&(scope(handle), reply))?;
     send(io, id, &metadata, &body).await

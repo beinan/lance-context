@@ -153,12 +153,29 @@ impl<T> Future for Pending<T> {
         match Pin::new(&mut self.0).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(value)) => Poll::Ready(value.result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(anyhow::anyhow!(
-                "replica worker stopped; outcome unknown"
-            ))),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(SubmissionFailure::WorkerStopped.into())),
         }
     }
 }
+
+#[derive(Debug)]
+enum SubmissionFailure {
+    RequestCredits,
+    ByteCredits,
+    QueueUnavailable,
+    WorkerStopped,
+}
+impl std::fmt::Display for SubmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RequestCredits => "runtime request credits exhausted",
+            Self::ByteCredits => "runtime byte credits exhausted",
+            Self::QueueUnavailable => "runtime queue unavailable; reconcile original request",
+            Self::WorkerStopped => "replica worker stopped; outcome unknown",
+        })
+    }
+}
+impl std::error::Error for SubmissionFailure {}
 
 struct Credits {
     slots: Arc<Semaphore>,
@@ -229,7 +246,7 @@ impl Credits {
             .clone()
             .try_acquire_owned()
             .inspect_err(|_| increment_rejection(&self.rejected_slots))
-            .context("runtime request credits exhausted")?;
+            .map_err(|_| SubmissionFailure::RequestCredits)?;
         let bytes = u32::try_from(
             bytes
                 .checked_add(256)
@@ -240,7 +257,7 @@ impl Credits {
             .clone()
             .try_acquire_many_owned(bytes)
             .inspect_err(|_| increment_rejection(&self.rejected_bytes))
-            .context("runtime byte credits exhausted")?;
+            .map_err(|_| SubmissionFailure::ByteCredits)?;
         Ok(Credit {
             _slot: slot,
             _bytes: bytes,
@@ -283,6 +300,8 @@ struct Route {
     observation: Arc<Mutex<Observation>>,
 }
 struct Shared {
+    #[cfg(feature = "peer-transport")]
+    appends: client::observation::Counters,
     stopped: AtomicBool,
     token: AtomicU64,
     data: Credits,
@@ -406,9 +425,9 @@ impl Handle {
     }
     fn enqueue(&self, route: &Route, work: Work, data: bool) -> Result<()> {
         let queue = if data { &route.data } else { &route.control };
-        queue.try_send(work).map_err(|_| {
-            anyhow::anyhow!("runtime queue unavailable; reconcile original request")
-        })?;
+        queue
+            .try_send(work)
+            .map_err(|_| SubmissionFailure::QueueUnavailable)?;
         route.wake.unpark();
         Ok(())
     }
@@ -562,6 +581,8 @@ impl Runtime {
         options.validate()?;
         node.healthy()?;
         let shared = Arc::new(Shared {
+            #[cfg(feature = "peer-transport")]
+            appends: client::observation::Counters::default(),
             stopped: AtomicBool::new(false),
             token: AtomicU64::new(1),
             data: Credits::new(options.data_requests, options.data_bytes),

@@ -11,6 +11,15 @@ use std::sync::{
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug)]
+pub(crate) struct DiskBudgetExhausted;
+impl std::fmt::Display for DiskBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node proposal disk budget exhausted; data admission preserves control window")
+    }
+}
+impl std::error::Error for DiskBudgetExhausted {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub measured_disk_bytes: u64,
@@ -124,7 +133,7 @@ impl Budget {
                 .checked_add(state.pending)
                 .and_then(|n| n.checked_add(bytes))
                 .is_some_and(|n| n <= limit()),
-            "node proposal disk budget exhausted; data admission preserves control window"
+            DiskBudgetExhausted
         );
         state.pending += bytes;
         if file {

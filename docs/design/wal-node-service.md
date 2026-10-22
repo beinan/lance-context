@@ -89,7 +89,22 @@ control, incoming peers and outgoing peers. Each lane reports request and byte
 capacity, current usage, and separate rejection counters. These independently
 sampled local values distinguish request pressure from response-byte pressure;
 they exclude the transport's separate budgets and do not change readiness.
-It allows at most 16 connections, bounds header buffers, disables keepalive and
+
+The `appends` counters distinguish disk-budget refusal, runtime request/byte
+credits, queue unavailability, pending-proposal capacity, leadership changes,
+committed capacity/sequence rejections, and stopped workers. They use typed
+causes before RPC errors become `Unknown`; unclassified execution failures stay
+in `execution_other`. Labels have fixed cardinality and contain no request data.
+Counting starts after a complete append body reaches execution. TLS/frame
+failures, transport admission waits, ingress-to-node timeouts and response
+delivery failures are outside this observation. `cancelled` means execution was
+dropped (for example by the server deadline or shutdown), not that its Raft
+proposal was aborted. `accepted` includes exact retries and only means the server
+observed a durable acceptance, not that the client received the ACK. Counters
+reset on process restart and are sampled independently. A routed request may
+produce redirects on other nodes, so these are not HTTP retry counts.
+
+The diagnostic listener allows at most 16 connections, bounds header buffers, disables keepalive and
 uses a two-second connection deadline, independently of WAL RPC capacity.
 Readiness reports active local workers and fresh local observations; it is not
 a quorum lease or proof of Lance visibility. Status includes each group's log
