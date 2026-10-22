@@ -69,6 +69,157 @@ async fn append(
     let accepted = ingress.append(&prepared).await?;
     Ok((body, accepted))
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batching_waits_for_size_then_flushes_a_timed_tail_and_record_limit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("batched.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding()).await?;
+    let storage = Storage::resolve(
+        path.to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let open = ProducerOpen {
+        bucket: 0,
+        slot: 0,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let (body, _) = append(&ingress, &open, 1, &["a"]).await?;
+    let mut expected = BTreeMap::new();
+    remember(&mut expected, body.clone())?;
+    let options = Options {
+        max_source_bytes: 1 << 20,
+        min_source_bytes: 2 * body.len(),
+        max_batch_wait: Duration::from_millis(150),
+        max_records: 8,
+        ..Options::default()
+    };
+    let budget = MergeMemoryBudget::new(32 << 20);
+    let mut publisher = Publisher::acquire(
+        ingress.clone(),
+        storage.clone(),
+        options.clone(),
+        budget.clone(),
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: 1,
+        },
+    )
+    .await?;
+    assert!(publisher.run_once().await?.is_none());
+    assert!(publisher.state().await?.progress.pending.is_none());
+    verify(&publisher, &BTreeMap::new(), 1).await?;
+    let (body, _) = append(&ingress, &open, 2, &["b"]).await?;
+    remember(&mut expected, body)?;
+    assert!(publisher.run_once().await?.is_some());
+    verify(&publisher, &expected, 2).await?;
+    let (body, _) = append(&ingress, &open, 3, &["c"]).await?;
+    remember(&mut expected, body)?;
+    assert!(publisher.run_once().await?.is_none());
+    tokio::time::sleep(Duration::from_millis(175)).await;
+    assert!(publisher.run_once().await?.is_some());
+    verify(&publisher, &expected, 3).await?;
+    drop(publisher);
+    let mut publisher = Publisher::acquire(
+        ingress.clone(),
+        storage,
+        Options {
+            max_records: 1,
+            ..options
+        },
+        budget.clone(),
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: 2,
+        },
+    )
+    .await?;
+    let (body, _) = append(&ingress, &open, 4, &["d"]).await?;
+    remember(&mut expected, body)?;
+    assert!(
+        publisher.run_once().await?.is_some(),
+        "full record selection must not wait"
+    );
+    verify(&publisher, &expected, 4).await?;
+    assert_eq!(budget.reserved(), 0);
+    drop((publisher, ingress));
+    cluster.shutdown().await
+}
+
+#[cfg(feature = "worker")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batching_deadline_survives_healthy_claim_rotation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("batched.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding()).await?;
+    let storage = Storage::resolve(
+        path.to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let open = ProducerOpen {
+        bucket: 0,
+        slot: 0,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let (body, _) = append(&ingress, &open, 1, &["claim-tail"]).await?;
+    let mut expected = BTreeMap::new();
+    remember(&mut expected, body)?;
+    let options = Options {
+        max_source_bytes: 1 << 20,
+        min_source_bytes: 1 << 20,
+        max_batch_wait: Duration::from_millis(150),
+        ..Options::default()
+    };
+    let budget = MergeMemoryBudget::new(32 << 20);
+    let mut publisher = Publisher::acquire(
+        ingress.clone(),
+        storage.clone(),
+        options.clone(),
+        budget.clone(),
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: 1,
+        },
+    )
+    .await?;
+    assert!(publisher.run_once().await?.is_none());
+    let progress = publisher.take_scan_progress();
+    drop(publisher);
+    tokio::time::sleep(Duration::from_millis(175)).await;
+    let mut successor = Publisher::acquire(
+        ingress.clone(),
+        storage,
+        options,
+        budget,
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: 2,
+        },
+    )
+    .await?;
+    successor.resume_scanning(progress)?;
+    assert!(
+        successor.run_once().await?.is_some(),
+        "claim rotation reset the flush deadline"
+    );
+    verify(&successor, &expected, 2).await?;
+    drop((successor, ingress));
+    cluster.shutdown().await
+}
 pub(super) async fn verify(
     publisher: &Publisher,
     expected: &BTreeMap<String, RecordBatch>,

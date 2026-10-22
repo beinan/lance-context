@@ -49,6 +49,20 @@ still supplies bounded scheduling, backoff, shutdown and table discovery.
 
 ## Resource and retention boundaries
 
+`min_source_bytes` lets a worker accumulate a larger publication before writing
+Lance files. A full byte/record selection flushes immediately; a smaller tail
+flushes after `max_batch_wait` on the next scheduled poll. The default minimum is
+zero, preserving immediate publication. The wait starts at the first observation
+of pending rows and survives healthy scheduling-claim rotation. A process restart
+can begin a fresh wait, but never advances a checkpoint or loses an append.
+Pending durable publication plans always resume immediately.
+
+Size the minimum below `max_source_bytes`, and budget `max_source_bytes` for the
+existing writer parallelism. The publication byte limit belongs to the immutable
+WAL policy; a worker setting cannot raise an existing group's limit. The minimum
+controls source IPC bytes, not an exact encoded Lance file size. Use session WAL
+reads when visibility must precede this publication delay.
+
 One materialization reserves space for source buffers, decoding and row metadata
 before payload fetch. Admitted file-writing work retains the reservation if its
 caller is cancelled, and joins all its file writers even when one fails. These

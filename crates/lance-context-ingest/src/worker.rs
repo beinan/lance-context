@@ -267,7 +267,7 @@ async fn publish_claim(
     assignment: Assignment,
     options: Options,
     budget: Arc<MergeMemoryBudget>,
-    stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
     counters: Arc<Counters>,
     scan_progress: &mut Option<ScanProgress>,
 ) -> Result<()> {
@@ -305,7 +305,8 @@ async fn publish_claim(
             publisher.use_preparers(pool);
         }
         let result = async {
-            for _ in 0..options.publications_per_claim {
+            let mut published = 0;
+            while published < options.publications_per_claim {
                 if *stop.borrow() || !claim.valid().await? {
                     break;
                 }
@@ -315,8 +316,18 @@ async fn publish_claim(
                     .context("publishing Lance data")?
                     .is_none()
                 {
+                    // Retain a healthy claim while accumulating the batch, so
+                    // competing workers cannot keep restarting its deadline.
+                    if publisher.waiting_for_batch() {
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            _ = tokio::time::sleep(options.poll_interval) => {}
+                        }
+                        continue;
+                    }
                     break;
                 }
+                published += 1;
                 counters.published.fetch_add(1, Ordering::Relaxed);
             }
             Ok::<_, anyhow::Error>(())

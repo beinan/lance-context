@@ -28,6 +28,11 @@ pub struct Storage {
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub max_source_bytes: usize,
+    /// Accumulate this many source bytes before publication. Zero flushes on
+    /// every poll, preserving the existing behavior.
+    pub min_source_bytes: usize,
+    /// Flush a smaller tail after this delay, on the next scheduled poll.
+    pub max_batch_wait: Duration,
     pub max_records: usize,
     pub fetch_parallelism: usize,
     pub write_parallelism: usize,
@@ -46,6 +51,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             max_source_bytes: 64 << 20,
+            min_source_bytes: 0,
+            max_batch_wait: Duration::from_secs(1),
             max_records: 128,
             fetch_parallelism: 4,
             write_parallelism: 2,
@@ -78,6 +85,11 @@ impl Options {
             self.max_source_bytes >= ingress.scope.contract.max_record_bytes as usize
                 && self.max_source_bytes as u64 <= ingress.client.max_plan_source_bytes(),
             "materializer source cap differs from WAL/ingress policy"
+        );
+        ensure!(
+            self.min_source_bytes <= self.max_source_bytes
+                && self.max_batch_wait <= Duration::from_secs(60),
+            "invalid materializer batch thresholds"
         );
         ensure!(
             (1..=p::MAX_INPUTS).contains(&self.max_records)
@@ -114,6 +126,7 @@ pub struct Acquisition {
 pub(crate) struct ScanProgress {
     scope: Arc<Scope>,
     empty_cursors: BTreeMap<u64, u64>,
+    batch_started: Option<tokio::time::Instant>,
 }
 
 pub struct Publisher {
@@ -125,6 +138,7 @@ pub struct Publisher {
     // Only skip pages proven to contain no records for this table. This hint
     // never advances a durable source checkpoint or skips a selected record.
     empty_cursors: BTreeMap<u64, u64>,
+    batch_started: Option<tokio::time::Instant>,
     plan_attempt: Option<p::Plan>,
     prepared_attempt: Option<p::PrepareRequest>,
     phases: Arc<PhaseCounters>,
@@ -180,6 +194,7 @@ impl Publisher {
             budget,
             authority,
             empty_cursors: BTreeMap::new(),
+            batch_started: None,
             plan_attempt: None,
             prepared_attempt: None,
             phases: Arc::default(),
@@ -193,6 +208,10 @@ impl Publisher {
         self.phases.observation()
     }
     #[cfg(feature = "worker")]
+    pub(crate) fn waiting_for_batch(&self) -> bool {
+        self.batch_started.is_some()
+    }
+    #[cfg(feature = "worker")]
     pub(crate) fn observe_with(&mut self, phases: Arc<PhaseCounters>) {
         self.phases = phases;
     }
@@ -203,6 +222,7 @@ impl Publisher {
             "scan progress belongs to another table binding"
         );
         self.empty_cursors = progress.empty_cursors;
+        self.batch_started = progress.batch_started;
         Ok(())
     }
     #[cfg(feature = "worker")]
@@ -210,6 +230,7 @@ impl Publisher {
         ScanProgress {
             scope: self.ingress.scope.clone(),
             empty_cursors: std::mem::take(&mut self.empty_cursors),
+            batch_started: self.batch_started.take(),
         }
     }
     pub fn authority(&self) -> &p::Authority {
@@ -622,6 +643,7 @@ impl Publisher {
         let mut sources = BTreeMap::new();
         let mut bytes = 0usize;
         let mut count = 0usize;
+        let mut full = false;
         let mut next_group = groups[0];
         for (ordinal, &group) in groups.iter().enumerate() {
             let after = view.progress.checkpoint.get(&group).copied().unwrap_or(0);
@@ -662,6 +684,7 @@ impl Publisher {
                         || count == self.options.max_records
                     {
                         stopped = true;
+                        full = true;
                         break;
                     }
                     bytes += size;
@@ -697,8 +720,20 @@ impl Publisher {
             }
         }
         if sources.is_empty() {
+            self.batch_started = None;
             return Ok(None);
         }
+        let started = self
+            .batch_started
+            .get_or_insert_with(tokio::time::Instant::now);
+        if !full
+            && bytes < self.options.min_source_bytes
+            && count < self.options.max_records
+            && started.elapsed() < self.options.max_batch_wait
+        {
+            return Ok(None);
+        }
+        self.batch_started = None;
         Ok(Some(p::Plan {
             transaction: Uuid::new_v4(),
             read_version: view.progress.minimum_read_version,
