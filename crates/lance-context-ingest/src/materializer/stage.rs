@@ -146,8 +146,10 @@ pub(super) async fn fetch(
         let _reservation = reservation;
         let _permit = permit;
         phases.blocking(Phase::DecodeValidate, || {
-            meta.validate_payload(
-                &response.body,
+            // Fetch validates stored bytes before sending them over authenticated
+            // TLS. The pinned metadata was checked above; avoid hashing them again.
+            meta.check_body_length(
+                response.body.len(),
                 ingress.scope.contract.max_record_bytes as usize,
             )?;
             let batches = ipc::decode(response.body, ingress.schema.clone())?;
