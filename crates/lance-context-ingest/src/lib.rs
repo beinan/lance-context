@@ -92,6 +92,8 @@ pub struct Ingress {
     session_read_concurrency: usize,
     #[cfg(feature = "materializer")]
     session_scan_batch_rows: usize,
+    #[cfg(feature = "materializer")]
+    session_scan_fragment_readahead: usize,
 }
 /// Held before body buffering; retained by preparation and every ambiguous retry.
 pub struct Upload {
@@ -232,6 +234,8 @@ impl Ingress {
             session_read_concurrency: reader::default_concurrency(),
             #[cfg(feature = "materializer")]
             session_scan_batch_rows: reader::default_scan_batch_rows(),
+            #[cfg(feature = "materializer")]
+            session_scan_fragment_readahead: reader::default_scan_fragment_readahead(),
         };
         value.visibility().await?;
         Ok(value)

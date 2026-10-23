@@ -144,18 +144,32 @@ async fn ack_visible_before_publication_after_restart_and_during_handoff() -> Re
         &expected,
     )
     .await?;
-    let added = batch(&["new-tail"], &[&s])?;
-    append(&ingress, &producer, 2, added.clone()).await?;
     let mut expected = expected;
+    for sequence in 2..=4 {
+        let added = batch(&[&format!("published-{sequence}")], &[&s])?;
+        append(&ingress, &producer, sequence, added.clone()).await?;
+        assert!(publisher.prepare_next().await?.is_some());
+        assert!(publisher.commit_pending().await?.is_some());
+        assert!(publisher.finish_pending().await?.is_some());
+        expected.push(added);
+    }
+    assert!(publisher.read_dataset(None).await?.get_fragments().len() >= 4);
+    let added = batch(&["new-tail"], &[&s])?;
+    append(&ingress, &producer, 5, added.clone()).await?;
     expected.push(added);
-    // Changing published-data batching preserves the union with the WAL tail.
+    // Parallel reads of several real fragments preserve the union with the tail.
     for rows in [1, 4] {
-        let batched = ingress.clone().with_session_scan_batch_rows(rows)?;
-        verify(
-            reader::read_session(&batched, &storage, &s).await?,
-            &expected,
-        )
-        .await?;
+        for fragments in [1, 4] {
+            let batched = ingress
+                .clone()
+                .with_session_scan_batch_rows(rows)?
+                .with_session_scan_fragment_readahead(fragments)?;
+            verify(
+                reader::read_session(&batched, &storage, &s).await?,
+                &expected,
+            )
+            .await?;
+        }
     }
     assert_eq!(ingress.budget.reserved(), 0);
     drop((publisher, ingress));
@@ -500,13 +514,28 @@ async fn http_ack_is_queryable_without_a_worker_then_merges_base_and_tail() -> R
     let path = root.path().join("rollouts.lance");
     let c = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&c, &path, &binding()).await?;
-    let mut config = c.application.clone();
+    // Older deployment JSON retains serial scanning; explicit settings reach HTTP reads.
+    let mut legacy = serde_json::to_value(&c.application)?;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("session_scan_fragment_readahead");
+    let mut config: application::Config = serde_json::from_value(legacy)?;
+    assert_eq!(config.session_scan_fragment_readahead, 1);
     config.tables.push(config::Table {
         binding: binding(),
         uri: path.to_str().unwrap().into(),
         storage_options: Default::default(),
         bootstrap: bootstrap::identity(),
     });
+    config.validate()?;
+    config.session_scan_fragment_readahead = 0;
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("session scan fragment readahead"));
+    config.session_scan_fragment_readahead = 4;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let token = "session-read-test-workload-token-0001";

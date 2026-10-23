@@ -35,6 +35,27 @@ impl Ingress {
         self.session_scan_batch_rows = rows;
         Ok(self)
     }
+
+    /// Bound concurrent Lance fragment reads for published session data.
+    /// Defaults to one. The scan's byte and decode targets stay unchanged;
+    /// measure memory and ingestion contention before increasing concurrency.
+    pub fn with_session_scan_fragment_readahead(mut self, fragments: usize) -> Result<Self> {
+        validate_scan_fragment_readahead(fragments)?;
+        self.session_scan_fragment_readahead = fragments;
+        Ok(self)
+    }
+}
+
+pub(crate) fn validate_scan_fragment_readahead(fragments: usize) -> Result<()> {
+    ensure!(
+        (1..=8).contains(&fragments),
+        "session scan fragment readahead must be 1..=8"
+    );
+    Ok(())
+}
+
+pub(crate) fn default_scan_fragment_readahead() -> usize {
+    1
 }
 
 pub(crate) fn validate_scan_batch_rows(rows: usize) -> Result<()> {
@@ -230,7 +251,7 @@ pub(super) fn from_positions(
         scanner.batch_size_bytes(batch_bytes as u64);
         scanner.batch_readahead(1);
         scanner.io_buffer_size(batch_bytes as u64);
-        scanner.fragment_readahead(1);
+        scanner.fragment_readahead(ingress.session_scan_fragment_readahead);
         scanner.materialization_readahead_bytes(batch_bytes as u64);
         scanner.filter(&format!("rollout_id = '{}'", session.replace('\'', "''")))?;
         let mut base = scanner.try_into_stream().await?;

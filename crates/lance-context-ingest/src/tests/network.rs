@@ -253,6 +253,7 @@ impl Cluster {
             ingress_memory_bytes: 32 << 20,
             session_read_concurrency: 1,
             session_scan_batch_rows: 1,
+            session_scan_fragment_readahead: 1,
             materializer_memory_bytes: 64 << 20,
             http: None,
             etcd: None,
