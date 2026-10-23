@@ -179,6 +179,24 @@ impl MemTable<VacantAllocator> {
 }
 
 impl<A: AllocatorTrait> MemTable<A> {
+    fn rewrite_size_hint(&self) -> Option<usize> {
+        // Include framing even if each item is emitted in its own batch. The
+        // per-group allowance also covers rewrite atomic-group markers.
+        let entries = self
+            .entry_indexes
+            .iter()
+            .try_fold(512usize, |size, entry| {
+                size.checked_add(entry.entry_len as usize)?.checked_add(128)
+            })?;
+        self.kvs
+            .iter()
+            .try_fold(entries, |size, (key, (value, _))| {
+                size.checked_add(key.len())?
+                    .checked_add(value.len())?
+                    .checked_add(128)
+            })
+    }
+
     fn with_allocator(
         region_id: u64,
         global_stats: Arc<GlobalStats>,
@@ -955,6 +973,16 @@ impl<A: AllocatorTrait> MemTableAccessor<A> {
             }
         }
         init
+    }
+
+    pub(crate) fn rewrite_size_hint(&self) -> Option<usize> {
+        let live = self.fold(Some(0usize), |size, table| {
+            size?.checked_add(table.rewrite_size_hint()?)
+        })?;
+        let tombstones = self.removed_memtables.lock().len().checked_mul(128)?;
+        // One native maintenance pass can rewrite both queues. This deliberately
+        // allows two copies of every live item instead of predicting selection.
+        live.checked_add(tombstones)?.checked_mul(2)
     }
 
     pub fn collect<F: FnMut(&MemTable<A>) -> bool>(

@@ -25,10 +25,15 @@ converts it to counted growth after all buffered writes finish. A later scan may
 replace this conservative charge with actual retained lengths/allocation; only
 actual deletion returns the space used by an orphan or installed file.
 
-Physical maintenance reserves an additional current-directory-size window
-before native rewriting. Rejection occurs before mutation and leaves the node
-healthy. A successful native pass refreshes measured usage while appends are
-excluded. Image collection instead holds a separate filesystem lifecycle guard:
+Physical maintenance reserves a conservative allowance for live native entries,
+key/value metadata and cleaned-group markers, plus two target files for rotation.
+The native estimate allows two copies of each live item for its two queue passes.
+Sizing reads in-memory lengths while writes are excluded; it does not scan
+payloads or charge obsolete segments and application images as rewrite input.
+Reserving another whole directory can otherwise prevent deletion precisely when
+dead segments have filled the data-admission window. Rejection occurs before
+mutation and leaves the node healthy. A successful native pass refreshes measured
+usage while appends are excluded. Image collection instead holds a separate filesystem lifecycle guard:
 ordinary log appends can continue during its bounded deletion batches. A fully
 drained image scan refreshes accounting after deletion. Neither lock substitutes
 for the image owners that protect installed snapshots and captured readers.
