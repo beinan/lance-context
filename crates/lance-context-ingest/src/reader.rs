@@ -190,10 +190,19 @@ pub(super) fn from_positions(
         };
         let dataset = materializer::read_dataset(&ingress, &storage, None).await?;
         if dataset.version().version < minimum_version { Err(anyhow::anyhow!("dataset precedes captured WAL closure"))?; }
+        let batch_bytes = ingress.scope.contract.max_record_bytes as usize;
+        // Output batching alone does not bound Lance's storage prefetch. Share
+        // admission with uploads/WAL reads and retain it across streamed batches.
+        // These are workspace targets, not an allocator limit: a Lance page or
+        // an oversized row can exceed a target, and callers may retain outputs.
+        let _scan_reservation = ingress.budget.reserve(workspace(&ingress.scope.contract, batch_bytes)?).await;
         let mut scanner = dataset.scan();
         // Large binary rows need a byte target, not just a row-count limit.
-        scanner.batch_size_bytes(u64::from(ingress.scope.contract.max_record_bytes));
+        scanner.batch_size_bytes(batch_bytes as u64);
         scanner.batch_readahead(1);
+        scanner.io_buffer_size(batch_bytes as u64);
+        scanner.fragment_readahead(1);
+        scanner.materialization_readahead_bytes(batch_bytes as u64);
         scanner.filter(&format!("rollout_id = '{}'", session.replace('\'', "''")))?;
         let mut base = scanner.try_into_stream().await?;
         while let Some(batch) = base.try_next().await? {

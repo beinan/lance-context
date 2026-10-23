@@ -59,6 +59,13 @@ Concurrent queries and uploads share the configured ingress byte budget. Droppin
 the stream cancels pending fetches; an already running blocking decode retains
 its reservation until it finishes. Tune concurrency against both read latency
 and ingestion throughput, since WAL storage and network resources are shared.
+The published Lance phase also reserves from the shared ingress budget for the
+lifetime of its scan. Its I/O buffer, decoded batch target, and blob-materialization
+readahead each use `max_record_bytes`; it decodes one batch and schedules one
+fragment at a time. This prevents concurrent queries from independently using
+the storage scanner's larger default prefetch budgets. These are workspace
+targets, not an RSS cap: individual pages or rows can exceed a target, and Rust
+callers can retain returned batches. Cancellation releases scan admission.
 Arrow filtering shares existing
 binary buffers. HTTP output is encoded once into an IPC stream, one batch at a
 time; the complete network path is not claimed to be zero-copy.
