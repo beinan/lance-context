@@ -26,6 +26,27 @@ impl Ingress {
         self.session_read_concurrency = concurrency;
         Ok(self)
     }
+
+    /// Limit rows gathered for late materialization of published session data.
+    /// Default one: a single binary row can fill the entire WAL record limit.
+    /// Larger batches amortize per-batch costs for workloads with smaller rows.
+    pub fn with_session_scan_batch_rows(mut self, rows: usize) -> Result<Self> {
+        validate_scan_batch_rows(rows)?;
+        self.session_scan_batch_rows = rows;
+        Ok(self)
+    }
+}
+
+pub(crate) fn validate_scan_batch_rows(rows: usize) -> Result<()> {
+    ensure!(
+        (1..=8192).contains(&rows),
+        "session scan batch rows must be 1..=8192"
+    );
+    Ok(())
+}
+
+pub(crate) fn default_scan_batch_rows() -> usize {
+    1
 }
 
 pub(crate) fn validate_concurrency(concurrency: usize) -> Result<()> {
@@ -195,9 +216,17 @@ pub(super) fn from_positions(
         // admission with uploads/WAL reads and retain it across streamed batches.
         // These are workspace targets, not an allocator limit: a Lance page or
         // an oversized row can exceed a target, and callers may retain outputs.
-        let _scan_reservation = ingress.budget.reserve(workspace(&ingress.scope.contract, batch_bytes)?).await;
+        // Lance 13's row-stream reader has four in-flight late-materialization
+        // batches, independent of batch_readahead. Reserve for their worst-case
+        // row sizes as well as the decode/encoding workspace. Oversized requests
+        // acquire the shared budget exclusively, following its normal semantics.
+        let scan_bytes = batch_bytes.checked_mul(ingress.session_scan_batch_rows)
+            .and_then(|bytes| bytes.checked_mul(4)).context("session scan workspace overflow")?;
+        let _scan_reservation = ingress.budget.reserve(workspace(&ingress.scope.contract, scan_bytes)?).await;
         let mut scanner = dataset.scan();
-        // Large binary rows need a byte target, not just a row-count limit.
+        // A byte output target alone still lets late materialization collect and
+        // concatenate the default 8192 rows before splitting them for emission.
+        scanner.batch_size(ingress.session_scan_batch_rows);
         scanner.batch_size_bytes(batch_bytes as u64);
         scanner.batch_readahead(1);
         scanner.io_buffer_size(batch_bytes as u64);

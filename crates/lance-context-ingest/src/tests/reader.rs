@@ -148,11 +148,15 @@ async fn ack_visible_before_publication_after_restart_and_during_handoff() -> Re
     append(&ingress, &producer, 2, added.clone()).await?;
     let mut expected = expected;
     expected.push(added);
-    verify(
-        reader::read_session(&ingress, &storage, &s).await?,
-        &expected,
-    )
-    .await?;
+    // Changing published-data batching preserves the union with the WAL tail.
+    for rows in [1, 4] {
+        let batched = ingress.clone().with_session_scan_batch_rows(rows)?;
+        verify(
+            reader::read_session(&batched, &storage, &s).await?,
+            &expected,
+        )
+        .await?;
+    }
     assert_eq!(ingress.budget.reserved(), 0);
     drop((publisher, ingress));
     c.shutdown().await

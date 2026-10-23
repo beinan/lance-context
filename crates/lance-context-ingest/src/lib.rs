@@ -90,6 +90,8 @@ pub struct Ingress {
     budget: Arc<MergeMemoryBudget>,
     #[cfg(feature = "materializer")]
     session_read_concurrency: usize,
+    #[cfg(feature = "materializer")]
+    session_scan_batch_rows: usize,
 }
 /// Held before body buffering; retained by preparation and every ambiguous retry.
 pub struct Upload {
@@ -228,6 +230,8 @@ impl Ingress {
             budget,
             #[cfg(feature = "materializer")]
             session_read_concurrency: reader::default_concurrency(),
+            #[cfg(feature = "materializer")]
+            session_scan_batch_rows: reader::default_scan_batch_rows(),
         };
         value.visibility().await?;
         Ok(value)
