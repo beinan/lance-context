@@ -7,8 +7,10 @@ use lance_context_wal::replication::publication as p;
 use lance_table::format::Fragment;
 use std::collections::BTreeMap;
 
+mod partition;
 mod pool;
 mod service;
+pub use partition::Partitioning;
 pub use pool::Pool;
 pub use service::{Observation, Service};
 
@@ -28,9 +30,17 @@ struct Task {
     read_version: u64,
     part: usize,
     parts: usize,
+    #[serde(default, skip_serializing_if = "Partitioning::is_record_stripe")]
+    partitioning: Partitioning,
 }
 impl Task {
-    fn new(ingress: &Ingress, pending: &p::PendingPlan, part: usize, parts: usize) -> Self {
+    fn new(
+        ingress: &Ingress,
+        pending: &p::PendingPlan,
+        part: usize,
+        parts: usize,
+        partitioning: Partitioning,
+    ) -> Self {
         Self {
             cluster: ingress.scope.cluster,
             layout: ingress.scope.layout,
@@ -41,6 +51,7 @@ impl Task {
             read_version: pending.plan.read_version,
             part,
             parts,
+            partitioning,
         }
     }
     fn validate(&self, ingress: &Ingress) -> Result<()> {
@@ -81,12 +92,7 @@ impl Task {
                     .map(move |(index, meta)| (group, *index, meta.clone()))
             })
             .collect::<Vec<_>>();
-        ensure!(self.parts <= inputs.len(), "empty preparation partition");
-        Ok(inputs
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, record)| (i % self.parts == self.part).then_some(record))
-            .collect())
+        self.partitioning.select(inputs, self.part, self.parts)
     }
 }
 

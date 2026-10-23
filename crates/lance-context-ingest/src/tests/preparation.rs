@@ -2,8 +2,9 @@ use super::*;
 use crate::{
     application::{self, config, Registry},
     materializer::Storage,
-    preparation::Pool,
+    preparation::{Partitioning, Pool},
 };
+use futures::TryStreamExt;
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -44,6 +45,15 @@ impl Server {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_preparers_require_every_partition_and_recover_the_durable_aggregate(
 ) -> Result<()> {
+    recover_partitioned_publication(Partitioning::RecordStripe).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bucket_preparers_keep_session_rows_in_one_file_across_retry_and_restart() -> Result<()> {
+    recover_partitioned_publication(Partitioning::BucketBytesV1).await
+}
+
+async fn recover_partitioned_publication(partitioning: Partitioning) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("distributed.lance");
     let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
@@ -65,19 +75,24 @@ async fn independent_preparers_require_every_partition_and_recover_the_durable_a
                 operation: Uuid::new_v4(),
             })
             .await?;
-        let ids = [format!("{bucket}-first"), format!("{bucket}-second")];
         let session = session(bucket);
-        let body = ipc_file(&[batch(&[&ids[0], &ids[1]], &[&session, &session])?])?;
-        let prepared = ingress
-            .prepare(
-                ingress.reserve_upload(body.len()).await?,
-                body.clone(),
-                &producer,
-                1,
-            )
-            .await?;
-        ingress.append(&prepared).await?;
-        materializer::remember(&mut expected, body)?;
+        for sequence in 1..=2 {
+            let ids = [
+                format!("{bucket}-{sequence}-first"),
+                format!("{bucket}-{sequence}-second"),
+            ];
+            let body = ipc_file(&[batch(&[&ids[0], &ids[1]], &[&session, &session])?])?;
+            let prepared = ingress
+                .prepare(
+                    ingress.reserve_upload(body.len()).await?,
+                    body.clone(),
+                    &producer,
+                    sequence,
+                )
+                .await?;
+            ingress.append(&prepared).await?;
+            materializer::remember(&mut expected, body)?;
+        }
     }
     let token = "independent-preparer-authorization-test-0001";
     let token_file = root.path().join("preparer.token");
@@ -90,6 +105,7 @@ async fn independent_preparers_require_every_partition_and_recover_the_durable_a
         bootstrap: bootstrap::identity(),
     });
     config.worker.publication.pipeline_preparation = true;
+    config.worker.publication.write_parallelism = 1;
     config.preparation = Some(config::Preparation {
         bearer_token_file: token_file,
         active: 2,
@@ -122,7 +138,12 @@ async fn independent_preparers_require_every_partition_and_recover_the_durable_a
         400
     );
     drop(second_port); // The second real endpoint is unavailable for the first round.
-    let pool = Pool::new(&endpoints, token.to_owned(), Duration::from_secs(10))?;
+    let pool = Pool::new_with_partitioning(
+        &endpoints,
+        token.to_owned(),
+        Duration::from_secs(10),
+        partitioning,
+    )?;
     let budget = MergeMemoryBudget::new(32 << 20);
     let mut publisher = materializer::publisher(&ingress, &storage, &budget, 1).await?;
     publisher.use_preparers(pool);
@@ -183,7 +204,7 @@ async fn independent_preparers_require_every_partition_and_recover_the_durable_a
             .find(|v| v["phase"] == "fetch")
             .unwrap();
         assert_eq!(
-            fetch["completed"], 2,
+            fetch["completed"], 4,
             "preparer did not fetch exactly its assigned half"
         );
     }
@@ -212,6 +233,35 @@ async fn independent_preparers_require_every_partition_and_recover_the_durable_a
         .await?
         .context("source advancement missing")?;
     materializer::verify(&publisher, &expected, 2).await?;
+    let dataset = publisher.read_dataset(None).await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    let mut locations = BTreeMap::<String, std::collections::BTreeSet<u64>>::new();
+    for fragment in dataset.fragments().iter() {
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![fragment.clone()]);
+        let mut batches = scanner.try_into_stream().await?;
+        while let Some(batch) = batches.try_next().await? {
+            let sessions = batch["rollout_id"]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                locations
+                    .entry(sessions.value(row).to_owned())
+                    .or_default()
+                    .insert(fragment.id);
+            }
+        }
+    }
+    assert_eq!(locations.len(), 4);
+    let expected_files = if partitioning == Partitioning::BucketBytesV1 {
+        1
+    } else {
+        2
+    };
+    assert!(locations
+        .values()
+        .all(|files| files.len() == expected_files));
     assert!(publisher.run_once().await?.is_none());
     assert_eq!(budget.reserved(), 0);
     cluster.shutdown().await?;

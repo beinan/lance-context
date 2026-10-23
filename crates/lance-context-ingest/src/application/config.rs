@@ -91,6 +91,9 @@ pub struct Preparation {
     pub timeout: Duration,
     pub active: usize,
     pub retained_results: usize,
+    /// Opt-in bucket locality within each publication; hot buckets remain whole.
+    #[serde(skip_serializing_if = "crate::preparation::Partitioning::is_record_stripe")]
+    pub partitioning: crate::preparation::Partitioning,
 }
 impl Default for Preparation {
     fn default() -> Self {
@@ -101,6 +104,7 @@ impl Default for Preparation {
             timeout: Duration::from_secs(120),
             active: 4,
             retained_results: 32,
+            partitioning: Default::default(),
         }
     }
 }
