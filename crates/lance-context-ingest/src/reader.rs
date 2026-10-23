@@ -93,8 +93,17 @@ pub(super) async fn positions(ingress: &Ingress, session: &str) -> Result<Positi
     let mut after = 0;
     let mut upper = None;
     loop {
-        let (cut, value) =
-            observe(ingress, group, query::Query::Accepted { after, limit: 128 }).await?;
+        let (cut, value) = observe(
+            ingress,
+            group,
+            query::Query::AcceptedBucket {
+                table: ingress.scope.table,
+                bucket,
+                after,
+                limit: 128,
+            },
+        )
+        .await?;
         let upper = *upper.get_or_insert(cut.applied);
         let query::Value::Accepted(page) = value else {
             bail!("source page unavailable");
