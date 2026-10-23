@@ -37,9 +37,21 @@ struct Identity {
 #[derive(Serialize)]
 struct Process {
     state: char,
+    flags: u64,
     start_ticks: u64,
     cpu_ticks: u64,
     rss_bytes: u64,
+}
+impl Process {
+    fn is_live_incarnation(&self, identity: &Identity) -> bool {
+        // Linux sets PF_EXITING before exit_mm(), while stat may still report R
+        // or D. Releasing a large address space need not finish within 100 ms.
+        // The flags field is exported by /proc/<pid>/stat (field 9).
+        const PF_EXITING: u64 = 0x0000_0004;
+        self.start_ticks == identity.start_ticks
+            && !matches!(self.state, 'Z' | 'X')
+            && self.flags & PF_EXITING == 0
+    }
 }
 fn stat(text: &str, page_bytes: u64) -> Result<Process> {
     let (_, rest) = text.rsplit_once(") ").context("invalid process stat")?;
@@ -47,6 +59,7 @@ fn stat(text: &str, page_bytes: u64) -> Result<Process> {
     ensure!(fields.len() >= 22, "truncated process stat");
     Ok(Process {
         state: fields[0].chars().next().context("empty process state")?,
+        flags: fields[6].parse()?,
         start_ticks: fields[19].parse()?,
         cpu_ticks: fields[11]
             .parse::<u64>()?
@@ -87,14 +100,14 @@ fn process(identity: &Identity, page_bytes: u64) -> Result<Option<Process>> {
         Err(error) => return Err(error),
     };
     let process = stat(&body, page_bytes)?;
-    if process.start_ticks != identity.start_ticks || matches!(process.state, 'Z' | 'X') {
+    if !process.is_live_incarnation(identity) {
         return Ok(None);
     }
     Ok(Some(process))
 }
 fn finish_sample<T>(sample: Result<T>, identity: &Identity, page_bytes: u64) -> Result<Option<T>> {
     // A dying task can lose access to /proc/<pid>/io before stat reports it as
-    // a zombie. Wait briefly for positive evidence that this incarnation ended;
+    // a zombie. Wait briefly for positive evidence that this incarnation is exiting;
     // permission denial alone must never be reported as successful completion.
     let permission_denied = sample.as_ref().err().is_some_and(|error| {
         error
@@ -219,7 +232,7 @@ fn main() -> Result<()> {
                 "allocated_directory_bytes":disk,"tcp":tcp,"sample_wall_seconds":begin.elapsed().as_secs_f64()}),
             )
         })();
-        // Ignore incomplete samples only when this exact process disappeared.
+        // Ignore incomplete samples only when this incarnation ended or is exiting.
         let Some(sample) = finish_sample(sample, &identity, page as u64)? else {
             break;
         };
@@ -232,7 +245,7 @@ fn main() -> Result<()> {
     serde_json::to_writer(
         &mut out,
         &serde_json::json!({"kind":"resource_sampling_complete","samples":samples,
-        "seconds":started.elapsed().as_secs_f64(),"reason":"recorded_process_gone"}),
+        "seconds":started.elapsed().as_secs_f64(),"reason":"recorded_process_ended_or_exiting"}),
     )?;
     out.write_all(b"\n")?;
     out.flush()?;
@@ -323,6 +336,30 @@ mod tests {
             std::io::ErrorKind::PermissionDenied
         );
         assert!(process(&identity, 4096)?.is_some());
+        Ok(())
+    }
+    #[test]
+    fn kernel_exit_flag_ends_sampling_before_zombie_state() -> Result<()> {
+        let identity = Identity {
+            pid: 42,
+            start_ticks: 99,
+            boot: String::new(),
+        };
+        for state in ['R', 'D', 'S'] {
+            // Include another flag to distinguish a bit test from equality.
+            for flags in [0x0040_0000, 0x0040_0004] {
+                let text = format!(
+                    "42 (worker ) x) {state} 1 2 3 4 5 {flags} 0 0 0 0 11 12 0 0 0 0 0 0 99 1024 7"
+                );
+                let p = stat(&text, 4096)?;
+                assert_eq!(p.flags, flags);
+                assert_eq!(
+                    (p.start_ticks, p.cpu_ticks, p.rss_bytes),
+                    (99, 23, 7 * 4096)
+                );
+                assert_eq!(p.is_live_incarnation(&identity), flags == 0x0040_0000);
+            }
+        }
         Ok(())
     }
     #[test]
