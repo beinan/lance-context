@@ -88,6 +88,8 @@ pub struct Ingress {
     scope: Arc<Scope>,
     schema: SchemaRef,
     budget: Arc<MergeMemoryBudget>,
+    #[cfg(feature = "materializer")]
+    session_read_concurrency: usize,
 }
 /// Held before body buffering; retained by preparation and every ambiguous retry.
 pub struct Upload {
@@ -224,6 +226,8 @@ impl Ingress {
             }),
             schema: Arc::new(rollout_schema()),
             budget,
+            #[cfg(feature = "materializer")]
+            session_read_concurrency: reader::default_concurrency(),
         };
         value.visibility().await?;
         Ok(value)

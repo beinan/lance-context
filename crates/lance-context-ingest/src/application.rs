@@ -47,7 +47,8 @@ impl Registry {
                 t.binding.clone(),
                 budget.clone(),
             )
-            .await?;
+            .await?
+            .with_session_read_concurrency(config.session_read_concurrency)?;
             // Validate both durable catalog scope and the configured blob path.
             materializer::read_dataset(&ingress, &storage, None).await?;
             tables.insert(

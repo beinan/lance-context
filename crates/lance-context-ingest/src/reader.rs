@@ -4,17 +4,40 @@
 //! from WAL and excluded from Lance. No reader lease or new consensus command.
 use super::*;
 use crate::materializer::{self, Storage};
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
+use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 
 pub type BatchStream = BoxStream<'static, Result<RecordBatch>>;
 
 /// A complete successful stream includes every session append acknowledged
 /// before the read began. Order is unspecified. Consume through EOF and propagate
 /// errors: an incomplete stream must not be treated as a complete query result.
-/// Payload workspace is bounded per WAL record; retained metadata and the IDs
+/// Concurrent payload workspace uses the shared ingress budget; metadata and the IDs
 /// used for overlap removal grow with the captured tail.
 pub struct SessionRead {
     pub batches: BatchStream,
+}
+
+impl Ingress {
+    /// Bound concurrent WAL record fetches/decodes per session read. All reads
+    /// and uploads still share the ingress byte budget. The default is one;
+    /// tune against concurrent ingestion, not isolated read throughput alone.
+    pub fn with_session_read_concurrency(mut self, concurrency: usize) -> Result<Self> {
+        validate_concurrency(concurrency)?;
+        self.session_read_concurrency = concurrency;
+        Ok(self)
+    }
+}
+
+pub(crate) fn validate_concurrency(concurrency: usize) -> Result<()> {
+    ensure!(
+        (1..=32).contains(&concurrency),
+        "session read concurrency must be 1..=32"
+    );
+    Ok(())
+}
+
+pub(crate) fn default_concurrency() -> usize {
+    1
 }
 
 pub(super) struct Positions {
@@ -124,24 +147,12 @@ pub(super) fn from_positions(
         let group = positions.group;
         let mut ids = HashSet::new();
         let mut missing_through = 0;
-        for (index, meta) in positions.records {
-            let reservation = Arc::new(ingress.budget.reserve(workspace(&ingress.scope.contract, meta.body_bytes as usize)?).await);
-            let mut fetched = None;
-            for node in &ingress.layout.groups[&group] {
-                let Ok(response) = ingress.client.request(*node, Request::Fetch { group, index }).await else { continue; };
-                if let Reply::Record(Some(observed)) = response.reply {
-                    if observed != meta { Err(anyhow::anyhow!("fetched record differs from committed source"))?; }
-                    // Fetch already validates stored bytes. Avoid another digest scan.
-                    meta.check_body_length(response.body.len(), ingress.scope.contract.max_record_bytes as usize)?;
-                    let schema = ingress.schema.clone();
-                    let keep = reservation.clone();
-                    fetched = Some(tokio::task::spawn_blocking(move || {
-                        let _keep = keep;
-                        ipc::decode(response.body, schema)
-                    }).await??);
-                    break;
-                }
-            }
+        // Unordered completion lets a ready record release its reservation even
+        // if an earlier record is waiting for the same shared byte budget.
+        let mut records = stream::iter(positions.records.into_iter().enumerate())
+            .map(|(ordinal, (index, meta))| fetch(&ingress, group, index, meta, ordinal))
+            .buffer_unordered(ingress.session_read_concurrency);
+        while let Some((index, fetched, reservation)) = records.try_next().await? {
             if let Some(batches) = fetched {
                 for batch in batches {
                     let sessions = strings(&batch, "rollout_id")?;
@@ -184,6 +195,58 @@ pub(super) fn from_positions(
         }
     }.boxed();
     SessionRead { batches }
+}
+
+async fn fetch(
+    ingress: &Ingress,
+    group: u64,
+    index: u64,
+    meta: BatchMeta,
+    ordinal: usize,
+) -> Result<(u64, Option<Vec<RecordBatch>>, Arc<MergeReservation>)> {
+    let reservation = Arc::new(
+        ingress
+            .budget
+            .reserve(workspace(
+                &ingress.scope.contract,
+                usize::try_from(meta.body_bytes)?,
+            )?)
+            .await,
+    );
+    let nodes = &ingress.layout.groups[&group];
+    // Spread distinct records across replicas; never fetch multiple copies of
+    // one record at once. Metadata was already captured with a quorum read.
+    for offset in 0..nodes.len() {
+        let node = nodes[(ordinal + offset) % nodes.len()];
+        let Ok(response) = ingress
+            .client
+            .request(node, Request::Fetch { group, index })
+            .await
+        else {
+            continue;
+        };
+        if let Reply::Record(Some(observed)) = response.reply {
+            ensure!(
+                observed == meta,
+                "fetched record differs from committed source"
+            );
+            // Fetch already validates stored bytes. Avoid another digest scan.
+            meta.check_body_length(
+                response.body.len(),
+                ingress.scope.contract.max_record_bytes as usize,
+            )?;
+            let schema = ingress.schema.clone();
+            let keep = reservation.clone();
+            let batches = tokio::task::spawn_blocking(move || {
+                // Blocking decode may outlive a cancelled query; retain its bytes.
+                let _keep = keep;
+                ipc::decode(response.body, schema)
+            })
+            .await??;
+            return Ok((index, Some(batches), reservation));
+        }
+    }
+    Ok((index, None, reservation))
 }
 
 fn strings<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {

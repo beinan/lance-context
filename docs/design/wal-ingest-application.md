@@ -41,9 +41,20 @@ The reader streams committed WAL data before opening Lance, checks source
 closures for any payload retired during capture, and deduplicates overlap by
 immutable row ID. Missing unpublished payload is an error. This is a session
 read with unspecified row order, not arbitrary SQL or a global snapshot. It
-currently scans the session's bucket. Payload workspace is reserved per record;
+currently scans retained metadata in the session's group, fetches payloads in the
+session's bucket, then filters rows by session. Payload workspace is reserved per record;
 captured metadata and row IDs grow with the WAL tail, but payloads are not retained
 for the whole query. Consumers must read to EOF and propagate stream errors.
+`session_read_concurrency` bounds concurrent WAL record fetches and decodes per
+query (1–32, default 1). Rust callers can use
+`Ingress::with_session_read_concurrency`. Different records start at different
+replicas, with fallback to the remaining replicas if needed. Ready records are
+returned without waiting for earlier records. Every fetch reserves workspace
+before reading; prefetched results retain that reservation through consumption.
+Concurrent queries and uploads share the configured ingress byte budget. Dropping
+the stream cancels pending fetches; an already running blocking decode retains
+its reservation until it finishes. Tune concurrency against both read latency
+and ingestion throughput, since WAL storage and network resources are shared.
 Arrow filtering shares existing
 binary buffers. HTTP output is encoded once into an IPC stream, one batch at a
 time; the complete network path is not claimed to be zero-copy.
