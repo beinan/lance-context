@@ -124,7 +124,7 @@ async fn producer(client: &Client, leader: u64, batch: &Batch) -> Result<Option<
 }
 
 // Wait for the real TLS listener to close its idle connection. Readiness does
-// not consume the EOF: the next request must encounter and handle it itself.
+// not consume the EOF: the pool must inspect it before the next request.
 async fn wait_for_idle_close(pool: &Pool) -> Result<()> {
     let stream = pool.idle.lock().unwrap().pop().context("no idle stream")?;
     timeout(Duration::from_secs(5), stream.get_ref().0.readable()).await??;
@@ -133,7 +133,7 @@ async fn wait_for_idle_close(pool: &Pool) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quorum_read_recovers_after_server_closes_idle_tls_connection() -> Result<()> {
+async fn closed_control_connection_is_discarded_before_read_or_mutation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open_with_options(
         dir.path(),
@@ -196,26 +196,17 @@ async fn quorum_read_recovers_after_server_closes_idle_tls_connection() -> Resul
         request: uuid::Uuid::from_u128(102),
         expected_epoch: 0,
     });
-    let error = c
+    let response = c
         .client
         .request(leader, Request::Commit(Box::new(command)))
-        .await
-        .err()
-        .context("closed control connection unexpectedly accepted a command")?;
-    assert!(disconnected(&error), "{error:#}");
-    let message = format!("{error:#}");
-    assert!(message.contains(&format!(
-        "WAL RPC acquire group=10 node={leader} reused=true stage="
-    )));
-    assert!(message.contains("outcome unknown"));
-    assert!(!message.contains("canonical/table"));
-    assert!(!message.contains("tenant"));
-    assert!(c.client.nodes[&leader]
-        .control
-        .idle
-        .lock()
-        .unwrap()
-        .is_empty());
+        .await?;
+    assert!(matches!(
+        response.reply,
+        Reply::Commit(Outcome::Committed(Applied::Publisher(
+            crate::replication::publication::Reply::Acquired(_)
+        )))
+    ));
+    drop(response);
     assert_eq!(
         c.client.budgets.control.available_permits(),
         c.client.options.control_bytes
@@ -224,7 +215,7 @@ async fn quorum_read_recovers_after_server_closes_idle_tls_connection() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn closed_data_connection_recovers_fetch_but_does_not_replay_append() -> Result<()> {
+async fn closed_data_connection_is_discarded_before_fetch_or_append() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open_with_options(
         dir.path(),
@@ -260,7 +251,7 @@ async fn closed_data_connection_recovers_fetch_but_does_not_replay_append() -> R
     drop(response);
     wait_for_idle_close(&c.client.nodes[&leader].data).await?;
     let second = batch(2);
-    let error = c
+    let response = c
         .client
         .request(
             leader,
@@ -269,32 +260,30 @@ async fn closed_data_connection_recovers_fetch_but_does_not_replay_append() -> R
                 batch: second.clone(),
             },
         )
-        .await
-        .err()
-        .context("closed data connection unexpectedly accepted an append")?;
-    assert!(disconnected(&error), "{error:#}");
-    assert!(error.to_string().contains(&format!(
-        "WAL RPC append group=10 node={leader} reused=true stage="
-    )));
-    assert_eq!(producer(&c.client, leader, &first).await?, Some(index));
-    assert!(c.client.nodes[&leader].data.idle.lock().unwrap().is_empty());
+        .await?;
+    let second_index = accepted(&response);
+    assert!(second_index > index);
+    drop(response);
+    assert_eq!(
+        producer(&c.client, leader, &second).await?,
+        Some(second_index)
+    );
+    assert_eq!(
+        c.net.nodes[&leader].handle.append_observation()["started"],
+        2
+    );
+    assert_eq!(
+        c.net.nodes[&leader]
+            .handle
+            .observation(10)?
+            .status
+            .accepted_records,
+        2
+    );
     assert_eq!(
         c.client.budgets.data.available_permits(),
         c.client.options.data_bytes
     );
-    // The caller explicitly retries the exact original identity after reconciling.
-    let response = c
-        .client
-        .request(
-            leader,
-            Request::Append {
-                group: 10,
-                batch: second,
-            },
-        )
-        .await?;
-    assert!(accepted(&response) > index);
-    drop(response);
     c.shutdown().await
 }
 

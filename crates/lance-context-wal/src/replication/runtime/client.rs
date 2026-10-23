@@ -517,6 +517,41 @@ impl Pool {
             slots: Arc::new(Semaphore::new(count)),
         }
     }
+
+    async fn take_idle(&self) -> Result<Option<Stream>> {
+        loop {
+            let candidate = self.idle.lock().unwrap().pop();
+            let Some(mut stream) = candidate else {
+                return Ok(None);
+            };
+            // Poll only input already available at a complete-response boundary.
+            // TLS may consume session tickets; discard an observed disconnect
+            // but propagate other errors and unsolicited application bytes.
+            // Nothing from the next request has been sent, so discarding it
+            // does not replay a mutation. A later disconnect can still race the
+            // send and must retain the existing unknown-outcome behavior.
+            let (read, received) = std::future::poll_fn(|cx| {
+                let mut byte = [0];
+                let mut buffer = tokio::io::ReadBuf::new(&mut byte);
+                let read = std::pin::Pin::new(&mut stream).poll_read(cx, &mut buffer);
+                std::task::Poll::Ready((read, buffer.filled().len()))
+            })
+            .await;
+            match read {
+                std::task::Poll::Pending => return Ok(Some(stream)),
+                std::task::Poll::Ready(Ok(())) => ensure!(
+                    received == 0,
+                    "unexpected application bytes on idle WAL connection"
+                ),
+                std::task::Poll::Ready(Err(error)) => {
+                    let error = anyhow::Error::from(error);
+                    if !disconnected(&error) {
+                        return Err(error.context("invalid idle WAL connection"));
+                    }
+                }
+            }
+        }
+    }
 }
 struct NodePools {
     endpoint: Endpoint,
@@ -767,7 +802,7 @@ impl Client {
         let metadata = codec().serialize(&(&expected, wire))?;
         let pool = if data { &pools.data } else { &pools.control };
         let _slot = pool.slots.clone().acquire_owned().await?;
-        let mut idle = pool.idle.lock().unwrap().pop();
+        let mut idle = pool.take_idle().await?;
         let mut reconnect_read = read_only && idle.is_some();
         loop {
             let reused = idle.is_some();
