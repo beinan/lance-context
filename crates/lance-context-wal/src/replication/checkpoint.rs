@@ -278,8 +278,8 @@ impl Image {
         Ok(body.into())
     }
 
-    /// The build/read owner validates this body against its captured BatchMeta.
-    /// Keep hashing at that common boundary, once for pack and log inputs alike.
+    /// The caller must validate this body against its captured BatchMeta.
+    /// Unlike native log blocks, these pack ranges have no individual CRC.
     pub(super) fn read_for_validation(&self, index: u64) -> Result<Option<Bytes>> {
         let Some(location) = self.locations.get(&index) else {
             return Ok(None);

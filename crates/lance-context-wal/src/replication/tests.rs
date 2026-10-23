@@ -1,6 +1,10 @@
 use super::*;
 use bytes::Bytes;
 
+#[cfg(unix)]
+#[path = "tests/accepted_reads.rs"]
+mod accepted_reads;
+
 #[path = "tests/disk_budget.rs"]
 mod disk_budget;
 #[path = "tests/image_collection.rs"]

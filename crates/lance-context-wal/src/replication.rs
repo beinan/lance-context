@@ -1045,8 +1045,26 @@ impl Node {
         let Some(meta) = group.state.accepted.get(&index) else {
             return Ok(None);
         };
-        let body = images::read_body(group.raw.store(), group.image.as_deref(), index, meta)?;
-        meta.validate_payload(&body, self.limits.max_record_bytes as usize)?;
+        let image_body = group
+            .image
+            .as_ref()
+            .map(|image| image.read_for_validation(index))
+            .transpose()?
+            .flatten();
+        let limit = self.limits.max_record_bytes as usize;
+        let body = if let Some(body) = image_body {
+            // Pack ranges have no individual storage checksum.
+            meta.validate_payload(&body, limit)?;
+            body
+        } else {
+            // Admission, peer reception and recovery validate the digest before
+            // accepting a record. Native reads check the complete block CRC on
+            // cache fill and bind the entry to this accepted metadata. Rely on
+            // those checks instead of rescanning the payload on every fetch.
+            let body = images::read_log_body(group.raw.store(), index, meta)?;
+            meta.check_body_length(body.len(), limit)?;
+            body
+        };
         Ok(Some(Batch {
             meta: meta.clone(),
             body,
