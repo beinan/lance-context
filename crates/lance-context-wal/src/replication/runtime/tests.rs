@@ -10,6 +10,8 @@ mod early;
 #[cfg(feature = "peer-transport")]
 mod fetch;
 mod images;
+#[cfg(feature = "service")]
+mod maintenance;
 
 // Actual dedicated workers and durable engines. This relay deliberately drops
 // selected links; it is not the production peer transport or a throughput test.
@@ -24,11 +26,21 @@ struct Cluster {
 }
 impl Cluster {
     fn open(root: &Path, options: Options) -> Result<Self> {
+        Self::open_with_disk(root, options, None)
+    }
+    fn open_with_disk(
+        root: &Path,
+        options: Options,
+        disk: Option<crate::raft_log::DiskOptions>,
+    ) -> Result<Self> {
         let mut runtimes = Vec::new();
         let mut handles = BTreeMap::new();
         let mut outboxes = Vec::new();
         for id in 1..=3 {
-            let node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?;
+            let mut node = Node::open(&root.join(id.to_string()), layout(), id, Limits::default())?;
+            if let Some(disk) = disk {
+                node = node.with_disk_budget(disk)?;
+            }
             let (runtime, outbox) = Runtime::spawn(node, options.clone())?;
             handles.insert(id, runtime.handle());
             runtimes.push(runtime);

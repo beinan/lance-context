@@ -62,7 +62,7 @@ fn micros(start: Instant) -> u64 {
 
 /// One scheduler per physical node, with at most one blocking job outstanding.
 /// Cancellation stops between file operations; every submitted job is joined.
-pub(super) async fn run(
+pub(crate) async fn run(
     handle: runtime::Handle,
     groups: Vec<u64>,
     options: Options,
@@ -144,9 +144,11 @@ pub(super) async fn run(
                 Ok(())
             }
             .await;
-            checkpoints.insert(group, Instant::now());
             match result {
                 Ok(()) => {
+                    // A failed attempt leaves this cut overdue. Retry on the
+                    // next scheduler tick instead of extending log retention.
+                    checkpoints.insert(group, Instant::now());
                     suggested.remove(&group);
                     let mut p = progress.lock().unwrap();
                     p.checkpoints = p.checkpoints.saturating_add(1);
@@ -165,9 +167,9 @@ pub(super) async fn run(
                 tokio::task::spawn_blocking(move || task.run()).await?
             }
             .await;
-            last_log = Instant::now();
             match result {
                 Ok(next) => {
+                    last_log = Instant::now();
                     suggested.extend(next.into_iter().filter(|group| groups.contains(group)));
                     let mut p = progress.lock().unwrap();
                     p.log_passes = p.log_passes.saturating_add(1);

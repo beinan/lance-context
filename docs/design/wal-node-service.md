@@ -69,6 +69,11 @@ while holding the engine's maintenance gate; it has no hard execution deadline.
 Counters expose its duration separately from checkpoint work. Admission errors
 or a busy image permit are observed and retried; a failed replica/transport task
 causes the service to drain and exit.
+Only successful checkpoints and log passes reset their scheduling intervals.
+Failed work stays eligible on the next scheduler tick, so a temporary busy
+permit or rewrite reservation does not add a full retention interval. The
+scheduler still runs one job at a time and enforces the existing disk budgets;
+this does not guarantee recovery after replicated traffic exhausts headroom.
 
 SIGTERM/SIGINT stops client admission, joins maintenance and snapshot file work,
 then stops and joins peer/runtime owners. Cancelling a shutdown waiter does not
