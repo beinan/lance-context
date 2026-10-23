@@ -196,11 +196,20 @@ async fn quorum_read_recovers_after_server_closes_idle_tls_connection() -> Resul
         request: uuid::Uuid::from_u128(102),
         expected_epoch: 0,
     });
-    assert!(c
+    let error = c
         .client
         .request(leader, Request::Commit(Box::new(command)))
         .await
-        .is_err());
+        .err()
+        .context("closed control connection unexpectedly accepted a command")?;
+    assert!(disconnected(&error), "{error:#}");
+    let message = format!("{error:#}");
+    assert!(message.contains(&format!(
+        "WAL RPC acquire group=10 node={leader} reused=true stage="
+    )));
+    assert!(message.contains("outcome unknown"));
+    assert!(!message.contains("canonical/table"));
+    assert!(!message.contains("tenant"));
     assert!(c.client.nodes[&leader]
         .control
         .idle
@@ -251,17 +260,22 @@ async fn closed_data_connection_recovers_fetch_but_does_not_replay_append() -> R
     drop(response);
     wait_for_idle_close(&c.client.nodes[&leader].data).await?;
     let second = batch(2);
-    assert!(c
+    let error = c
         .client
         .request(
             leader,
             Request::Append {
                 group: 10,
-                batch: second.clone()
-            }
+                batch: second.clone(),
+            },
         )
         .await
-        .is_err());
+        .err()
+        .context("closed data connection unexpectedly accepted an append")?;
+    assert!(disconnected(&error), "{error:#}");
+    assert!(error.to_string().contains(&format!(
+        "WAL RPC append group=10 node={leader} reused=true stage="
+    )));
     assert_eq!(producer(&c.client, leader, &first).await?, Some(index));
     assert!(c.client.nodes[&leader].data.idle.lock().unwrap().is_empty());
     assert_eq!(
