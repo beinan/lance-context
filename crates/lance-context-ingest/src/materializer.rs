@@ -8,10 +8,12 @@ use lance_context_wal::replication::{publication as p, source};
 use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
+mod compaction;
 pub mod observation;
 mod pipeline;
 mod read_policy;
 pub(crate) mod stage;
+pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
 
@@ -46,6 +48,9 @@ pub struct Options {
     pub scan_pages_per_group: usize,
     /// Catalog metadata only; retiring it never deletes immutable blob objects.
     pub retained_manifest_versions: usize,
+    /// Compact small published fragments after the WAL scan catches up.
+    /// All table publishers must support compaction before enabling this.
+    pub compaction: Option<SmallFileCompaction>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -60,6 +65,7 @@ impl Default for Options {
             pipeline_preparation: false,
             scan_pages_per_group: 4,
             retained_manifest_versions: 64,
+            compaction: None,
         }
     }
 }
@@ -81,6 +87,12 @@ impl Options {
             .context("materializer workspace overflow")
     }
     pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+        if let Some(compaction) = &self.compaction {
+            compaction.validate(
+                ingress.scope.contract.max_record_bytes as usize,
+                budget.limit(),
+            )?;
+        }
         ensure!(
             self.max_source_bytes >= ingress.scope.contract.max_record_bytes as usize
                 && self.max_source_bytes as u64 <= ingress.client.max_plan_source_bytes(),
@@ -140,6 +152,7 @@ pub struct Publisher {
     empty_cursors: BTreeMap<u64, u64>,
     batch_started: Option<tokio::time::Instant>,
     plan_attempt: Option<p::Plan>,
+    source_scan_idle: bool,
     prepared_attempt: Option<p::PrepareRequest>,
     phases: Arc<PhaseCounters>,
     #[cfg(feature = "service")]
@@ -196,6 +209,7 @@ impl Publisher {
             empty_cursors: BTreeMap::new(),
             batch_started: None,
             plan_attempt: None,
+            source_scan_idle: false,
             prepared_attempt: None,
             phases: Arc::default(),
             #[cfg(feature = "service")]
@@ -291,6 +305,9 @@ impl Publisher {
             self.retire_history(&view).await?;
             if self.plan_attempt.is_none() {
                 self.plan_attempt = self.select(&view).await?;
+                if self.plan_attempt.is_none() && self.source_scan_idle {
+                    self.plan_attempt = compaction::plan(self, &view).await?;
+                }
             }
             let Some(plan) = self.plan_attempt.clone() else {
                 return Ok(None);
@@ -356,6 +373,9 @@ impl Publisher {
         Ok(self.state().await?.progress.prepared)
     }
     async fn materialize(&self, pending: &Arc<p::PendingPlan>) -> Result<p::Descriptors> {
+        if pending.plan.is_compaction() {
+            return compaction::prepare(self, pending).await;
+        }
         #[cfg(feature = "service")]
         if let Some(pool) = &self.preparers {
             return pool
@@ -624,6 +644,8 @@ impl Publisher {
         Ok(())
     }
     async fn select(&mut self, view: &p::Table) -> Result<Option<p::Plan>> {
+        self.source_scan_idle = false;
+        let mut caught_up = true;
         let mut groups = self
             .ingress
             .layout
@@ -646,6 +668,7 @@ impl Publisher {
         let mut full = false;
         let mut next_group = groups[0];
         for (ordinal, &group) in groups.iter().enumerate() {
+            let mut at_end = false;
             let after = view.progress.checkpoint.get(&group).copied().unwrap_or(0);
             let mut cursor = self
                 .empty_cursors
@@ -699,11 +722,16 @@ impl Publisher {
                 if records.is_empty() {
                     self.empty_cursors.insert(group, through);
                 }
-                if page.through == cursor || !records.is_empty() {
+                if page.through == cursor {
+                    at_end = true;
+                    break;
+                }
+                if !records.is_empty() {
                     break;
                 }
                 cursor = page.through;
             }
+            caught_up &= at_end;
             if !records.is_empty() {
                 sources.insert(
                     group,
@@ -721,6 +749,7 @@ impl Publisher {
         }
         if sources.is_empty() {
             self.batch_started = None;
+            self.source_scan_idle = caught_up;
             return Ok(None);
         }
         let started = self
