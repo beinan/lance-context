@@ -2,7 +2,7 @@
 use super::*;
 use lance::{dataset::transaction::Operation, index::DatasetIndexExt};
 use lance_index::{scalar::ScalarIndexParams, IndexType};
-use lance_table::format::{pb, IndexMetadata};
+use lance_table::format::{pb, Fragment, IndexMetadata};
 use prost::Message;
 use std::collections::BTreeSet;
 
@@ -118,6 +118,36 @@ fn validate_metadata(dataset: &Dataset, index: &IndexMetadata) -> Result<()> {
         "incompatible managed session index metadata"
     );
     Ok(())
+}
+
+/// Split one snapshot only when a known session index has an uncovered tail.
+/// Lance's exact-index plan otherwise reads the tail's full payload projection
+/// before filtering it. Keep native planning for absent or unfamiliar indexes.
+pub(crate) async fn scan_fragments(dataset: &Dataset) -> Result<Option<[Vec<Fragment>; 2]>> {
+    let indices = dataset.load_indices().await?;
+    let mut coverage = BTreeSet::new();
+    for index in indices.iter().filter(|index| index.name == NAME) {
+        if validate_metadata(dataset, index).is_err() {
+            return Ok(None);
+        }
+        coverage.extend(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(u64::from),
+        );
+    }
+    if coverage.is_empty() {
+        return Ok(None);
+    }
+    let (covered, tail): (Vec<_>, Vec<_>) = dataset
+        .fragments()
+        .iter()
+        .cloned()
+        .partition(|fragment| coverage.contains(&fragment.id));
+    Ok((!covered.is_empty() && !tail.is_empty()).then_some([covered, tail]))
 }
 
 pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {

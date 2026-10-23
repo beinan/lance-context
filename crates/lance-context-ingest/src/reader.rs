@@ -244,6 +244,13 @@ pub(super) fn from_positions(
         let scan_bytes = batch_bytes.checked_mul(ingress.session_scan_batch_rows)
             .and_then(|bytes| bytes.checked_mul(4)).context("session scan workspace overflow")?;
         let _scan_reservation = ingress.budget.reserve(workspace(&ingress.scope.contract, scan_bytes)?).await;
+        let selections = match materializer::session_scan_fragments(&dataset).await? {
+            Some([covered, tail]) => vec![(true, Some(covered)), (false, Some(tail))],
+            None => vec![(true, None)],
+        };
+        // Both selections belong to this captured snapshot. Consume them
+        // sequentially under the same reservation and WAL overlap filter.
+        for (indexed, fragments) in selections {
         let mut scanner = dataset.scan();
         // A byte output target alone still lets late materialization collect and
         // concatenate the default 8192 rows before splitting them for emission.
@@ -253,6 +260,10 @@ pub(super) fn from_positions(
         scanner.io_buffer_size(batch_bytes as u64);
         scanner.fragment_readahead(ingress.session_scan_fragment_readahead);
         scanner.materialization_readahead_bytes(batch_bytes as u64);
+        scanner.use_scalar_index(indexed);
+        if let Some(fragments) = fragments {
+            scanner.with_fragments(fragments);
+        }
         scanner.filter(&format!("rollout_id = '{}'", session.replace('\'', "''")))?;
         let mut base = scanner.try_into_stream().await?;
         while let Some(batch) = base.try_next().await? {
@@ -260,6 +271,7 @@ pub(super) fn from_positions(
             for selected in slices(&batch, |row| !ids.contains(keys.value(row))) {
                 yield selected;
             }
+        }
         }
     }.boxed();
     SessionRead { batches }
