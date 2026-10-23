@@ -103,17 +103,22 @@ async fn failed_read(failure: Failure) -> Result<()> {
         Err(error) => error,
     };
     match failure {
-        Failure::Disconnect => assert!(disconnected(&error), "{error:#}"),
+        Failure::Disconnect => {
+            assert!(disconnected(&error), "{error:#}");
+            assert!(error.to_string().contains(&format!(
+                "WAL RPC status group=10 node={leader} reused=false stage=response_prefix"
+            )));
+        }
         Failure::Stall => assert!(
             error.to_string().contains("exchange timed out"),
             "{error:#}"
         ),
         Failure::Scope => assert!(
-            error.to_string().contains("foreign client response scope"),
+            format!("{error:#}").contains("foreign client response scope"),
             "{error:#}"
         ),
         Failure::Correlation => assert!(
-            error.to_string().contains("correlation mismatch"),
+            format!("{error:#}").contains("correlation mismatch"),
             "{error:#}"
         ),
     }

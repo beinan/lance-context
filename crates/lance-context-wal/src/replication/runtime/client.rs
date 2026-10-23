@@ -134,6 +134,49 @@ impl WireRequest {
     fn data(&self) -> bool {
         matches!(self, Self::Append { .. } | Self::Fetch { .. })
     }
+
+    // Fixed labels avoid formatting commands, payloads, or table identities.
+    fn diagnostic(&self, catalog: u64) -> (u64, &'static str) {
+        match self {
+            Self::Append { group, .. } => (*group, "append"),
+            Self::Fetch { group, .. } => (*group, "fetch"),
+            Self::Status { group } => (*group, "status"),
+            Self::Control(command) => (
+                command.group(catalog),
+                match command.as_ref() {
+                    Command::Append { .. } => "append",
+                    Command::Acquire(_) => "acquire",
+                    Command::Plan(_) => "plan",
+                    Command::Prepare(_) => "prepare",
+                    Command::Bootstrap(_) => "bootstrap",
+                    Command::Reserve(_) => "reserve",
+                    Command::Confirm(_) => "confirm",
+                    Command::Advance(_) => "advance",
+                    Command::RetireHistory(_) => "retire_history",
+                    Command::Pin(_) => "pin",
+                    Command::Close(_) => "close",
+                    Command::Producer(_) => "producer",
+                },
+            ),
+            Self::Query { group, query } => (
+                *group,
+                match query {
+                    query::Query::ClosePermit { .. } => "query.close_permit",
+                    query::Query::SourceClosure { .. } => "query.source_closure",
+                    query::Query::Manifest { .. } => "query.manifest",
+                    query::Query::Publisher { .. } => "query.publisher",
+                    query::Query::Accepted { .. } => "query.accepted",
+                    query::Query::Producer { .. } => "query.producer",
+                    query::Query::Pin { .. } => "query.pin",
+                    query::Query::SourcePin { .. } => "query.source_pin",
+                    query::Query::ClosedProof { .. } => "query.closed_proof",
+                    query::Query::ProducerSlot { .. } => "query.producer_slot",
+                    query::Query::Visibility { .. } => "query.visibility",
+                    query::Query::AcceptedBucket { .. } => "query.accepted_bucket",
+                },
+            ),
+        }
+    }
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -694,6 +737,7 @@ impl Client {
             Request::Status { group } => (WireRequest::Status { group }, Bytes::new()),
         };
         let data = wire.data();
+        let (group, operation) = wire.diagnostic(self.catalog);
         let read_only = matches!(
             wire,
             WireRequest::Query { .. } | WireRequest::Fetch { .. } | WireRequest::Status { .. }
@@ -726,6 +770,7 @@ impl Client {
         let mut idle = pool.idle.lock().unwrap().pop();
         let mut reconnect_read = read_only && idle.is_some();
         loop {
+            let reused = idle.is_some();
             let mut stream = match idle.take() {
                 Some(stream) => stream,
                 None => {
@@ -752,15 +797,18 @@ impl Client {
                     stream
                 }
             };
+            let mut stage = "send";
             let response: Result<(Reply, Bytes)> = async {
                 let id = self
                     .next
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                     .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
                 send(&mut stream, id, &metadata, &body).await?;
+                stage = "response_prefix";
                 let (received_id, meta_len, body_len) =
                     prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
                 ensure!(received_id == id, "client response correlation mismatch");
+                stage = "response_metadata";
                 let metadata = receive(&mut stream, meta_len).await?;
                 let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
                 ensure!(observed == expected, "foreign client response scope");
@@ -785,6 +833,7 @@ impl Client {
                     Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),
                     _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
                 }
+                stage = "response_body";
                 let body = receive(&mut stream, body_len).await?;
                 Ok((reply, body))
             }
@@ -798,7 +847,13 @@ impl Client {
                     reconnect_read = false;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A transport stage does not establish whether a mutation
+                    // committed. Preserve the cause and original retry policy.
+                    return Err(error.context(format!(
+                        "WAL RPC {operation} group={group} node={node} reused={reused} stage={stage}; outcome unknown"
+                    )));
+                }
             };
             // The durable owner already validated fetched bytes; checking corruption
             // here belongs off the async executor for large records. TLS authenticates
