@@ -212,6 +212,9 @@ pub(crate) async fn genesis(
     let marker = serde_json::to_string(&(scope, identity))?;
     let parameters = WriteParams {
         mode: WriteMode::Create,
+        // Keep row identities across future indexed compaction. Reopening an
+        // existing genesis below preserves its original row-ID setting.
+        enable_stable_row_ids: true,
         store_params: Some(parameters(&storage.options)),
         session: Some(storage.session.clone()),
         commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),

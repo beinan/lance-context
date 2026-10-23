@@ -6,6 +6,7 @@ use crate::{
 use arrow_array::RecordBatchIterator;
 use lance::dataset::WriteParams;
 use lance_table::io::commit::ConditionalPutCommitHandler;
+use std::collections::HashMap;
 
 pub(super) fn identity() -> Identity {
     Identity {
@@ -54,6 +55,10 @@ async fn production_bootstrap_restarts_idempotently_and_refuses_foreign_empty_ge
     let original = view(&c, binding().table).await?;
     assert_eq!(original.authority.epoch, 1);
     assert_eq!(original.manifests.as_ref().unwrap().head, 1);
+    assert!(Dataset::open(&storage.uri)
+        .await?
+        .manifest()
+        .uses_stable_row_ids());
     provision(
         c.client.clone(),
         layout(),
@@ -119,6 +124,60 @@ async fn production_bootstrap_restarts_idempotently_and_refuses_foreign_empty_ge
     let untouched = Dataset::open(&foreign.uri).await?;
     assert_eq!(untouched.version().version, 1);
     assert_eq!(untouched.count_rows(None).await?, 0);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_recovers_legacy_genesis_without_changing_row_ids() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let storage = Storage::resolve(
+        root.path().join("legacy.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    // An older binary wrote the original genesis and stopped before selecting
+    // it in the WAL catalog. Preserve the exact persisted bootstrap marker.
+    let marker = serde_json::to_string(&(scope(&binding()), identity()))?;
+    let original = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch(&[], &[])?)], Arc::new(rollout_schema())),
+        &storage.uri,
+        Some(WriteParams {
+            enable_stable_row_ids: false,
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            transaction_properties: Some(Arc::new(HashMap::from([(
+                "lance-context.ingest.genesis.v1".to_owned(),
+                marker,
+            )]))),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert!(!original.manifest().uses_stable_row_ids());
+    let transaction = original.read_transaction_by_version(1).await?.unwrap();
+    let location = original.manifest_location().clone();
+    let c = network::Cluster::open_signed(root.path(), layout()).await?;
+    for _ in 0..2 {
+        provision(
+            c.client.clone(),
+            layout(),
+            binding(),
+            storage.clone(),
+            identity(),
+        )
+        .await?;
+        let selected = view(&c, binding().table).await?;
+        let manifests = selected.manifests.as_ref().unwrap();
+        assert_eq!(manifests.head, 1);
+        assert_eq!(
+            manifests.versions[&1].transaction.to_string(),
+            transaction.uuid
+        );
+        let reopened = Dataset::open(&storage.uri).await?;
+        assert_eq!(reopened.version().version, 1);
+        assert_eq!(reopened.manifest_location().path, location.path);
+        assert!(!reopened.manifest().uses_stable_row_ids());
+    }
     c.shutdown().await
 }
 
