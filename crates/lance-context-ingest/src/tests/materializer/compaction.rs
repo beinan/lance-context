@@ -1,6 +1,9 @@
 use super::*;
 use crate::{materializer::SmallFileCompaction, reader};
 
+#[cfg(all(unix, feature = "service"))]
+mod process;
+
 fn options(enabled: bool) -> Options {
     Options {
         max_source_bytes: 1 << 20,
