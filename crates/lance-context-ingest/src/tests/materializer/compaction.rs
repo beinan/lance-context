@@ -4,7 +4,7 @@ use crate::{materializer::SmallFileCompaction, reader};
 #[cfg(all(unix, feature = "service"))]
 mod process;
 
-fn options(enabled: bool) -> Options {
+pub(super) fn options(enabled: bool) -> Options {
     Options {
         max_source_bytes: 1 << 20,
         max_records: 8,
@@ -17,7 +17,7 @@ fn options(enabled: bool) -> Options {
     }
 }
 
-async fn acquire(
+pub(super) async fn acquire(
     ingress: &Ingress,
     storage: &Storage,
     budget: &Arc<MergeMemoryBudget>,
@@ -38,7 +38,7 @@ async fn acquire(
     .await
 }
 
-async fn query_all(
+pub(super) async fn query_all(
     ingress: &Ingress,
     storage: &Storage,
     expected: &BTreeMap<String, RecordBatch>,

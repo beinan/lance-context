@@ -12,10 +12,12 @@ mod compaction;
 pub mod observation;
 mod pipeline;
 mod read_policy;
+mod session_index;
 pub(crate) mod stage;
 pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
+pub use session_index::SessionIndex;
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]
@@ -51,6 +53,10 @@ pub struct Options {
     /// Compact small published fragments between appends or after the WAL scan catches up.
     /// All table publishers must support compaction before enabling this.
     pub compaction: Option<SmallFileCompaction>,
+    /// Build bounded native rollout_id index segments between append publications.
+    /// All catalog voters and table publishers must support index maintenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_index: Option<SessionIndex>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -66,6 +72,7 @@ impl Default for Options {
             scan_pages_per_group: 4,
             retained_manifest_versions: 64,
             compaction: None,
+            session_index: None,
         }
     }
 }
@@ -87,6 +94,9 @@ impl Options {
             .context("materializer workspace overflow")
     }
     pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+        if let Some(index) = &self.session_index {
+            index.validate(budget.limit())?;
+        }
         if let Some(compaction) = &self.compaction {
             compaction.validate(
                 ingress.scope.contract.max_record_bytes as usize,
@@ -313,13 +323,13 @@ impl Publisher {
                     .as_ref()
                     .is_some_and(|completed| !completed.sources.is_empty())
                 {
-                    self.plan_attempt = compaction::plan(self, &view).await?;
+                    self.plan_attempt = self.maintenance_plan(&view).await?;
                 }
                 if self.plan_attempt.is_none() {
                     self.plan_attempt = self.select(&view).await?;
                 }
                 if self.plan_attempt.is_none() && self.source_scan_idle {
-                    self.plan_attempt = compaction::plan(self, &view).await?;
+                    self.plan_attempt = self.maintenance_plan(&view).await?;
                 }
             }
             let Some(plan) = self.plan_attempt.clone() else {
@@ -385,8 +395,18 @@ impl Publisher {
         );
         Ok(self.state().await?.progress.prepared)
     }
+    async fn maintenance_plan(&self, view: &p::Table) -> Result<Option<p::Plan>> {
+        if let Some(plan) = session_index::plan(self, view).await? {
+            return Ok(Some(plan));
+        }
+        compaction::plan(self, view).await
+    }
+
     async fn materialize(&self, pending: &Arc<p::PendingPlan>) -> Result<p::Descriptors> {
-        if pending.plan.is_compaction() {
+        if pending.plan.is_maintenance() {
+            if let Some(index) = session_index::prepare(self, pending).await? {
+                return Ok(index);
+            }
             return compaction::prepare(self, pending).await;
         }
         #[cfg(feature = "service")]

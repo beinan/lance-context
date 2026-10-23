@@ -14,6 +14,19 @@ fn reopen(f: &mut Fixture, index: u64) -> Result<()> {
 
 #[test]
 fn compaction_recovers_fixed_publication_without_advancing_wal_cursors() -> Result<()> {
+    maintenance_recovers(Descriptors::lance_compaction(Bytes::from_static(
+        b"rewrite-files",
+    ))?)
+}
+
+#[test]
+fn index_recovers_fixed_publication_without_advancing_wal_cursors() -> Result<()> {
+    maintenance_recovers(Descriptors::lance_index(Bytes::from_static(
+        b"index-files",
+    ))?)
+}
+
+fn maintenance_recovers(descriptors: Descriptors) -> Result<()> {
     let mut f = fixture()?;
     let old_plan = f.table().progress.pending.as_ref().unwrap().plan.clone();
     let append = f.request()?;
@@ -52,7 +65,7 @@ fn compaction_recovers_fixed_publication_without_advancing_wal_cursors() -> Resu
         Reply::Rejected(Rejection::PreparedConflict),
         "empty-source plan cannot publish append descriptors"
     );
-    prepare.descriptors = Descriptors::lance_compaction(Bytes::from_static(b"rewrite-files"))?;
+    prepare.descriptors = descriptors;
     assert_eq!(
         command(&mut f, Command::Prepare(Box::new(prepare.clone())), 34)?,
         Reply::Prepared { index: 34 }
@@ -177,13 +190,26 @@ fn compaction_recovers_fixed_publication_without_advancing_wal_cursors() -> Resu
 
 #[test]
 fn append_cannot_prepare_compaction_descriptors_or_lose_its_sources() -> Result<()> {
+    append_rejects_maintenance(Descriptors::lance_compaction(Bytes::from_static(
+        b"rewrite-files",
+    ))?)
+}
+
+#[test]
+fn append_cannot_prepare_index_descriptors_or_lose_its_sources() -> Result<()> {
+    append_rejects_maintenance(Descriptors::lance_index(Bytes::from_static(
+        b"index-files",
+    ))?)
+}
+
+fn append_rejects_maintenance(descriptors: Descriptors) -> Result<()> {
     let mut f = fixture()?;
     let prepared = f.table().progress.prepared.as_ref().unwrap();
     let request = PrepareRequest {
         authority: f.table().authority.clone(),
         transaction: prepared.transaction,
         plan_index: prepared.plan_index,
-        descriptors: Descriptors::lance_compaction(Bytes::from_static(b"rewrite-files"))?,
+        descriptors,
     };
     assert_eq!(
         command(&mut f, Command::Prepare(Box::new(request.clone())), 30)?,

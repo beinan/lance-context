@@ -6,7 +6,7 @@ use lance::dataset::{
     transaction::{Operation, RewriteGroup},
 };
 use lance::index::DatasetIndexExt;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, IndexMetadata};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,9 +49,9 @@ impl SmallFileCompaction {
         );
         Ok(())
     }
-    fn fragments(&self, dataset: &Dataset) -> Option<Vec<Fragment>> {
-        let mut selected = Vec::new();
-        let mut bytes = 0usize;
+    fn fragments(&self, dataset: &Dataset, indices: &[IndexMetadata]) -> Option<Vec<Fragment>> {
+        // A rewrite must have uniform coverage in every native index segment.
+        let mut groups: BTreeMap<Vec<bool>, (Vec<Fragment>, usize)> = BTreeMap::new();
         for fragment in dataset.manifest().fragments.iter() {
             // Managed ingest creates append-only, sized fragments. Unknown
             // sizes and deletion rewrites need separate planning policies.
@@ -64,17 +64,44 @@ impl SmallFileCompaction {
             let Some(size) = size.filter(|n| *n > 0 && *n < self.target_file_bytes / 2) else {
                 continue;
             };
-            if size > self.target_file_bytes * 2 - bytes {
+            let coverage = indices
+                .iter()
+                .map(|index| {
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .unwrap()
+                        .contains(fragment.id as u32)
+                })
+                .collect();
+            let (selected, bytes) = groups.entry(coverage).or_default();
+            if size > self.target_file_bytes * 2 - *bytes {
                 continue;
             }
             selected.push(fragment.clone());
-            bytes += size;
+            *bytes += size;
             if selected.len() == 64 {
-                break;
+                return Some(std::mem::take(selected));
             }
         }
-        (selected.len() >= self.min_fragments).then_some(selected)
+        groups
+            .into_values()
+            .map(|(fragments, _)| fragments)
+            .find(|fragments| fragments.len() >= self.min_fragments)
     }
+}
+
+async fn supported_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
+    let indices = dataset.load_indices().await?;
+    ensure!(
+        indices.is_empty() || dataset.manifest().uses_stable_row_ids(),
+        "indexed compaction requires stable row IDs"
+    );
+    ensure!(
+        indices.iter().all(|i| i.fragment_bitmap.is_some()),
+        "compaction index coverage is unknown"
+    );
+    Ok(indices)
 }
 
 pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
@@ -83,13 +110,10 @@ pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
     };
     let version = view.progress.minimum_read_version;
     let dataset = publisher.read_dataset(Some(version)).await?;
-    if options.fragments(&dataset).is_none() {
+    let indices = supported_indices(&dataset).await?;
+    if options.fragments(&dataset, &indices).is_none() {
         return Ok(None);
     }
-    ensure!(
-        dataset.load_indices().await?.is_empty(),
-        "managed small-file compaction requires an unindexed table"
-    );
     Ok(Some(p::Plan {
         transaction: Uuid::new_v4(),
         read_version: version,
@@ -110,12 +134,9 @@ pub(super) async fn prepare(
     let dataset = publisher
         .read_dataset(Some(pending.plan.read_version))
         .await?;
-    ensure!(
-        dataset.load_indices().await?.is_empty(),
-        "managed small-file compaction requires an unindexed table"
-    );
+    let indices = supported_indices(&dataset).await?;
     let fragments = options
-        .fragments(&dataset)
+        .fragments(&dataset, &indices)
         .context("pending compaction has no eligible fragments under configured limits")?;
     let rows = fragments
         .iter()
@@ -152,9 +173,21 @@ pub(super) async fn prepare(
     // No prepared output is deleted on an error or an ambiguous later commit.
     tokio::spawn(async move {
         let _reservation = reservation;
-        let result = phases
+        let mut result = phases
             .measure(Phase::BlobWrite, task.execute(&dataset))
             .await?;
+        if !indices.is_empty() {
+            // The catalog fixes the read and target versions and fences other
+            // writers. Persist real IDs now so bitmap maintenance sees the same
+            // IDs as the selected manifest, without a separate reservation commit.
+            for (ordinal, fragment) in result.new_fragments.iter_mut().enumerate() {
+                ensure!(
+                    fragment.id == 0,
+                    "native compaction assigned unexpected fragment IDs"
+                );
+                fragment.id = next_fragment_id(&dataset, ordinal)?;
+            }
+        }
         validate_result(&dataset, &result).await?;
         p::Descriptors::lance_compaction(Bytes::from(serde_json::to_vec(&result)?))
     })
@@ -170,10 +203,26 @@ async fn validate_result(dataset: &Dataset, result: &RewriteResult) -> Result<()
             && result.row_addrs.is_none(),
         "invalid or ineffective compaction result"
     );
-    ensure!(
-        dataset.load_indices().await?.is_empty(),
-        "indexed compaction requires index remapping"
-    );
+    let indices = supported_indices(dataset).await?;
+    if !indices.is_empty() {
+        for (ordinal, fragment) in result.new_fragments.iter().enumerate() {
+            ensure!(
+                fragment.id == next_fragment_id(dataset, ordinal)?,
+                "compaction fragment IDs differ from fixed snapshot"
+            );
+        }
+        for index in indices.iter() {
+            let bitmap = index.fragment_bitmap.as_ref().unwrap();
+            let covered = bitmap.contains(result.original_fragments[0].id as u32);
+            ensure!(
+                result
+                    .original_fragments
+                    .iter()
+                    .all(|f| bitmap.contains(f.id as u32) == covered),
+                "compaction mixes index coverage"
+            );
+        }
+    }
     let mut ids = BTreeSet::new();
     for fragment in &result.original_fragments {
         ensure!(
@@ -198,6 +247,18 @@ async fn validate_result(dataset: &Dataset, result: &RewriteResult) -> Result<()
         "compaction changed row count"
     );
     Ok(())
+}
+
+fn next_fragment_id(dataset: &Dataset, ordinal: usize) -> Result<u64> {
+    let base = dataset
+        .manifest()
+        .max_fragment_id
+        .context("missing fragment high-water mark")?;
+    let id = base
+        .checked_add(1)
+        .and_then(|id| id.checked_add(u32::try_from(ordinal).ok()?))
+        .context("compaction fragment ID space exhausted")?;
+    Ok(u64::from(id))
 }
 
 pub(super) async fn operation(
