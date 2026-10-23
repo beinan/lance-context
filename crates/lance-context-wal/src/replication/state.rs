@@ -161,6 +161,34 @@ pub(super) struct State {
     pub producers: BTreeMap<(Uuid, u32, Uuid), (BatchMeta, u64)>,
 }
 impl State {
+    pub fn bucket_page(&self, table: Uuid, bucket: u32, after: u64, limit: usize) -> Result<Page> {
+        ensure!((1..=128).contains(&limit), "invalid accepted page limit");
+        ensure!(
+            after <= self.applied,
+            "cursor exceeds local applied position"
+        );
+        let mut remaining = self
+            .accepted
+            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded));
+        let mut entries = Vec::new();
+        let mut through = after;
+        // Bound owner-thread work even when no record matches. Only metadata is
+        // inspected; no payload reads, new index or replicated writes are needed.
+        for (&index, meta) in remaining.by_ref().take(4096) {
+            through = index;
+            if meta.stream == table && meta.bucket == bucket && meta.kind == RecordKind::Data {
+                entries.push((index, meta.clone()));
+                if entries.len() == limit {
+                    break;
+                }
+            }
+        }
+        if remaining.next().is_none() {
+            through = self.applied;
+        }
+        Ok(Page { entries, through })
+    }
+
     pub fn page(&self, after: u64, limit: usize) -> Result<Page> {
         ensure!((1..=128).contains(&limit), "invalid accepted page limit");
         ensure!(

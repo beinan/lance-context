@@ -7,6 +7,75 @@ const PAYLOAD: usize = 256 << 10;
 const ROWS: usize = 64;
 const APPENDS: usize = 256;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "local TLS metadata scaling experiment; run explicitly with --ignored --nocapture"]
+async fn session_metadata_under_unrelated_backlog() -> Result<()> {
+    // Bucket 2 shares group 10 with the target bucket 0; bucket 1 uses group 20.
+    // Fresh stores per arm avoid accumulated retained records from earlier arms.
+    for (trial, (unrelated, bucket)) in [(0, 2), (128, 2), (2048, 2), (2048, 1), (128, 2), (0, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("rollouts.lance");
+        let c = network::Cluster::open_signed(root.path(), layout()).await?;
+        bootstrap(&c, &path, &binding()).await?;
+        let storage = storage(&path).await?;
+        let ingress = connect(&c, binding())
+            .await?
+            .with_session_read_concurrency(2)?;
+        let s = session(0);
+        let target = producer(&ingress, 0).await?;
+        let mut expected = Vec::new();
+        for i in 0..16 {
+            let b = batch(&[&format!("target-{i}")], &[&s])?;
+            append(&ingress, &target, i + 1, b.clone()).await?;
+            expected.push(b);
+        }
+        let other = producer(&ingress, bucket).await?;
+        for i in 0..unrelated {
+            append(
+                &ingress,
+                &other,
+                i + 1,
+                batch(&[&format!("unrelated-{i}")], &[&session(bucket)])?,
+            )
+            .await?;
+        }
+        // One warm-up is excluded, all measured reads still verify every column.
+        verify(
+            reader::read_session(&ingress, &storage, &s).await?,
+            &expected,
+        )
+        .await?;
+        let mut metadata_ms = Vec::new();
+        let mut complete_ms = Vec::new();
+        for _ in 0..16 {
+            let start = Instant::now();
+            let read = reader::read_session(&ingress, &storage, &s).await?;
+            metadata_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            verify(read, &expected).await?;
+            complete_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        metadata_ms.sort_by(f64::total_cmp);
+        complete_ms.sort_by(f64::total_cmp);
+        println!(
+            "SESSION_METADATA_EXPERIMENT {}",
+            serde_json::json!({
+                "trial":trial,"unrelated_records":unrelated,"unrelated_bucket":bucket,
+                "same_group":bucket==2,"target_records":16,"payload_bytes_per_row":16<<10,
+                "queries":metadata_ms.len(),"metadata_p50_ms":metadata_ms[8],
+                "metadata_max_ms":metadata_ms[15],"complete_p50_ms":complete_ms[8],
+                "complete_max_ms":complete_ms[15],"fetch_concurrency":2,
+                "scope":"three real TLS replicas in one process, local disk; metadata scaling only, no publication or concurrent writer"
+            })
+        );
+        ensure!(ingress.budget.reserved() == 0, "query leaked reservation");
+        c.shutdown().await?;
+    }
+    Ok(())
+}
+
 fn row(id: &str, session: &str) -> Result<RecordBatch> {
     let b = batch(&[id], &[session])?;
     let mut columns = b.columns().to_vec();

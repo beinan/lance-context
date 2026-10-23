@@ -52,6 +52,14 @@ pub enum Query {
     Visibility {
         table: Uuid,
     },
+    /// A bounded scan of committed metadata, returning only this table/bucket.
+    /// Empty pages may still advance over unrelated records.
+    AcceptedBucket {
+        table: Uuid,
+        bucket: u32,
+        after: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +165,18 @@ impl Query {
             Self::Accepted { after, limit } => ensure!(
                 *after < u64::MAX && (1..=128).contains(limit),
                 "invalid accepted query bounds"
+            ),
+            Self::AcceptedBucket {
+                table,
+                bucket,
+                after,
+                limit,
+            } => ensure!(
+                !table.is_nil()
+                    && layout.group_for_bucket(*bucket)? == group
+                    && *after < u64::MAX
+                    && (1..=128).contains(limit),
+                "invalid accepted bucket query scope"
             ),
             Self::Producer {
                 table,
@@ -292,10 +312,20 @@ impl Query {
                     })
                 }))
             }
-            Self::Accepted { after, .. } if *after > state.applied => Value::CursorAhead {
-                applied: state.applied,
-            },
+            Self::Accepted { after, .. } | Self::AcceptedBucket { after, .. }
+                if *after > state.applied =>
+            {
+                Value::CursorAhead {
+                    applied: state.applied,
+                }
+            }
             Self::Accepted { after, limit } => Value::Accepted(state.page(*after, *limit)?),
+            Self::AcceptedBucket {
+                table,
+                bucket,
+                after,
+                limit,
+            } => Value::Accepted(state.bucket_page(*table, *bucket, *after, *limit)?),
             Self::Producer {
                 table,
                 bucket,

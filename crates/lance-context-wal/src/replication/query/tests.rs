@@ -47,6 +47,124 @@ fn evaluate(query: &Query, cut: &Cut, state: &State) -> Result<Value> {
 }
 
 #[test]
+fn bucket_pages_skip_unrelated_rows_and_advance_empty_bounded_scans() -> Result<()> {
+    let table = Uuid::from_u128(2);
+    let mut state = State {
+        applied: 10_000,
+        ..Default::default()
+    };
+    for index in 1..=9000 {
+        let mut meta = super::super::tests::batch(index).meta;
+        if index <= 5000 || index % 2 != 0 {
+            meta.stream = Uuid::from_u128(99);
+        }
+        if index % 4 != 0 {
+            meta.bucket = 2;
+        }
+        state.accepted.insert(index, meta);
+    }
+    let first = state.bucket_page(table, 0, 0, 128)?;
+    assert!(first.entries.is_empty());
+    assert_eq!(
+        first.through, 4096,
+        "empty scan did not respect its work bound"
+    );
+    let mut after = first.through;
+    let mut found = Vec::new();
+    while after < state.applied {
+        let page = state.bucket_page(table, 0, after, 128)?;
+        assert!(page.through > after && page.through <= state.applied);
+        assert!(page.entries.len() <= 128);
+        for (index, meta) in page.entries {
+            assert!(index > after && index <= page.through);
+            assert_eq!(meta.stream, table);
+            assert_eq!(meta.bucket, 0);
+            found.push(index);
+        }
+        after = page.through;
+    }
+    assert_eq!(
+        found,
+        (5001..=9000).filter(|i| i % 4 == 0).collect::<Vec<_>>()
+    );
+    assert!(state.bucket_page(table, 0, after, 128)?.entries.is_empty());
+    assert!(state.bucket_page(table, 0, after + 1, 128).is_err());
+    assert!(state.bucket_page(table, 0, 0, 0).is_err());
+    assert!(state.bucket_page(table, 0, 0, 129).is_err());
+    Ok(())
+}
+
+#[test]
+fn bucket_query_preserves_quorum_scope_and_cursor_validation() -> Result<()> {
+    let (_root, mut nodes) = nodes(Limits::default())?;
+    nodes[0].campaign(10)?;
+    pump(&mut nodes)?;
+    let batch = super::super::tests::batch(1);
+    nodes[0].propose(10, 1, batch.clone())?;
+    pump(&mut nodes)?;
+    let query = Query::AcceptedBucket {
+        table: batch.meta.stream,
+        bucket: batch.meta.bucket,
+        after: 0,
+        limit: 128,
+    };
+    assert!(nodes[0].query(20, 2, query.clone()).is_err());
+    assert!(nodes[1].query(10, 2, query.clone()).is_err());
+    nodes[0].query(10, 2, query.clone())?;
+    let events = nodes[0].poll()?;
+    assert!(events.reads.is_empty(), "bucket query bypassed the quorum");
+    for packet in events.messages {
+        nodes[packet.message.to as usize - 1].step(packet)?;
+    }
+    let reads = pump(&mut nodes)?.reads;
+    let Outcome::Observed {
+        cut,
+        value: Value::Accepted(page),
+    } = &reads[0].outcome
+    else {
+        anyhow::bail!("missing quorum bucket page");
+    };
+    assert!(cut.quorum_index > 0 && cut.applied >= cut.quorum_index);
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].1, batch.meta);
+    assert_eq!(page.through, cut.applied);
+    for query in [
+        Query::AcceptedBucket {
+            table: Uuid::nil(),
+            bucket: 0,
+            after: 0,
+            limit: 1,
+        },
+        Query::AcceptedBucket {
+            table: batch.meta.stream,
+            bucket: 0,
+            after: 0,
+            limit: 129,
+        },
+    ] {
+        assert!(nodes[0].query(10, 3, query).is_err());
+    }
+    nodes[0].query(
+        10,
+        3,
+        Query::AcceptedBucket {
+            table: batch.meta.stream,
+            bucket: 0,
+            after: cut.applied + 1,
+            limit: 128,
+        },
+    )?;
+    assert!(matches!(
+        pump(&mut nodes)?.reads[0].outcome,
+        Outcome::Observed {
+            value: Value::CursorAhead { .. },
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
 fn compact_visibility_uses_catalog_quorum_and_fits_control_reply_budget() -> Result<()> {
     let (_root, mut nodes) = nodes(Limits::default())?;
     nodes[0].campaign(10)?;

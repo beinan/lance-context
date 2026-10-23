@@ -473,7 +473,7 @@ impl Handle {
             query::Query::Pin { .. } | query::Query::SourcePin { .. } => {
                 source::MAX_PIN_BYTES + 4096
             }
-            query::Query::Accepted { limit, .. } => {
+            query::Query::Accepted { limit, .. } | query::Query::AcceptedBucket { limit, .. } => {
                 ensure!((1..=128).contains(limit), "invalid accepted query bounds");
                 256 * limit + 1024
             }

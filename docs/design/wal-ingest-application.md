@@ -41,8 +41,12 @@ The reader streams committed WAL data before opening Lance, checks source
 closures for any payload retired during capture, and deduplicates overlap by
 immutable row ID. Missing unpublished payload is an error. This is a session
 read with unspecified row order, not arbitrary SQL or a global snapshot. It
-currently scans retained metadata in the session's group, fetches payloads in the
-session's bucket, then filters rows by session. Payload workspace is reserved per record;
+asks the session's group to filter retained metadata by table and bucket, fetches
+those payloads, then filters rows by session. Each quorum page scans at most 4096
+retained metadata entries and returns at most 128 matches; an empty page can still
+advance past unrelated records. This reduces metadata transfer and quorum round
+trips without introducing a separate index. Upgrade WAL servers before ingress
+instances that use the new `AcceptedBucket` query. Payload workspace is reserved per record;
 captured metadata and row IDs grow with the WAL tail, but payloads are not retained
 for the whole query. Consumers must read to EOF and propagate stream errors.
 `session_read_concurrency` bounds concurrent WAL record fetches and decodes per
