@@ -31,6 +31,7 @@ struct LostAck {
     lost: AtomicBool,
     accepted: Mutex<Option<Accepted>>,
     producer: Mutex<Option<String>>,
+    response_body: Option<&'static str>,
 }
 async fn lose_one_ack(State(state): State<Arc<LostAck>>, request: Request, next: Next) -> Response {
     let append = request.uri().path().ends_with("/append");
@@ -49,7 +50,11 @@ async fn lose_one_ack(State(state): State<Arc<LostAck>>, request: Request, next:
         *state.producer.lock().unwrap() = token;
         // The real gateway has durably accepted the append, but the client sees
         // an intermediary failure and must retain its journaled original body.
-        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            state.response_body.unwrap_or_default(),
+        )
+            .into_response();
     }
     response
 }
@@ -173,6 +178,45 @@ async fn storage(path: &Path) -> Result<crate::materializer::Storage> {
         options: HashMap::new(),
         session: Arc::new(lance::session::Session::default()),
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_error_details_preserve_the_original_durable_intent() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("rollouts.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding()).await?;
+    let lost = Arc::new(LostAck {
+        response_body: Some(
+            r#"{"error":"append_outcome_unknown","operation_outcome":"unknown","retry_same_request":true}"#,
+        ),
+        ..Default::default()
+    });
+    let server = HttpServer::start(ingress, Some(lost.clone()), Default::default()).await?;
+    let client = writer(root.path(), &server, MergeMemoryBudget::new(64 << 20)).await?;
+    let error = client.append(0, data(0, 0)?).await.unwrap_err();
+    let details = error
+        .downcast_ref::<http::journal::AppendResponseError>()
+        .context("missing service diagnostics")?;
+    assert_eq!(details.status, 503);
+    assert_eq!(details.code, "append_outcome_unknown");
+    assert_eq!(details.operation_outcome, "unknown");
+    assert_eq!(
+        error.root_cause().to_string(),
+        "append outcome unresolved (HTTP 503 Service Unavailable); retain original intent"
+    );
+    assert!(client.last_accepted(0).await?.is_none());
+    assert!(
+        client.stage(0, data(0, 1)?).await.is_err(),
+        "service diagnostics discarded the pending intent"
+    );
+    let original = lost.accepted.lock().unwrap().clone().unwrap();
+    assert_eq!(client.resume(0).await?.unwrap(), original);
+    assert!(client.resume(0).await?.is_none());
+    client.shutdown().await?;
+    server.shutdown().await?;
+    cluster.shutdown().await
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_http_ack_recovers_shared_journal_across_gateway_and_wal_restart_then_publishes_lance(

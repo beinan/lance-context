@@ -10,6 +10,45 @@ use tokio::sync::Mutex as AsyncMutex;
 const MAX_METADATA: usize = 32 << 10;
 const MAX_TOKEN: usize = 12 << 10;
 
+/// Diagnostics reported by the HTTP service, not proof of an append's outcome.
+/// These details never advance or discard the durable pending intent.
+#[derive(Debug, Deserialize)]
+pub struct AppendResponseError {
+    #[serde(skip)]
+    pub status: u16,
+    #[serde(rename = "error")]
+    pub code: String,
+    pub operation_outcome: String,
+}
+impl std::fmt::Display for AppendResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "append service response (HTTP {}): {} ({})",
+            self.status, self.code, self.operation_outcome
+        )
+    }
+}
+impl std::error::Error for AppendResponseError {}
+
+async fn unresolved_append(response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let error =
+        anyhow::anyhow!("append outcome unresolved (HTTP {status}); retain original intent");
+    // Use the same bounded response reader as ACKs. An empty, malformed or
+    // oversized intermediary response must not hide the original HTTP status.
+    if let Ok(mut details) = bounded_json::<AppendResponseError>(response).await {
+        let label = |s: &str| {
+            !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        };
+        if label(&details.code) && label(&details.operation_outcome) {
+            details.status = status.as_u16();
+            return error.context(details);
+        }
+    }
+    error
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
@@ -375,11 +414,9 @@ impl DurableClient {
             .body(pending.body.clone())
             .send()
             .await?;
-        ensure!(
-            response.status() == reqwest::StatusCode::ACCEPTED,
-            "append outcome unresolved (HTTP {}); retain original intent",
-            response.status()
-        );
+        if response.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(unresolved_append(response).await);
+        }
         let accepted: Accepted = bounded_json(response).await?;
         ensure!(
             accepted.sequence == pending.sequence
