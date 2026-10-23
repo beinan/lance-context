@@ -234,7 +234,117 @@ async fn compaction_preserves_wal_queries_and_resumes_prepared_and_published_out
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compaction_waits_for_pending_append_batch() -> Result<()> {
+async fn compaction_and_appends_progress_with_backlog_across_takeover() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("backlogged.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding())
+        .await?
+        .with_session_read_concurrency(2)?;
+    let storage = Storage::resolve(
+        path.to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let budget = MergeMemoryBudget::new(32 << 20);
+    let opens = (0..2)
+        .map(|bucket| ProducerOpen {
+            bucket,
+            slot: bucket,
+            expected_generation: 0,
+            operation: Uuid::new_v4(),
+        })
+        .collect::<Vec<_>>();
+    let mut expected = BTreeMap::new();
+    let mut publisher = acquire(&ingress, &storage, &budget, 1, options(false)).await?;
+    for i in 0..24 {
+        let (body, _) = append(
+            &ingress,
+            &opens[i % 2],
+            (i / 2 + 1) as u64,
+            &[&format!("row-{i}")],
+        )
+        .await?;
+        remember(&mut expected, body)?;
+        if i < 16 {
+            assert!(publisher.run_once().await?.is_some());
+        }
+    }
+    assert_eq!(
+        publisher
+            .read_dataset(None)
+            .await?
+            .manifest()
+            .fragments
+            .len(),
+        16
+    );
+    let mut checkpoint = publisher.state().await?.progress.checkpoint.clone();
+    drop(publisher);
+    let bounded = Options {
+        max_records: 1,
+        compaction: Some(SmallFileCompaction {
+            target_file_bytes: 64 << 10,
+            min_fragments: 2,
+        }),
+        ..options(true)
+    };
+    let mut published_rows = 16;
+    let mut published_groups = std::collections::BTreeSet::new();
+    for turn in 0..4 {
+        // A new owner each turn cannot reset the append/rewrite scheduling.
+        let mut publisher = acquire(&ingress, &storage, &budget, 2 + turn, bounded.clone()).await?;
+        query_all(&ingress, &storage, &expected).await?;
+        let before = publisher
+            .read_dataset(None)
+            .await?
+            .manifest()
+            .fragments
+            .len();
+        let completed = publisher
+            .run_once()
+            .await?
+            .context("backlog made no progress")?;
+        let dataset = publisher.read_dataset(None).await?;
+        if turn % 2 == 0 {
+            assert!(
+                completed.sources.is_empty(),
+                "WAL backlog starved compaction"
+            );
+            assert!(dataset.manifest().fragments.len() < before);
+            assert_eq!(publisher.state().await?.progress.checkpoint, checkpoint);
+        } else {
+            assert!(
+                !completed.sources.is_empty(),
+                "compaction starved WAL publication"
+            );
+            published_groups.extend(completed.sources.keys().copied());
+            published_rows += 1;
+            let after = publisher.state().await?.progress.checkpoint.clone();
+            assert_ne!(after, checkpoint);
+            for (group, position) in &checkpoint {
+                assert!(after.get(group).is_some_and(|next| next >= position));
+            }
+            checkpoint = after;
+        }
+        assert_eq!(dataset.count_rows(None).await?, published_rows);
+        assert!(
+            published_rows < expected.len(),
+            "test drained the WAL backlog"
+        );
+        // Verify every column and ID across both source groups and Lance.
+        query_all(&ingress, &storage, &expected).await?;
+    }
+    assert_eq!(published_groups.len(), 2, "rewrites starved a source group");
+    assert_eq!(budget.reserved(), 0);
+    drop(ingress);
+    cluster.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_does_not_flush_pending_append_batch() -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("priority.lance");
     let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
@@ -293,8 +403,8 @@ async fn compaction_waits_for_pending_append_batch() -> Result<()> {
                 == 0
         })
         .unwrap();
-    // Eligible small files must not trigger compaction when an append is still
-    // beyond this poll's bounded scan through another table's metadata.
+    // After one rewrite, an incomplete scan or an accumulating append must not
+    // trigger another rewrite or force a small append publication.
     for seq in 1..=129 {
         let body = ipc_file(&[batch(&[&format!("foreign-{seq}")], &[&other_session])?])?;
         let prepared = other
@@ -318,10 +428,19 @@ async fn compaction_waits_for_pending_append_batch() -> Result<()> {
             min_source_bytes: 1 << 20,
             max_batch_wait: Duration::from_secs(60),
             scan_pages_per_group: 1,
+            compaction: Some(SmallFileCompaction {
+                min_fragments: 2,
+                ..options(true).compaction.unwrap()
+            }),
             ..options(true)
         },
     )
     .await?;
+    let checkpoint = publisher.state().await?.progress.checkpoint.clone();
+    let rewrite = publisher.run_once().await?.context("missing rewrite")?;
+    assert!(rewrite.sources.is_empty());
+    assert_eq!(publisher.state().await?.progress.checkpoint, checkpoint);
+    assert_eq!(publisher.read_dataset(None).await?.version().version, 6);
     assert!(publisher.prepare_next().await?.is_none());
     assert!(publisher.state().await?.progress.pending.is_none());
     assert!(
@@ -341,6 +460,10 @@ async fn compaction_waits_for_pending_append_batch() -> Result<()> {
             min_source_bytes: 1 << 20,
             max_batch_wait: Duration::from_secs(60),
             scan_pages_per_group: 1,
+            compaction: Some(SmallFileCompaction {
+                min_fragments: 2,
+                ..options(true).compaction.unwrap()
+            }),
             ..options(true)
         },
     )
@@ -364,9 +487,8 @@ async fn compaction_waits_for_pending_append_batch() -> Result<()> {
         .is_compaction());
     publisher.commit_pending().await?;
     publisher.finish_pending().await?;
-    verify(&publisher, &expected, 6).await?;
-    // A one-page poll may first advance past control entries after the append.
-    // Continue ordinary scheduling until every source has been observed idle.
+    verify(&publisher, &expected, 7).await?;
+    // Completing an append permits another bounded rewrite.
     let mut compacted = false;
     for _ in 0..4 {
         if publisher.run_once().await?.is_some() {
@@ -374,8 +496,8 @@ async fn compaction_waits_for_pending_append_batch() -> Result<()> {
             break;
         }
     }
-    assert!(compacted, "bounded source scans never reached compaction");
-    verify(&publisher, &expected, 7).await?;
+    assert!(compacted, "append completion never reached compaction");
+    verify(&publisher, &expected, 8).await?;
     assert!(
         publisher
             .read_dataset(None)

@@ -27,11 +27,23 @@ contains at most 64 fragments and twice the target's stored bytes. Only sized,
 nonempty fragments smaller than half the target qualify; deletion files and
 indexed tables are unsupported by this initial policy.
 
-The worker first scans every source group for pending appends. Compaction runs
-only after that scan catches up: an incomplete metadata scan or an append waiting
-for the normal batch threshold takes priority. A bounded rewrite already in
-progress completes before later appends publish; those appends remain queryable
-in the WAL. A constantly backlogged table can postpone compaction, so large append
+After an append completes, the worker may select one bounded rewrite before its
+next append. It uses the catalog's existing completion receipt, so claim rotation
+and publisher takeover preserve this scheduling. If a rewrite just completed,
+the worker scans for appends first; another rewrite waits until an append completes
+or every source group has caught up. A pending batch keeps its normal size and age
+thresholds. This lets small-file rewriting progress during continuous backlog
+without starving appends or forcing smaller append batches.
+
+With compaction enabled, source-group scan order rotates from the completed
+Lance version divided by two. There is at most one rewrite between backlogged
+append publications, so this position advances without skipping groups. The
+rotation survives takeover without adding state to the catalog or checkpoint
+format; a compaction's empty source receipt cannot reset it to the first group.
+
+A selected rewrite completes before later appends publish; those appends remain
+queryable in the WAL. Rewrites share the publisher and its I/O budget, so their
+effect on sustained ingestion must be measured for the workload. Large append
 batches remain the first defense against small files.
 
 Preparation uses Lance 13's `CompactionTask` with `TryBinaryCopy`, which copies
@@ -55,4 +67,5 @@ takeover with retained prepared output, checkpoint round trips through publicati
 unchanged source cursors, and a completion retry while the next append is pending.
 Ingest tests use actual TLS replicas and Lance files to exercise prepared and
 published recovery, concurrent session queries over published rows and pending
-WAL appends, old-snapshot reads, and append batching priority.
+WAL appends, old-snapshot reads, preserved append batching, and progress of both
+rewrites and appends during backlog across publisher takeover.
