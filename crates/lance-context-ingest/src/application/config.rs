@@ -120,6 +120,8 @@ pub struct Config {
     pub session_read_concurrency: usize,
     #[serde(default = "crate::reader::default_scan_batch_rows")]
     pub session_scan_batch_rows: usize,
+    #[serde(default = "crate::reader::default_scan_fragment_readahead")]
+    pub session_scan_fragment_readahead: usize,
     pub materializer_memory_bytes: usize,
     pub http: Option<Http>,
     pub etcd: Option<Etcd>,
@@ -164,6 +166,7 @@ impl Config {
         self.layout.validate()?;
         crate::reader::validate_concurrency(self.session_read_concurrency)?;
         crate::reader::validate_scan_batch_rows(self.session_scan_batch_rows)?;
+        crate::reader::validate_scan_fragment_readahead(self.session_scan_fragment_readahead)?;
         // Client::new validates the complete WAL policy before any RPC.
         ensure!(
             (1..=4096).contains(&self.tables.len()),

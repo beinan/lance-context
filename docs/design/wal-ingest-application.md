@@ -61,7 +61,14 @@ its reservation until it finishes. Tune concurrency against both read latency
 and ingestion throughput, since WAL storage and network resources are shared.
 The published Lance phase also reserves from the shared ingress budget for the
 lifetime of its scan. Its I/O buffer, decoded batch target, and blob-materialization
-readahead each use `max_record_bytes`; it sets decode and fragment readahead to one.
+readahead each use `max_record_bytes`; decode readahead remains one.
+`session_scan_fragment_readahead` (1–8, default 1) controls concurrent Lance
+fragment reads. Rust callers can use
+`Ingress::with_session_scan_fragment_readahead`. Increasing it overlaps file reads
+without changing the scan's byte targets or late-materialization row limit.
+Measure query latency, memory, and ingestion contention before raising it.
+This overlaps the existing scan; it does not reduce the fragments a session
+filter must inspect. Fragment metadata can add memory outside scan admission.
 `session_scan_batch_rows` (1–8192, default 1) also limits the rows gathered before
 late materialization. A byte target alone does not prevent that stage from
 collecting, concatenating, and copying an entire session before emitting results.

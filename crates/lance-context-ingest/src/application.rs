@@ -49,7 +49,8 @@ impl Registry {
             )
             .await?
             .with_session_read_concurrency(config.session_read_concurrency)?
-            .with_session_scan_batch_rows(config.session_scan_batch_rows)?;
+            .with_session_scan_batch_rows(config.session_scan_batch_rows)?
+            .with_session_scan_fragment_readahead(config.session_scan_fragment_readahead)?;
             // Validate both durable catalog scope and the configured blob path.
             materializer::read_dataset(&ingress, &storage, None).await?;
             tables.insert(
