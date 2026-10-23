@@ -104,14 +104,18 @@ async fn supported_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>>
     Ok(indices)
 }
 
-pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
+pub(super) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool> {
     let Some(options) = &publisher.options.compaction else {
-        return Ok(None);
+        return Ok(false);
     };
-    let version = view.progress.minimum_read_version;
     let dataset = publisher.read_dataset(Some(version)).await?;
     let indices = supported_indices(&dataset).await?;
-    if options.fragments(&dataset, &indices).is_none() {
+    Ok(options.fragments(&dataset, &indices).is_some())
+}
+
+pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
+    let version = view.progress.minimum_read_version;
+    if !has_work(publisher, version).await? {
         return Ok(None);
     }
     Ok(Some(p::Plan {

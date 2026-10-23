@@ -31,8 +31,11 @@ Prepared output survives takeover with new index scheduling disabled. Completion
 advances the Lance version without advancing WAL cursors. Existing snapshots
 retain their index files; this path does not delete old objects.
 
-An eligible index operation currently precedes small-file compaction in a
-maintenance turn. There is at most one maintenance operation between backlogged
+When both policies remain eligible, maintenance preference rotates between
+index work and small-file compaction using the fixed read version divided by
+two. Each append/maintenance pair advances two versions, so neither policy
+can continually displace the other during backlog; takeover preserves the
+preference. There is at most one maintenance operation between backlogged
 appends. Indexing and compaction share the active publisher, so measure their
 effect on ingestion before enabling them for a workload. Indexed compaction
 groups fragments by coverage in every segment and preserves stable row IDs.

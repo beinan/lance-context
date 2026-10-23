@@ -396,14 +396,30 @@ impl Publisher {
         Ok(self.state().await?.progress.prepared)
     }
     async fn maintenance_plan(&self, view: &p::Table) -> Result<Option<p::Plan>> {
+        if Self::compaction_first(view.progress.minimum_read_version) {
+            if let Some(plan) = compaction::plan(self, view).await? {
+                return Ok(Some(plan));
+            }
+        }
         if let Some(plan) = session_index::plan(self, view).await? {
             return Ok(Some(plan));
         }
         compaction::plan(self, view).await
     }
 
+    fn compaction_first(read_version: u64) -> bool {
+        // During backlog, each append/maintenance pair advances two versions.
+        // Rotate from durable state so takeover cannot reset the preference.
+        (read_version / 2) % 2 == 1
+    }
+
     async fn materialize(&self, pending: &Arc<p::PendingPlan>) -> Result<p::Descriptors> {
         if pending.plan.is_maintenance() {
+            if Self::compaction_first(pending.plan.read_version)
+                && compaction::has_work(self, pending.plan.read_version).await?
+            {
+                return compaction::prepare(self, pending).await;
+            }
             if let Some(index) = session_index::prepare(self, pending).await? {
                 return Ok(index);
             }

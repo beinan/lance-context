@@ -104,7 +104,8 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
 
     let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
     let ingress = connect(&cluster, binding()).await?;
-    let mut recovered = compaction::acquire(&ingress, &storage, &budget, 4, options).await?;
+    let mut recovered =
+        compaction::acquire(&ingress, &storage, &budget, 4, options.clone()).await?;
     assert_eq!(recovered.prepare_next().await?.unwrap(), prepared);
     let completed = recovered
         .run_once()
@@ -170,6 +171,10 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     assert_eq!(old_snapshot.count_rows(None).await?, 4);
     assert!(old_snapshot.load_indices().await?.is_empty());
 
+    // Isolate incremental index/consolidation recovery after indexed compaction
+    // has passed. Fair scheduling with both policies enabled is covered below.
+    options.compaction = None;
+    let mut recovered = compaction::acquire(&ingress, &storage, &budget, 5, options).await?;
     for sequence in 4..=6 {
         let (body, _) = append(
             &ingress,
@@ -207,5 +212,70 @@ async fn index_recovers_prepared_and_selected_files_then_compacts_with_a_visible
     );
     assert_eq!(budget.reserved(), 0);
     drop((recovered, ingress));
+    cluster.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backlog_allows_index_and_compaction_to_progress_across_takeover() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("fair-maintenance.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let ingress = connect(&cluster, binding()).await?;
+    let storage = Storage::resolve(
+        path.to_str().unwrap().into(),
+        Default::default(),
+        Arc::default(),
+    )
+    .await?;
+    let budget = MergeMemoryBudget::new(768 << 20);
+    let open = ProducerOpen {
+        bucket: 0,
+        slot: 0,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let mut expected = BTreeMap::new();
+    let mut writer =
+        compaction::acquire(&ingress, &storage, &budget, 1, compaction::options(false)).await?;
+    for sequence in 1..=16 {
+        let (body, _) = append(&ingress, &open, sequence, &[&format!("row-{sequence}")]).await?;
+        remember(&mut expected, body)?;
+        assert!(writer.run_once().await?.is_some());
+    }
+    let mut options = compaction::options(true);
+    options.session_index = Some(SessionIndex {
+        min_fragments: 4,
+        max_fragments: 4,
+        max_segments: 16,
+    });
+    let mut writer = compaction::acquire(&ingress, &storage, &budget, 2, options.clone()).await?;
+    let (body, _) = append(&ingress, &open, 17, &["first-tail"]).await?;
+    remember(&mut expected, body)?;
+    assert_eq!(writer.prepare_next().await?.unwrap().descriptors.format, 3);
+    assert!(writer.run_once().await?.unwrap().sources.is_empty());
+    assert!(!writer.run_once().await?.unwrap().sources.is_empty());
+    let (body, _) = append(&ingress, &open, 18, &["second-tail"]).await?;
+    remember(&mut expected, body)?;
+    let checkpoint = writer.state().await?.progress.checkpoint.clone();
+    // Both policies remain eligible, but a new owner must give compaction its
+    // next turn instead of resetting to index-first and indefinitely deferring it.
+    let mut writer = compaction::acquire(&ingress, &storage, &budget, 3, options).await?;
+    let before = writer.read_dataset(None).await?;
+    let prepared = writer.prepare_next().await?.unwrap();
+    assert_eq!(prepared.descriptors.format, 2);
+    assert!(writer.run_once().await?.unwrap().sources.is_empty());
+    let after = writer.read_dataset(None).await?;
+    assert!(after.get_fragments().len() < before.get_fragments().len());
+    assert_eq!(
+        after.count_rows(None).await?,
+        before.count_rows(None).await?
+    );
+    assert_eq!(writer.state().await?.progress.checkpoint, checkpoint);
+    compaction::query_all(&ingress, &storage, &expected).await?;
+    assert!(!writer.run_once().await?.unwrap().sources.is_empty());
+    compaction::query_all(&ingress, &storage, &expected).await?;
+    assert_eq!(budget.reserved(), 0);
+    drop((writer, ingress));
     cluster.shutdown().await
 }
