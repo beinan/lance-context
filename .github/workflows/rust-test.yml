@@ -116,6 +116,7 @@ jobs:
       - name: Standalone WAL service and automatic maintenance
         run: |
           cargo clippy -p lance-context-wal --features service --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features service --lib replication::runtime::tests::maintenance -- --test-threads=1
           cargo test -p lance-context-wal --features service --test node_service
       - name: WAL resource observation in a container cgroup namespace
         run: |
