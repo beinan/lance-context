@@ -25,6 +25,12 @@ snapshot returns `SnapshotTemporarilyUnavailable`. Logs without a checkpoint
 continue to start at index 1. An application binding must precede checkpointing.
 Missing, corrupt or inconsistent checkpoint metadata fails recovery.
 
+Native file purging can discard a compaction command while older entries remain
+in a shared rewrite file. On reopen, storage validates each group's metadata and
+the complete retained suffix, then durably reapplies compaction for entries at or
+below its persisted checkpoint. Missing or extra entries above that boundary
+still fail recovery. This does not advance the checkpoint or discard its suffix.
+
 Compaction uses an explicit `Command::Compact` in the same synced batch as its
 metadata. The pinned engine's convenience `compact_to` method is insufficient:
 it does not sync and does not return failures. Shared engine failures invalidate
