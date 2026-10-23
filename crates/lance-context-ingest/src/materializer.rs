@@ -17,6 +17,7 @@ pub(crate) mod stage;
 pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
+pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
 
 /// Resolve this from the authorized namespace, never from an append request.

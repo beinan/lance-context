@@ -47,6 +47,118 @@ async fn verify(read: reader::SessionRead, expected: &[RecordBatch]) -> Result<(
     verify_batches(read.batches.try_collect().await?, expected)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_index_reads_full_rows_from_index_tail_and_wal_during_publication() -> Result<()> {
+    use crate::materializer::{Acquisition, Options, Publisher, SessionIndex};
+    use lance::index::DatasetIndexExt;
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("partial-index.lance");
+    let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&cluster, &path, &binding()).await?;
+    let storage = storage(&path).await?;
+    let ingress = connect(&cluster, binding())
+        .await?
+        .with_session_scan_batch_rows(4)?
+        .with_session_scan_fragment_readahead(4)?;
+    let selected = (0..1000)
+        .map(|i| format!("quoted'session-{i}"))
+        .find(|s| ingress.bucket_for_session(s).unwrap() == 0)
+        .unwrap();
+    let foreign = session(0);
+    let producer = producer(&ingress, 0).await?;
+    let budget = MergeMemoryBudget::new(768 << 20);
+    let mut publisher = Publisher::acquire(
+        ingress.clone(),
+        storage.clone(),
+        Options {
+            session_index: Some(SessionIndex {
+                min_fragments: 2,
+                max_fragments: 2,
+                max_segments: 2,
+            }),
+            ..Options::default()
+        },
+        budget.clone(),
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: 1,
+        },
+    )
+    .await?;
+    let mut expected = Vec::new();
+    for sequence in 1..=4 {
+        let ids = [
+            format!("selected-{sequence}"),
+            format!("foreign-{sequence}"),
+        ];
+        let mixed = batch(&[&ids[0], &ids[1]], &[&selected, &foreign])?;
+        let mut columns = mixed.columns().to_vec();
+        // Distinct binary values catch payload substitution as well as ID errors.
+        columns[mixed.schema().index_of("binary_payload")?] =
+            Arc::new(LargeBinaryArray::from_iter_values([
+                vec![sequence as u8; 64 << 10],
+                vec![sequence as u8 + 10; 64 << 10],
+            ]));
+        let mixed = RecordBatch::try_new(mixed.schema(), columns)?;
+        expected.push(mixed.slice(0, 1));
+        append(&ingress, &producer, sequence, mixed).await?;
+        if sequence <= 3 {
+            assert!(!publisher.run_once().await?.unwrap().sources.is_empty());
+        }
+        if sequence == 2 {
+            // First check the unindexed path, then complete index coverage.
+            verify(
+                reader::read_session(&ingress, &storage, &selected).await?,
+                &expected,
+            )
+            .await?;
+            assert!(publisher.run_once().await?.unwrap().sources.is_empty());
+            let dataset = publisher.read_dataset(None).await?;
+            assert_eq!(dataset.load_indices().await?.len(), 1);
+            assert!(crate::materializer::session_scan_fragments(&dataset)
+                .await?
+                .is_none());
+        }
+        verify(
+            reader::read_session(&ingress, &storage, &selected).await?,
+            &expected,
+        )
+        .await?;
+    }
+    let dataset = publisher.read_dataset(None).await?;
+    let [covered, tail] = crate::materializer::session_scan_fragments(&dataset)
+        .await?
+        .context("expected partial index coverage")?;
+    assert_eq!(covered.len(), 2);
+    assert_eq!(tail.len(), 1);
+    // The fourth batch is still WAL-only. Commit it while preserving the source,
+    // then retire it: each full row must appear exactly once in all three states.
+    assert!(publisher.prepare_next().await?.is_some());
+    assert!(publisher.commit_pending().await?.is_some());
+    verify(
+        reader::read_session(&ingress, &storage, &selected).await?,
+        &expected,
+    )
+    .await?;
+    assert!(publisher.finish_pending().await?.is_some());
+    verify(
+        reader::read_session(&ingress, &storage, &selected).await?,
+        &expected,
+    )
+    .await?;
+    verify(
+        reader::read_session(&ingress, &storage, "absent'session").await?,
+        &[],
+    )
+    .await?;
+    assert_eq!(ingress.budget.reserved(), 0);
+    assert_eq!(budget.reserved(), 0);
+    drop((publisher, ingress));
+    cluster.shutdown().await
+}
+
 fn verify_batches(batches: Vec<RecordBatch>, expected: &[RecordBatch]) -> Result<()> {
     fn rows(batches: &[RecordBatch]) -> BTreeMap<String, RecordBatch> {
         let mut rows = BTreeMap::new();
