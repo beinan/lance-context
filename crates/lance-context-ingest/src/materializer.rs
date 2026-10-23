@@ -48,7 +48,7 @@ pub struct Options {
     pub scan_pages_per_group: usize,
     /// Catalog metadata only; retiring it never deletes immutable blob objects.
     pub retained_manifest_versions: usize,
-    /// Compact small published fragments after the WAL scan catches up.
+    /// Compact small published fragments between appends or after the WAL scan catches up.
     /// All table publishers must support compaction before enabling this.
     pub compaction: Option<SmallFileCompaction>,
 }
@@ -304,7 +304,20 @@ impl Publisher {
         if view.progress.pending.is_none() {
             self.retire_history(&view).await?;
             if self.plan_attempt.is_none() {
-                self.plan_attempt = self.select(&view).await?;
+                // The durable completion receipt survives claim rotation and
+                // takeover. Allow one bounded rewrite after an append, then
+                // give WAL publication another turn even if small files remain.
+                if view
+                    .progress
+                    .advanced
+                    .as_ref()
+                    .is_some_and(|completed| !completed.sources.is_empty())
+                {
+                    self.plan_attempt = compaction::plan(self, &view).await?;
+                }
+                if self.plan_attempt.is_none() {
+                    self.plan_attempt = self.select(&view).await?;
+                }
                 if self.plan_attempt.is_none() && self.source_scan_idle {
                     self.plan_attempt = compaction::plan(self, &view).await?;
                 }
@@ -653,7 +666,14 @@ impl Publisher {
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        if let Some(last) = view
+        if self.options.compaction.is_some() {
+            // A rewrite replaces the last append receipt. Rotate from the
+            // durable version instead: at most one rewrite between appends
+            // means version/2 advances by at most one per append selection.
+            // Every group gets the first turn without adding catalog state.
+            let offset = (view.progress.minimum_read_version / 2) % groups.len() as u64;
+            groups.rotate_left(offset as usize);
+        } else if let Some(last) = view
             .progress
             .advanced
             .as_ref()
