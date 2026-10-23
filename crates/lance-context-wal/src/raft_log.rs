@@ -66,7 +66,6 @@ struct NodeEngine {
     engine: LogEngine,
     #[cfg(any(test, feature = "replication"))]
     directory: PathBuf,
-    #[cfg(feature = "replication")]
     target_file_bytes: u64,
     written: Arc<AtomicU64>,
     budget: OnceLock<Arc<crate::admission::Budget>>,
@@ -432,7 +431,6 @@ impl PhysicalLog {
             engine,
             #[cfg(any(test, feature = "replication"))]
             directory: PathBuf::from(directory),
-            #[cfg(feature = "replication")]
             target_file_bytes: options.target_file_bytes,
             written: Arc::new(AtomicU64::new(0)),
             budget: OnceLock::new(),
