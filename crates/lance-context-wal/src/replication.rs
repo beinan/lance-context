@@ -9,8 +9,8 @@
 //! component supports explicit application checkpoints and prepared snapshot
 //! transfer and explicit collection of unreferenced application images. Raft
 //! segment reclamation and production scheduling remain separate responsibilities.
-//! Optional shared node disk admission covers proposals and image files while
-//! preserving a window for accepted peer traffic; it is not a filesystem quota.
+//! Optional shared node disk admission covers proposals, new replicated payloads
+//! and image files while preserving a control window; it is not a filesystem quota.
 //! Message scope checks are not authentication. Do not expose it to untrusted
 //! transport or enable ingestion without the remaining admission/lifecycle work.
 
@@ -266,6 +266,7 @@ struct Group {
     state: State,
     // Index AND term prevents suffix replacement from completing another input.
     pending: BTreeMap<(u64, u64), (u64, BatchMeta, Option<crate::admission::Reservation>)>,
+    peer_reservations: Vec<crate::admission::Reservation>,
     reads: query::Tracker,
     image: Option<Arc<checkpoint::Image>>,
     incoming: Option<PreparedCheckpoint>,
@@ -435,6 +436,7 @@ impl Node {
                     raw,
                     state,
                     pending: BTreeMap::new(),
+                    peer_reservations: Vec::new(),
                     reads: query::Tracker::default(),
                     image,
                     incoming: None,
@@ -835,11 +837,51 @@ impl Node {
         for entry in &message.entries {
             state::validate_entry(&self.layout, packet.group, &self.limits, entry, true)?;
         }
-        self.groups
+        let group = self
+            .groups
             .get_mut(&packet.group)
-            .context("unhosted group")?
-            .raw
-            .step(message)?;
+            .context("unhosted group")?;
+        let reservation = if message.get_msg_type() == MessageType::MsgAppend
+            && message.term >= group.raw.raft.term
+        {
+            let mut bytes = 0usize;
+            let mut data = false;
+            for entry in &message.entries {
+                // A retransmission of an existing entry needs no new payload
+                // space. It must still reach Raft when the original ACK was lost.
+                if entry.index < group.raw.raft.raft_log.first_index()
+                    || group.raw.raft.raft_log.term(entry.index).ok() == Some(entry.term)
+                {
+                    continue;
+                }
+                bytes = bytes
+                    .checked_add(entry.compute_size() as usize)
+                    .and_then(|n| n.checked_add(4096))
+                    .context("peer disk reservation overflow")?;
+                if !entry.context.is_empty() {
+                    data |=
+                        state::decode_meta(&entry.context)?.kind == crate::record::RecordKind::Data;
+                }
+            }
+            if bytes == 0 {
+                None
+            } else {
+                group
+                    .raw
+                    .store()
+                    .disk_budget()
+                    .map(|budget| budget.reserve(bytes, data))
+                    .transpose()?
+            }
+        } else {
+            None
+        };
+        group.raw.step(message)?;
+        if let Some(reservation) = reservation {
+            // Keep queued entries charged across sibling-group admission until
+            // poll persists them or Raft discards them. No peer ACK precedes it.
+            group.peer_reservations.push(reservation);
+        }
         Ok(())
     }
 
@@ -866,6 +908,10 @@ impl Node {
         let result = self.drive(send);
         if result.is_err() {
             self.failed = true;
+        } else {
+            for group in self.groups.values_mut() {
+                group.peer_reservations.clear();
+            }
         }
         result
     }

@@ -5,9 +5,10 @@ use crate::admission::Budget;
 use crate::admission::Snapshot;
 
 /// Local admission policy, independent of replicated layout/state. Producer
-/// proposals stop at `data_bytes`; new images preserve `headroom_bytes` for
-/// accepted Raft/control traffic and physical rewrites. Peer writes must still
-/// persist and can consume this window. This is not a hard filesystem quota.
+/// proposals and new replicated payloads stop at `data_bytes`; new images
+/// preserve `headroom_bytes` for accepted Raft/control traffic and physical
+/// rewrites. Existing entries can still be acknowledged and control traffic
+/// can consume this window. This is not a hard filesystem quota.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "service", serde(deny_unknown_fields))]
