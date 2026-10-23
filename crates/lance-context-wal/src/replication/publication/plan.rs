@@ -62,15 +62,20 @@ impl SourceRange {
 pub struct Plan {
     pub transaction: Uuid,
     pub read_version: u64,
-    /// An empty selection denotes compaction of the fixed read version. Such a
-    /// plan requires compaction descriptors and never advances source cursors.
+    /// An empty selection denotes maintenance of the fixed read version. Its
+    /// immutable prepared descriptors select the operation; no source cursor advances.
     pub sources: BTreeMap<u64, SourceRange>,
     /// Resume fair source selection from this group after publication.
     pub next_group: u64,
 }
 impl Plan {
-    pub fn is_compaction(&self) -> bool {
+    pub fn is_maintenance(&self) -> bool {
         self.sources.is_empty()
+    }
+
+    /// Legacy name for a source-free maintenance plan.
+    pub fn is_compaction(&self) -> bool {
+        self.is_maintenance()
     }
 
     pub fn target_version(&self) -> Result<u64> {

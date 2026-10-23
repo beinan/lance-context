@@ -175,8 +175,12 @@ pub(crate) async fn publish(
     prepared
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
-    let operation = if pending.plan.is_compaction() {
-        super::compaction::operation(&base, &prepared.descriptors).await?
+    let operation = if pending.plan.is_maintenance() {
+        match prepared.descriptors.format {
+            2 => super::compaction::operation(&base, &prepared.descriptors).await?,
+            3 => super::session_index::operation(&base, &prepared.descriptors).await?,
+            _ => bail!("unexpected maintenance descriptor format"),
+        }
     } else {
         ensure!(
             prepared.descriptors.format == 1,

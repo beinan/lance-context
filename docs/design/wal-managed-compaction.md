@@ -8,8 +8,9 @@ and publisher fencing.
 
 The catalog represents compaction as a publication plan with no WAL sources.
 It retains the existing fixed read version, transaction, target version and
-publisher authority. Only descriptor format 2, the JSON representation of a
-Lance 13 `RewriteResult`, may prepare this plan. Append plans require format 1
+publisher authority. Descriptor format 2 contains the JSON representation of a
+Lance 13 `RewriteResult`; format 3 selects managed session-index maintenance.
+Append plans require format 1
 fragment descriptors. Replicas check this distinction and the descriptor bounds
 and digest; the materializer must validate the actual fragment rewrite.
 
@@ -24,8 +25,13 @@ Workers can opt into automatic small-file rewriting with the materializer's
 `compaction` option (`null` by default). For example, `{"target_file_bytes":
 134217728, "min_fragments": 4}` targets 128 MiB output files. Each selection
 contains at most 64 fragments and twice the target's stored bytes. Only sized,
-nonempty fragments smaller than half the target qualify; deletion files and
-indexed tables are unsupported by this initial policy.
+nonempty fragments smaller than half the target qualify; deletion files remain
+unsupported. Indexed tables require stable row IDs and known fragment coverage
+for every index segment. Each rewrite groups fragments with identical coverage
+in every segment, keeping indexed and unindexed fragments separate. Replacement
+fragment IDs are assigned above the fixed snapshot's fragment high-water mark
+before preparation, so native commit updates the same coverage bitmaps without
+a separate reservation commit.
 
 After an append completes, the worker may select one bounded rewrite before its
 next append. It uses the catalog's existing completion receipt, so claim rotation

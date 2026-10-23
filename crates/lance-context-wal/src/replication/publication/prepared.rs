@@ -29,6 +29,12 @@ impl Descriptors {
         Self::new(2, bytes)
     }
 
+    /// Native scalar-index metadata, interpreted and validated by the
+    /// materializer. Enable only after every catalog voter supports format 3.
+    pub fn lance_index(bytes: Bytes) -> Result<Self> {
+        Self::new(3, bytes)
+    }
+
     fn new(format: u32, bytes: Bytes) -> Result<Self> {
         let descriptors = Self {
             format,
@@ -40,12 +46,16 @@ impl Descriptors {
     }
 
     pub(super) fn matches_plan(&self, plan: &Plan) -> bool {
-        self.format == if plan.is_compaction() { 2 } else { 1 }
+        if plan.is_maintenance() {
+            matches!(self.format, 2 | 3)
+        } else {
+            self.format == 1
+        }
     }
 
     pub fn validate(&self, maximum: u64) -> Result<()> {
         ensure!(
-            (1..=2).contains(&self.format)
+            (1..=3).contains(&self.format)
                 && !self.bytes.is_empty()
                 && self.bytes.len() <= MAX_DESCRIPTOR_BYTES
                 && self.bytes.len() as u64 <= maximum

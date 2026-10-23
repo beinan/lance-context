@@ -5,6 +5,7 @@ use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
 mod compaction;
+mod session_index;
 
 pub(super) async fn publisher(
     ingress: &Ingress,
