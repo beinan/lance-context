@@ -362,6 +362,8 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
 
 /// Metadata-only WAL demand probe for rollout and generic tables. This opens no
 /// writer, evolves no schema, and reads no generation payloads.
+///
+/// Use [`SealedWalProbe`] when checking shards repeatedly in one execution.
 pub async fn has_sealed_wal(
     uri: &str,
     session: Option<Arc<Session>>,
@@ -369,6 +371,44 @@ pub async fn has_sealed_wal(
 ) -> Result<bool> {
     let dataset = StorageBase::load_with_options(uri, None, session).await?;
     dataset_has_sealed_wal(&dataset, shards).await
+}
+
+/// Resolve the base's storage and WAL root once, then refresh each shard's latest
+/// manifest. Retain only the storage handle and path, so a long merge does not
+/// pin an obsolete base manifest. No watermarks or empty results are cached.
+pub struct SealedWalProbe {
+    store: Arc<lance_io::object_store::ObjectStore>,
+    root: object_store::path::Path,
+}
+
+impl SealedWalProbe {
+    pub async fn open(uri: &str, session: Option<Arc<Session>>) -> Result<Self> {
+        let dataset = StorageBase::load_with_options(uri, None, session).await?;
+        Ok(Self {
+            store: dataset.object_store(None).await?,
+            root: dataset.branch_location().path.clone(),
+        })
+    }
+
+    pub async fn has_sealed_wal(&self, shard: &str) -> Result<bool> {
+        Ok(ShardManifestStore::new(
+            self.store.clone(),
+            &self.root,
+            derive_shard_id(Some(shard)),
+            16,
+        )
+        .refresh_latest()
+        .await?
+        .is_some_and(|manifest| !manifest.sstables.is_empty()))
+    }
+}
+
+async fn dataset_shard_has_sealed_wal(dataset: &Dataset, shard: Uuid) -> Result<bool> {
+    Ok(shard_store(dataset, shard)
+        .await?
+        .refresh_latest()
+        .await?
+        .is_some_and(|manifest| !manifest.sstables.is_empty()))
 }
 
 async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<bool> {
@@ -380,12 +420,8 @@ async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<
     let mut seen = HashSet::new();
     for name in shards {
         let id = derive_shard_id(Some(name));
-        if seen.insert(id) {
-            if let Some(manifest) = shard_store(dataset, id).await?.refresh_latest().await? {
-                if !manifest.sstables.is_empty() {
-                    return Ok(true);
-                }
-            }
+        if seen.insert(id) && dataset_shard_has_sealed_wal(dataset, id).await? {
+            return Ok(true);
         }
     }
     Ok(false)
