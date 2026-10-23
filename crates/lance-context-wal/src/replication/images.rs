@@ -204,6 +204,14 @@ pub(super) fn read_body(
             return Ok(body);
         }
     }
+    read_log_body(store, index, meta)
+}
+
+pub(super) fn read_log_body(
+    store: &GroupLog,
+    index: u64,
+    meta: &BatchMeta,
+) -> Result<bytes::Bytes> {
     let mut entries = store.entries(
         index,
         index + 1,
