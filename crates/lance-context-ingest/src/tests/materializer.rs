@@ -4,6 +4,8 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
+mod compaction;
+
 pub(super) async fn publisher(
     ingress: &Ingress,
     storage: &Storage,

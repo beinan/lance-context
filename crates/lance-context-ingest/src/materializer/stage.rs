@@ -163,7 +163,7 @@ pub(super) async fn fetch(
     .await?
 }
 
-pub(super) async fn publish(
+pub(crate) async fn publish(
     publisher: &Publisher,
     pending: &p::PendingPlan,
     prepared: &p::Prepared,
@@ -173,13 +173,18 @@ pub(super) async fn publish(
     prepared
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
-    let fragments: Vec<Fragment> = serde_json::from_slice(&prepared.descriptors.bytes)?;
-    ensure!(!fragments.is_empty(), "empty prepared fragment list");
-    let mut transaction = Transaction::new(
-        pending.plan.read_version,
-        Operation::Append { fragments },
-        None,
-    );
+    let operation = if pending.plan.is_compaction() {
+        super::compaction::operation(&base, &prepared.descriptors).await?
+    } else {
+        ensure!(
+            prepared.descriptors.format == 1,
+            "unexpected append descriptor format"
+        );
+        let fragments: Vec<Fragment> = serde_json::from_slice(&prepared.descriptors.bytes)?;
+        ensure!(!fragments.is_empty(), "empty prepared fragment list");
+        Operation::Append { fragments }
+    };
+    let mut transaction = Transaction::new(pending.plan.read_version, operation, None);
     transaction.uuid = pending.plan.transaction.to_string();
     let handler = p::lance::ManagedManifest::new(
         Arc::new(publisher.ingress.client.manifest_catalog()),
