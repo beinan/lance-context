@@ -8,6 +8,7 @@ pub struct Pool {
     endpoints: Vec<reqwest::Url>,
     token: String,
     timeout: Duration,
+    partitioning: Partitioning,
 }
 impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,6 +20,15 @@ impl std::fmt::Debug for Pool {
 }
 impl Pool {
     pub fn new(endpoints: &[String], token: String, timeout: Duration) -> Result<Arc<Self>> {
+        Self::new_with_partitioning(endpoints, token, timeout, Partitioning::RecordStripe)
+    }
+
+    pub fn new_with_partitioning(
+        endpoints: &[String],
+        token: String,
+        timeout: Duration,
+        partitioning: Partitioning,
+    ) -> Result<Arc<Self>> {
         ensure!(
             (1..=8).contains(&endpoints.len())
                 && (32..=1024).contains(&token.len())
@@ -58,6 +68,7 @@ impl Pool {
             endpoints,
             token,
             timeout,
+            partitioning,
         }))
     }
     pub(crate) async fn prepare(
@@ -66,8 +77,7 @@ impl Pool {
         pending: Arc<p::PendingPlan>,
         budget: Arc<MergeMemoryBudget>,
     ) -> Result<p::Descriptors> {
-        let count: usize = pending.plan.sources.values().map(|s| s.records.len()).sum();
-        let parts = self.endpoints.len().min(count);
+        let parts = self.partitioning.parts(&pending, self.endpoints.len());
         ensure!(parts > 0, "empty remote preparation");
         let maximum = ingress.client.max_descriptor_bytes();
         let workspace = (parts + 1)
@@ -79,7 +89,7 @@ impl Pool {
         );
         let reservation = budget.reserve(workspace).await;
         let tasks = (0..parts)
-            .map(|part| Task::new(ingress, &pending, part, parts))
+            .map(|part| Task::new(ingress, &pending, part, parts, self.partitioning))
             .collect::<Vec<_>>();
         let pool = self.clone();
         // Cancellation only drops the observer. Join every admitted request;

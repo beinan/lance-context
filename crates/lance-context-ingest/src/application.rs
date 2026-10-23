@@ -88,10 +88,11 @@ impl Registry {
         let mut options = config.worker.clone();
         if let Some(preparation) = &config.preparation {
             let token = config::read(&preparation.bearer_token_file, 4096)?;
-            options.preparers = Some(crate::preparation::Pool::new(
+            options.preparers = Some(crate::preparation::Pool::new_with_partitioning(
                 &preparation.endpoints,
                 std::str::from_utf8(&token)?.trim().to_owned(),
                 preparation.timeout,
+                preparation.partitioning,
             )?);
         }
         Worker::start(
