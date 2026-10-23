@@ -1,4 +1,5 @@
-//! Atomic source-cursor advancement after all selected source quorums close.
+//! Complete publication after all selected source quorums close. Compaction
+//! has no WAL sources and leaves every source cursor unchanged.
 use super::*;
 use crate::replication::source::{ClosedProof, Selection};
 
@@ -26,7 +27,6 @@ impl AdvancePublication {
         ensure!(
             self.published_index > 0
                 && self.published_index < u64::MAX
-                && !self.proofs.is_empty()
                 && self.proofs.len() <= layout.groups.len()
                 && self.proofs.len() <= 64,
             "invalid source closure set"
@@ -51,12 +51,16 @@ impl AdvancePublication {
             .iter()
             .map(|(group, proof)| (*group, proof.closed().permit.closure()))
             .collect();
-        Ok(Sha256::digest(
-            codec(MAX_ADVANCE_BYTES)
-                .serialize(&("lance-context/catalog-advanced-closures/v1", closures))?,
-        )
-        .into())
+        closure_digest(&closures)
     }
+}
+
+fn closure_digest(closures: &[(u64, &crate::replication::source::Closure)]) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(
+        codec(MAX_ADVANCE_BYTES)
+            .serialize(&("lance-context/catalog-advanced-closures/v1", closures))?,
+    )
+    .into())
 }
 
 /// One bounded receipt per table. It shares the already selected manifest and
@@ -87,7 +91,9 @@ impl Advanced {
                 && self.index <= cut
                 && self.index != table.authority.grant_index
                 && self.closure_digest != [0; 32]
-                && !self.sources.is_empty()
+                // The empty closure set has a distinct identity. Clearing the
+                // sources of a completed append must still fail validation.
+                && (self.sources.is_empty() == (self.closure_digest == closure_digest(&[])?))
                 && self.sources.len() <= 64
                 && self.sources.iter().all(|(group, through)| {
                     *through > 0

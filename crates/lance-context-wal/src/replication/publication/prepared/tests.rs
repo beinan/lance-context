@@ -182,7 +182,7 @@ fn descriptor_budget_digest_and_wire_type_limits_apply_before_admission() -> Res
             0 => invalid.descriptors = Descriptors::lance_fragments(Bytes::from(vec![7; 513]))?,
             1 => invalid.descriptors.bytes = Bytes::new(),
             2 => invalid.descriptors.digest[0] ^= 1,
-            3 => invalid.descriptors.format = 2,
+            3 => invalid.descriptors.format = 3,
             4 => invalid.authority.layout[0] ^= 1,
             5 => invalid.plan_index = 0,
             _ => unreachable!(),

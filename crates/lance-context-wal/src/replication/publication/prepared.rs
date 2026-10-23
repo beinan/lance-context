@@ -20,8 +20,18 @@ impl Descriptors {
     /// JSON representation of Lance 13 `Vec<Fragment>`, interpreted by the
     /// materializer. This constructor does not validate the fragment semantics.
     pub fn lance_fragments(bytes: Bytes) -> Result<Self> {
+        Self::new(1, bytes)
+    }
+
+    /// JSON representation of Lance 13 `RewriteResult`, interpreted by the
+    /// compactor. Replicas do not validate the referenced fragment semantics.
+    pub fn lance_compaction(bytes: Bytes) -> Result<Self> {
+        Self::new(2, bytes)
+    }
+
+    fn new(format: u32, bytes: Bytes) -> Result<Self> {
         let descriptors = Self {
-            format: 1,
+            format,
             digest: Sha256::digest(&bytes).into(),
             bytes,
         };
@@ -29,9 +39,13 @@ impl Descriptors {
         Ok(descriptors)
     }
 
+    pub(super) fn matches_plan(&self, plan: &Plan) -> bool {
+        self.format == if plan.is_compaction() { 2 } else { 1 }
+    }
+
     pub fn validate(&self, maximum: u64) -> Result<()> {
         ensure!(
-            self.format == 1
+            (1..=2).contains(&self.format)
                 && !self.bytes.is_empty()
                 && self.bytes.len() <= MAX_DESCRIPTOR_BYTES
                 && self.bytes.len() as u64 <= maximum
@@ -88,6 +102,9 @@ impl Catalog {
         };
         if pending.index != request.plan_index || pending.plan.transaction != request.transaction {
             return Reply::Rejected(Rejection::PlanIdentity);
+        }
+        if !request.descriptors.matches_plan(&pending.plan) {
+            return Reply::Rejected(Rejection::PreparedConflict);
         }
         if let Some(prepared) = &table.progress.prepared {
             return if prepared.descriptors == request.descriptors {

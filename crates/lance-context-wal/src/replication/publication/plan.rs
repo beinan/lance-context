@@ -62,11 +62,17 @@ impl SourceRange {
 pub struct Plan {
     pub transaction: Uuid,
     pub read_version: u64,
+    /// An empty selection denotes compaction of the fixed read version. Such a
+    /// plan requires compaction descriptors and never advances source cursors.
     pub sources: BTreeMap<u64, SourceRange>,
     /// Resume fair source selection from this group after publication.
     pub next_group: u64,
 }
 impl Plan {
+    pub fn is_compaction(&self) -> bool {
+        self.sources.is_empty()
+    }
+
     pub fn target_version(&self) -> Result<u64> {
         ensure!(
             self.read_version > 0,
@@ -92,7 +98,6 @@ impl Plan {
         ensure!(
             !self.transaction.is_nil()
                 && !table.is_nil()
-                && !self.sources.is_empty()
                 && self.sources.len() <= layout.groups.len()
                 && layout.groups.contains_key(&self.next_group),
             "invalid publication plan identity or group selection"
@@ -201,7 +206,8 @@ impl Progress {
                 .context("prepared result without plan")?;
             prepared.descriptors.validate(limits.max_descriptor_bytes)?;
             ensure!(
-                prepared.plan_index == pending.index
+                prepared.descriptors.matches_plan(&pending.plan)
+                    && prepared.plan_index == pending.index
                     && prepared.transaction == pending.plan.transaction
                     && prepared.index > pending.index
                     && prepared.index <= cut
