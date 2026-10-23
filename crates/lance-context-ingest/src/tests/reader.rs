@@ -148,11 +148,15 @@ async fn ack_visible_before_publication_after_restart_and_during_handoff() -> Re
     append(&ingress, &producer, 2, added.clone()).await?;
     let mut expected = expected;
     expected.push(added);
-    verify(
-        reader::read_session(&ingress, &storage, &s).await?,
-        &expected,
-    )
-    .await?;
+    // Changing published-data batching preserves the union with the WAL tail.
+    for rows in [1, 4] {
+        let batched = ingress.clone().with_session_scan_batch_rows(rows)?;
+        verify(
+            reader::read_session(&batched, &storage, &s).await?,
+            &expected,
+        )
+        .await?;
+    }
     assert_eq!(ingress.budget.reserved(), 0);
     drop((publisher, ingress));
     c.shutdown().await
@@ -217,6 +221,48 @@ async fn publication_between_read_phases_neither_loses_nor_duplicates_rows() -> 
     verify_batches(actual, &[first, second])?;
     assert_eq!(ingress.budget.reserved(), 0);
     drop((publisher, ingress));
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn published_scan_waits_for_shared_budget_and_releases_on_cancel() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("rollouts.lance");
+    let c = network::Cluster::open_signed(root.path(), layout()).await?;
+    bootstrap(&c, &path, &binding()).await?;
+    let storage = storage(&path).await?;
+    let ingress = connect(&c, binding()).await?;
+    let s = session(0);
+    let expected = batch(&["published"], &[&s])?;
+    append(&ingress, &producer(&ingress, 0).await?, 1, expected.clone()).await?;
+    let mut publisher =
+        materializer::publisher(&ingress, &storage, &MergeMemoryBudget::new(32 << 20), 1).await?;
+    publisher.run_once().await?.context("publication absent")?;
+
+    let mut limited = ingress.clone();
+    limited.budget = MergeMemoryBudget::new(workspace(
+        &limited.scope.contract,
+        limited.scope.contract.max_record_bytes as usize,
+    )?);
+    // Publication closed the WAL source. The published scan must keep its
+    // reservation even while the consumer is suspended after a yielded batch.
+    let mut first = reader::read_session(&limited, &storage, &s).await?;
+    let row = first.batches.try_next().await?.context("missing row")?;
+    verify_batches(vec![row], std::slice::from_ref(&expected))?;
+    assert!(limited.budget.reserved() > 0);
+    let mut second = reader::read_session(&limited, &storage, &s).await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second.batches.try_next())
+            .await
+            .is_err()
+    );
+    drop(first);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        verify(second, std::slice::from_ref(&expected)),
+    )
+    .await??;
+    assert_eq!(limited.budget.reserved(), 0);
     c.shutdown().await
 }
 
