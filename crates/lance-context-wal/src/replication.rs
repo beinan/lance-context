@@ -111,7 +111,7 @@ impl Limits {
                     .len()
                     == self.source_keys.len()
                 && (1..=256).contains(&self.max_active_plans)
-                && (1..=1024 * 1024 * 1024).contains(&self.max_plan_source_bytes)
+                && (1..=2_u64 << 30).contains(&self.max_plan_source_bytes)
                 && (1..=publication::MAX_DESCRIPTOR_BYTES as u64)
                     .contains(&self.max_descriptor_bytes)
                 && (1..=16_384).contains(&self.max_manifest_records)
