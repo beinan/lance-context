@@ -2,8 +2,9 @@
 use super::*;
 use lance::dataset::{transaction::Operation, InsertBuilder, WriteMode, WriteParams};
 use lance::deps::datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter,
+    error::DataFusionError,
+    execution::SendableRecordBatchStream,
+    physical_plan::stream::{RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter},
 };
 use tokio::sync::Semaphore;
 
@@ -54,10 +55,33 @@ pub(super) async fn materialize(
             .map_err(|error| DataFusionError::External(error.into()))
             .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
             .try_flatten();
-            Box::pin(RecordBatchStreamAdapter::new(schema, records)) as SendableRecordBatchStream
+            prefetch(
+                Box::pin(RecordBatchStreamAdapter::new(schema, records)),
+                options.fetch_parallelism,
+            )
         })
         .collect();
     write_streams(dataset, streams, reservation, phases).await
+}
+
+fn prefetch(mut source: SendableRecordBatchStream, capacity: usize) -> SendableRecordBatchStream {
+    // Poll WAL fetches independently while the file writer encodes or uploads.
+    // The existing full-source reservation covers these queued Arrow batches;
+    // sending them transfers shared buffers without another encode or decode.
+    let mut output = RecordBatchReceiverStreamBuilder::new(source.schema(), capacity);
+    let send = output.tx();
+    output.spawn(async move {
+        while let Some(batch) = source.try_next().await? {
+            if send.send(Ok(batch)).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+    // DataFusion propagates task errors/panics and cancels the producer when
+    // its receiver is dropped. A previously started blocking decode retains
+    // its own reservation and fetch permit until it actually finishes.
+    output.build()
 }
 
 async fn write_streams(
@@ -110,6 +134,73 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatchIterator};
     use tokio::sync::{oneshot, Notify};
 
+    #[tokio::test]
+    async fn prefetch_advances_while_writer_is_idle_and_preserves_order() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int32Array::from(vec![0])) as arrow_array::ArrayRef,
+        )])?;
+        let schema = batch.schema();
+        let (progress, mut observed) = tokio::sync::watch::channel(0);
+        let source = async_stream::try_stream! {
+            for value in 0..10 {
+                progress.send_replace(value + 1);
+                yield RecordBatch::try_from_iter(vec![(
+                    "value",
+                    Arc::new(Int32Array::from(vec![value])) as arrow_array::ArrayRef,
+                )]).map_err(DataFusionError::from)?;
+            }
+        };
+        let output = prefetch(Box::pin(RecordBatchStreamAdapter::new(schema, source)), 2);
+        // The writer has not polled its input. Two batches may be queued and
+        // one held by the sender; no further input should be consumed yet.
+        tokio::time::timeout(Duration::from_secs(3), observed.wait_for(|n| *n >= 3))
+            .await
+            .context("source did not advance independently of the writer")??;
+        tokio::task::yield_now().await;
+        assert_eq!(*observed.borrow(), 3, "prefetch exceeded its queue bound");
+        let batches = output.try_collect::<Vec<_>>().await?;
+        let values = batches
+            .iter()
+            .map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, (0..10).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_prefetch_cancels_pending_source_and_releases_reservation() -> Result<()> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+        )])?;
+        let schema = batch.schema();
+        let budget = MergeMemoryBudget::new(1 << 20);
+        let owned = budget.clone();
+        let (entered, ready) = oneshot::channel();
+        let source = async_stream::try_stream! {
+            let _reservation = owned.reserve(1 << 20).await;
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+            yield batch;
+        };
+        let output = prefetch(Box::pin(RecordBatchStreamAdapter::new(schema, source)), 1);
+        tokio::time::timeout(Duration::from_secs(3), ready).await??;
+        assert_eq!(budget.reserved(), 1 << 20);
+        drop(output);
+        let reservation =
+            tokio::time::timeout(Duration::from_secs(3), budget.reserve(1 << 20)).await?;
+        drop(reservation);
+        assert_eq!(budget.reserved(), 0);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_stream_and_cancelled_observer_keep_sibling_and_budget_alive() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -149,6 +240,10 @@ mod tests {
             Box::pin(RecordBatchStreamAdapter::new(schema.clone(), first)),
             Box::pin(RecordBatchStreamAdapter::new(schema, second)),
         ];
+        let streams = streams
+            .into_iter()
+            .map(|stream| prefetch(stream, 1))
+            .collect();
         let budget = MergeMemoryBudget::new(1 << 20);
         let reservation = Arc::new(budget.reserve(1 << 20).await);
         let (done, completion) = oneshot::channel();
