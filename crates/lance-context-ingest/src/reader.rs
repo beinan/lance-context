@@ -243,7 +243,12 @@ pub(super) fn from_positions(
         // acquire the shared budget exclusively, following its normal semantics.
         let scan_bytes = batch_bytes.checked_mul(ingress.session_scan_batch_rows)
             .and_then(|bytes| bytes.checked_mul(4)).context("session scan workspace overflow")?;
-        let _scan_reservation = ingress.budget.reserve(workspace(&ingress.scope.contract, scan_bytes)?).await;
+        // Storage prefetch needs room to overlap reads even when one record is
+        // small. Account for the extra I/O window without enlarging decode batches.
+        let io_bytes = batch_bytes.max(16 * 1024 * 1024);
+        let scan_workspace = workspace(&ingress.scope.contract, scan_bytes)?
+            .checked_add(io_bytes - batch_bytes).context("session scan workspace overflow")?;
+        let _scan_reservation = ingress.budget.reserve(scan_workspace).await;
         let selections = match materializer::session_scan_fragments(&dataset).await? {
             Some([covered, tail]) => vec![(true, Some(covered)), (false, Some(tail))],
             None => vec![(true, None)],
@@ -257,7 +262,7 @@ pub(super) fn from_positions(
             scanner.batch_size(ingress.session_scan_batch_rows);
             scanner.batch_size_bytes(batch_bytes as u64);
             scanner.batch_readahead(1);
-            scanner.io_buffer_size(batch_bytes as u64);
+            scanner.io_buffer_size(io_bytes as u64);
             scanner.fragment_readahead(ingress.session_scan_fragment_readahead);
             scanner.materialization_readahead_bytes(batch_bytes as u64);
             scanner.use_scalar_index(indexed);

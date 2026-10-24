@@ -389,6 +389,25 @@ async fn published_scan_waits_for_shared_budget_and_releases_on_cancel() -> Resu
     )
     .await??;
     assert_eq!(limited.budget.reserved(), 0);
+
+    // Two uploads leave enough room for the decode workspace, but not for the
+    // scan's additional storage prefetch. The scan must wait for that space too.
+    limited.budget = MergeMemoryBudget::new(32 << 20);
+    let upload_a = limited.reserve_upload(1 << 20).await?;
+    let upload_b = limited.reserve_upload(1 << 20).await?;
+    let mut read = reader::read_session(&limited, &storage, &s).await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read.batches.try_next())
+            .await
+            .is_err()
+    );
+    drop((upload_a, upload_b));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        verify(read, std::slice::from_ref(&expected)),
+    )
+    .await??;
+    assert_eq!(limited.budget.reserved(), 0);
     c.shutdown().await
 }
 

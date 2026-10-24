@@ -60,8 +60,11 @@ the stream cancels pending fetches; an already running blocking decode retains
 its reservation until it finishes. Tune concurrency against both read latency
 and ingestion throughput, since WAL storage and network resources are shared.
 The published Lance phase also reserves from the shared ingress budget for the
-lifetime of its scan. Its I/O buffer, decoded batch target, and blob-materialization
-readahead each use `max_record_bytes`; decode readahead remains one.
+lifetime of its scan. Its I/O buffer uses the larger of `max_record_bytes` and
+16 MiB so storage reads can overlap independently of the decoded batch size.
+The decoded batch target and blob-materialization readahead still use
+`max_record_bytes`; decode readahead remains one. The extra I/O window is included
+in the shared reservation and held until the scan finishes or is dropped.
 `session_scan_fragment_readahead` (1–8, default 1) controls concurrent Lance
 fragment reads. Rust callers can use
 `Ingress::with_session_scan_fragment_readahead`. Increasing it overlaps file reads
