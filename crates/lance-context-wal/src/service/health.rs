@@ -42,6 +42,10 @@ struct View {
     peer_drops: (u64, u64),
     peer_sent_frames: u64,
     peer_received_frames: u64,
+    peer_dropped_outbound: u64,
+    peer_failed_exchanges: u64,
+    peer_rejected_connections: u64,
+    peer_rejected_packets: u64,
 }
 impl State {
     fn view(&self) -> Result<View> {
@@ -81,6 +85,10 @@ impl State {
             peer_drops: self.handle.peer_drops(),
             peer_sent_frames: self.peers.sent_frames.load(Ordering::Relaxed),
             peer_received_frames: self.peers.received_frames.load(Ordering::Relaxed),
+            peer_dropped_outbound: self.peers.dropped_outbound.load(Ordering::Relaxed),
+            peer_failed_exchanges: self.peers.failed_exchanges.load(Ordering::Relaxed),
+            peer_rejected_connections: self.peers.rejected_connections.load(Ordering::Relaxed),
+            peer_rejected_packets: self.peers.rejected_packets.load(Ordering::Relaxed),
         })
     }
 }

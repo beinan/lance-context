@@ -160,6 +160,19 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
         .await?;
     }
     let lagging = *(1..=3).find(|n| *n != first_leader).as_ref().unwrap();
+    let before_disconnect = f.status(first_leader).await?;
+    for field in [
+        "peer_dropped_outbound",
+        "peer_failed_exchanges",
+        "peer_rejected_connections",
+        "peer_rejected_packets",
+    ] {
+        ensure!(
+            before_disconnect[field].is_u64(),
+            "missing counter: {field}"
+        );
+    }
+    let failed_exchanges = before_disconnect["peer_failed_exchanges"].as_u64().unwrap();
     children.get_mut(&lagging).unwrap().kill()?;
     let mut expected = BTreeMap::new();
     let mut tails = BTreeMap::new();
@@ -185,6 +198,7 @@ async fn run_cluster(f: &Fixture) -> Result<()> {
                 .unwrap_or(0)
                 >= tails[&10].0
                 && status["maintenance"]["log_passes"].as_u64().unwrap_or(0) > 0
+                && status["peer_failed_exchanges"].as_u64().unwrap_or(0) > failed_exchanges
             {
                 break;
             }
