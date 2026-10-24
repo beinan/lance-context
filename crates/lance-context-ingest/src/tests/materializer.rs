@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 mod compaction;
 mod session_index;
+mod source_rotation;
 
 pub(super) async fn publisher(
     ingress: &Ingress,

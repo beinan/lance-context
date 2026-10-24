@@ -703,10 +703,10 @@ impl Publisher {
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        if self.options.compaction.is_some() {
-            // A rewrite replaces the last append receipt. Rotate from the
-            // durable version instead: at most one rewrite between appends
-            // means version/2 advances by at most one per append selection.
+        if self.options.compaction.is_some() || self.options.session_index.is_some() {
+            // Maintenance replaces the last append receipt. Rotate from the
+            // durable version instead: at most one maintenance operation
+            // between appends advances version/2 by at most one per selection.
             // Every group gets the first turn without adding catalog state.
             let offset = (view.progress.minimum_read_version / 2) % groups.len() as u64;
             groups.rotate_left(offset as usize);
