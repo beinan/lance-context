@@ -113,6 +113,28 @@ fn pump_images(
 }
 
 #[test]
+fn larger_publication_budget_remains_an_explicit_persisted_policy() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("node");
+    let limits = Limits {
+        max_plan_source_bytes: 2_u64 << 30,
+        ..Default::default()
+    };
+    drop(Node::open(&path, layout(), 1, limits.clone())?);
+    drop(Node::open(&path, layout(), 1, limits.clone())?);
+    for cap in [0, 64 << 20, 1 << 30, (2_u64 << 30) + 1] {
+        let changed = Limits {
+            max_plan_source_bytes: cap,
+            ..limits.clone()
+        };
+        assert!(Node::open(&path, layout(), 1, changed).is_err());
+    }
+    // Failed reopens must not replace the original policy identity.
+    drop(Node::open(&path, layout(), 1, limits)?);
+    Ok(())
+}
+
+#[test]
 fn application_images_keep_payloads_tails_suffix_and_lagging_peer_recovery() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let open = || {
