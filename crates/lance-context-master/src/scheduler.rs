@@ -1174,17 +1174,75 @@ pub(crate) async fn enqueue_merge_request(
 async fn enqueue_execution_recovery(
     state: &Arc<MasterState>,
     coordinator: &lance_context_merge::Coordinator,
-    execution: &lance_context_merge::Execution,
+    observed: &lance_context_merge::ExecutionObservation,
 ) -> Result<(), String> {
+    let execution = &observed.execution;
     if execution.maintenance.is_some() {
-        return crate::maintenance_execution::enqueue_recovery(state, coordinator, execution).await;
+        return crate::maintenance_execution::enqueue_recovery(state, coordinator, observed).await;
     }
     // Durable worker executions survive flags, endpoint list changes and loss
     // of their coalesced request. Task claims still serialize reconciliation.
     crate::merge_execution::ensure_recovery_due(coordinator, execution).await?;
-    enqueue(state, TaskKind::MergeWal, &execution.target)
+    enqueue_observed_execution(state, TaskKind::MergeWal, observed)
         .await
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn enqueue_execution_recovery_page(
+    state: &Arc<MasterState>,
+    coordinator: &lance_context_merge::Coordinator,
+    executions: &[lance_context_merge::ExecutionObservation],
+) -> Result<(), String> {
+    let candidates: Vec<_> = executions
+        .iter()
+        .filter_map(|observed| {
+            let execution = &observed.execution;
+            let kind = if execution.maintenance.is_some() {
+                crate::maintenance_execution::retry_kind(&execution.endpoint)?
+            } else {
+                TaskKind::MergeWal
+            };
+            Some((observed, (kind, execution.target.clone())))
+        })
+        .collect();
+    let targets: Vec<_> = candidates
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect();
+    let needed = state
+        .task_store
+        .recovery_enqueue_needed(&targets)
+        .await
+        .map_err(|error| error.to_string())?;
+    for ((observed, _), needed) in candidates.into_iter().zip(needed) {
+        if needed {
+            // Retain all failure budgets, version checks and final enqueue CAS.
+            if let Err(error) = enqueue_execution_recovery(state, coordinator, observed).await {
+                tracing::warn!(target = %observed.execution.target, %error,
+                    "local execution recovery enqueue failed");
+            }
+        } else {
+            metrics::counter!("master_execution_recovery_already_active_total").increment(1);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn enqueue_observed_execution(
+    state: &Arc<MasterState>,
+    kind: TaskKind,
+    observed: &lance_context_merge::ExecutionObservation,
+) -> lance::Result<()> {
+    let admitted = state
+        .task_store
+        .enqueue_execution_recovery(kind, observed)
+        .await?;
+    if admitted.is_some() {
+        metrics::counter!("master_task_enqueued_total", "kind" => kind_label(kind)).increment(1);
+    } else {
+        metrics::counter!("master_execution_recovery_enqueue_superseded_total", "kind" => kind_label(kind)).increment(1);
+    }
     Ok(())
 }
 
@@ -1325,17 +1383,18 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 }
             }
             match coordinator
-                .execution_page(execution_cursor.as_deref())
+                .execution_observation_page(execution_cursor.as_deref())
                 .await
             {
                 Ok((executions, next)) => {
+                    // Each observation remains durable for the next sweep;
+                    // an error on this page must not starve later targets.
                     execution_cursor = next;
-                    for execution in executions {
-                        if let Err(error) =
-                            enqueue_execution_recovery(&retry_state, &coordinator, &execution).await
-                        {
-                            tracing::warn!(target = %execution.target, %error, "local execution recovery enqueue failed");
-                        }
+                    if let Err(error) =
+                        enqueue_execution_recovery_page(&retry_state, &coordinator, &executions)
+                            .await
+                    {
+                        tracing::warn!(%error, "local execution recovery page deferred");
                     }
                 }
                 Err(error) => tracing::warn!(%error, "local execution recovery scan failed"),
@@ -2659,6 +2718,104 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn stale_execution_inventory_does_not_enqueue_finished_work() {
+        use lance_context_merge::Execution;
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let mut execution = Execution::new("exp", "http://127.0.0.1:1", "worker", 60);
+        execution.background = true;
+        assert!(coordinator.reserve_background(&execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.finish(&running, Ok(0)).await.unwrap());
+        let request = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        assert!(coordinator.acknowledge_request(&request).await.unwrap());
+        // One scanner retains its page while the worker releases the finished
+        // execution. A delayed recovery observation is not fresh WAL demand.
+        let observed = coordinator
+            .execution_observation_page(None)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert!(coordinator
+            .release_background(&observed.execution)
+            .await
+            .unwrap());
+        enqueue_execution_recovery(&state, &coordinator, &observed)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+                .is_none(),
+            "released execution inventory must not create a fresh zero-work fanout"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn active_execution_inventory_bounds_duplicate_reads() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(!endpoint.contains(',') && endpoint.starts_with("http://127.0.0.1:"));
+        async fn reads(endpoint: &str) -> u64 {
+            reqwest::get(format!("{endpoint}/metrics"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_handled_total{")
+                        && line.contains("grpc_code=\"OK\"")
+                        && (line.contains("grpc_method=\"Range\"")
+                            || line.contains("grpc_method=\"Txn\""))
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap() as u64
+                })
+                .sum()
+        }
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        for i in 0..64 {
+            let target = format!("inventory-{i:03}");
+            let mut execution = lance_context_merge::Execution::new(&target, "worker", "old", 60);
+            execution.background = true;
+            assert!(coordinator.reserve_background(&execution).await.unwrap());
+            enqueue(&state, TaskKind::MergeWal, &target).await.unwrap();
+        }
+        let rows = coordinator
+            .execution_observation_page(None)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(rows.len(), 64);
+        let before = reads(&endpoint).await;
+        enqueue_execution_recovery_page(&state, &coordinator, &rows)
+            .await
+            .unwrap();
+        let calls = reads(&endpoint).await - before;
+        eprintln!("active_inventory_rows=64 read_rpc={calls}");
+        assert!(
+            calls <= 16,
+            "already-active recovery page repeats {calls} reads"
+        );
+        assert_eq!(state.task_store.list().await.unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn background_inventory_recovers_after_flags_and_requests_disappear() {
         use lance_context_merge::Execution;
         let dir = TempDir::new().unwrap();
@@ -2674,7 +2831,7 @@ mod tests {
         assert!(c.finish(&e, Ok(19)).await.unwrap());
         let request = c.request_page(None).await.unwrap().0.remove(0);
         assert!(c.acknowledge_request(&request).await.unwrap());
-        let inventory = c.execution_page(None).await.unwrap().0;
+        let inventory = c.execution_observation_page(None).await.unwrap().0;
         enqueue_execution_recovery(&state, &c, &inventory[0])
             .await
             .unwrap();
@@ -2710,7 +2867,12 @@ mod tests {
             .report_uncertain(&running, "lost response".into())
             .await
             .unwrap());
-        let old = c.get("new-hot-table").await.unwrap().unwrap();
+        let old = c
+            .execution_observation_page(None)
+            .await
+            .unwrap()
+            .0
+            .remove(0);
         enqueue_execution_recovery(&state, &c, &old).await.unwrap();
         let claim = state
             .task_store
