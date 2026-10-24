@@ -95,6 +95,16 @@ capacity, current usage, and separate rejection counters. These independently
 sampled local values distinguish request pressure from response-byte pressure;
 they exclude the transport's separate budgets and do not change readiness.
 
+Peer transport counters complement the runtime-only `peer_drops` pair:
+`peer_dropped_outbound` counts frames or snapshots discarded during dispatch,
+disconnects or failed sends; `peer_failed_exchanges` counts failed connection or
+frame exchanges, including timeouts; `peer_rejected_connections` counts inbound
+connection admission and TLS/identity failures; `peer_rejected_packets` counts
+complete received frames rejected by runtime validation or admission. The latter
+can overlap runtime rejection counters. These counters are sampled independently and reset
+on process restart. They describe transport events, so they cannot be added to
+HTTP retry counts or interpreted as lost acknowledged records.
+
 The `appends` counters distinguish disk-budget refusal, runtime request/byte
 credits, queue unavailability, pending-proposal capacity, leadership changes,
 committed capacity/sequence rejections, and stopped workers. They use typed
