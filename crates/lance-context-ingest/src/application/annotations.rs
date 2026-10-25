@@ -119,10 +119,16 @@ pub async fn serve_owner(
         let acquisition = claim.acquisition(&ingress).await?.context("annotation claim expired")?;
         let table = &config.tables[0];
         let a = config.annotations.as_ref().unwrap();
+        // Repeated publications leave file metadata cached after staging drains.
+        // Bound that cache separately from live annotation generations.
         let storage = Storage::resolve(
             table.uri.clone(),
             table.storage_options.clone(),
-            Arc::new(lance::session::Session::default()),
+            Arc::new(lance::session::Session::new(
+                lance::dataset::DEFAULT_INDEX_CACHE_SIZE,
+                128 << 20,
+                Arc::default(),
+            )),
         ).await?;
         let (service, runtime) = runtime::Runtime::connect(
             ingress.client.clone(),
