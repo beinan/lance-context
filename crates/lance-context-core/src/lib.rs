@@ -1,6 +1,7 @@
 //! Core types for the lance-context storage layer.
 #![recursion_limit = "256"]
 
+pub mod annotation_staging;
 mod api_impl;
 mod context;
 mod datagen;
