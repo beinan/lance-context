@@ -64,6 +64,13 @@ retires only the current frozen generation under one lock. It never removes
 active entries by turn ID. Native transaction matching is an additional local
 guard, not proof of publication authority or of group-wide WAL coverage.
 
+`install_compacted` switches the base after the caller confirms an exact native
+compaction. It requires unchanged scoped annotation coverage and request-result
+properties, rejects overlapping frozen publication, and leaves active values
+and application progress intact. Captured readers keep their old base registered
+for reclamation until released. This view check complements the publisher's
+row-preserving rewrite validation and durable publication protocol.
+
 ## Bounds
 
 Allocation charges include owned strings and conservative map/set/Arc node
