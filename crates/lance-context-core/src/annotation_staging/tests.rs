@@ -11,6 +11,7 @@ use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
 mod reclamation;
+mod views;
 
 #[tokio::test]
 async fn cold_batches_keep_frozen_values_and_order_across_lookup_windows() -> Result<()> {
@@ -201,9 +202,27 @@ async fn result_only_generation_publishes_a_new_version_without_data_files() -> 
     staging.install_published(&prepared, selected).await?;
     assert_eq!(staging.observation().await.materialized, 1);
     assert!(staging.observation().await.retained_metadata_bytes > 0);
+    assert_eq!(
+        staging
+            .protected_bases()
+            .await?
+            .datasets()
+            .map(Dataset::version_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
     drop(prepared);
     drop(frozen);
     assert_eq!(staging.observation().await.retained_metadata_bytes, 0);
+    assert_eq!(
+        staging
+            .protected_bases()
+            .await?
+            .datasets()
+            .map(Dataset::version_id)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
     Ok(())
 }
 

@@ -18,7 +18,7 @@ pub(super) const METADATA_BUDGET: usize = 8 * MAX_RESULTS_BYTES + 1024;
 
 pub(super) struct Generation {
     pub values: Values,
-    base: Arc<Dataset>,
+    base: Arc<views::Base>,
     scope: Scope,
     through: u64,
     id: String,
@@ -49,7 +49,7 @@ impl PreparedAnnotations {
         &self.prepared.merge
     }
     pub fn base(&self) -> &Arc<Dataset> {
-        &self.generation.base
+        &self.generation.base.dataset
     }
     pub fn through(&self) -> u64 {
         self.generation.through
@@ -138,7 +138,7 @@ impl AnnotationStaging {
         {
             return Err(invalid("annotation frozen generation is no longer current"));
         }
-        state.base = selected;
+        state.base = state.views.install(selected);
         state.materialized = generation.through;
         state.frozen = None;
         // Never remove active entries by turn ID. They belong to the suffix.
@@ -244,7 +244,7 @@ impl FrozenAnnotations {
                 inserted_rows_filter: None,
             }
         } else {
-            MergeInsertBuilder::try_new(self.0.base.clone(), vec!["id".into()])?
+            MergeInsertBuilder::try_new(self.0.base.dataset.clone(), vec!["id".into()])?
                 .when_matched(WhenMatched::UpdateAll)
                 .when_not_matched(WhenNotMatched::DoNothing)
                 .write_mode(MergeInsertWriteMode::RewriteColumns)
