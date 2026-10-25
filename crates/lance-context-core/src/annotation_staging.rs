@@ -17,9 +17,11 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 mod preserve_id;
 mod publication;
+mod views;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
+pub use views::ProtectedBases;
 #[cfg(test)]
 mod tests;
 
@@ -114,7 +116,8 @@ enum PendingBatch {
 }
 
 struct State {
-    base: Arc<Dataset>,
+    base: Arc<views::Base>,
+    views: views::Registry,
     applied: u64,
     materialized: u64,
     active: Values,
@@ -131,6 +134,7 @@ pub struct AnnotationStaging {
     entries: Arc<Semaphore>,
     readers: Arc<Semaphore>,
     metadata: Arc<Semaphore>,
+    root_snapshot: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,15 +219,18 @@ impl AnnotationStaging {
         {
             return Err(invalid("invalid annotation staging scope or limits"));
         }
+        let (base, views) = views::Registry::new(base);
         Ok(Self {
             scope,
             bytes: Arc::new(Semaphore::new(limits.retained_bytes)),
             entries: Arc::new(Semaphore::new(limits.retained_entries)),
             readers: Arc::new(Semaphore::new(limits.readers)),
             metadata: Arc::new(Semaphore::new(publication::METADATA_BUDGET)),
+            root_snapshot: Arc::new(Semaphore::new(1)),
             limits,
             state: Mutex::new(State {
                 base,
+                views,
                 applied: materialized,
                 materialized,
                 active: Values::new(),
@@ -494,7 +501,7 @@ fn reject(row: usize, reason: RejectionReason) -> PendingBatch {
 
 enum PointSource {
     Staged(Arc<Stored>),
-    Base(Arc<Dataset>, String),
+    Base(Arc<views::Base>, String),
 }
 pub struct PointRead {
     pub applied: u64,
