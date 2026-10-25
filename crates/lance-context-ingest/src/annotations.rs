@@ -51,6 +51,7 @@ struct Shared {
     replay_cut: Mutex<Option<u64>>,
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
+    reclamation: Mutex<runtime::reclamation::Observation>,
 }
 
 /// Multiple independently connected ingresses may keep their own bounded view.
@@ -102,6 +103,9 @@ pub async fn connect_ingress(
 }
 
 impl Service {
+    pub fn reclamation_observation(&self) -> runtime::reclamation::Observation {
+        self.shared.reclamation.lock().unwrap().clone()
+    }
     #[cfg(feature = "http")]
     pub(crate) fn ingress(&self) -> &Ingress {
         &self.ingress
@@ -221,6 +225,7 @@ impl Service {
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
                 progress,
+                reclamation: Mutex::new(Default::default()),
             }),
         };
         service.barrier().await?;
