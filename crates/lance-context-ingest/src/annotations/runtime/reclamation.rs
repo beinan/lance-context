@@ -190,7 +190,7 @@ impl Collector {
                 examined += 1;
                 (meta.location, meta.size)
             };
-            if !candidate(&path, &storage.base) {
+            if !candidate(&path, &storage.base, service.ingress.scope.incarnation) {
                 continue;
             }
             // Charge string storage and map nodes conservatively. A deferred
@@ -351,7 +351,7 @@ impl Collector {
     }
 }
 
-fn candidate(path: &Path, base: &Path) -> bool {
+fn candidate(path: &Path, base: &Path, incarnation: Uuid) -> bool {
     if path.as_ref().len() > 4096 {
         return false;
     }
@@ -365,6 +365,27 @@ fn candidate(path: &Path, base: &Path) -> bool {
     let Some((directory, name)) = relative.split_once('/') else {
         return false;
     };
+    if directory == "_annotation_preparations" {
+        // The serial collector only runs after pending preparation/confirmation
+        // recovery has finished. No reader depends on this sidecar: selected
+        // Lance versions carry their own native transaction file, protected
+        // below with the manifest. Keep the closed-page quorum fence for these
+        // objects as well, including requests outliving an old owner.
+        let mut parts = name.split('/');
+        let (Some(instance), Some(transaction), Some(file), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        return Uuid::parse_str(instance).is_ok_and(|id| id == incarnation)
+            && Uuid::parse_str(transaction).is_ok_and(|id| !id.is_nil())
+            && file.strip_suffix(".pb").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            });
+    }
     if name.contains('/') {
         return false;
     }
@@ -419,4 +440,40 @@ fn protect(
         candidates.remove(&prefix.clone().join(file.path.as_str()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preparation_candidates_are_scoped_to_this_table_incarnation() {
+        let base = Path::from("owned/table");
+        let incarnation = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let digest = "a".repeat(64);
+        let path = |name: &str| Path::from(format!("owned/table/_annotation_preparations/{name}"));
+        assert!(candidate(
+            &path(&format!("{incarnation}/{transaction}/{digest}.pb")),
+            &base,
+            incarnation
+        ));
+        for name in [
+            format!("{}/{transaction}/{digest}.pb", Uuid::new_v4()),
+            format!("{incarnation}/{}/{digest}.pb", Uuid::nil()),
+            format!("{incarnation}/{transaction}/short.pb"),
+            format!("{incarnation}/{transaction}/{}.pb", "z".repeat(64)),
+            format!("{incarnation}/{transaction}/{digest}.pb/child"),
+            format!("{incarnation}/{transaction}/{digest}.json"),
+        ] {
+            assert!(!candidate(&path(&name), &base, incarnation), "{name}");
+        }
+        assert!(!candidate(
+            &Path::from(format!(
+                "owned/table-other/_annotation_preparations/{incarnation}/{transaction}/{digest}.pb"
+            )),
+            &base,
+            incarnation
+        ));
+    }
 }

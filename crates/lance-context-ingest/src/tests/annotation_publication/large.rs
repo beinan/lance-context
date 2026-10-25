@@ -124,11 +124,30 @@ async fn large_annotation_preparation_respects_configured_catalog_limit() -> Res
 }
 
 async fn recover(stage: Stop, fragments: usize) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(180), recover_inner(stage, fragments)).await?
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(stage, fragments, false),
+    )
+    .await?
 }
 
-async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
-    let root = tempfile::tempdir()?;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_annotation_preparation_collects_metadata_after_recovery() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(Stop::Prepared, 4096, true),
+    )
+    .await?
+}
+
+async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<()> {
+    let mut directory = tempfile::Builder::new();
+    directory.prefix("annotation-large-");
+    let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
+        directory.disable_cleanup(true).tempdir_in(parent)?
+    } else {
+        directory.tempdir()?
+    };
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
         Default::default(),
@@ -268,6 +287,15 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
         .await?;
     }
     let (service, runtime) = owner(&c, &storage, &limits).await?;
+    let runtime = if collect {
+        runtime.with_exclusive_reclamation(crate::annotations::runtime::reclamation::Options {
+            max_bytes: 256 << 10,
+            interval: Duration::from_millis(10),
+            ..Default::default()
+        })?
+    } else {
+        runtime
+    };
     let (stop, task) = runtime::run_owner(runtime);
     assert_eq!(
         service
@@ -287,6 +315,19 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
         current
     );
     runtime::drained(&service, suffix_result.index).await?;
+    if collect {
+        collected_metadata(&storage, &base).await?;
+        assert_eq!(
+            service
+                .submit(&last_request, Duration::from_secs(30))
+                .await?,
+            last_result
+        );
+        assert_eq!(
+            service.submit(&suffix, Duration::from_secs(30)).await?,
+            suffix_result
+        );
+    }
     let published = read(&c, &storage, Some(selection.pending.plan.target_version()?)).await?;
     assert_eq!(published.read_transaction().await?, Some(original));
     let selected = read(&c, &storage, None).await?;
@@ -386,9 +427,54 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
             Reply::Record(None)
         ));
     }
+    if collect {
+        collected_metadata(&storage, &base).await?;
+        assert!(service.reclamation_observation().deleted > 0);
+        let fresh =
+            Storage::resolve(storage.uri.clone(), Default::default(), Arc::default()).await?;
+        let selected = read(&c, &fresh, None).await?;
+        assert_eq!(
+            selected
+                .count_rows(Some("status = 'round-3'".into()))
+                .await?,
+            fragments
+        );
+        let mut scan = selected.scan();
+        scan.project(&["body"])?;
+        let mut stream = scan.try_into_stream().await?;
+        let mut rows = 0;
+        while let Some(batch) = stream.try_next().await? {
+            let bodies = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for body in bodies.iter() {
+                let body = body.context("missing original body after collection")?;
+                assert_eq!(body.len(), 1024);
+                assert!(body.iter().all(|b| *b == 0x5a));
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2 * fragments);
+    }
     stop.send(()).unwrap();
     task.await??;
     c.shutdown().await
+}
+
+async fn collected_metadata(storage: &Storage, base: &Dataset) -> Result<()> {
+    let prefix = storage.base.clone().join("_annotation_preparations");
+    let store = base.object_store(None).await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if store.inner.list(Some(&prefix)).try_next().await?.is_none() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
 }
 
 async fn rejects_broken_metadata(
