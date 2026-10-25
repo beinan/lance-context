@@ -147,22 +147,46 @@ impl Service {
         budget: Arc<MergeMemoryBudget>,
         apply_budget: Arc<MergeMemoryBudget>,
     ) -> Result<(Self, Driver)> {
+        let ingress =
+            Self::validated_ingress(client, layout, binding, &limits, budget, &apply_budget)
+                .await?;
+        Self::open(ingress, storage, limits, apply_budget).await
+    }
+
+    /// Validate configuration before acquiring ownership, without opening a
+    /// Lance snapshot that a still-active predecessor could supersede.
+    pub(super) async fn validated_ingress(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        limits: &Limits,
+        budget: Arc<MergeMemoryBudget>,
+        apply_budget: &Arc<MergeMemoryBudget>,
+    ) -> Result<Ingress> {
         ensure!(
             layout.buckets.len() == 1,
             "annotation service requires one shard"
         );
-        let schema = wire::schema(&limits);
-        let contract = Self::contract(&binding, &limits)?;
+        let schema = wire::schema(limits);
+        let contract = Self::contract(&binding, limits)?;
         ensure!(
-            decode_workspace(&contract, &limits, contract.max_record_bytes as usize)?
+            decode_workspace(&contract, limits, contract.max_record_bytes as usize)?
                 <= budget.limit(),
             "annotation decode exceeds shared workspace"
         );
-        ensure!(!Arc::ptr_eq(&budget, &apply_budget)
-            && decode_workspace(&contract, &limits, contract.max_record_bytes as usize)? <= apply_budget.limit(),
+        ensure!(!Arc::ptr_eq(&budget, apply_budget)
+            && decode_workspace(&contract, limits, contract.max_record_bytes as usize)? <= apply_budget.limit(),
             "annotation apply needs independent reserved workspace so waiting uploads cannot block it");
-        let ingress =
-            Ingress::connect_with_schema(client, layout, binding, budget, contract, schema).await?;
+        Ingress::connect_with_schema(client, layout, binding, budget, contract, schema).await
+    }
+
+    /// Owned runtimes call this only after their publisher epoch is acquired.
+    pub(super) async fn open(
+        ingress: Ingress,
+        storage: &Storage,
+        limits: Limits,
+        apply_budget: Arc<MergeMemoryBudget>,
+    ) -> Result<(Self, Driver)> {
         let (base, snapshot) = checkpoint::open(&ingress, storage).await?;
         let through = snapshot.through;
         let staging = AnnotationStaging::new(

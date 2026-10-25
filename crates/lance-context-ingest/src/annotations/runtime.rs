@@ -67,26 +67,34 @@ impl Runtime {
                 && !Arc::ptr_eq(&c.publication_budget, &c.apply_budget),
             "annotation publication requires independent capacity for a full frozen generation"
         );
+        let ingress = Service::validated_ingress(
+            client,
+            layout,
+            binding,
+            &c.limits,
+            c.upload_budget.clone(),
+            &c.apply_budget,
+        )
+        .await?;
         let connect = || {
-            Service::connect(
-                client.clone(),
-                layout.clone(),
-                binding.clone(),
+            Service::open(
+                ingress.clone(),
                 &storage,
                 c.limits.clone(),
-                c.upload_budget.clone(),
                 c.apply_budget.clone(),
             )
         };
-        let (mut service, mut driver) = connect().await?;
         let catalog = materializer::Publisher::acquire(
-            service.ingress.clone(),
+            ingress.clone(),
             storage.clone(),
             c.publication.clone(),
             c.publication_budget.clone(),
             acquisition,
         )
         .await?;
+        // Fence the predecessor before selecting a recovery base. Opening first
+        // could capture a snapshot that it supersedes before this acquisition.
+        let (mut service, mut driver) = connect().await?;
         let mut publisher = Publisher {
             service: service.clone(),
             catalog,
