@@ -10,6 +10,8 @@ use lance_context_api::annotation::AnnotationFieldUpdate::{Clear, Set};
 use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
+mod reclamation;
+
 #[tokio::test]
 async fn cold_batches_keep_frozen_values_and_order_across_lookup_windows() -> Result<()> {
     let root = tempfile::tempdir()?;
