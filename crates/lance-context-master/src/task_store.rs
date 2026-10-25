@@ -649,6 +649,194 @@ impl TaskStore {
             .ok_or_else(|| lance::Error::io("discovery enqueue lost leadership"))
     }
 
+    /// Commit the observed seal frontier only when creating a new durable task.
+    /// Dedupe never consumes a frontier: a running pass may have already visited
+    /// a writer, and a failed CAS must leave all new seals available on replay.
+    pub(crate) async fn enqueue_aggregate_wal(
+        &self,
+        target: &str,
+        frontier_revision: i64,
+        frontier_value: &[u8],
+    ) -> lance::Result<crate::demand_controller::aggregate::Admission> {
+        use crate::demand_controller::aggregate::{frontier_key, Admission};
+        let fence = self
+            .publication_fence
+            .as_ref()
+            .ok_or_else(|| lance::Error::io("aggregate admission requires leader fence"))?;
+        if frontier_revision < 0 || frontier_value.len() > 256 * 1024 {
+            return Err(lance::Error::io("invalid aggregate frontier observation"));
+        }
+        let inner = &self.inner;
+        let checkpoint = frontier_key(&inner.prefix, target);
+        let dedupe = inner.dedupe_key(TaskKind::MergeWal, target, &[]).unwrap();
+        let task = new_task(TaskKind::MergeWal, target, vec![]);
+        let value = encode_task(&task)?;
+        let mut frontier: crate::demand_controller::aggregate::Frontier =
+            serde_json::from_slice(frontier_value).map_err(|e| lance::Error::io(e.to_string()))?;
+        frontier.task = Some(task.id.clone());
+        let frontier_value =
+            serde_json::to_vec(&frontier).map_err(|e| lance::Error::io(e.to_string()))?;
+        if frontier_value.len() > 256 * 1024 {
+            return Err(lance::Error::io(
+                "oversized aggregate frontier with task identity",
+            ));
+        }
+        let mut client = inner.client.clone();
+        let response = client
+            .txn(
+                Txn::new()
+                    .when(with_publication_fence(
+                        vec![
+                            Compare::mod_revision(
+                                checkpoint.as_str(),
+                                CompareOp::Equal,
+                                frontier_revision,
+                            ),
+                            Compare::version(dedupe.as_str(), CompareOp::Equal, 0),
+                        ],
+                        Some(fence),
+                    ))
+                    .and_then([
+                        TxnOp::put(inner.task_key(&task.id), value.clone(), None),
+                        TxnOp::put(inner.queue_key(&task.id), value, None),
+                        TxnOp::put(dedupe.as_str(), task.id.as_str(), None),
+                        TxnOp::put(checkpoint.as_str(), frontier_value.clone(), None),
+                    ])
+                    .or_else([
+                        TxnOp::get(checkpoint.as_str(), None),
+                        TxnOp::get(dedupe.as_str(), None),
+                    ]),
+            )
+            .await
+            .map_err(etcd_error("admit aggregate WAL demand"))?;
+        if response.succeeded() {
+            return Ok(Admission::Admitted {
+                revision: response
+                    .header()
+                    .ok_or_else(|| lance::Error::io("missing WAL admission revision"))?
+                    .revision(),
+                frontier: frontier_value,
+                task: task.id,
+            });
+        }
+        let replies = response.op_responses();
+        let [TxnOpResponse::Get(current), TxnOpResponse::Get(existing)] = replies.as_slice() else {
+            return Err(lance::Error::io("invalid WAL admission conflict response"));
+        };
+        if current.kvs().first().map_or(0, |kv| kv.mod_revision()) != frontier_revision {
+            return Ok(Admission::Changed);
+        }
+        let Some(existing) = existing.kvs().first() else {
+            return Ok(Admission::Changed);
+        };
+        let id =
+            std::str::from_utf8(existing.value()).map_err(|e| lance::Error::io(e.to_string()))?;
+        let stored = client
+            .get(inner.task_key(id), None)
+            .await
+            .map_err(etcd_error("resolve aggregate WAL dedupe"))?;
+        let mut compares = vec![Compare::value(dedupe.as_str(), CompareOp::Equal, id)];
+        if let Some(kv) = stored.kvs().first() {
+            let record = decode_task(kv.value(), id)?;
+            if record.target != target || record.kind != TaskKind::MergeWal {
+                return Err(lance::Error::io("aggregate WAL dedupe target mismatch"));
+            }
+            if matches!(record.state, TaskState::Queued | TaskState::Running) {
+                return Ok(Admission::Blocked {
+                    id: id.to_string(),
+                    revision: existing.mod_revision(),
+                });
+            }
+            compares.push(Compare::mod_revision(
+                inner.task_key(id),
+                CompareOp::Equal,
+                kv.mod_revision(),
+            ));
+        } else {
+            compares.push(Compare::version(inner.task_key(id), CompareOp::Equal, 0));
+        }
+        client
+            .txn(
+                Txn::new()
+                    .when(with_publication_fence(compares, Some(fence)))
+                    .and_then([TxnOp::delete(dedupe.as_str(), None)]),
+            )
+            .await
+            .map_err(etcd_error("clean terminal aggregate WAL dedupe"))?;
+        Ok(Admission::Changed)
+    }
+
+    /// Resolve an ambiguous aggregate publication without waiting for its old
+    /// RPC. Rewriting the PREVIOUS frontier at the expected revision invalidates
+    /// that RPC's CAS without consuming any unadmitted seal. If it already won,
+    /// the comparison fails and returns its actual frontier/dedupe instead.
+    pub(crate) async fn resolve_aggregate_admission(
+        &self,
+        target: &str,
+        revision: i64,
+        previous: &[u8],
+    ) -> lance::Result<crate::demand_controller::aggregate::AdmissionSnapshot> {
+        use crate::demand_controller::aggregate::{frontier_key, AdmissionSnapshot};
+        let fence = self
+            .publication_fence
+            .as_ref()
+            .ok_or_else(|| lance::Error::io("aggregate resolution requires leader fence"))?;
+        if revision < 0 || previous.len() > 256 * 1024 {
+            return Err(lance::Error::io("invalid aggregate resolution observation"));
+        }
+        let checkpoint = frontier_key(&self.inner.prefix, target);
+        let dedupe = self
+            .inner
+            .dedupe_key(TaskKind::MergeWal, target, &[])
+            .unwrap();
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when(with_publication_fence(
+                        vec![Compare::mod_revision(
+                            checkpoint.as_str(),
+                            CompareOp::Equal,
+                            revision,
+                        )],
+                        Some(fence),
+                    ))
+                    .and_then([
+                        TxnOp::put(checkpoint.as_str(), previous, None),
+                        TxnOp::get(checkpoint.as_str(), None),
+                        TxnOp::get(dedupe.as_str(), None),
+                    ])
+                    .or_else([
+                        TxnOp::get(checkpoint.as_str(), None),
+                        TxnOp::get(dedupe.as_str(), None),
+                    ]),
+            )
+            .await
+            .map_err(etcd_error("resolve aggregate admission outcome"))?;
+        let observed = response
+            .header()
+            .ok_or_else(|| lance::Error::io("missing resolution revision"))?
+            .revision();
+        let mut replies = response.op_responses();
+        if response.succeeded() {
+            replies.remove(0);
+        }
+        let [TxnOpResponse::Get(frontier), TxnOpResponse::Get(dedupe)] = replies.as_slice() else {
+            return Err(lance::Error::io("invalid aggregate resolution response"));
+        };
+        let row = |response: &etcd_client::GetResponse| {
+            response.kvs().first().map_or((observed, None), |kv| {
+                (kv.mod_revision(), Some(kv.value().to_vec()))
+            })
+        };
+        Ok(AdmissionSnapshot {
+            frontier: row(frontier),
+            dedupe: row(dedupe),
+        })
+    }
+
     /// Recovery inventory is a hint, not new demand. Bind a new queue entry to
     /// the observed execution version without adding an ownership read/RPC.
     pub(crate) async fn enqueue_execution_recovery(
