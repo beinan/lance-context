@@ -177,9 +177,11 @@ impl Cache {
                 .map(|_| serde_json::from_slice::<Policy>(value).map_err(|e| e.to_string()));
             let active = task_state.and_then(|expected| {
                 let task: TaskRecord = serde_json::from_slice(value).ok()?;
-                // Dependency chains deliberately do not participate in dedupe.
+                // A queued dependency chain must not absorb independent work.
+                // Once running, its live claim must suppress recovery of the
+                // same kind/target just like a task without dependencies.
                 (task.state == expected
-                    && task.depends_on.is_empty()
+                    && (task.depends_on.is_empty() || expected == TaskState::Running)
                     && location.is_some_and(|(_, id)| id == task.id))
                 .then_some((task.kind, task.target))
             });
@@ -1319,6 +1321,47 @@ mod tests {
         assert!(!cache.has_active(TaskKind::MergeWal, "waiting"));
         assert!(cache.has_active(TaskKind::IndexId, "dependency"));
     }
+
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn running_dependent_index_suppresses_recovery_until_claim_finishes() {
+        let (_dir, cfg, store) = fixture().await;
+        let compact = store
+            .enqueue(TaskKind::Compact, "table", vec![])
+            .await
+            .unwrap();
+        let index = store
+            .enqueue(TaskKind::IndexId, "table", vec![compact.id.clone()])
+            .await
+            .unwrap();
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        assert!(
+            !cache.has_active(TaskKind::IndexId, "table"),
+            "queued dependency chains must not hide independent work"
+        );
+        let claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, compact.id);
+        store
+            .finish(claim, Ok("compaction finished".into()))
+            .await
+            .unwrap();
+        let claim = store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, index.id);
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        let active = cache.has_active(TaskKind::IndexId, "table");
+        // Always release the real lease, including on the regression's red run.
+        store
+            .finish(claim, Ok("index finished".into()))
+            .await
+            .unwrap();
+        assert!(
+            active,
+            "an already running dependent index must suppress duplicate recovery"
+        );
+        let cache = list(store.etcd_client(), cfg.etcd.prefix()).await.unwrap();
+        assert!(!cache.has_active(TaskKind::IndexId, "table"));
+    }
+
     #[tokio::test]
     #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
     async fn cached_acknowledgement_preserves_newer_flush_and_running_followup() {

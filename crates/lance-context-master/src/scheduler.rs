@@ -3359,15 +3359,15 @@ mod tests {
             rewriting_compactions += 1;
             assert!(rewriting_compactions <= 4, "compaction never converged");
         }
-        let indexes = state
-            .task_store
-            .list()
-            .await
-            .unwrap()
-            .into_iter()
+        let all_tasks = state.task_store.list().await.unwrap();
+        let indexes = all_tasks
+            .iter()
             .filter(|task| task.kind == TaskKind::IndexId)
             .count();
-        assert_eq!(indexes, rewriting_compactions);
+        assert_eq!(
+            indexes, rewriting_compactions,
+            "unexpected index tasks: {all_tasks:#?}"
+        );
 
         worker.abort();
     }
