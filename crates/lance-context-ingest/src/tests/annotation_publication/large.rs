@@ -19,6 +19,15 @@ async fn owner(
     storage: &Storage,
     limits: &Limits,
 ) -> Result<(Service, Runtime)> {
+    owner_with_workspace(c, storage, limits, 8 << 20).await
+}
+
+async fn owner_with_workspace(
+    c: &network::Cluster,
+    storage: &Storage,
+    limits: &Limits,
+    publication_bytes: usize,
+) -> Result<(Service, Runtime)> {
     Runtime::connect(
         c.client.clone(),
         one_shard(),
@@ -28,7 +37,7 @@ async fn owner(
             limits: limits.clone(),
             upload_budget: MergeMemoryBudget::new(32 << 20),
             apply_budget: MergeMemoryBudget::new(16 << 20),
-            publication_budget: MergeMemoryBudget::new(8 << 20),
+            publication_budget: MergeMemoryBudget::new(publication_bytes),
             publication: Options {
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,
@@ -148,6 +157,10 @@ async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<(
     } else {
         directory.tempdir()?
     };
+    eprintln!(
+        "annotation large fixture: {} fragments={fragments} collection={collect}",
+        root.path().display()
+    );
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
         Default::default(),
@@ -286,13 +299,51 @@ async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<(
         )
         .await?;
     }
-    let (service, runtime) = owner(&c, &storage, &limits).await?;
+    let (service, runtime) = if collect {
+        // The 8 MiB preparation fixture cannot also admit a complete retained
+        // manifest plus the collection page. Keep this refusal as a tested
+        // boundary, including the acknowledged suffix's recovery dependency.
+        let (small, runtime) = owner(&c, &storage, &limits).await?;
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            collector(runtime)?.run(std::future::pending()),
+        )
+        .await?
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("annotation retained manifest exceeds collection workspace"),
+            "{error:#}"
+        );
+        assert_eq!(small.reclamation_observation().deleted, 0);
+        let prefix = storage.base.clone().join("_annotation_preparations");
+        assert!(base
+            .object_store(None)
+            .await?
+            .inner
+            .list(Some(&prefix))
+            .try_next()
+            .await?
+            .is_some());
+        assert!(matches!(
+            c.client
+                .request_routed(Request::Fetch {
+                    group: 10,
+                    index: suffix_result.index
+                })
+                .await?
+                .reply,
+            Reply::Record(Some(_))
+        ));
+        drop(small);
+        // A separate recovery configuration matches the existing 64 MiB
+        // publication workspace used by the executable blob experiment.
+        owner_with_workspace(&c, &storage, &limits, 64 << 20).await?
+    } else {
+        owner(&c, &storage, &limits).await?
+    };
     let runtime = if collect {
-        runtime.with_exclusive_reclamation(crate::annotations::runtime::reclamation::Options {
-            max_bytes: 256 << 10,
-            interval: Duration::from_millis(10),
-            ..Default::default()
-        })?
+        collector(runtime)?
     } else {
         runtime
     };
@@ -475,6 +526,14 @@ async fn collected_metadata(storage: &Storage, base: &Dataset) -> Result<()> {
         }
     })
     .await?
+}
+
+fn collector(runtime: Runtime) -> Result<Runtime> {
+    runtime.with_exclusive_reclamation(crate::annotations::runtime::reclamation::Options {
+        max_bytes: 256 << 10,
+        interval: Duration::from_millis(10),
+        ..Default::default()
+    })
 }
 
 async fn rejects_broken_metadata(
