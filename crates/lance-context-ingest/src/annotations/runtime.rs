@@ -6,6 +6,8 @@ use lance_context_core::annotation_staging::MAX_RESULTS_BYTES;
 use lance_context_wal::replication::publication as p;
 use std::collections::BTreeMap;
 
+pub mod reclamation;
+
 pub struct Configuration {
     pub limits: Limits,
     pub upload_budget: Arc<MergeMemoryBudget>,
@@ -28,9 +30,23 @@ struct Publisher {
     options: materializer::Options,
     budget: Arc<MergeMemoryBudget>,
     batch_started: Option<tokio::time::Instant>,
+    reclamation: Option<reclamation::Collector>,
 }
 
 impl Runtime {
+    /// Enable data/manifest/transaction collection for an exclusively owned, unbranched
+    /// table. Readers must check ownership after materializing their response,
+    /// as the annotation HTTP Owner does. Independently served Services, raw
+    /// Dataset readers, shared files and URI reuse are outside this contract.
+    /// Only this runtime may prepare/publish files. The ordinary constructor
+    /// keeps physical collection disabled.
+    pub fn with_exclusive_reclamation(mut self, options: reclamation::Options) -> Result<Self> {
+        self.publisher.reclamation = Some(reclamation::Collector::new(
+            options,
+            &self.publisher.budget,
+        )?);
+        Ok(self)
+    }
     #[cfg(feature = "http")]
     pub(crate) fn http_binding(&self) -> (Service, p::Authority) {
         (
@@ -102,6 +118,7 @@ impl Runtime {
             options: c.publication.clone(),
             budget: c.publication_budget.clone(),
             batch_started: None,
+            reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;
         if view.progress.prepared.is_some() {
@@ -156,6 +173,11 @@ impl Publisher {
 
     async fn run(&mut self) -> Result<()> {
         loop {
+            if let Some(collector) = &mut self.reclamation {
+                collector
+                    .step(&self.service, &self.catalog, &self.storage, &self.budget)
+                    .await?;
+            }
             self.publish_next().await?;
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
