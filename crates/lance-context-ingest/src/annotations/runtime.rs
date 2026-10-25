@@ -288,7 +288,9 @@ impl Publisher {
 
     /// Reuse the exact durable descriptors or verify the already selected native
     /// transaction. Upload completion alone is never evidence of publication.
-    async fn resolve_prepared(&self, view: &p::Table) -> Result<Arc<Dataset>> {
+    /// An exclusive borrow keeps the future Send: the collector's retained LIST
+    /// stream is Send but need not be Sync.
+    async fn resolve_prepared(&mut self, view: &p::Table) -> Result<Arc<Dataset>> {
         let pending = view
             .progress
             .pending
