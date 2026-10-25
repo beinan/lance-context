@@ -9,7 +9,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -38,12 +40,14 @@ const CLAIM_READ_BATCH_KEYS: usize = 64;
 
 /// Owned by one scheduler pool, never shared between kind/target filters.
 /// A fixed etcd revision closes each sweep even while new tasks keep arriving.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct SchedulerClaimCursor {
     queue: ScanCursor,
     recovery: ScanCursor,
 }
 
+#[cfg(test)]
 impl SchedulerClaimCursor {
     pub(crate) fn has_more_pages(&self) -> bool {
         self.queue.next.is_some() || self.recovery.next.is_some()
@@ -87,7 +91,7 @@ impl SchedulerClaimScan<'_> {
 /// Small enough to copy; used to let each scheduler execution pool claim only
 /// the kinds it can actually run, so a saturated pool's backlog never hides a
 /// runnable task belonging to an idle pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskKinds {
     compact: bool,
     merge_wal: bool,
@@ -144,6 +148,7 @@ pub struct TaskStore {
     cooldown: CooldownPolicy,
     global_maintenance: bool,
     pending_history_prune: Arc<AtomicBool>,
+    #[cfg(test)]
     scheduler_notifications: Arc<OnceLock<tokio::sync::watch::Receiver<u64>>>,
     publication_fence: Option<PublicationFence>,
 }
@@ -212,6 +217,8 @@ struct EtcdTaskStore {
     auto_local_merge: bool,
     #[cfg(test)]
     claim_owner_swap: std::sync::Mutex<Option<(String, String)>>,
+    #[cfg(test)]
+    lose_claim_response: AtomicBool,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -228,6 +235,41 @@ impl TaskClaim {
 
     pub(crate) fn preparing_maintenance(&self) -> bool {
         self.backend.preparation_key.is_some() && self.backend.target_key.is_none()
+    }
+}
+
+/// A controller offer is permission to attempt one canonical claim, not table
+/// ownership. Its ticket is backed by a permit held by the receiving pool.
+#[derive(Clone, Debug)]
+pub(crate) struct DispatchAssignment {
+    pub task_id: String,
+    pub offer_key: String,
+    pub offer_value: Vec<u8>,
+    pub ticket_key: String,
+    pub ticket_value: Vec<u8>,
+    pub reservation_key: String,
+}
+
+#[derive(Clone, Copy)]
+enum ClaimSource<'a> {
+    Queue,
+    Catchup { task_id: &'a str, job: &'a str },
+    Assigned(&'a DispatchAssignment),
+}
+
+impl ClaimSource<'_> {
+    fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Queue => None,
+            Self::Catchup { task_id, .. } => Some(task_id),
+            Self::Assigned(offer) => Some(&offer.task_id),
+        }
+    }
+    fn catchup_job(&self) -> Option<&str> {
+        match self {
+            Self::Catchup { job, .. } => Some(job),
+            _ => None,
+        }
     }
 }
 
@@ -252,6 +294,10 @@ pub struct CoordinationGuard {
 }
 
 impl CoordinationGuard {
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     pub(crate) fn token(&self) -> &str {
         &self.token
     }
@@ -509,6 +555,7 @@ impl TaskStore {
     }
 
     /// Share admission-change notifications across this master's scheduler pools.
+    #[cfg(test)]
     pub(crate) fn scheduler_notifications(&self) -> tokio::sync::watch::Receiver<u64> {
         self.scheduler_notifications
             .get_or_init(|| {
@@ -527,6 +574,15 @@ impl TaskStore {
     }
 
     pub async fn open(config: &MasterConfig) -> lance::Result<Self> {
+        Self::open_mode(config, true).await
+    }
+
+    /// Native scheduler replicas leave global recovery/history to the leader.
+    pub(crate) async fn open_executor(config: &MasterConfig) -> lance::Result<Self> {
+        Self::open_mode(config, false).await
+    }
+
+    async fn open_mode(config: &MasterConfig, legacy_maintenance: bool) -> lance::Result<Self> {
         let store = Self {
             inner: Arc::new(EtcdTaskStore::connect(config).await?),
             history_limit: config.task_history_limit.max(1),
@@ -536,8 +592,9 @@ impl TaskStore {
                 base: Duration::from_secs(config.task_cooldown_base_secs),
                 max: Duration::from_secs(config.task_cooldown_max_secs),
             },
-            global_maintenance: config.catchup.target.is_none(),
+            global_maintenance: legacy_maintenance && config.catchup.target.is_none(),
             pending_history_prune: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             scheduler_notifications: Arc::new(OnceLock::new()),
             publication_fence: None,
         };
@@ -776,7 +833,10 @@ impl TaskStore {
     /// saturated one.
     pub async fn claim_next_of_kinds(&self, kinds: TaskKinds) -> lance::Result<Option<TaskClaim>> {
         self.inner.recover_orphaned().await?;
-        let (claim, dependency_failed) = self.inner.claim_next(kinds, None, None, None).await?;
+        let (claim, dependency_failed) = self
+            .inner
+            .claim_next(kinds, ClaimSource::Queue, None, None)
+            .await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
                 tracing::warn!(error = %error, "failed to prune task history");
@@ -795,7 +855,12 @@ impl TaskStore {
         self.inner.recover_orphaned().await?;
         let (claim, dependency_failed) = self
             .inner
-            .claim_next(TaskKinds::MERGE_WAL, None, Some(targets), None)
+            .claim_next(
+                TaskKinds::MERGE_WAL,
+                ClaimSource::Queue,
+                Some(targets),
+                None,
+            )
             .await?;
         if dependency_failed {
             if let Err(error) = self.prune_terminal_history().await {
@@ -807,6 +872,7 @@ impl TaskStore {
 
     /// Yield between bounded queue/recovery slices without cancelling any
     /// ownership RPC. The caller keeps this cursor for its own execution pool.
+    #[cfg(test)]
     pub(crate) async fn claim_scheduler_slice(
         &self,
         kinds: TaskKinds,
@@ -825,7 +891,7 @@ impl TaskStore {
         };
         let (claim, dependency_failed) = self
             .inner
-            .claim_next(kinds, None, resident_targets, Some(&mut scan))
+            .claim_next(kinds, ClaimSource::Queue, resident_targets, Some(&mut scan))
             .await?;
         if let Some(claim) = &claim {
             // Publish accepted ownership before any terminal-history work.
@@ -841,6 +907,37 @@ impl TaskStore {
         } else {
             "scan_complete"
         });
+        Ok(claim)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lose_next_claim_response_for_test(&self, owner_swap: Option<(String, String)>) {
+        *self.inner.claim_owner_swap.lock().unwrap() = owner_swap;
+        self.inner
+            .lose_claim_response
+            .store(true, Ordering::Release);
+    }
+
+    /// Consume one controller offer through the same claim/fencing transaction
+    /// as ordinary scheduling. The receiver has already reserved local capacity.
+    pub(crate) async fn claim_assignment(
+        &self,
+        offer: &DispatchAssignment,
+        kinds: TaskKinds,
+        resident_targets: Option<&[String]>,
+        operation: &crate::admission::Operation,
+    ) -> lance::Result<Option<TaskClaim>> {
+        operation.claim_phase("assigned_task");
+        let (claim, dependency_failed) = self
+            .inner
+            .claim_next(kinds, ClaimSource::Assigned(offer), resident_targets, None)
+            .await?;
+        if let Some(claim) = &claim {
+            operation.task(&claim.task.id, &claim.task.target);
+        }
+        if dependency_failed && self.global_maintenance {
+            self.pending_history_prune.store(true, Ordering::Release);
+        }
         Ok(claim)
     }
 
@@ -860,7 +957,12 @@ impl TaskStore {
         }
         Ok(self
             .inner
-            .claim_next(TaskKinds::MERGE_WAL, Some((&id, job)), None, None)
+            .claim_next(
+                TaskKinds::MERGE_WAL,
+                ClaimSource::Catchup { task_id: &id, job },
+                None,
+                None,
+            )
             .await?
             .0)
     }
@@ -1007,9 +1109,208 @@ impl TaskStore {
         Ok(CoordinationGuard {
             token,
             lease_id,
-            key: format!("{}/demand-controller/leader", self.inner.prefix),
+            key: format!("{}/demand-controller/leader-v2", self.inner.prefix),
             keepalive,
         })
+    }
+
+    /// A ticket exists only while its execution pool holds a real slot. Its
+    /// lease also bounds an offer that was published but never claimed.
+    pub(crate) async fn create_dispatch_ticket(
+        &self,
+        policy: Vec<u8>,
+    ) -> lance::Result<CoordinationGuard> {
+        let token = String::from_utf8(policy).map_err(|e| lance::Error::io(e.to_string()))?;
+        let lease_id = self.inner.grant_lease().await?;
+        let keepalive = self.inner.start_keepalive(lease_id).await?;
+        let key = format!(
+            "{}/demand-controller/tickets/{}",
+            self.inner.prefix,
+            generate_id()
+        );
+        self.inner
+            .client
+            .clone()
+            .put(
+                key.as_str(),
+                token.as_str(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            )
+            .await
+            .map_err(etcd_error("register dispatch capacity"))?;
+        Ok(CoordinationGuard {
+            token,
+            lease_id,
+            key,
+            keepalive,
+        })
+    }
+
+    /// Re-advertise a reserved local slot after its previous offer was consumed.
+    /// Reuses the pool's lease; running tasks have their own independent leases.
+    pub(crate) async fn rearm_dispatch_ticket(
+        &self,
+        guard: &mut CoordinationGuard,
+        policy: Vec<u8>,
+    ) -> lance::Result<i64> {
+        if !guard.is_live() {
+            return Err(lance::Error::io("dispatch session lease ended"));
+        }
+        let token = String::from_utf8(policy).map_err(|e| lance::Error::io(e.to_string()))?;
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new()
+                    .when([
+                        Compare::version(guard.key.as_str(), CompareOp::Equal, 0),
+                        Compare::version(
+                            guard.key.replace("/tickets/", "/offers/"),
+                            CompareOp::Equal,
+                            0,
+                        ),
+                    ])
+                    .and_then([TxnOp::put(
+                        guard.key.as_str(),
+                        token.as_str(),
+                        Some(PutOptions::new().with_lease(guard.lease_id)),
+                    )]),
+            )
+            .await
+            .map_err(etcd_error("rearm dispatch capacity"))?;
+        if !response.succeeded() {
+            return Err(lance::Error::io(
+                "previous dispatch capacity still advertised",
+            ));
+        }
+        guard.token = token;
+        response
+            .header()
+            .map(|header| header.revision())
+            .ok_or_else(|| lance::Error::io("missing dispatch capacity revision"))
+    }
+
+    pub(crate) async fn publish_assignment(
+        &self,
+        offer: &DispatchAssignment,
+        ticket_lease: i64,
+        queue_revision: i64,
+    ) -> lance::Result<Option<i64>> {
+        if self.publication_fence.is_none() || ticket_lease <= 0 || queue_revision <= 0 {
+            return Err(lance::Error::io(
+                "assignment requires a leader fence and live observations",
+            ));
+        }
+        let compares = with_publication_fence(
+            vec![
+                Compare::value(
+                    offer.ticket_key.as_str(),
+                    CompareOp::Equal,
+                    offer.ticket_value.clone(),
+                ),
+                Compare::lease(offer.ticket_key.as_str(), CompareOp::Equal, ticket_lease),
+                Compare::version(offer.offer_key.as_str(), CompareOp::Equal, 0),
+                Compare::version(offer.reservation_key.as_str(), CompareOp::Equal, 0),
+                Compare::mod_revision(
+                    self.inner.queue_key(&offer.task_id),
+                    CompareOp::Equal,
+                    queue_revision,
+                ),
+            ],
+            self.publication_fence.as_ref(),
+        );
+        let options = Some(PutOptions::new().with_lease(ticket_lease));
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(Txn::new().when(compares).and_then([
+                TxnOp::put(
+                    offer.offer_key.as_str(),
+                    offer.offer_value.clone(),
+                    options.clone(),
+                ),
+                TxnOp::put(
+                    offer.reservation_key.as_str(),
+                    offer.offer_value.clone(),
+                    options,
+                ),
+            ]))
+            .await
+            .map_err(etcd_error("offer task to reserved executor capacity"))?;
+        Ok(response
+            .succeeded()
+            .then(|| response.header().map_or(0, |h| h.revision())))
+    }
+
+    pub(crate) async fn dispatch_dependency_observations(
+        &self,
+        ids: &[String],
+        revision: i64,
+    ) -> lance::Result<(Vec<Option<TaskState>>, i64)> {
+        if ids.len() > 64 || ids.is_empty() {
+            return Err(lance::Error::io("invalid dependency observation batch"));
+        }
+        let response = self
+            .inner
+            .client
+            .clone()
+            .txn(
+                Txn::new().and_then(
+                    ids.iter()
+                        .map(|id| {
+                            TxnOp::get(
+                                self.inner.task_key(id),
+                                (revision > 0).then(|| GetOptions::new().with_revision(revision)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .await
+            .map_err(etcd_error("observe dispatch dependencies"))?;
+        let snapshot = if revision > 0 {
+            revision
+        } else {
+            response
+                .header()
+                .ok_or_else(|| lance::Error::io("missing dependency snapshot revision"))?
+                .revision()
+        };
+        let responses = response.op_responses();
+        if responses.len() != ids.len() {
+            return Err(lance::Error::io("incomplete dependency observations"));
+        }
+        let states = responses
+            .into_iter()
+            .zip(ids)
+            .map(|(op, id)| match op {
+                TxnOpResponse::Get(value) => match value.kvs().first() {
+                    Some(kv) => {
+                        let task = decode_task(kv.value(), id)?;
+                        if task.id != *id {
+                            return Err(lance::Error::io("dependency identity mismatch"));
+                        }
+                        Ok(Some(task.state))
+                    }
+                    None => Ok(None),
+                },
+                _ => Err(lance::Error::io("invalid dependency observation response")),
+            })
+            .collect::<lance::Result<Vec<_>>>()?;
+        Ok((states, snapshot))
+    }
+
+    pub(crate) async fn recover_observed_task(&self, task: &TaskRecord) -> lance::Result<bool> {
+        if self.publication_fence.is_none() {
+            return Err(lance::Error::io(
+                "controller recovery requires leader fence",
+            ));
+        }
+        self.inner
+            .recover_task(task, self.publication_fence.as_ref())
+            .await
     }
 
     pub(crate) async fn elect_discovery_leader(
@@ -1158,10 +1459,12 @@ impl TaskStore {
         self.inner.revoke_lease(lease_id).await
     }
 
+    #[cfg(test)]
     pub(crate) fn history_prune_pending(&self) -> bool {
         self.pending_history_prune.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) async fn prune_pending_history(&self) -> lance::Result<usize> {
         if !self.pending_history_prune.swap(false, Ordering::AcqRel) {
             return Ok(0);
@@ -1175,6 +1478,66 @@ impl TaskStore {
         }
     }
 
+    pub(crate) async fn prune_controller_history(&self) -> lance::Result<usize> {
+        if self.publication_fence.is_none() {
+            return Err(lance::Error::io(
+                "history maintenance requires leader fence",
+            ));
+        }
+        let mut tasks = Vec::new();
+        let mut start = self.inner.tasks_prefix().into_bytes();
+        let end = prefix_range_end(&start);
+        let mut revision = 0;
+        let mut bytes = 0;
+        loop {
+            let options = GetOptions::new().with_range(end.clone()).with_limit(128);
+            let options = if revision > 0 {
+                options.with_revision(revision)
+            } else {
+                options
+            };
+            let response = self
+                .inner
+                .client
+                .clone()
+                .get(start, Some(options))
+                .await
+                .map_err(etcd_error("page controller task history"))?;
+            if revision == 0 {
+                revision = response
+                    .header()
+                    .ok_or_else(|| lance::Error::io("missing task history revision"))?
+                    .revision();
+            }
+            for kv in response.kvs() {
+                bytes += kv.key().len() + kv.value().len();
+                if tasks.len() >= 100_000 || bytes > 64 * 1024 * 1024 {
+                    return Err(lance::Error::io(
+                        "task history maintenance capacity exceeded",
+                    ));
+                }
+                tasks.push(decode_task(kv.value(), &String::from_utf8_lossy(kv.key()))?);
+            }
+            if !response.more() {
+                break;
+            }
+            start = response
+                .kvs()
+                .last()
+                .ok_or_else(|| lance::Error::io("empty task history continuation"))?
+                .key()
+                .to_vec();
+            start.push(0);
+        }
+        let cutoff =
+            (self.history_ttl_secs > 0).then(|| now_ms() - self.history_ttl_secs as i64 * 1_000);
+        let ids = prunable_terminal_ids(tasks, self.history_limit, cutoff);
+        self.inner
+            .delete_many(&ids, self.publication_fence.as_ref())
+            .await?;
+        Ok(ids.len())
+    }
+
     async fn prune_terminal_history(&self) -> lance::Result<usize> {
         let tasks = self.list().await?;
         let ttl_cutoff = if self.history_ttl_secs > 0 {
@@ -1186,7 +1549,7 @@ impl TaskStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        self.inner.delete_many(&ids).await?;
+        self.inner.delete_many(&ids, None).await?;
         Ok(ids.len())
     }
 }
@@ -1245,6 +1608,8 @@ impl EtcdTaskStore {
             client,
             #[cfg(test)]
             claim_owner_swap: Default::default(),
+            #[cfg(test)]
+            lose_claim_response: AtomicBool::new(false),
             prefix: config.etcd.prefix().to_string(),
             lease_ttl: config.etcd_lease_ttl_secs,
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
@@ -1686,13 +2051,13 @@ impl EtcdTaskStore {
     async fn claim_next(
         &self,
         kinds: TaskKinds,
-        only_id: Option<(&str, &str)>,
+        source: ClaimSource<'_>,
         resident_targets: Option<&[String]>,
         scan: Option<&mut SchedulerClaimScan<'_>>,
     ) -> lance::Result<(Option<TaskClaim>, bool)> {
         let mut lease = None;
         let result = self
-            .claim_next_with_lease(kinds, only_id, resident_targets, scan, &mut lease)
+            .claim_next_with_lease(kinds, source, resident_targets, scan, &mut lease)
             .await;
         if let Some(lease) = lease {
             drop(lease.keepalive);
@@ -1709,13 +2074,15 @@ impl EtcdTaskStore {
     async fn claim_next_with_lease(
         &self,
         kinds: TaskKinds,
-        only_id: Option<(&str, &str)>,
+        source: ClaimSource<'_>,
         resident_targets: Option<&[String]>,
         mut scan: Option<&mut SchedulerClaimScan<'_>>,
         lease: &mut Option<UnclaimedLease>,
     ) -> lance::Result<(Option<TaskClaim>, bool)> {
-        let prefix = only_id.map_or_else(|| self.queue_prefix(), |(id, _)| self.queue_key(id));
-        let range_end = if only_id.is_some() {
+        let prefix = source
+            .task_id()
+            .map_or_else(|| self.queue_prefix(), |id| self.queue_key(id));
+        let range_end = if source.task_id().is_some() {
             let mut end = prefix.as_bytes().to_vec();
             end.push(0);
             end
@@ -1896,7 +2263,7 @@ impl EtcdTaskStore {
                 let expected_owner = merge_execution
                     .as_ref()
                     .map(lance_context_merge::execution_owner);
-                let orphaned_catchup = only_id.is_none()
+                let orphaned_catchup = source.catchup_job().is_none()
                     && snapshot[3].is_none()
                     && snapshot[4].is_none()
                     && snapshot[1].as_deref() == expected_owner.as_deref().map(str::as_bytes)
@@ -1924,7 +2291,7 @@ impl EtcdTaskStore {
                         continue;
                     }
                 }
-                let expected_job = only_id.map(|(_, job)| job.as_bytes()).or(
+                let expected_job = source.catchup_job().map(str::as_bytes).or(
                     if shape.shared_owner || orphaned_catchup {
                         snapshot[2].as_deref()
                     } else {
@@ -2110,6 +2477,30 @@ impl EtcdTaskStore {
                         ));
                     }
                 }
+                if let ClaimSource::Assigned(offer) = source {
+                    compares.extend([
+                        Compare::value(
+                            offer.offer_key.as_str(),
+                            CompareOp::Equal,
+                            offer.offer_value.clone(),
+                        ),
+                        Compare::value(
+                            offer.ticket_key.as_str(),
+                            CompareOp::Equal,
+                            offer.ticket_value.clone(),
+                        ),
+                        Compare::value(
+                            offer.reservation_key.as_str(),
+                            CompareOp::Equal,
+                            offer.offer_value.clone(),
+                        ),
+                    ]);
+                    operations.extend([
+                        TxnOp::delete(offer.offer_key.as_str(), None),
+                        TxnOp::delete(offer.ticket_key.as_str(), None),
+                        TxnOp::delete(offer.reservation_key.as_str(), None),
+                    ]);
+                }
                 #[cfg(test)]
                 {
                     // Deterministic race after snapshot/compare construction.
@@ -2126,6 +2517,16 @@ impl EtcdTaskStore {
                 let response = client
                     .txn(Txn::new().when(compares).and_then(operations))
                     .await;
+                #[cfg(test)]
+                let response = if self.lose_claim_response.swap(false, Ordering::AcqRel) {
+                    // The real transaction has completed, but the caller sees
+                    // a lost response and must reconcile its original token.
+                    Err(etcd_client::Error::Internal(
+                        "injected lost claim response".into(),
+                    ))
+                } else {
+                    response
+                };
                 if let Some(operation) = operation {
                     operation.claim_phase("claim_reconciliation");
                 }
@@ -2319,6 +2720,7 @@ impl EtcdTaskStore {
         Ok(response)
     }
 
+    #[cfg(test)]
     async fn recover_scheduler_slice(
         &self,
         cursor: &mut ScanCursor,
@@ -2433,7 +2835,7 @@ impl EtcdTaskStore {
                 }
                 continue;
             }
-            if self.recover_task(task).await? {
+            if self.recover_task(task, None).await? {
                 recovered += 1;
             }
             if let Some(operation) = operation {
@@ -2445,24 +2847,31 @@ impl EtcdTaskStore {
         Ok(recovered)
     }
 
-    async fn recover_task(&self, task: &TaskRecord) -> lance::Result<bool> {
+    async fn recover_task(
+        &self,
+        task: &TaskRecord,
+        fence: Option<&PublicationFence>,
+    ) -> lance::Result<bool> {
         let mut queued = task.clone();
         requeue(&mut queued);
         let value = encode_task(&queued)?;
         let txn = Txn::new()
-            .when([
-                Compare::value(
-                    self.task_key(&task.id),
-                    CompareOp::Equal,
-                    encode_task(task)?,
-                ),
-                Compare::version(self.claim_key(&task.id), CompareOp::Equal, 0),
-                Compare::value(
-                    self.running_key(&task.id),
-                    CompareOp::Equal,
-                    encode_task(task)?,
-                ),
-            ])
+            .when(with_publication_fence(
+                vec![
+                    Compare::value(
+                        self.task_key(&task.id),
+                        CompareOp::Equal,
+                        encode_task(task)?,
+                    ),
+                    Compare::version(self.claim_key(&task.id), CompareOp::Equal, 0),
+                    Compare::value(
+                        self.running_key(&task.id),
+                        CompareOp::Equal,
+                        encode_task(task)?,
+                    ),
+                ],
+                fence,
+            ))
             .and_then([
                 TxnOp::put(self.task_key(&task.id), value.clone(), None),
                 TxnOp::put(self.queue_key(&task.id), value, None),
@@ -2655,18 +3064,28 @@ impl EtcdTaskStore {
         operation: Option<&crate::admission::Operation>,
     ) -> lance::Result<DependencyStatus> {
         let mut waiting = false;
-        for dependency in &task.depends_on {
-            let record = self.get(dependency).await?;
+        for dependencies in task.depends_on.chunks(64) {
+            let keys = dependencies
+                .iter()
+                .map(|id| self.task_key(id))
+                .collect::<Vec<_>>();
+            let values = self.read_values(&keys).await?;
             if let Some(operation) = operation {
                 operation.claim_completed(1, 0, 0);
             }
-            match record {
-                Some(record) if record.state == TaskState::Done => {}
-                Some(record) if record.state == TaskState::Failed => {
-                    return Ok(DependencyStatus::Failed(dependency.clone()));
+            for (dependency, value) in dependencies.iter().zip(values) {
+                let record = value
+                    .as_deref()
+                    .map(|value| decode_task(value, dependency))
+                    .transpose()?;
+                match record {
+                    Some(record) if record.state == TaskState::Done => {}
+                    Some(record) if record.state == TaskState::Failed => {
+                        return Ok(DependencyStatus::Failed(dependency.clone()))
+                    }
+                    Some(_) => waiting = true,
+                    None => return Ok(DependencyStatus::Failed(dependency.clone())),
                 }
-                Some(_) => waiting = true,
-                None => return Ok(DependencyStatus::Failed(dependency.clone())),
             }
         }
         Ok(if waiting {
@@ -2697,17 +3116,28 @@ impl EtcdTaskStore {
             .map_err(etcd_error("fail task with unsuccessful dependency"))
     }
 
-    async fn delete_many(&self, ids: &[String]) -> lance::Result<()> {
+    async fn delete_many(
+        &self,
+        ids: &[String],
+        fence: Option<&PublicationFence>,
+    ) -> lance::Result<()> {
         for chunk in ids.chunks(100) {
             let operations = chunk
                 .iter()
                 .map(|id| TxnOp::delete(self.task_key(id), None))
                 .collect::<Vec<_>>();
             let mut client = self.client.clone();
-            client
-                .txn(Txn::new().and_then(operations))
+            let response = client
+                .txn(
+                    Txn::new()
+                        .when(with_publication_fence(Vec::new(), fence))
+                        .and_then(operations),
+                )
                 .await
                 .map_err(etcd_error("prune task history"))?;
+            if !response.succeeded() {
+                return Err(lance::Error::io("task history controller lost leadership"));
+            }
         }
         Ok(())
     }
@@ -3171,7 +3601,7 @@ fn etcd_error(action: &'static str) -> impl FnOnce(etcd_client::Error) -> lance:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::TempDir;
 
@@ -3645,15 +4075,15 @@ mod tests {
         assert!(store.list().await.unwrap().is_empty());
     }
 
-    struct LeaseTestProxy {
-        endpoint: String,
-        online: tokio::sync::watch::Sender<bool>,
+    pub(crate) struct LeaseTestProxy {
+        pub(crate) endpoint: String,
+        pub(crate) online: tokio::sync::watch::Sender<bool>,
         responses: tokio::sync::watch::Sender<bool>,
         task: JoinHandle<()>,
     }
 
     impl LeaseTestProxy {
-        async fn start(upstream: &str) -> Self {
+        pub(crate) async fn start(upstream: &str) -> Self {
             let upstream = upstream.strip_prefix("http://").unwrap().to_owned();
             assert!(upstream.starts_with("127.0.0.1:") || upstream.starts_with("localhost:"));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5420,7 +5850,7 @@ mod tests {
             .unwrap();
         for kv in running.kvs() {
             let task = decode_task(kv.value(), "fixture").unwrap();
-            assert!(!store.inner.recover_task(&task).await.unwrap());
+            assert!(!store.inner.recover_task(&task, None).await.unwrap());
         }
         let old_sweep_seconds = baseline.elapsed().as_secs_f64();
         let batch = std::time::Instant::now();

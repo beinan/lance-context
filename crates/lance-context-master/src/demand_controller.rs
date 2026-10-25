@@ -21,6 +21,8 @@ use crate::{
     task_store::{CoordinationGuard, TaskStore},
 };
 
+pub(crate) mod dispatch;
+
 const RANGES: &[&str] = &[
     "merge-requests",
     "merge-executions",
@@ -28,6 +30,18 @@ const RANGES: &[&str] = &[
     "demand-controller/members",
     "queue",
     "running",
+    "demand-controller/tickets",
+    "demand-controller/offers",
+    "demand-controller/reservations",
+    "claims",
+    "target-locks",
+    "merge-claims",
+    "catchup-active",
+    "catchup-records",
+    "compact-preparations",
+    "compact-commit-ready",
+    // Watch dependency changes without listing retained task history.
+    "tasks",
 ];
 const MAX_KEYS: usize = 100_000;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -108,9 +122,11 @@ impl Policy {
 struct Entry {
     value: Vec<u8>,
     revision: i64,
+    lease_id: i64,
     due: Instant,
     active: Option<(TaskKind, String)>,
     policy: Option<Result<Policy, String>>,
+    offered_target: Option<String>,
 }
 
 struct Cache {
@@ -121,6 +137,8 @@ struct Cache {
     bytes: usize,
     revisions: Vec<i64>,
     active: BTreeMap<(TaskKind, String), BTreeSet<Vec<u8>>>,
+    placement: dispatch::Placement,
+    offered_targets: BTreeMap<String, usize>,
 }
 
 impl Cache {
@@ -131,6 +149,8 @@ impl Cache {
             bytes: 0,
             revisions: vec![0; RANGES.len()],
             active: BTreeMap::new(),
+            placement: dispatch::Placement::default(),
+            offered_targets: BTreeMap::new(),
         }
     }
 
@@ -146,9 +166,27 @@ impl Cache {
         {
             return Err("demand informer capacity exceeded; durable records retained".into());
         }
+        let location = std::str::from_utf8(key)
+            .ok()
+            .and_then(|key| key.rsplit_once('/'));
+        let offered_target =
+            if location.is_some_and(|(parent, _)| parent.ends_with("/demand-controller/offers")) {
+                value.map(dispatch::offer_target).transpose()?
+            } else {
+                None
+            };
         let due = old.map_or_else(Instant::now, |e| e.due);
+        self.placement.forget_queue_entry(key);
         if let Some(old) = self.entries.remove(key) {
             self.ready.remove(&(old.due, key.to_vec()));
+            if let Some(target) = old.offered_target {
+                if let Some(count) = self.offered_targets.get_mut(&target) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.offered_targets.remove(&target);
+                    }
+                }
+            }
             if let Some(active) = old.active {
                 if let Some(keys) = self.active.get_mut(&active) {
                     keys.remove(key);
@@ -160,9 +198,9 @@ impl Cache {
         }
         self.bytes = bytes;
         if let Some(value) = value {
-            let location = std::str::from_utf8(key)
-                .ok()
-                .and_then(|key| key.rsplit_once('/'));
+            if let Some(target) = &offered_target {
+                *self.offered_targets.entry(target.clone()).or_default() += 1;
+            }
             let task_state = location.and_then(|(parent, _)| {
                 if parent.ends_with("/queue") {
                     Some(TaskState::Queued)
@@ -191,15 +229,22 @@ impl Cache {
                     .or_default()
                     .insert(key.to_vec());
             }
-            let auxiliary = task_state.is_some() || policy.is_some();
+            let auxiliary = location.is_some_and(|(parent, _)| {
+                RANGES
+                    .iter()
+                    .skip(3)
+                    .any(|range| parent.ends_with(&format!("/{range}")))
+            });
             self.entries.insert(
                 key.to_vec(),
                 Entry {
                     value: value.to_vec(),
                     revision,
+                    lease_id: 0,
                     due,
                     active,
                     policy,
+                    offered_target,
                 },
             );
             if !auxiliary {
@@ -278,6 +323,9 @@ async fn list(client: &Client, prefix: &str) -> Result<Cache, String> {
     let mut cache = Cache::new();
     let mut revision = 0;
     for range in RANGES {
+        if *range == "tasks" {
+            continue;
+        }
         let start = prefix_key(prefix, range);
         let mut end = start.as_bytes().to_vec();
         *end.last_mut().unwrap() += 1;
@@ -305,6 +353,9 @@ async fn list(client: &Client, prefix: &str) -> Result<Cache, String> {
             }
             for kv in response.kvs() {
                 cache.apply(kv.key(), Some(kv.value()), kv.mod_revision())?;
+                if let Some(entry) = cache.entries.get_mut(kv.key()) {
+                    entry.lease_id = kv.lease();
+                }
             }
             if !response.more() {
                 break;
@@ -371,11 +422,19 @@ fn apply_response(cache: &mut Cache, response: &etcd_client::WatchResponse) -> R
     }
     for event in response.events() {
         let kv = event.kv().ok_or("informer event missing key")?;
-        cache.apply(
-            kv.key(),
-            (event.event_type() != EventType::Delete).then_some(kv.value()),
-            kv.mod_revision(),
-        )?;
+        let value = (event.event_type() != EventType::Delete).then_some(kv.value());
+        if RANGES[index] == "tasks" {
+            cache
+                .placement
+                .observe_dependency(kv.key(), value, kv.mod_revision());
+        } else {
+            cache.apply(kv.key(), value, kv.mod_revision())?;
+            if let Some(entry) = cache.entries.get_mut(kv.key()) {
+                if entry.revision == kv.mod_revision() {
+                    entry.lease_id = kv.lease();
+                }
+            }
+        }
     }
     // Each prefix advances separately; events on another watch are no proof
     // that this prefix has delivered that global revision.
@@ -571,6 +630,9 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
     let prefix = state.config.etcd.prefix().trim_end_matches('/');
     let client = store.etcd_client();
     let mut cache = list(client, prefix).await?;
+    let mut place_more = true;
+    let mut place_dirty = false;
+    let mut recovery_due = Instant::now();
     loop {
         let mut stream = match watch(client, prefix, &cache).await {
             Ok(stream) => stream,
@@ -585,10 +647,32 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
             tokio::select! {
                 response = stream.message() => {
                     match response {
-                        Ok(Some(response)) => if let Err(error) = apply_response(&mut cache, &response) { break error; },
+                        Ok(Some(response)) => {
+                            if !response.events().is_empty() { place_dirty = true; place_more = true; }
+                            if let Err(error) = apply_response(&mut cache, &response) { break error; }
+                        },
                         Ok(None) => break "demand watch ended".to_string(),
                         Err(error) => break error.to_string(),
                     }
+                }
+                _ = tokio::task::yield_now(), if place_more => {
+                    let Some(operation) = state.admission.try_admit_named("task_dispatch") else { return Ok(()); };
+                    operation.phase("offer_reserved_capacity");
+                    match dispatch::place(&publisher, prefix, &mut cache).await {
+                        Ok(more) => {
+                            place_more = more || place_dirty;
+                            if !more { place_dirty = false; }
+                        },
+                        Err(error) => break error,
+                    }
+                }
+                _ = tokio::time::sleep_until(recovery_due) => {
+                    recovery_due = Instant::now() + Duration::from_secs(1);
+                    let Some(operation) = state.admission.try_admit_named("task_recovery") else { return Ok(()); };
+                    operation.phase("recover_observed_orphan");
+                    // No RPC unless the cache contains a running task with no
+                    // claim. A fenced transaction rechecks actual ownership.
+                    if let Err(error) = dispatch::recover(&publisher, prefix, &cache).await { break error; }
                 }
                 _ = tokio::time::sleep_until(next) => {
                     if let Some((key, entry)) = cache.take_due() {
@@ -607,6 +691,12 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
                     }
                 }
             }
+            let queued = cache
+                .entries
+                .range(prefix_key(prefix, "queue").into_bytes()..)
+                .take_while(|(key, _)| key.starts_with(prefix_key(prefix, "queue").as_bytes()))
+                .count();
+            metrics::gauge!("master_task_queue_depth").set(queued as f64);
             metrics::gauge!("master_demand_controller_cache_keys").set(cache.entries.len() as f64);
             metrics::gauge!("master_demand_controller_cache_bytes").set(cache.bytes as f64);
         };
@@ -615,10 +705,30 @@ async fn lead(state: &Arc<MasterState>, session: &CoordinationGuard) -> Result<(
         tokio::time::sleep(RECONNECT).await;
         if failure == "compacted" || failure.contains("message length") {
             cache = list(client, prefix).await?;
+            place_more = true;
         }
         // An oversized historical response also needs a bounded fresh List;
         // reconnecting the same cursor would otherwise fail forever.
         // For transport errors retain each cursor and replay only deltas.
+    }
+}
+
+async fn maintain_history(
+    state: &Arc<MasterState>,
+    session: &CoordinationGuard,
+) -> Result<(), String> {
+    let publisher = state.task_store.discovery_publisher(session);
+    let mut ticker = tokio::time::interval(Duration::from_secs(300));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let Some(operation) = state.admission.try_admit_named("task_history") else {
+            return Ok(());
+        };
+        operation.phase("controller_history_maintenance");
+        if let Err(error) = publisher.prune_controller_history().await {
+            tracing::warn!(%error, "controller history maintenance deferred");
+        }
     }
 }
 
@@ -646,6 +756,7 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
             .expect("serialize discovery policy");
         let store = &state.task_store;
         metrics::gauge!("master_demand_controller_leader").set(0.0);
+        metrics::gauge!("master_task_queue_depth").set(0.0);
         loop {
             if !state.admission.is_accepting() {
                 return;
@@ -660,7 +771,7 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
             };
             let work = async {
                 let key = format!(
-                    "{}/demand-controller/leader",
+                    "{}/demand-controller/leader-v2",
                     state.config.etcd.prefix().trim_end_matches('/')
                 );
                 become_leader(store, &session, &key).await?;
@@ -669,6 +780,7 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
                 // if our lease expires. Publication also has a CAS fence.
                 tokio::select! {
                     result = lead(&state, &session) => result,
+                    result = maintain_history(&state, &session) => result,
                     result = wait_for_vacancy(store.etcd_client(), &key, Some(session.token())) => result,
                 }
             };
@@ -682,6 +794,7 @@ pub(crate) fn spawn(state: &Arc<MasterState>) -> tokio::task::JoinHandle<()> {
                 _ = health => {},
             }
             metrics::gauge!("master_demand_controller_leader").set(0.0);
+            metrics::gauge!("master_task_queue_depth").set(0.0);
             metrics::gauge!("master_demand_controller_cache_keys").set(0.0);
             metrics::gauge!("master_demand_controller_cache_bytes").set(0.0);
             if let Err(error) = store.release_coordination_lock(session).await {
@@ -702,7 +815,7 @@ mod tests {
         MasterConfig::parse_from(["test"])
     }
 
-    async fn fixture() -> (tempfile::TempDir, MasterConfig, TaskStore) {
+    pub(super) async fn fixture() -> (tempfile::TempDir, MasterConfig, TaskStore) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config();
         cfg.data_dir = dir.path().to_string_lossy().into_owned();
@@ -798,7 +911,7 @@ mod tests {
             .any(|p| p.admits_request("narrow", None)));
     }
 
-    async fn next_events(
+    pub(super) async fn next_events(
         stream: &mut etcd_client::WatchStream,
         cache: &mut Cache,
         predicate: impl Fn(&Cache) -> bool,
@@ -892,7 +1005,7 @@ mod tests {
             Duration::from_secs(1),
             wait_for_vacancy(
                 store.etcd_client(),
-                &format!("{}/demand-controller/leader", cfg.etcd.prefix()),
+                &format!("{}/demand-controller/leader-v2", cfg.etcd.prefix()),
                 Some(&old_token),
             ),
         )
@@ -943,7 +1056,7 @@ mod tests {
         );
         store.release_coordination_lock(new).await.unwrap();
     }
-    async fn rpc_count(endpoint: &str, methods: &[&str]) -> u64 {
+    pub(super) async fn rpc_count(endpoint: &str, methods: &[&str]) -> u64 {
         reqwest::get(format!("{endpoint}/metrics"))
             .await
             .unwrap()
@@ -977,7 +1090,7 @@ mod tests {
             let (_dir, cfg, store) = fixture().await;
             let policy = serde_json::to_vec(&Policy::from_config(&cfg)).unwrap();
             let leader = store.discovery_session(policy.clone()).await.unwrap();
-            let key = format!("{}/demand-controller/leader", cfg.etcd.prefix());
+            let key = format!("{}/demand-controller/leader-v2", cfg.etcd.prefix());
             become_leader(&store, &leader, &key).await.unwrap();
             let coordinator = store.merge_coordinator();
             for i in 0..256 {
@@ -1017,7 +1130,11 @@ mod tests {
             let reads = rpc_count(&endpoint, &["Range", "Txn"]).await - baseline;
             // Two request pages plus execution/failure/member/queue/running pages. All
             // membership records fit on one page even with fifty masters.
-            assert_eq!(reads, 7, "discovery reads grew with replicas={replicas}");
+            assert_eq!(
+                reads,
+                RANGES.len() as u64,
+                "discovery reads grew with replicas={replicas}"
+            );
             assert_eq!(cache.entries.len(), 256 + replicas as usize);
             eprintln!("replicas={replicas} demand_keys=256 discovery_range_txn={reads} follower_discovery_range_txn=0");
             let before = Instant::now();
@@ -1135,7 +1252,7 @@ mod tests {
         broad.worker_endpoints = vec!["http://worker-a:8080".into()];
         broad.merge_wal_interval_secs = 30;
         let second = crate::state::MasterState::new(broad).await.unwrap();
-        let key = format!("{}/demand-controller/leader", cfg.etcd.prefix());
+        let key = format!("{}/demand-controller/leader-v2", cfg.etcd.prefix());
         let controller_a = spawn(&first);
         until(async || {
             !store

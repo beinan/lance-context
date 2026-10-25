@@ -1330,26 +1330,6 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::resident_recovery::spawn(state);
     crate::planner::spawn(state);
     crate::executors::spawn(state);
-    // Dependency failure bookkeeping must never delay an accepted claim.
-    // Coalesce cleanup into one admitted, joined operation per master.
-    let history_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if !history_state.task_store.history_prune_pending() {
-                continue;
-            }
-            let Some(operation) = history_state.admission.try_admit_named("task_history") else {
-                break;
-            };
-            operation.phase("prune_terminal_history");
-            if let Err(error) = history_state.task_store.prune_pending_history().await {
-                tracing::warn!(%error, "deferred task history pruning failed");
-            }
-        }
-    });
     crate::demand_controller::spawn(state);
 
     // Optional periodic compaction auto-sweep feeds the same queue.
@@ -1423,15 +1403,14 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
         state.clone(),
         sem.clone(),
         if !claim_merges || merge_sem.is_some() {
-            TaskKinds::GENERAL.without_compact()
+            TaskKinds::GENERAL
         } else {
             // No separate merge budget: the general pool runs everything, so it
             // must still be allowed to claim MergeWal.
-            TaskKinds::ANY.without_compact()
+            TaskKinds::ANY
         },
         true,
     );
-    spawn_pool_poller(state.clone(), sem, TaskKinds::COMPACT, false);
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
@@ -1468,19 +1447,11 @@ fn spawn_pool_poller(
     spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
 }
 
-/// Decrements a gauge when dropped, so unwinding pays it back.
-struct GaugeHold(metrics::Gauge);
-impl Drop for GaugeHold {
-    fn drop(&mut self) {
-        self.0.decrement(1.0);
-    }
-}
-
 fn spawn_filtered_pool_poller(
     state: Arc<MasterState>,
     pool: Arc<Semaphore>,
     kinds: TaskKinds,
-    report_depth: bool,
+    _report_depth: bool,
     resident_only: bool,
 ) -> tokio::task::JoinHandle<()> {
     let pool_label: &'static str = if resident_only {
@@ -1492,63 +1463,69 @@ fn spawn_filtered_pool_poller(
     } else {
         "general"
     };
-    // Permits in use are split by what holds them: `claiming` while the etcd
-    // claim is outstanding, `running` once a task owns the permit. Both are
-    // updated at the permit boundaries themselves, so a claim that blocks on
-    // etcd for minutes shows as a held permit rather than as idle capacity.
-    let claiming =
-        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "claiming");
+    // Dispatch owns the waiting/claiming gauges at the actual phase
+    // boundaries; reserving capacity is not an in-flight ownership request.
+    for phase in ["waiting_for_offer", "claiming"] {
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => phase).set(0.0);
+    }
     let running =
         metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "running");
-    claiming.set(0.0);
     running.set(0.0);
     tokio::spawn(async move {
-        let mut claim_cursor = crate::task_store::SchedulerClaimCursor::default();
-        let mut notifications = state.task_store.scheduler_notifications();
-        let mut next_depth = tokio::time::Instant::now();
+        let executor = state.admission.status().executor_id;
+        let resuming = Arc::new(crate::merge_capacity::Resuming::default());
+        let mut receiver = crate::demand_controller::dispatch::Receiver::new(resuming.clone());
         loop {
-            // Consume prior changes before reading. A change during the scan
-            // remains unseen and wakes the next pass, avoiding lost wakeups.
-            notifications.borrow_and_update();
-            if report_depth && tokio::time::Instant::now() >= next_depth {
-                next_depth =
-                    tokio::time::Instant::now() + crate::scheduler_wakeup::RECONCILE_INTERVAL;
-                if let Ok(queued) = state.task_store.queue_depth().await {
-                    metrics::gauge!("master_task_queue_depth").set(queued as f64);
+            if !state.admission.is_accepting() {
+                if let Err(error) = receiver.close(&state.task_store).await {
+                    tracing::warn!(%error, "dispatch session cleanup failed during drain");
                 }
+                return;
             }
             while pool.available_permits() > 0 {
                 // Reserve both budgets before taking durable table ownership.
-                let compact_permit = if kinds == TaskKinds::COMPACT {
-                    match state.compaction_permits.clone().try_acquire_owned() {
-                        Ok(permit) => Some(permit),
-                        Err(_) => break,
-                    }
+                let compact_permit = if kinds.contains(TaskKind::Compact) {
+                    state.compaction_permits.clone().try_acquire_owned().ok()
                 } else {
                     None
                 };
+                if kinds == TaskKinds::COMPACT && compact_permit.is_none() {
+                    break;
+                }
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
                 let Some(operation) = state.admission.try_admit_named(pool_label) else {
                     break;
                 };
-                // Held across the await so a poller aborted mid-claim (drain,
-                // shutdown, test teardown) still pays the gauge back.
-                claiming.increment(1.0);
-                let claiming_hold = GaugeHold(claiming.clone());
-                operation.phase("claiming");
-                let claim_start = std::time::Instant::now();
-                let targets = resident_only.then(|| crate::local_merge::targets(&state.config));
-                let claim = state
-                    .task_store
-                    .claim_scheduler_slice(kinds, targets.as_deref(), &mut claim_cursor, &operation)
+                // Shared pools advertise one combined policy so an idle
+                // compact ticket cannot monopolize capacity needed by other kinds.
+                let offered_kinds = if compact_permit.is_some() {
+                    kinds
+                } else {
+                    kinds.without_compact()
+                };
+                let refresh_compaction =
+                    kinds.contains(TaskKind::Compact) && compact_permit.is_none();
+                let ticket = crate::demand_controller::dispatch::Ticket::new(
+                    &state.config,
+                    &executor,
+                    pool_label,
+                    offered_kinds,
+                    resident_only,
+                );
+                let claim = receiver
+                    .claim(&state, &ticket, &operation, refresh_compaction)
                     .await;
-                drop(claiming_hold);
                 match claim {
-                    Ok(Some(claim)) => {
+                    Ok(Some((claim, claim_elapsed))) => {
+                        let compact_permit = if claim.task.kind == TaskKind::Compact {
+                            compact_permit
+                        } else {
+                            drop(compact_permit);
+                            None
+                        };
                         operation.task(&claim.task.id, &claim.task.target);
-                        let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
                         // claimed table waits on a compaction semaphore.
                         let timing = TaskClaimTiming {
@@ -1564,6 +1541,7 @@ fn spawn_filtered_pool_poller(
                             Duration::from_secs(state.config.legacy_merge_foreground_secs),
                             running.clone(),
                             operation.clone(),
+                            resuming.clone(),
                         );
                         tokio::spawn(async move {
                             crate::merge_capacity::scope(capacity, run_task(&st, claim, timing))
@@ -1574,13 +1552,23 @@ fn spawn_filtered_pool_poller(
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        tracing::warn!(error = %error, "scheduler queue poll failed");
+                        tracing::warn!(error = %error, "controller assignment failed; retrying without a queue scan");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         break;
                     }
                 }
             }
-            crate::scheduler_wakeup::wait(&mut notifications, &pool, claim_cursor.has_more_pages())
-                .await;
+            // Wake promptly when productive work releases local capacity.
+            // The timer only checks in-memory admission/handles empty claims;
+            // there is no recurring etcd scan or broad queue subscription.
+            if pool.available_permits() == 0 {
+                tokio::select! {
+                    permit = pool.clone().acquire_owned() => { drop(permit); },
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
     })
 }
@@ -1935,6 +1923,7 @@ mod tests {
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
         let pool = Arc::new(Semaphore::new(2));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::COMPACT, false);
         tokio::time::sleep(Duration::from_millis(650)).await;
         assert_eq!(
@@ -1985,6 +1974,7 @@ mod tests {
         .await
         .unwrap();
         poller.abort();
+        controller.abort();
     }
 
     #[tokio::test]
@@ -4327,6 +4317,7 @@ mod tests {
         let budget = state.local_append.as_ref().unwrap().budget.clone();
         let held = budget.reserve(budget.limit()).await;
         let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let controller = crate::demand_controller::spawn(&state);
         let merge_poller = spawn_pool_poller(
             state.clone(),
             Arc::new(Semaphore::new(1)),
@@ -4385,6 +4376,7 @@ mod tests {
         );
         merge_poller.abort();
         general.abort();
+        controller.abort();
     }
 
     /// Enqueuing the same experiment twice while queued de-dupes to one task.
@@ -4646,6 +4638,7 @@ mod tests {
         let state = MasterState::new(cfg).await.unwrap();
         let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
         let pool = Arc::new(Semaphore::new(1));
+        let controller = crate::demand_controller::spawn(&state);
         let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::MERGE_WAL, false);
         tokio::time::timeout(Duration::from_secs(5), started.notified())
             .await
@@ -4689,6 +4682,22 @@ mod tests {
             TaskState::Queued
         );
         assert!(state.admission.status().active_operations > 0);
+        // Make the idle reservation deterministic: the only free slot is
+        // advertised while the next queued task still depends on this response.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state
+                .admission
+                .status()
+                .operations
+                .values()
+                .any(|op| op.phase == "waiting_for_offer")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pool.available_permits(), 0);
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), async {
             while state
@@ -4717,6 +4726,7 @@ mod tests {
         assert_eq!(pool.available_permits(), 1);
         poller.abort();
         let _ = poller.await;
+        controller.abort();
         server.abort();
     }
 
@@ -5767,6 +5777,62 @@ mod tests {
             artifact_type: None,
             metadata: None,
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated ETCD_TEST_ENDPOINTS"]
+    async fn controller_shared_capacity_keeps_index_moving_while_compaction_budget_is_full() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.task_concurrency = 1;
+        cfg.merge_wal_concurrency = 0;
+        let state = MasterState::new(cfg).await.unwrap();
+        for name in ["exp", "other"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(name)).await.unwrap();
+            for n in 0..3 {
+                writer
+                    .add(&[rollout_record(&format!("row-{n}"))])
+                    .await
+                    .unwrap();
+                writer.cleanup_own_shard().await.unwrap();
+            }
+        }
+        let occupied = state
+            .compaction_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+        let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+        let scheduler = spawn_scheduler(&state);
+        let indexed = await_terminal(&state, &index.id).await;
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        let waiting = state.task_store.get(&compact.id).await.unwrap().unwrap();
+        assert_eq!(waiting.state, TaskState::Queued);
+        assert_eq!(
+            waiting.started_at, None,
+            "no task may own storage while waiting for the compaction permit"
+        );
+        drop(occupied);
+        let compacted = await_terminal(&state, &compact.id).await;
+        assert_eq!(compacted.state, TaskState::Done, "{compacted:?}");
+        for name in ["exp", "other"] {
+            assert_eq!(
+                lance::Dataset::open(&state.rollout_uri(name))
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                3
+            );
+        }
+        state.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+            .await
+            .unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
     }
 }
 
