@@ -10,6 +10,8 @@ use crate::{
 };
 use lance_context_core::annotation_staging::Limits;
 
+mod open;
+
 #[cfg(unix)]
 mod process;
 
