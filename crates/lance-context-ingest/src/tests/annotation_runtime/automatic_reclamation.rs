@@ -263,3 +263,5 @@ async fn annotation_owner_refuses_collection_when_a_native_tag_exists() -> Resul
     assert_eq!(files(&path)?, before);
     c.shutdown().await
 }
+
+mod deletion_faults;
