@@ -1,3 +1,4 @@
+pub mod annotation;
 pub mod schema_spec;
 pub use schema_spec::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
 mod trace;
