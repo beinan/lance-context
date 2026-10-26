@@ -10,6 +10,7 @@ use lance_context_api::annotation::AnnotationFieldUpdate::{Clear, Set};
 use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
+mod compaction;
 mod reclamation;
 mod views;
 
