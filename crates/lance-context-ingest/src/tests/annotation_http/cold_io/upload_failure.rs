@@ -103,7 +103,9 @@ async fn exercise() -> Result<()> {
     })
     .await?;
     let view = service.observation().await.0;
-    assert_eq!(view.applied, acknowledged[2].1.index);
+    // Producer-open/control records may advance the processed cursor beyond
+    // the last mutation; the waiting mutation itself must remain unapplied.
+    assert!(view.applied >= acknowledged[2].1.index);
     assert!(view.applied < accepted.position.index);
     assert_eq!(view.frozen_entries, 1);
     assert_eq!(view.active_entries, 1);
