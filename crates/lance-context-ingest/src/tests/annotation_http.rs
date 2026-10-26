@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 const TOKEN: &str = "annotation-test-workload-token-00000000";
 
 mod batches;
+mod cold_io;
 mod pressure;
 mod read_cut;
 
