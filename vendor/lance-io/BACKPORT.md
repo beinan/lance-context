@@ -87,3 +87,23 @@ checks for identical requests, headers, bounded retries, and no re-uploads.
 
 Replace the fork pin with an upstream commit containing the fix when available,
 and remove both patches after a compatible crates.io release includes it.
+
+## Classify exhausted SDK failures separately from throttling
+
+An additional local correction removes the generic `retries, max_retries` test
+from `is_throttle_error`. Native SDK errors include this metadata after ordinary
+HTTP 500 failures and read timeouts as well as throttle responses. Classifying
+every exhausted retry as throttling restarts the SDK retry loop and decreases
+the AIMD rate without an actual throttle signal.
+
+The classifier now requires explicit status or provider throttle messages.
+Existing 429 handling is preserved, and 503 status context is recognized without
+depending on the retry metadata. SDK retry limits, timeouts and the AIMD mechanism
+are unchanged. This is separate from the multipart completion backport above.
+
+The context ingestion regression `annotation_storage_retry_preserves_sdk_error_boundaries`
+uses the real Azure SDK and this outer wrapper with an injected HTTP transport.
+It checks exhausted 500/read-timeout attempts, 429/503 controls, permission errors
+and unknown conditional-create PUT timeouts. Its injected timeouts establish
+request counts and error classification, not real network timeout durations or
+an explanation of a particular storage latency incident.

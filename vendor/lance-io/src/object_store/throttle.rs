@@ -58,29 +58,26 @@ use crate::object_store::ObjectStoreParams;
 /// Regrettably, this information is not fully exposed by the `object_store` crate.
 /// There is no generic mechanism for a custom object store to return a throttle error.
 ///
-/// However, the builtin object stores all use RetryError when retries are configured and
-/// throttle errors are returned.  Sadly, RetryError is not a public type, so we have to
-/// infer it from the error message.  This is potentially dangerous because these errors
-/// often include the URI itself and that URI could have any characters in it (e.g. if we
-/// look for 429 then we might match a 429 in a UUID).These error messages currently look like:
-///
-/// ", after ... retries, max_retries: ..., retry_timeout: ..."
-///
-/// So, as a crude heuristic, which should work for the builtin object stores, but won't
-/// work for custom object stores, we simply look for the string "retries, max_retries"
-/// in the error message.
+/// Builtin stores use a private RetryError, so classification relies on explicit
+/// status or provider error messages. Retry-exhaustion metadata alone is not a
+/// throttle signal: ordinary server errors and transport timeouts carry it too.
+/// Treating those errors as throttles would restart the exhausted SDK retry loop
+/// and lower the rate without evidence of throttling. Match status context rather
+/// than bare numbers, which may occur in an object URI.
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
         let message = source.to_string();
         let lowercase = message.to_ascii_lowercase();
-        lowercase.contains("retries, max_retries")
-            || lowercase.contains("serverbusy")
+        lowercase.contains("serverbusy")
             || lowercase.contains("server busy")
             || lowercase.contains("egress is over the account limit")
             || lowercase.contains("http 429")
             || lowercase.contains("status code: 429")
             || lowercase.contains("429 too many requests")
+            || lowercase.contains("http 503")
+            || lowercase.contains("status code: 503")
+            || lowercase.contains("503 service unavailable")
             || lowercase.contains("too many requests")
             || lowercase.contains("slowdown")
             || lowercase.contains("please reduce your request rate")
@@ -1331,11 +1328,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::retry_error("Error after 10 retries, max_retries: 10, retry_timeout: 180s", true)]
+    #[case::retry_error("Error after 10 retries, max_retries: 10, retry_timeout: 180s", false)]
     #[case::retries_in_message(
         "request failed, after 3 retries, max_retries: 5, retry_timeout: 60s",
-        true
+        false
     )]
+    #[case::exhausted_server_error(
+        "Error after 3 retries, max_retries: 3, retry_timeout: 180s - Server returned non-2xx status code: 500 Internal Server Error",
+        false
+    )]
+    #[case::exhausted_transport_timeout(
+        "Error after 3 retries, max_retries: 3, retry_timeout: 180s - HTTP error: operation timed out",
+        false
+    )]
+    #[case::exhausted_service_unavailable(THROTTLE_ERROR_RESPONSE, true)]
+    #[case::http_503_without_retries("HTTP 503 Service Unavailable", true)]
     #[case::not_found("Object not found", false)]
     #[case::permission_denied("Access denied", false)]
     #[case::timeout("Connection timed out", false)]
