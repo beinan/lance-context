@@ -54,6 +54,21 @@ pub struct Observation {
     pub examined: u64,
     pub deleted: u64,
     pub deleted_bytes: u64,
+    /// Failed DELETE attempts, including unknown replies. Not failed mutations.
+    #[serde(default)]
+    pub delete_failures: u64,
+    /// Unresolved immutable paths in the one sealed page blocking publication.
+    #[serde(default)]
+    pub pending_objects: usize,
+    #[serde(default)]
+    pub pending_bytes: u64,
+}
+
+struct SealedPage {
+    store: Arc<dyn object_store::ObjectStore>,
+    paths: Vec<(Path, u64)>,
+    batch_size: usize,
+    _workspace: MergeReservation,
 }
 
 pub(super) struct Collector {
@@ -61,6 +76,7 @@ pub(super) struct Collector {
     next_run: tokio::time::Instant,
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
+    sealed: Option<SealedPage>,
 }
 impl Collector {
     pub(super) fn new(options: Options, budget: &Arc<MergeMemoryBudget>) -> Result<Self> {
@@ -70,6 +86,7 @@ impl Collector {
             next_run: tokio::time::Instant::now(),
             listing: None,
             deferred: None,
+            sealed: None,
         })
     }
 
@@ -79,16 +96,24 @@ impl Collector {
         catalog: &materializer::Publisher,
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if tokio::time::Instant::now() < self.next_run {
-            return Ok(());
+            return Ok(self.sealed.is_none());
         }
-        let result = self.collect_page(service, catalog, storage, budget).await;
+        let result = if self.sealed.is_some() {
+            // Reissue only unresolved immutable DELETEs from the original,
+            // successfully fenced page. Never relist or add paths here.
+            service.check_owner(catalog.authority()).await?;
+            self.delete_page(service).await?;
+            Ok(())
+        } else {
+            self.collect_page(service, catalog, storage, budget).await
+        };
         // LIST/protection/DELETE can take longer than the configured interval.
         // Starting the clock before that I/O makes every following publisher
         // iteration eligible for another pass, starving materialization.
         self.next_run = tokio::time::Instant::now() + self.options.interval;
-        result
+        result.map(|()| self.sealed.is_none())
     }
 
     async fn collect_page(
@@ -134,7 +159,7 @@ impl Collector {
             );
         }
         let page_charge = self.options.max_bytes * 3;
-        let _workspace = budget.reserve(page_charge).await;
+        let workspace = budget.reserve(page_charge).await;
         if self.listing.is_none() {
             self.listing = Some(store.list(Some(&storage.base)));
         }
@@ -238,28 +263,71 @@ impl Collector {
         } else {
             1
         };
-        let outcomes = stream::iter(candidates)
-            .chunks(batch_size)
-            .map(|batch| deletion::delete_batch(store.clone(), batch))
+        self.sealed = Some(SealedPage {
+            store,
+            paths: candidates.into_iter().collect(),
+            batch_size,
+            _workspace: workspace,
+        });
+        self.delete_page(service).await?;
+        Ok(())
+    }
+
+    async fn delete_page(&mut self, service: &Service) -> Result<()> {
+        let page = self.sealed.as_mut().unwrap();
+        let outcomes = stream::iter(std::mem::take(&mut page.paths))
+            .chunks(page.batch_size)
+            .map(|batch| {
+                let store = page.store.clone();
+                async move {
+                    let results = deletion::delete_batch(store, &batch).await;
+                    (batch, results)
+                }
+            })
             .buffer_unordered(self.options.delete_parallelism)
-            .flat_map(stream::iter)
             .collect::<Vec<_>>()
             .await;
+        // Locally detected response corruption remains a protocol failure.
+        // It must not be treated like an unresolved storage DELETE.
+        if outcomes.iter().any(|(_, results)| {
+            results
+                .iter()
+                .any(|result| result.as_ref().err().is_some_and(deletion::invalid))
+        }) {
+            bail!("invalid sealed annotation deletion response");
+        }
         let mut first_error = None;
         let mut observed = service.shared.reclamation.lock().unwrap();
-        for outcome in outcomes {
-            match outcome {
-                Ok(bytes) => {
-                    observed.deleted += 1;
-                    observed.deleted_bytes += bytes;
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
+        for (batch, results) in outcomes {
+            if results.len() != batch.len() {
+                // A whole-request failure leaves every path unresolved. Some
+                // may already be absent; repeating these immutable DELETEs is safe.
+                observed.delete_failures += batch.len() as u64;
+                page.paths.extend(batch);
+                first_error = first_error.or_else(|| results.into_iter().find_map(Result::err));
+                continue;
+            }
+            for (path, outcome) in batch.into_iter().zip(results) {
+                match outcome {
+                    Ok(bytes) => {
+                        observed.deleted += 1;
+                        observed.deleted_bytes += bytes;
+                    }
+                    Err(error) => {
+                        observed.delete_failures += 1;
+                        page.paths.push(path);
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
         }
+        observed.pending_objects = page.paths.len();
+        observed.pending_bytes = page.paths.iter().map(|(_, bytes)| bytes).sum();
         if let Some(error) = first_error {
-            return Err(error).context("deleting sealed annotation file page");
+            eprintln!("sealed annotation deletion remains pending: {error}");
+        }
+        if page.paths.is_empty() {
+            self.sealed = None;
         }
         Ok(())
     }

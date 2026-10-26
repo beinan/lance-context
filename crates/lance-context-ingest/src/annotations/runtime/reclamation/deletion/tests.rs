@@ -52,6 +52,8 @@ impl HttpService for Transport {
                     "404 Not Found"
                 } else if self.failure == 1 && index == 1 {
                     "403 Forbidden"
+                } else if self.failure == 3 && index == 1 {
+                    "503 Service Unavailable"
                 } else {
                     "202 Accepted"
                 };
@@ -73,7 +75,7 @@ impl HttpService for Transport {
 
 #[tokio::test]
 async fn azure_bulk_collection_keeps_per_path_and_whole_request_failures() {
-    for failure in 0..=2 {
+    for failure in 0..=3 {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let store = MicrosoftAzureBuilder::new()
             .with_account("account")
@@ -96,8 +98,8 @@ async fn azure_bulk_collection_keeps_per_path_and_whole_request_failures() {
                     100 + index,
                 )
             })
-            .collect();
-        let outcomes = delete_batch(Arc::new(store), batch).await;
+            .collect::<Vec<_>>();
+        let outcomes = delete_batch(Arc::new(store), &batch).await;
         assert_eq!(*requests.lock().unwrap(), vec![256]);
         if failure == 2 {
             assert_eq!(outcomes.len(), 1);
@@ -114,7 +116,7 @@ async fn azure_bulk_collection_keeps_per_path_and_whole_request_failures() {
             );
             assert_eq!(
                 outcomes.iter().filter(|r| r.is_err()).count(),
-                usize::from(failure)
+                usize::from(failure != 0)
             );
             for (index, outcome) in outcomes.iter().enumerate().skip(2) {
                 assert_eq!(*outcome.as_ref().unwrap(), 100 + index as u64);

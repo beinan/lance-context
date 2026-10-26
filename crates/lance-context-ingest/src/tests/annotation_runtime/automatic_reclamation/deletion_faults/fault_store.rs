@@ -18,11 +18,19 @@ pub(super) enum Action {
         entered: oneshot::Sender<()>,
         resume: oneshot::Receiver<()>,
     },
+    FailBefore,
+    WrongReply,
+    #[cfg(feature = "http")]
+    FailWhile(Arc<std::sync::atomic::AtomicBool>),
+    LoseReply,
+    #[cfg(unix)]
+    CrashAfter(std::path::PathBuf),
 }
 
 #[derive(Debug, Default)]
 pub(super) struct Faults {
     actions: Mutex<BTreeMap<Path, Action>>,
+    pub calls: Mutex<Vec<Path>>,
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -158,26 +166,57 @@ impl ObjectStore for FaultStore {
                 let faults = faults.clone();
                 async move {
                     let path = path?;
+                    faults.calls.lock().unwrap().push(path.clone());
                     let action = faults.actions.lock().unwrap().remove(&path);
-                    if let Some(Action::Pause { entered, resume }) = action {
-                        // Once sent to remote storage, a DELETE can outlive the
-                        // client's future. Keep the real operation in the test
-                        // server's owned task set, including across owner exit.
-                        let (reply, response) = oneshot::channel();
-                        let deleting = path.clone();
-                        let task = tokio::spawn(async move {
-                            let _ = entered.send(());
-                            let result = async {
-                                resume.await.map_err(|_| failure())?;
-                                inner.delete(&deleting).await
+                    let (lose, crash): (bool, Option<std::path::PathBuf>) = match action {
+                        Some(Action::Pause { entered, resume }) => {
+                            // Once sent to remote storage, a DELETE can outlive the
+                            // client's future. Keep the real operation in the test
+                            // server's owned task set, including across owner exit.
+                            let (reply, response) = oneshot::channel();
+                            let deleting = path.clone();
+                            let task = tokio::spawn(async move {
+                                let _ = entered.send(());
+                                let result = async {
+                                    resume.await.map_err(|_| failure())?;
+                                    inner.delete(&deleting).await
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            });
+                            faults.remote.lock().unwrap().push(task);
+                            response.await.map_err(|_| failure())??;
+                            return Ok(path);
+                        }
+                        Some(Action::FailBefore) => return Err(failure()),
+                        Some(Action::WrongReply) => {
+                            inner.delete(&path).await?;
+                            return Ok(path.join("unexpected"));
+                        }
+                        #[cfg(feature = "http")]
+                        Some(Action::FailWhile(blocked)) => {
+                            if blocked.load(std::sync::atomic::Ordering::SeqCst) {
+                                faults
+                                    .actions
+                                    .lock()
+                                    .unwrap()
+                                    .insert(path.clone(), Action::FailWhile(blocked));
+                                return Err(failure());
                             }
-                            .await;
-                            let _ = reply.send(result);
-                        });
-                        faults.remote.lock().unwrap().push(task);
-                        response.await.map_err(|_| failure())??;
-                    } else {
-                        inner.delete(&path).await?;
+                            (false, None)
+                        }
+                        Some(Action::LoseReply) => (true, None),
+                        #[cfg(unix)]
+                        Some(Action::CrashAfter(marker)) => (false, Some(marker)),
+                        None => (false, None),
+                    };
+                    inner.delete(&path).await?;
+                    if let Some(marker) = crash {
+                        std::fs::write(marker, path.as_ref()).map_err(|_| failure())?;
+                        std::future::pending::<()>().await;
+                    }
+                    if lose {
+                        return Err(failure());
                     }
                     Ok(path)
                 }
