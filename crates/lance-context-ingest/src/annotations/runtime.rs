@@ -21,6 +21,8 @@ pub struct Configuration {
 pub struct Runtime {
     driver: Driver,
     publisher: Publisher,
+    #[cfg(feature = "http")]
+    read_cut: u64,
 }
 
 struct Publisher {
@@ -48,10 +50,11 @@ impl Runtime {
         Ok(self)
     }
     #[cfg(feature = "http")]
-    pub(crate) fn http_binding(&self) -> (Service, p::Authority) {
+    pub(crate) fn http_binding(&self) -> (Service, p::Authority, u64) {
         (
             self.publisher.service.clone(),
             self.publisher.catalog.authority().clone(),
+            self.read_cut,
         )
     }
     /// The caller supplies the existing durable scheduler's acquisition identity.
@@ -146,7 +149,21 @@ impl Runtime {
             );
             *service.shared.replay_cut.lock().unwrap() = Some(through);
         }
-        Ok((service, Self { driver, publisher }))
+        // Ownership was fenced before opening this view. An owned point read
+        // must first replay every predecessor write, including ACKed updates
+        // absent from Lance. Later successful writes already await local apply;
+        // reads need not wait for later, still-unacknowledged WAL proposals.
+        #[cfg(feature = "http")]
+        let read_cut = service.barrier().await?;
+        Ok((
+            service,
+            Self {
+                driver,
+                publisher,
+                #[cfg(feature = "http")]
+                read_cut,
+            },
+        ))
     }
 
     /// No detached tasks. A storage/protocol failure stops this owner and its
