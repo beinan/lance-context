@@ -297,11 +297,18 @@ impl Service {
                 upload.scope.contract.max_rows,
                 value_bytes,
             )?;
+            let rows = mutations.len() as u32;
+            drop(mutations);
+            // Validation owns decoded patches only inside this blocking task.
+            // Keep the existing encoded-body allowance through WAL submission
+            // and applied visibility, but release the discarded decode workspace.
+            let mut reservation = upload.reservation;
+            reservation.shrink_to(body.len() * 3);
             Ok(PreparedAppend {
                 batch: Batch::new(upload.scope.table, 0, producer, sequence, body),
-                rows: mutations.len() as u32,
+                rows,
                 scope: upload.scope,
-                _reservation: upload.reservation,
+                _reservation: reservation,
             })
         })
         .await?

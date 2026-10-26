@@ -119,6 +119,23 @@ impl MergeReservation {
         self.bytes
     }
 
+    /// Release capacity after the covered allocations have been dropped.
+    /// A larger value leaves the reservation unchanged; growth requires
+    /// `try_grow_to` so shrinking can never wait while holding permits.
+    pub fn shrink_to(&mut self, new_total: usize) {
+        if new_total >= self.bytes {
+            return;
+        }
+        let keep = MergeMemoryBudget::permits_for(new_total).min(self.budget.permits_total());
+        let release = self.permits - keep;
+        self.budget
+            .reserved
+            .fetch_sub(self.bytes - new_total, Ordering::AcqRel);
+        self.bytes = new_total;
+        self.permits = keep;
+        self.budget.permits.add_permits(release as usize);
+    }
+
     /// Try to cover `new_total` without waiting while holding permits.
     /// False leaves the reservation unchanged. The caller must release any
     /// unaccounted batches and either commit a complete prefix or retry later.
@@ -164,6 +181,47 @@ mod tests {
         drop(a);
         assert_eq!(budget.reserved(), 0);
         assert_eq!(budget.permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn releasing_workspace_admits_a_waiter_while_payload_remains_held() {
+        let budget = MergeMemoryBudget::new(4 * PERMIT_BYTES);
+        let mut held = budget.reserve(3 * PERMIT_BYTES).await;
+        let next = budget.reserve(2 * PERMIT_BYTES);
+        tokio::pin!(next);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut next)
+            .await
+            .is_err());
+
+        // Retain a partial-MiB payload charge while freeing its decode workspace.
+        held.shrink_to(PERMIT_BYTES + 1);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .expect("the waiter must use released workspace before payload drop");
+        assert_eq!(budget.reserved(), 3 * PERMIT_BYTES + 1);
+        assert_eq!(budget.permits.available_permits(), 0);
+        held.shrink_to(4 * PERMIT_BYTES);
+        assert_eq!(held.bytes(), PERMIT_BYTES + 1);
+        drop((held, admitted));
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn oversized_reservation_can_shrink_then_grow_without_losing_permits() {
+        let budget = MergeMemoryBudget::new(2 * PERMIT_BYTES);
+        let mut held = budget.reserve(10 * PERMIT_BYTES).await;
+        held.shrink_to(3 * PERMIT_BYTES);
+        assert_eq!(budget.reserved(), 3 * PERMIT_BYTES);
+        assert_eq!(budget.permits.available_permits(), 0);
+        held.shrink_to(1);
+        assert_eq!(budget.permits.available_permits(), 1);
+        assert!(held.try_grow_to(2 * PERMIT_BYTES));
+        held.shrink_to(0);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(budget.permits.available_permits(), 2);
+        drop(held);
+        assert_eq!(budget.permits.available_permits(), 2);
     }
 
     /// The property that matters in production: with the budget full, the next
