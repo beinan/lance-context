@@ -25,6 +25,9 @@ struct Workload {
     max_batches: Option<u64>,
     phase: String,
     slots: [u32; 2],
+    /// Reuse slots only after committed close and retirement of their source tails.
+    #[serde(default)]
+    expected_generations: [u64; 2],
     ingresses: [String; 2],
     directory: PathBuf,
     #[serde(default)]
@@ -54,6 +57,7 @@ impl Workload {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 && self.slots[0] != self.slots[1]
                 && self.slots.iter().all(|s| *s < config.limits.producer_slots)
+                && self.expected_generations.iter().all(|g| *g < u64::MAX)
                 && self.prior_journals.len() <= 16,
             "invalid bounded workload"
         );
