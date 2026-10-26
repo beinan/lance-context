@@ -121,6 +121,65 @@ fn label_patch(limits: &Limits) -> Result<Bytes> {
 }
 
 #[tokio::test]
+async fn prepared_annotations_release_validation_workspace_before_submit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let storage = Storage::resolve(
+        root.path().join("turns.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::new(lance::session::Session::default()),
+    )
+    .await?;
+    let limits = Limits {
+        value_bytes: 4096,
+        retained_bytes: 16 << 20,
+        retained_entries: 16384,
+        ..Limits::default()
+    };
+    let binding = TableBinding {
+        max_rows: 2048,
+        ..binding()
+    };
+    annotation_publication::seed_contract(&c, &storage, Service::contract(&binding, &limits)?)
+        .await?;
+    let upload_budget = MergeMemoryBudget::new(32 << 20);
+    let (service, _driver) = Service::connect(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding,
+        &storage,
+        limits.clone(),
+        upload_budget.clone(),
+        MergeMemoryBudget::new(32 << 20),
+    )
+    .await?;
+    let producer = producer(&service, 1).await?;
+    let ids = (0..2048).map(|n| format!("t{n:08}")).collect::<Vec<_>>();
+    let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+    let body = wire(&limits, &ids, 1, Some("reviewed"), 0, None)?;
+    let mut held = Vec::new();
+    // Keep all original payloads alive without an applier or ACK releasing them.
+    // Previously each retained the worst-case decode workspace (~9 MiB), so
+    // the fourth request could not enter a 32 MiB budget.
+    for sequence in 1..=4 {
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(&service, &producer, sequence, body.clone()),
+        )
+        .await
+        .context("retained payloads must not retain discarded validation workspace")??;
+        assert_eq!(prepared.rows(), 2048);
+        assert_eq!(prepared.body(), &body);
+        held.push(prepared);
+    }
+    assert_eq!(upload_budget.reserved(), 4 * body.len() * 3);
+    drop(held);
+    assert_eq!(upload_budget.reserved(), 0);
+    c.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_scan() -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
