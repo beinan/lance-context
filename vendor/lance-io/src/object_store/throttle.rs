@@ -1820,8 +1820,7 @@ mod tests {
             let errors = futures::stream::iter((0..n).map(|_| {
                 Err(object_store::Error::Generic {
                     store: "ThrottlingListMock",
-                    source: "request failed, after 3 retries, max_retries: 5, retry_timeout: 60s"
-                        .into(),
+                    source: THROTTLE_ERROR_RESPONSE.into(),
                 })
             }));
             errors.chain(inner_stream).boxed()
