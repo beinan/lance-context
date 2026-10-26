@@ -4,13 +4,17 @@
 //! the final catalog operation and opens its recovery base after acquisition.
 use super::*;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
-use object_store::{path::Path, ObjectMeta, ObjectStoreExt};
+use object_store::{path::Path, ObjectMeta};
+
+mod deletion;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub max_objects: usize,
     pub max_bytes: usize,
+    /// Concurrent SDK delete calls. S3/Azure calls contain at most 256 paths;
+    /// other backends retain one path per call.
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
     /// does not consume this cooldown.
@@ -226,17 +230,19 @@ impl Collector {
         );
         // An unknown fence result returns above without deleting anything. A
         // subsequent owner enumerates again; it never guesses the old outcome.
+        // Each cloud chunk fits a single native batch (Azure: 256, S3: 1000).
+        // Keep the same sealed page and configured call concurrency. Passing
+        // one path to ObjectStoreExt::delete would defeat SDK bulk deletion.
+        let batch_size = if matches!(object_store.scheme(), "az" | "s3") {
+            256
+        } else {
+            1
+        };
         let outcomes = stream::iter(candidates)
-            .map(|(path, bytes)| {
-                let store = store.clone();
-                async move {
-                    match store.delete(&path).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(bytes),
-                        Err(error) => Err(error),
-                    }
-                }
-            })
+            .chunks(batch_size)
+            .map(|batch| deletion::delete_batch(store.clone(), batch))
             .buffer_unordered(self.options.delete_parallelism)
+            .flat_map(stream::iter)
             .collect::<Vec<_>>()
             .await;
         let mut first_error = None;
