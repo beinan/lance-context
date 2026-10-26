@@ -54,6 +54,17 @@ Unknown seals still issue no deletion and require fenced recovery. After a crash
 the successor uses the existing fresh listing/protection/sealing protocol; the
 process-local page is not a new durable journal.
 
+Data listing uses a time slice bounded by the collection interval, capped at one
+second. If the next listing item is pending, the runtime retains that exact
+stream and closes any candidates already collected into the usual finite page.
+Publication can proceed between slices. Each subsequent pass captures current
+protected bases and quorum history before protecting/sealing its candidates;
+the stream's continuation token or pending response is not discarded. Actual
+listing errors still stop the runtime, and an unresolved sealed DELETE still
+pauses publication. Reference checks, protection reads and DELETE are not covered
+by this data-listing slice. Prolonged listing delays can temporarily increase
+obsolete blob files; bounded working memory is not a bound on total blob garbage.
+
 The Rust tests exercise plan-only recovery, prepared-file reuse, lost selected
 manifest replies, automatic timed result-only publication, and repeated concurrent
 status/score updates with complete drain between cycles. A separate Rust child

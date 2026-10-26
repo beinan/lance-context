@@ -1,7 +1,8 @@
 //! Bounded file collection for an exclusively owned annotation table.
-//! Called only between publications in the same serial publisher loop. Native
-//! preparation cannot overlap listing/sealing in this owner; a successor fences
-//! the final catalog operation and opens its recovery base after acquisition.
+//! Called only between publications in the same serial publisher loop. A pending
+//! listing response can span publications; candidate protection/sealing cannot
+//! overlap native preparation. A successor fences the final catalog operation
+//! and opens its recovery base after acquisition.
 use super::*;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectMeta};
@@ -17,7 +18,8 @@ pub struct Options {
     /// other backends retain one path per call.
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
-    /// does not consume this cooldown.
+    /// does not consume this cooldown. Data listing yields after at most this
+    /// interval (capped at one second), retaining the same listing stream.
     pub interval: Duration,
 }
 impl Default for Options {
@@ -166,11 +168,22 @@ impl Collector {
         let mut candidates = BTreeMap::new();
         let mut bytes = 0;
         let mut examined = 0;
+        let until = tokio::time::Instant::now() + self.options.interval.min(Duration::from_secs(1));
         for _ in 0..self.options.max_objects {
+            // Check even when the stream is immediately ready. Only stop polling
+            // this borrowed next-item future: the stream retains its in-flight
+            // request and continuation token across publications.
+            if tokio::time::Instant::now() >= until {
+                break;
+            }
             let (path, size) = if let Some(deferred) = self.deferred.take() {
                 deferred
             } else {
-                let Some(meta) = self.listing.as_mut().unwrap().try_next().await? else {
+                let next = self.listing.as_mut().unwrap().try_next();
+                let Ok(next) = tokio::time::timeout_at(until, next).await else {
+                    break;
+                };
+                let Some(meta) = next? else {
                     self.listing = None;
                     break;
                 };
@@ -194,6 +207,11 @@ impl Collector {
             let mut observed = service.shared.reclamation.lock().unwrap();
             observed.passes += 1;
             observed.examined += examined;
+        }
+        if candidates.is_empty() {
+            // Nothing to protect, seal or delete in this slice. The next pass
+            // captures current roots before classifying further listing items.
+            return Ok(());
         }
         // This finite page is now closed. No more listing or candidate additions
         // occur after protection/sealing, even if a DELETE outlives this owner.
