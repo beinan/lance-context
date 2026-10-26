@@ -51,11 +51,14 @@ The workload requires an even turn count between 256 and 65,536, divisible by
 both writers' batch size. Batches contain 1–2048 rows and duration is 1–600 seconds.
 `max_batches` can cap each writer for an unmaterialized recovery experiment.
 After a run has finished and its pending outcomes and final values are verified,
-its slots can be reused with `expected_generations`, a two-element array matching
-`slots`. Supply the generation saved in each old `producer.json`; the default is
-`[0, 0]` for unused slots. Use a fresh output directory. Opening fences the old
-producers, so this is not a way to recover an unresolved request. The client
-persists the new open identity and checks the returned generation.
+close each producer with the receipt for its last acknowledged request and wait
+for its source tail to be retired. Only then can its slot be reused with
+`expected_generations`, a two-element array matching `slots`. Supply the generation
+saved in each old `producer.json`; the default is `[0, 0]` for unused slots. Use a
+fresh output directory. Changing the expected generation does not close an open
+producer; unresolved requests must be reconciled before closing. The client
+persists the new open identity and checks the returned generation. The probe
+does not close producers automatically at the end of a run.
 
 For indexed point lookups, add `"id_index": true` before seeding. Seed builds an
 ID B-tree and emits `id_index_uuid`; copy that UUID into `expected_id_index` in

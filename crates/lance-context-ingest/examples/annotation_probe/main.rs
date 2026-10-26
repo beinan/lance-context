@@ -25,7 +25,7 @@ struct Workload {
     max_batches: Option<u64>,
     phase: String,
     slots: [u32; 2],
-    /// Explicitly fence a previously completed run when reusing its slots.
+    /// Reuse slots only after committed close and retirement of their source tails.
     #[serde(default)]
     expected_generations: [u64; 2],
     ingresses: [String; 2],
