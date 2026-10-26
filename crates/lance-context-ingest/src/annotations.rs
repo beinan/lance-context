@@ -111,7 +111,6 @@ impl Service {
         &self.ingress
     }
 
-    #[cfg(feature = "http")]
     pub(crate) async fn check_owner(
         &self,
         authority: &lance_context_wal::replication::publication::Authority,

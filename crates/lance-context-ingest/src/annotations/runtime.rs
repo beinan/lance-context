@@ -166,9 +166,11 @@ impl Runtime {
         ))
     }
 
-    /// No detached tasks. A storage/protocol failure stops this owner and its
+    /// No detached tasks. Publication/protocol failures stop this owner and its
     /// read barriers. Restart reconciles durable plan/preparation/selection state.
-    /// This loop does not invent a new request or blindly retry failed mutations.
+    /// Sealed DELETE failures retain one bounded page and pause publication while
+    /// keeping applied values readable. Only immutable DELETE requests are repeated;
+    /// this loop never invents a request or blindly retries failed mutations.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);
         tokio::select! {
@@ -191,9 +193,17 @@ impl Publisher {
     async fn run(&mut self) -> Result<()> {
         loop {
             if let Some(collector) = &mut self.reclamation {
-                collector
+                let cleared = collector
                     .step(&self.service, &self.catalog, &self.storage, &self.budget)
                     .await?;
+                if !cleared {
+                    // Keep this owner and its applied read view alive, but do
+                    // not create more files behind an unresolved deletion page.
+                    // The independent applier stops at its existing source and
+                    // staging bounds; it never ACKs an unapplied update.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
             }
             self.publish_next().await?;
             tokio::time::sleep(Duration::from_millis(5)).await;
