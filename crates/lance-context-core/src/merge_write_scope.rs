@@ -810,7 +810,13 @@ impl CommitHandler for GuardedCommit {
                 .try_with(|version| manifest.version != *version)
                 .unwrap_or(false)
             {
-                return Err(CommitError::CommitConflict);
+                // This pin cannot change within the operation. A retryable
+                // handler conflict would ask Lance to rebase and retry the
+                // same rejection; the caller must reconcile the newer base.
+                return Err(CommitError::OtherError(Error::commit_conflict_source(
+                    manifest.version,
+                    "publication base changed; reconcile before retrying".into(),
+                )));
             }
             authorize("base", manifest.version).await?;
             let inner = self.inner.clone();
@@ -924,6 +930,10 @@ impl CommitHandler for GuardedCommit {
 #[cfg(test)]
 #[path = "merge_write_scope/create_tests.rs"]
 mod create_tests;
+
+#[cfg(test)]
+#[path = "merge_write_scope/pinned_tests.rs"]
+mod pinned_tests;
 
 #[cfg(test)]
 mod tests {
