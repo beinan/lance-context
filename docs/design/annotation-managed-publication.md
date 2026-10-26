@@ -72,9 +72,18 @@ manifest, just as it checks an inline transaction.
 A 64 MiB limit bounds the raw metadata encoded or fetched by one operation. It
 does not bound decoded engine allocations or total process memory, and is
 separate from dirty staging admission. Preparations above that limit still fail;
-this is not arbitrary-fragment-count qualification. Physical deletion of these
-objects, including uploads orphaned before Prepare, remains part of blob
-retention work and is not provided by WAL source GC.
+this is not arbitrary-fragment-count qualification.
+
+For an exclusively owned annotation table, `annotations.exclusive_reclamation`
+also collects resolved preparation objects and uploads orphaned before Prepare.
+The serial collector first resolves any retained publication plan. It only
+classifies metadata paths for the current table incarnation and seals each
+bounded deletion page through the existing quorum fence. Selected Lance versions
+retain their native transaction files under the existing manifest and reader
+protection; they no longer depend on the preparation sidecar. Unresolved DELETE
+requests keep their original sealed page and pause publication. WAL source GC
+alone does not remove these blob objects; collection remains opt-in under the
+exclusive-ownership contract described in `annotation-application.md`.
 
 Rust regression tests submit real annotation requests to three disk-backed WAL
 replicas and update one row per fragment. With 4,096 fragments, they restart after
@@ -89,3 +98,7 @@ power-loss qualification.
 After prepared-state recovery, the 4,096-fragment fixture also submits three more
 rounds of updates without waiting for publication between batches. It checks each
 ACK's point-read value, bounded staging charges, final values and source drain.
+With exclusive reclamation enabled, it also verifies preparation-object removal,
+original request results and body bytes after recovery. An insufficient collection
+workspace is rejected before deleting anything, preserving the acknowledged
+suffix's recovery sources.
