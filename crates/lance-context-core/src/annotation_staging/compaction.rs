@@ -18,7 +18,7 @@ impl AnnotationStaging {
         selected: Arc<Dataset>,
     ) -> Result<()> {
         let (base, materialized) = {
-            let state = self.state.lock().await;
+            let state = self.state.read().await;
             if state.frozen.is_some() {
                 return Err(invalid(
                     "compaction overlaps a frozen annotation generation",
@@ -60,7 +60,8 @@ impl AnnotationStaging {
                 ));
             }
         }
-        let mut state = self.state.lock().await;
+        let _mutation = self.mutation.lock().await;
+        let mut state = self.state.write().await;
         if state.frozen.is_some() || !Arc::ptr_eq(&state.base, &base) {
             return Err(invalid(
                 "annotation base changed during compaction installation",

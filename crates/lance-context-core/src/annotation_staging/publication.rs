@@ -76,7 +76,8 @@ impl AnnotationStaging {
         if transaction.is_nil() {
             return Err(invalid("nil annotation publication identity"));
         }
-        let mut state = self.state.lock().await;
+        let _mutation = self.mutation.lock().await;
+        let mut state = self.state.write().await;
         if state.frozen.is_some() {
             return Err(invalid("an annotation generation is already frozen"));
         }
@@ -130,7 +131,8 @@ impl AnnotationStaging {
                 "selected Lance snapshot is not this prepared annotation transaction",
             ));
         }
-        let mut state = self.state.lock().await;
+        let _mutation = self.mutation.lock().await;
+        let mut state = self.state.write().await;
         if !state
             .frozen
             .as_ref()
