@@ -64,8 +64,22 @@ standalone config. Exactly one table and one virtual shard are supported.
 independent budgets. Publication needs capacity for the full bounded frozen
 generation and its checkpoint metadata. `worker.publication` controls maximum
 source records/bytes, minimum batch bytes, maximum batch wait, and retained
-manifests. Ingestion compaction, session indexing and remote preparation options
-are rejected for these annotation roles.
+manifests. Optional `worker.publication.compaction` uses the existing bounded
+native small-file rewrite, starting after the first annotation checkpoint. It
+preserves the cut and request results, and permits one maintenance publication
+between annotation publications, or further compaction while no source waits.
+Its configured workspace must fit the publication budget. `TryBinaryCopy` may
+fall back to re-encoding bodies for multi-file column layouts; this is not a
+zero-copy guarantee. Session indexing and remote preparation remain unsupported.
+
+Compaction recovery tests retain or SIGKILL the three local WAL replicas and
+annotation applier after the maintenance plan, prepared files, an unknown
+manifest-selection reply, and confirmation before retirement. Reopening checks
+the original successful and rejected request results, a concurrent score update,
+body bytes, ID-index coverage, later publications and file collection. These
+small indexed fixtures exercise recovery with retained disks; they do not qualify
+large fragmented tables or sustained production throughput. Annotation batches
+still have to fit the existing preparation descriptor limit.
 
 The owner requires the same authorized etcd prefix on every candidate. It claims
 the table with the existing durable scope/owner/request tuple. Acquisition reads

@@ -873,3 +873,5 @@ fn rejects_foreign_preparation(
     }
     Ok(())
 }
+
+mod compaction;

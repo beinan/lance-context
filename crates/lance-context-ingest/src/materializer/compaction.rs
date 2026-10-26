@@ -104,16 +104,34 @@ async fn supported_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>>
     Ok(indices)
 }
 
+async fn read_compaction_base(publisher: &Publisher, version: u64) -> Result<Dataset> {
+    if publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations {
+        // Annotation bases contain the original turn schema plus narrow columns;
+        // they do not have the immutable rollout ingress's exact Arrow schema.
+        Ok(
+            (*crate::annotations::checkpoint::load(
+                &publisher.ingress,
+                &publisher.storage,
+                version,
+            )
+            .await?)
+                .clone(),
+        )
+    } else {
+        publisher.read_dataset(Some(version)).await
+    }
+}
+
 pub(super) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool> {
     let Some(options) = &publisher.options.compaction else {
         return Ok(false);
     };
-    let dataset = publisher.read_dataset(Some(version)).await?;
+    let dataset = read_compaction_base(publisher, version).await?;
     let indices = supported_indices(&dataset).await?;
     Ok(options.fragments(&dataset, &indices).is_some())
 }
 
-pub(super) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
+pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
     let version = view.progress.minimum_read_version;
     if !has_work(publisher, version).await? {
         return Ok(None);
@@ -135,9 +153,7 @@ pub(super) async fn prepare(
         .compaction
         .as_ref()
         .context("pending compaction needs configured limits")?;
-    let dataset = publisher
-        .read_dataset(Some(pending.plan.read_version))
-        .await?;
+    let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
     let indices = supported_indices(&dataset).await?;
     let fragments = options
         .fragments(&dataset, &indices)
