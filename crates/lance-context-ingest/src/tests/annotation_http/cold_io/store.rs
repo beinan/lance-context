@@ -44,6 +44,8 @@ impl Drop for Paused {
 pub(super) struct Gates {
     get: Mutex<Option<Gate>>,
     put: Mutex<Option<Gate>>,
+    committed_put: Mutex<Option<Gate>>,
+    pub(super) failed_upload: Mutex<Option<Path>>,
 }
 impl Gates {
     fn arm(slot: &Mutex<Option<Gate>>) -> Paused {
@@ -67,6 +69,30 @@ impl Gates {
     }
     pub fn pause_put(&self) -> Paused {
         Self::arm(&self.put)
+    }
+    pub fn lose_put_reply(&self) -> Paused {
+        Self::arm(&self.committed_put)
+    }
+    async fn after_put(&self, path: &Path) -> object_store::Result<()> {
+        if !path.as_ref().ends_with(".lance") {
+            return Ok(());
+        }
+        let gate = self.committed_put.lock().unwrap().take();
+        if let Some(gate) = gate {
+            assert!(self
+                .failed_upload
+                .lock()
+                .unwrap()
+                .replace(path.clone())
+                .is_none());
+            let _ = gate.entered.send(());
+            let _ = gate.resume.await;
+            return Err(object_store::Error::Generic {
+                store: "annotation-test",
+                source: std::io::Error::other("injected lost native PUT reply").into(),
+            });
+        }
+        Ok(())
     }
     async fn wait(slot: &Mutex<Option<Gate>>, path: &Path) {
         if !path.as_ref().ends_with(".lance") {
@@ -136,7 +162,9 @@ impl ObjectStore for GatedStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         Gates::wait(&self.gates.put, path).await;
-        self.inner.put_opts(path, payload, opts).await
+        let result = self.inner.put_opts(path, payload, opts).await?;
+        self.gates.after_put(path).await?;
+        Ok(result)
     }
     async fn put_multipart_opts(
         &self,
@@ -144,7 +172,11 @@ impl ObjectStore for GatedStore {
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         Gates::wait(&self.gates.put, path).await;
-        self.inner.put_multipart_opts(path, opts).await
+        Ok(Box::new(GatedUpload {
+            inner: self.inner.put_multipart_opts(path, opts).await?,
+            gates: self.gates.clone(),
+            path: path.clone(),
+        }))
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         if !opts.head {
@@ -179,5 +211,26 @@ impl ObjectStore for GatedStore {
         opts: CopyOptions,
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+#[derive(Debug)]
+struct GatedUpload {
+    inner: Box<dyn MultipartUpload>,
+    gates: Arc<Gates>,
+    path: Path,
+}
+#[async_trait::async_trait]
+impl MultipartUpload for GatedUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.inner.put_part(data)
+    }
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let result = self.inner.complete().await?;
+        self.gates.after_put(&self.path).await?;
+        Ok(result)
+    }
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
     }
 }

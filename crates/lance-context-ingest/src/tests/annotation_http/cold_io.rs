@@ -4,6 +4,7 @@ use arrow_array::Array;
 use futures::TryStreamExt;
 
 mod store;
+mod upload_failure;
 
 #[tokio::test]
 async fn owned_reads_remain_visible_during_cold_apply_and_old_publication() -> Result<()> {
