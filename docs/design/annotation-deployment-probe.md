@@ -50,6 +50,12 @@ The client needs access to both HTTP endpoints and the WAL/blob configuration.
 The workload requires an even turn count between 256 and 65,536, divisible by
 both writers' batch size. Batches contain 1–2048 rows and duration is 1–600 seconds.
 `max_batches` can cap each writer for an unmaterialized recovery experiment.
+After a run has finished and its pending outcomes and final values are verified,
+its slots can be reused with `expected_generations`, a two-element array matching
+`slots`. Supply the generation saved in each old `producer.json`; the default is
+`[0, 0]` for unused slots. Use a fresh output directory. Opening fences the old
+producers, so this is not a way to recover an unresolved request. The client
+persists the new open identity and checks the returned generation.
 
 For indexed point lookups, add `"id_index": true` before seeding. Seed builds an
 ID B-tree and emits `id_index_uuid`; copy that UUID into `expected_id_index` in
@@ -93,7 +99,10 @@ the owner process and its staging memory.
 ## Interpreting results
 
 Per-writer output includes accepted batches/rows, Arrow bytes, explicit refusal
-count, and millisecond upper bounds for ACK/read p99. ACK latency includes the
+count, and millisecond upper bounds for ACK/read p99. ACK output also includes
+p99.9, the exact maximum in microseconds, and counts above one and ten seconds;
+reads include their maximum. Report these alongside p99 so rare pauses remain
+visible. ACK latency includes the
 client's pending-request and ACK journal syncs. Aggregate update rate includes
 producer opening, journal I/O, cross-ingress reads, and completion of final
 in-flight requests. This is a closed-loop correctness workload; it does not

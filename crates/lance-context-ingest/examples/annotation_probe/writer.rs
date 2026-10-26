@@ -16,20 +16,26 @@ use lance_context_ingest::{
 struct Hist {
     count: u64,
     milliseconds: Vec<u64>,
+    maximum: Duration,
 }
 impl Hist {
     fn new() -> Self {
         Self {
             count: 0,
             milliseconds: vec![0; 60_001],
+            maximum: Duration::ZERO,
         }
     }
     fn record(&mut self, duration: Duration) {
         self.count += 1;
+        self.maximum = self.maximum.max(duration);
         self.milliseconds[duration.as_micros().div_ceil(1000).min(60_000) as usize] += 1;
     }
     fn p99(&self) -> usize {
-        let wanted = (self.count * 99).div_ceil(100);
+        self.quantile(990)
+    }
+    fn quantile(&self, thousandths: u64) -> usize {
+        let wanted = (self.count * thousandths).div_ceil(1000);
         let mut count = 0;
         self.milliseconds
             .iter()
@@ -126,7 +132,7 @@ async fn writer(
     let operation = ProducerOpen {
         bucket: 0,
         slot: w.slots[which],
-        expected_generation: 0,
+        expected_generation: w.expected_generations[which],
         operation: uuid::Uuid::new_v4(),
     };
     durable_json(&directory.join("open.json"), &operation)?;
@@ -138,6 +144,10 @@ async fn writer(
         .json()
         .await?;
     durable_json(&directory.join("producer.json"), &producer)?;
+    ensure!(
+        producer.generation == operation.expected_generation + 1,
+        "unexpected producer generation; retain open identity and response"
+    );
     let mut journal = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -205,7 +215,11 @@ async fn writer(
         "{}",
         serde_json::json!({"writer":w.slots[which],"acks":acks.count,
         "updated_rows":acks.count * w.batch_rows as u64,"ack_p99_ms_upper_bound":acks.p99(),
+        "ack_p999_ms_upper_bound":acks.quantile(999),"ack_max_us":acks.maximum.as_micros(),
+        "ack_over_1s":acks.milliseconds[1001..].iter().sum::<u64>(),
+        "ack_over_10s":acks.milliseconds[10001..].iter().sum::<u64>(),
         "reads":reads.count,"read_p99_ms_upper_bound":reads.p99(),"refused":refused,
+        "read_max_us":reads.maximum.as_micros(),
         "acked_arrow_bytes":acked_bytes,"elapsed_ms":started.elapsed().as_millis(),
         "client_phase_us": {"encode":phases[0].as_micros(),"pending_journal":phases[1].as_micros(),
         "update_request":phases[2].as_micros(),"ack_journal":phases[3].as_micros(),"point_reads":phases[4].as_micros()},
@@ -220,7 +234,8 @@ pub(super) async fn run(config: &Config, w: &Workload) -> Result<()> {
     durable_json(
         &w.directory.join("run.json"),
         &serde_json::json!({"phase":w.phase,"slots":w.slots,
-        "turns":w.turns,"batch_rows":w.batch_rows,"seconds":w.seconds}),
+        "turns":w.turns,"batch_rows":w.batch_rows,"seconds":w.seconds,
+        "expected_generations":w.expected_generations}),
     )?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
