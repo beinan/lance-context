@@ -409,8 +409,15 @@ impl Publisher {
         if pending.plan.is_maintenance() {
             checkpoint::validate_compacted(&selected, &base, pending, prepared, record).await?;
         } else {
-            publication::selected_cut(&selected, &base, &prepared.descriptors, &selection, record, &self.storage)
-                .await?;
+            publication::selected_cut(
+                &selected,
+                &base,
+                &prepared.descriptors,
+                &selection,
+                record,
+                &self.storage,
+            )
+            .await?;
         }
         let reply = materializer::commit(
             &self.service.ingress.client,
