@@ -89,6 +89,38 @@ replays the required suffix through the existing runtime. Owner observations
 report applied/materialized positions, retained staging bytes, active/frozen
 entries, source bytes/records, and application pressure once per second.
 
+## Physical file collection
+
+For a table served exclusively by its annotation owner, set
+`annotations.exclusive_reclamation` to enable the existing bounded collector:
+
+```json
+"exclusive_reclamation": {
+  "max_objects": 512,
+  "max_bytes": 2097152,
+  "delete_parallelism": 16,
+  "interval": {"secs": 1, "nanos": 0}
+}
+```
+
+The option is disabled when omitted. The owner protects captured annotation
+readers, retained managed manifests and unresolved publications before sealing
+each deletion page through the fenced catalog. It collects superseded data,
+manifests and transactions between publications. Forwarding ingresses may use the
+same configuration; only the owner runs collection.
+
+All reads and writes must use the managed annotation roles. Raw Dataset readers,
+other writers, tags, branches and reusing the destination URI for another table
+are outside this exclusive-ownership contract. A raw reader's retained version
+is not registered in the owner's reader protection.
+
+`max_objects` and `max_bytes` bound each candidate page; `delete_parallelism`
+bounds concurrent deletes. The interval starts after a collection pass finishes.
+Page workspace must fit `materializer_memory_bytes`; invalid limits are rejected
+before ownership acquisition. Owner observations include process-local
+`reclamation` counters for passes, examined objects and completed deletes. These
+counters are not a current object-store inventory.
+
 The application process test uses real RF3 RPCs, etcd, Lance storage, two ingress
 executables and an owner executable. It starts by handing off a full rollout
 table with existing scores and body columns. It checks cross-ingress reads, publication
@@ -97,5 +129,8 @@ lease expiry, replacement behind the same address, field clearing, and lease-los
 shutdown. It also gives ingress processes an unusable Lance URI to verify that
 forwarding does not open storage. It is a correctness test with a small fixture;
 it does not qualify sustained throughput or large-table cold lookup performance.
+With collection enabled, it also checks invalid configuration before acquisition,
+physical file draining across owner replacement, exact retries after collection,
+and retained body contents after further updates through both ingresses.
 
 Refs #378.

@@ -92,6 +92,11 @@ pub struct Annotations {
     /// Fixed, quiesced source snapshot for the explicit annotation-bootstrap role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<bootstrap::annotations::Snapshot>,
+    /// Opt into physical collection for a table served exclusively by its
+    /// annotation owner. Raw Dataset readers, other writers, tags, branches and
+    /// URI reuse are outside this contract. Forwarders never run collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_reclamation: Option<crate::annotations::runtime::reclamation::Options>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -209,6 +214,9 @@ impl Config {
                     && !self.worker.publication.pipeline_preparation,
                 "invalid annotation application options"
             );
+            if let Some(reclamation) = &a.exclusive_reclamation {
+                reclamation.validate(self.materializer_memory_bytes)?;
+            }
         }
         let (mut names, mut ids, mut destinations) =
             (HashSet::new(), HashSet::new(), HashSet::new());

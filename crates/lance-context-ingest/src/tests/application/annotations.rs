@@ -69,6 +69,29 @@ async fn reclaimed(c: &network::Cluster, index: u64) -> Result<()> {
     .await?
 }
 
+async fn files_drained(path: &Path) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let mut counts = Vec::new();
+            for directory in ["data", "_versions", "_transactions"] {
+                counts.push(
+                    std::fs::read_dir(path.join(directory))?
+                        .collect::<std::io::Result<Vec<_>>>()?
+                        .iter()
+                        .filter(|entry| entry.file_name() != "latest_version_hint.json")
+                        .count(),
+                );
+            }
+            if counts == [2, 2, 2] {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires INGEST_TEST_BIN and ETCD_TEST_ENDPOINTS; executed by application CI"]
 async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease() -> Result<()> {
@@ -143,8 +166,22 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         apply_memory_bytes: 8 << 20,
         staging: limits.clone(),
         source: Some(source),
+        exclusive_reclamation: None,
     });
+    let encoded = serde_json::to_value(config.annotations.as_ref().unwrap())?;
+    assert!(encoded.get("exclusive_reclamation").is_none());
+    assert!(serde_json::from_value::<config::Annotations>(encoded)?
+        .exclusive_reclamation
+        .is_none());
+    config.annotations.as_mut().unwrap().exclusive_reclamation =
+        Some(crate::annotations::runtime::reclamation::Options {
+            max_objects: 2,
+            max_bytes: 16 << 10,
+            delete_parallelism: 2,
+            interval: Duration::from_millis(10),
+        });
     config.worker.publication.max_records = 2;
+    config.worker.publication.retained_manifest_versions = 2;
     config.worker.publication.min_source_bytes = 1 << 20;
     config.worker.publication.max_batch_wait = Duration::from_secs(60);
     let files: Vec<_> = (0..4)
@@ -171,6 +208,34 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
     assert_eq!(
         Dataset::open(&storage.uri).await?.manifest().fragments,
         original.manifest().fragments
+    );
+    drop(original);
+    // Invalid collection configuration must not claim ownership or increment
+    // the publisher epoch, including when no other owner is running yet.
+    let initial_authority = annotation_publication::state(&c).await?.authority;
+    let mut invalid = config.clone();
+    invalid
+        .annotations
+        .as_mut()
+        .unwrap()
+        .exclusive_reclamation
+        .as_mut()
+        .unwrap()
+        .max_objects = 0;
+    let invalid_file = root.join("invalid-gc-config.json");
+    std::fs::write(&invalid_file, serde_json::to_vec(&invalid)?)?;
+    let mut invalid_owner = Process::spawn(
+        &binary,
+        &invalid_file,
+        "annotation-owner",
+        &root.join("invalid-owner.log"),
+    )?;
+    failed(&mut invalid_owner).await?;
+    assert!(std::fs::read_to_string(root.join("invalid-owner.log"))?
+        .contains("invalid annotation collection limits"));
+    assert_eq!(
+        annotation_publication::state(&c).await?.authority,
+        initial_authority
     );
     let mut owner = Process::spawn(
         &binary,
@@ -245,6 +310,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
     let body = wire(&limits, &["T"], 0, None, 1, Some(0.9))?;
     let published = update(&client, &bases[2], &producer, 2, body.clone()).await?;
     reclaimed(&c, published.completion.index).await?;
+    files_drained(Path::new(&storage.uri)).await?;
     assert_eq!(
         update(&client, &bases[1], &producer, 2, body).await?,
         published
@@ -301,6 +367,46 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
     let value = read(&client, &bases[1]).await?;
     assert_eq!((value.status, value.score), (None, None));
     assert!(value.labels.is_empty());
+    // Continue updating through both forwarders while the replacement owner
+    // publishes and physically collects. Each two-record window must drain.
+    for sequence in 5..=12 {
+        let status = format!("review-{sequence}");
+        let body = wire(&limits, &["T"], 1, Some(&status), 1, Some(sequence as f32))?;
+        let ingress = (sequence % 2 + 1) as usize;
+        let result = update(&client, &bases[ingress], &producer, sequence, body.clone()).await?;
+        let current = read(&client, &bases[3 - ingress]).await?;
+        assert_eq!(current.status.as_deref(), Some(status.as_str()));
+        assert_eq!(current.score, Some(sequence as f32));
+        if sequence % 2 == 0 {
+            reclaimed(&c, result.completion.index).await?;
+            files_drained(Path::new(&storage.uri)).await?;
+            assert_eq!(
+                update(&client, &bases[3 - ingress], &producer, sequence, body).await?,
+                result
+            );
+        }
+    }
+    let latest = annotation_publication::read(&c, &storage, None).await?;
+    assert!(latest.read_transaction().await?.is_some());
+    let batches = latest
+        .scan()
+        .project(&["id", "content"])?
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    for batch in batches {
+        let content = batch
+            .column_by_name("content")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+            .unwrap();
+        for body in content.iter() {
+            assert_eq!(body, Some("body".repeat(64 << 10).as_str()));
+        }
+    }
     let lease = etcd.get(claim_key, None).await?.kvs()[0].lease();
     etcd.lease_revoke(lease).await?;
     failed(&mut replacement).await?;
