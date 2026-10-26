@@ -142,6 +142,10 @@ async fn exercise() -> Result<()> {
         failed.progress.prepared.is_none(),
         "upload is not a prepared publication"
     );
+    assert!(
+        orphan.is_file(),
+        "the failed upload must leave an actual orphan"
+    );
     for index in acknowledged
         .iter()
         .map(|(_, result)| result.index)
@@ -172,6 +176,10 @@ async fn exercise() -> Result<()> {
     );
     let (service, runtime) = annotation_runtime::owner(&c, &storage, &limits).await?;
     let (_, _, read_cut) = runtime.http_binding();
+    assert!(
+        orphan.is_file(),
+        "the orphan must survive until collection runs"
+    );
     let runtime =
         runtime.with_exclusive_reclamation(annotations::runtime::reclamation::Options {
             max_objects: 16,
