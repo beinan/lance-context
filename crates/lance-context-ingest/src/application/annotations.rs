@@ -144,6 +144,10 @@ pub async fn serve_owner(
             },
             acquisition,
         ).await?;
+        let runtime = match &a.exclusive_reclamation {
+            Some(options) => runtime.with_exclusive_reclamation(options.clone())?,
+            None => runtime,
+        };
         let owner = Owner::new(&runtime, keys, options.options.clone())?;
         let app = owner.router().layer(middleware::from_fn_with_state(auth, authorize));
         let (stop_http, stopped_http) = oneshot::channel();
@@ -172,6 +176,7 @@ pub async fn serve_owner(
                     "active_entries": view.active_entries, "frozen_entries": view.frozen_entries,
                     "retained_bytes": view.retained_bytes, "source_records": source.records,
                     "source_bytes": source.bytes, "backpressured": pressured,
+                    "reclamation": service.reclamation_observation(),
                 }}));
             }
         };

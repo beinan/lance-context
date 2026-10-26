@@ -1,7 +1,10 @@
 # Annotation file reclamation boundaries
 
-Refs #378. This covers item 6 of the single-shard annotation loop. It does not
-enable physical cleanup for managed tables.
+Refs #378. These native cleanup experiments characterize the hazards relevant to
+item 6 of the single-shard annotation loop. The managed annotation owner now has
+an opt-in collector with its own fencing and reader protection; see
+[Physical file collection](annotation-application.md#physical-file-collection).
+The experiments below do not authorize using native cleanup on managed tables.
 
 A column rewrite uploads a new annotation file for each affected fragment.
 Lance 13 prunes fully superseded file references when building the selected
@@ -30,7 +33,7 @@ these tests. No managed catalog, owner takeover, distributed reader pins or blob
 service is qualified by them. The production `ManagedManifest` handler must
 continue rejecting native enumeration and cleanup.
 
-The next implementation must bind a deletion boundary to the table incarnation
+Managed collection must bind a deletion boundary to the table incarnation
 and coordinate three sets of references: captured readers, selected manifests
 and recovery evidence, and uploads from unresolved publications. Reader
 registration and advancing the boundary must be ordered so a new reader cannot
@@ -40,8 +43,8 @@ An expired publisher lease alone is not evidence that an old reader released its
 base. The chosen protocol must also bound abandoned-reader retention.
 
 Keep this accounting at the owner/version level rather than adding a consensus
-write per point read. Start with replaced annotation data; unselected manifests
+write per point read. In addition to replaced annotation data, unselected manifests
 and uploads additionally need durable attempt identity and resolution. A blob
 listing or age threshold cannot supply that identity. Until these conditions
 are implemented, tested across restart, and connected to the managed catalog,
-physical historical/orphan blob GC remains unfinished.
+a cleanup path cannot safely reclaim historical or orphaned managed objects.
