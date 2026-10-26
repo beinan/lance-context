@@ -11,6 +11,8 @@ use crate::{
 use lance_context_core::annotation_staging::Limits;
 
 mod automatic_reclamation;
+#[cfg(feature = "service")]
+mod lost_prepare;
 mod open;
 
 #[cfg(unix)]

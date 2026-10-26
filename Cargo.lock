@@ -4208,6 +4208,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bincode",
  "bytes",
  "etcd-client",
  "futures",
