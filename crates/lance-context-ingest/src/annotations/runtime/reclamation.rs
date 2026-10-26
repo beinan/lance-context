@@ -101,7 +101,7 @@ impl Collector {
             return Ok(self.sealed.is_none());
         }
         let result = if self.sealed.is_some() {
-            // Reissue only unresolved immutable DELETEs from the original,
+            // Reissue only unresolved immutable DELETE requests from the original,
             // successfully fenced page. Never relist or add paths here.
             service.check_owner(catalog.authority()).await?;
             self.delete_page(service).await?;
@@ -301,7 +301,7 @@ impl Collector {
         for (batch, results) in outcomes {
             if results.len() != batch.len() {
                 // A whole-request failure leaves every path unresolved. Some
-                // may already be absent; repeating these immutable DELETEs is safe.
+                // may already be absent; repeating these immutable DELETE requests is safe.
                 observed.delete_failures += batch.len() as u64;
                 page.paths.extend(batch);
                 first_error = first_error.or_else(|| results.into_iter().find_map(Result::err));

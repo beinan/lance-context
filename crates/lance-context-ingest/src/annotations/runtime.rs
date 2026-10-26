@@ -169,7 +169,7 @@ impl Runtime {
     /// No detached tasks. Publication/protocol failures stop this owner and its
     /// read barriers. Restart reconciles durable plan/preparation/selection state.
     /// Sealed DELETE failures retain one bounded page and pause publication while
-    /// keeping applied values readable. Only those immutable DELETEs are repeated;
+    /// keeping applied values readable. Only immutable DELETE requests are repeated;
     /// this loop never invents a request or blindly retries failed mutations.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
         tokio::pin!(shutdown);

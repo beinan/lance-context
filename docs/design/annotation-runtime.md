@@ -42,7 +42,7 @@ keeps the page's memory reservation. New publication and compaction pause until
 that page clears. The applier keeps its existing source/staging limits, so an
 extended storage failure backpressures updates while owned reads still serve
 previously applied values. Each later collection interval checks ownership and
-reissues only unresolved DELETEs from that original page. Successful paths are
+reissues only unresolved DELETE requests from that original page. Successful paths are
 removed; an absent path resolves a lost reply. An unknown whole-batch response
 retains all paths in that batch. Paths are never added after sealing.
 
