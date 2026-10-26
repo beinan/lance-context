@@ -13,7 +13,7 @@ use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::{Dataset, Error, Result};
 use lance_context_api::annotation::{TurnAnnotation, TurnAnnotationPatch};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod compaction;
 mod preserve_id;
@@ -130,7 +130,11 @@ struct State {
 pub struct AnnotationStaging {
     scope: Scope,
     limits: Limits,
-    state: Mutex<State>,
+    // Writers queue here before requesting exclusive state access. Cold apply
+    // holds only shared state access, so installed values remain readable even
+    // when another mutation or publication is waiting behind that IO.
+    mutation: Mutex<()>,
+    state: RwLock<State>,
     bytes: Arc<Semaphore>,
     entries: Arc<Semaphore>,
     readers: Arc<Semaphore>,
@@ -229,7 +233,8 @@ impl AnnotationStaging {
             metadata: Arc::new(Semaphore::new(publication::METADATA_BUDGET)),
             root_snapshot: Arc::new(Semaphore::new(1)),
             limits,
-            state: Mutex::new(State {
+            mutation: Mutex::new(()),
+            state: RwLock::new(State {
                 base,
                 views,
                 applied: materialized,
@@ -292,7 +297,8 @@ impl AnnotationStaging {
     /// Advance through already processed control/unrelated entries. This must
     /// never skip an unapplied mutation; a bare quorum index is not that proof.
     pub async fn advance_processed(&self, after: u64, through: u64) -> Result<()> {
-        let mut state = self.state.lock().await;
+        let _mutation = self.mutation.lock().await;
+        let mut state = self.state.write().await;
         check_order(&state, after, through)?;
         state.applied = through;
         Ok(())
@@ -305,9 +311,16 @@ impl AnnotationStaging {
         mutations: &[Mutation<'_>],
         advance_rejection: bool,
     ) -> Result<ApplyOutcome> {
-        let mut state = self.state.lock().await;
-        check_order(&state, after, through)?;
-        match self.pending_batch(&state, mutations).await? {
+        let _mutation = self.mutation.lock().await;
+        let pending = {
+            let state = self.state.read().await;
+            check_order(&state, after, through)?;
+            self.pending_batch(&state, mutations).await?
+        };
+        // The mutation gate keeps the base, values and applied cut unchanged
+        // while upgrading. Cancellation before this point installs nothing.
+        let mut state = self.state.write().await;
+        match pending {
             PendingBatch::Values(pending) => {
                 // No awaits/fallible operations after installing the whole batch.
                 state.active.extend(pending);
@@ -454,7 +467,7 @@ impl AnnotationStaging {
             return Err(invalid("invalid annotation turn key"));
         }
         let permit = reserve(&self.readers, 1)?;
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         let value = state.active.get(turn).cloned().or_else(|| {
             state
                 .frozen
@@ -474,7 +487,7 @@ impl AnnotationStaging {
     }
 
     pub async fn observation(&self) -> Observation {
-        let state = self.state.lock().await;
+        let state = self.state.read().await;
         Observation {
             applied: state.applied,
             materialized: state.materialized,

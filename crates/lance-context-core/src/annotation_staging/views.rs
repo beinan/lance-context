@@ -28,17 +28,8 @@ impl Registry {
         base
     }
 
-    fn capture(&mut self) -> Vec<Arc<Base>> {
-        let mut bases = Vec::new();
-        self.0.retain(|base| {
-            if let Some(base) = base.upgrade() {
-                bases.push(base);
-                true
-            } else {
-                false
-            }
-        });
-        bases
+    fn capture(&self) -> Vec<Arc<Base>> {
+        self.0.iter().filter_map(Weak::upgrade).collect()
     }
 }
 
@@ -65,13 +56,13 @@ impl AnnotationStaging {
     /// Capture local protection under the same gate as reads and base switches.
     /// This does not pause subsequent point reads or publication.
     ///
-    /// The registry keeps weak references, pruned at each publication/capture.
+    /// The registry keeps weak references, pruned at each base installation.
     /// Live old bases require admitted readers or generations charged to value
     /// or metadata budgets. The one outstanding snapshot may pin one previous
     /// bounded set, but callers cannot accumulate snapshots across publications.
     pub async fn protected_bases(&self) -> Result<ProtectedBases> {
         let permit = reserve(&self.root_snapshot, 1)?;
-        let bases = self.state.lock().await.views.capture();
+        let bases = self.state.read().await.views.capture();
         Ok(ProtectedBases {
             bases,
             _permit: permit,
