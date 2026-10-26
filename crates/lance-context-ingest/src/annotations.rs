@@ -333,6 +333,24 @@ impl Service {
         .context("annotation read barrier deadline expired")?
     }
 
+    /// The HTTP owner fences both sides of this read. Its acquisition cut
+    /// covers all predecessor writes; this owner's ACKs already await apply.
+    /// A later unacknowledged proposal must not block reading applied values.
+    #[cfg(feature = "http")]
+    pub(crate) async fn get_owned(
+        &self,
+        turn: &str,
+        recovery_cut: u64,
+        deadline: Duration,
+    ) -> Result<Option<TurnAnnotation>> {
+        tokio::time::timeout(deadline, async {
+            self.wait_through(recovery_cut).await?;
+            Ok(self.shared.staging.capture(turn).await?.resolve().await?)
+        })
+        .await
+        .context("annotation owned read deadline expired")?
+    }
+
     async fn barrier(&self) -> Result<u64> {
         let (cut, value) = reader::observe(
             &self.ingress,

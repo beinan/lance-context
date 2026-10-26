@@ -4,13 +4,16 @@ use super::*;
 pub struct Owner {
     service: Service,
     authority: p::Authority,
+    recovery_cut: u64,
     gate: Gateway,
     reply_limit: usize,
 }
 impl Owner {
     /// Bind HTTP to this runtime's actual service and fenced publisher identity.
+    /// Successful annotation writes in this epoch must await this runtime's
+    /// applier, through these routes or its shared Service handle.
     pub fn new(runtime: &Runtime, keys: ReceiptKeys, options: Options) -> Result<Self> {
-        let (service, authority) = runtime.http_binding();
+        let (service, authority, recovery_cut) = runtime.http_binding();
         let ingress = service.ingress().clone();
         let reply_limit = reply_limit(&ingress)?;
         let gate = Gateway::new(
@@ -21,6 +24,7 @@ impl Owner {
         Ok(Self {
             service,
             authority,
+            recovery_cut,
             gate,
             reply_limit,
         })
@@ -175,7 +179,7 @@ impl Owner {
                         .map_err(|_| Failure::bad("invalid_point_read"))?;
                     let value = self
                         .service
-                        .get(&point.turn, options.body_total_timeout)
+                        .get_owned(&point.turn, self.recovery_cut, options.body_total_timeout)
                         .await
                         .map_err(|_| {
                             Failure::unavailable("annotation_read_unavailable", "not_submitted")

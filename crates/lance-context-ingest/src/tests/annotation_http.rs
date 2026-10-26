@@ -16,6 +16,7 @@ const TOKEN: &str = "annotation-test-workload-token-00000000";
 
 mod batches;
 mod pressure;
+mod read_cut;
 
 struct Server {
     address: std::net::SocketAddr,
