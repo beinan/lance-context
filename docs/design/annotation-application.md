@@ -66,9 +66,13 @@ generation and its checkpoint metadata. `worker.publication` controls maximum
 source records/bytes, minimum batch bytes, maximum batch wait, and retained
 manifests. Optional `worker.publication.compaction` uses the existing bounded
 native small-file rewrite, starting after the first annotation checkpoint. It
-preserves the cut and request results, and permits one maintenance publication
-between annotation publications, or further compaction while no source waits.
-Its configured workspace must fit the publication budget. `TryBinaryCopy` may
+preserves the cut and request results. After an annotation publication, it allows
+one compaction and starts further rewrites only within the smaller of
+`max_batch_wait` and one second while source updates are waiting. An already
+retained plan must finish even if its native rewrite exceeds that window; the
+window limits starting more work, not the duration of a rewrite. While idle,
+compaction can continue draining small files. Its configured workspace must fit
+the publication budget. `TryBinaryCopy` may
 fall back to re-encoding bodies for multi-file column layouts; this is not a
 zero-copy guarantee. Session indexing and remote preparation remain unsupported.
 
