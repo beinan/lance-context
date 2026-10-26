@@ -78,8 +78,12 @@ manifest-selection reply, and confirmation before retirement. Reopening checks
 the original successful and rejected request results, a concurrent score update,
 body bytes, ID-index coverage, later publications and file collection. These
 small indexed fixtures exercise recovery with retained disks; they do not qualify
-large fragmented tables or sustained production throughput. Annotation batches
-still have to fit the existing preparation descriptor limit.
+large fragmented tables or sustained production throughput. Native annotation
+preparations within the catalog's descriptor budget stay inline; larger ones use
+a scoped immutable reference to destination-store metadata, capped at 64 MiB of
+raw encoded bytes. That cap does not bound decoded engine memory. All voters and
+owners must support the reference descriptor before it is emitted; see
+`annotation-managed-publication.md` for recovery and collection requirements.
 
 The owner requires the same authorized etcd prefix on every candidate. It claims
 the table with the existing durable scope/owner/request tuple. Acquisition reads
