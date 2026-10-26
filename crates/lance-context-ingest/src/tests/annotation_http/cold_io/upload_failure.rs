@@ -40,11 +40,13 @@ async fn exercise() -> Result<()> {
     let mut upload = gates.lose_put_reply();
     let mut acknowledged = Vec::new();
     for (slot, status, score) in [
-        (0, Some("reviewed"), None),
-        (1, None, Some(0.9)),
-        (2, Some("approved"), None),
+        (1, Some("reviewed"), None),
+        (2, None, Some(0.9)),
+        (3, Some("approved"), None),
     ] {
-        let producer = producer(&service, slot).await?;
+        let producer = producer(&service, slot)
+            .await
+            .with_context(|| format!("open annotation test producer slot {slot}"))?;
         let update = request(
             &service,
             &producer,
@@ -62,7 +64,7 @@ async fn exercise() -> Result<()> {
         let result = service.submit(&update, Duration::from_secs(30)).await?;
         assert_eq!(result.result, annotations::MutationResult::Applied);
         acknowledged.push((update, result));
-        if slot == 0 {
+        if slot == 1 {
             upload.entered().await?;
         }
     }
@@ -85,7 +87,7 @@ async fn exercise() -> Result<()> {
 
     // The active two-record window is full. A fourth committed request must
     // wait for apply without receiving an annotation ACK or growing staging.
-    let producer = producer(&service, 3).await?;
+    let producer = producer(&service, 4).await?;
     let waiting = request(
         &service,
         &producer,
