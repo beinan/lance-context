@@ -293,8 +293,12 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
     // Fresh sessions prevent a warm reader cache from hiding missing blob files.
     let storage = fixture_storage(root).await?;
     let limits = fixture_limits();
-    let c = network::Cluster::open_signed(root, one_shard()).await?;
-    let recovered = state(&c).await?;
+    let c = network::Cluster::open_signed(root, one_shard())
+        .await
+        .context("reopening compaction replica cluster")?;
+    let recovered = state(&c)
+        .await
+        .context("reading the reopened compaction catalog")?;
     assert_eq!(recovered.progress, expected.progress);
     assert_eq!(
         recovered.manifests.as_ref().unwrap().head,
@@ -306,11 +310,19 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         current,
         ..
     } = expected;
-    let (service, owner) = compaction_owner(&c, &storage, &limits).await?;
+    let (service, owner) = compaction_owner(&c, &storage, &limits)
+        .await
+        .context("acquiring the recovered compaction owner")?;
     let (stop, task) = runtime::run_owner(collector(owner)?);
-    let a = producer(&service, 1).await?;
-    let b = producer(&service, 2).await?;
-    let d = producer(&service, 3).await?;
+    let a = producer(&service, 1)
+        .await
+        .context("restoring producer 1")?;
+    let b = producer(&service, 2)
+        .await
+        .context("restoring producer 2")?;
+    let d = producer(&service, 3)
+        .await
+        .context("restoring producer 3")?;
     // Each prepared request reserves workspace for the contract's 2048-row
     // maximum. Resolve and release one at a time instead of holding three full
     // reservations on the same bounded upload budget across subsequent writes.
@@ -319,9 +331,14 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         (&b, rejected_body.clone(), &rejected_result),
         (&d, suffix_body, &suffix_result),
     ] {
-        let retry = request(&service, producer, 1, Bytes::from(body)).await?;
+        let retry = request(&service, producer, 1, Bytes::from(body))
+            .await
+            .context("reserving recovered request workspace")?;
         assert_eq!(
-            &service.submit(&retry, Duration::from_secs(30)).await?,
+            &service
+                .submit(&retry, Duration::from_secs(30))
+                .await
+                .context("resolving the original recovered request")?,
             outcome
         );
     }
@@ -329,7 +346,9 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         service.get("t00000000", Duration::from_secs(30)).await?,
         Some(current.clone())
     );
-    runtime::drained(&service, suffix_result.index).await?;
+    runtime::drained(&service, suffix_result.index)
+        .await
+        .context("draining the recovered suffix")?;
     let selected = read(&c, &storage, None).await?;
     assert_eq!(selected.manifest().fragments.len(), 1);
     assert_eq!(selected.count_rows(None).await?, 16);
