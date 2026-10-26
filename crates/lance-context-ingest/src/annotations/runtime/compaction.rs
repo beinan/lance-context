@@ -9,8 +9,10 @@ impl Publisher {
             }
         } else {
             // The first annotation publication installs the durable cut/result
-            // checkpoint. Afterwards allow one compaction between publications,
-            // or continue draining small files while no source is waiting.
+            // checkpoint. Spend at most the existing batch-wait window starting
+            // further rewrites between publications. This reduces the fragment
+            // fanout of subsequent narrow updates without an unbounded burst.
+            // A retained plan always resolves above; idle maintenance may drain.
             if self.options.compaction.is_none()
                 || view
                     .progress
@@ -24,13 +26,20 @@ impl Publisher {
                         .progress
                         .advanced
                         .as_ref()
-                        .is_some_and(|a| !a.sources.is_empty()))
+                        .is_some_and(|a| !a.sources.is_empty())
+                    && self.compaction_started.is_none_or(|started| {
+                        started.elapsed() >= self.options.max_batch_wait.min(Duration::from_secs(1))
+                    }))
             {
                 return Ok(false);
             }
             let Some(plan) = materializer::compaction::plan(&self.catalog, view).await? else {
                 return Ok(false);
             };
+            // One slow rewrite can exceed the window. Its durable plan must
+            // finish, but after that pending annotations get the next turn.
+            self.compaction_started
+                .get_or_insert_with(tokio::time::Instant::now);
             self.catalog.retire_history(view).await?;
             let reply = materializer::commit(
                 &self.service.ingress.client,

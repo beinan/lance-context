@@ -34,6 +34,7 @@ struct Publisher {
     options: materializer::Options,
     budget: Arc<MergeMemoryBudget>,
     batch_started: Option<tokio::time::Instant>,
+    compaction_started: Option<tokio::time::Instant>,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -121,6 +122,7 @@ impl Runtime {
             options: c.publication.clone(),
             budget: c.publication_budget.clone(),
             batch_started: None,
+            compaction_started: None,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;
@@ -289,6 +291,7 @@ impl Publisher {
             frozen
         };
         self.batch_started = None;
+        self.compaction_started = None;
         let pending = view
             .progress
             .pending
