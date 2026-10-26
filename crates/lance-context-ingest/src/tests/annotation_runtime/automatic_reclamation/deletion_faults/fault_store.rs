@@ -1,6 +1,6 @@
 //! Test-only interception of actual file-object-store deletions.
 use super::*;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use lance_io::object_store::{
     providers::{ObjectStoreProvider, ObjectStoreRegistry},
     ObjectStore as LanceStore, ObjectStoreParams,
@@ -32,9 +32,38 @@ pub(super) struct Faults {
     actions: Mutex<BTreeMap<Path, Action>>,
     pub calls: Mutex<Vec<Path>>,
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
+    listing: Mutex<Option<PausedListing>>,
+    pub data_listings: Mutex<Vec<Path>>,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+#[derive(Debug)]
+struct PausedListing {
+    prefix: Path,
+    first: Option<Path>,
+    entered: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
 impl Faults {
+    pub fn pause_listing(
+        &self,
+        prefix: &std::path::Path,
+        first: Option<&std::path::Path>,
+        entered: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let pause = PausedListing {
+            prefix: Path::from_absolute_path(prefix)?,
+            first: first.map(Path::from_absolute_path).transpose()?,
+            entered,
+            resume,
+        };
+        assert!(self.listing.lock().unwrap().replace(pause).is_none());
+        self.data_listings.lock().unwrap().clear();
+        Ok(())
+    }
+
     pub fn arm(&self, path: &std::path::Path, action: Action) -> Result<()> {
         let path = Path::from_absolute_path(path)?;
         assert!(self.actions.lock().unwrap().insert(path, action).is_none());
@@ -141,7 +170,42 @@ impl ObjectStore for FaultStore {
                 .unwrap()
                 .push(tokio::time::Instant::now());
         }
-        self.inner.list(prefix)
+        if let Some(prefix) = prefix.filter(|p| p.as_ref().ends_with(".lance")) {
+            self.faults
+                .data_listings
+                .lock()
+                .unwrap()
+                .push(prefix.clone());
+        }
+        let pause = self
+            .faults
+            .listing
+            .lock()
+            .unwrap()
+            .take_if(|pause| Some(&pause.prefix) == prefix);
+        let listing = self.inner.list(prefix);
+        let Some(pause) = pause else {
+            return listing;
+        };
+        // Snapshot real object metadata before holding one page response. The
+        // receiver lives inside the retained stream, just like SDK pagination.
+        async_stream::try_stream! {
+            let mut objects = listing.try_collect::<Vec<_>>().await?;
+            if let Some(first) = pause.first {
+                let index = objects.iter().position(|o| o.location == first)
+                    .expect("paused listing candidate missing");
+                yield objects.remove(index);
+            }
+            let _ = pause.entered.send(());
+            pause.resume.await.map_err(|_| object_store::Error::Generic {
+                store: "annotation-list-test",
+                source: std::io::Error::other("paused listing receiver dropped").into(),
+            })?;
+            for object in objects {
+                yield object;
+            }
+        }
+        .boxed()
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await

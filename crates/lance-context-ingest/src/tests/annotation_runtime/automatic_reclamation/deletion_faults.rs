@@ -4,6 +4,7 @@ use std::path::{Path as FsPath, PathBuf};
 use tokio::sync::oneshot;
 
 mod fault_store;
+mod listing;
 use fault_store::{Action, Faults};
 
 fn limits() -> Limits {
