@@ -12,6 +12,8 @@ pub struct Options {
     pub max_objects: usize,
     pub max_bytes: usize,
     pub delete_parallelism: usize,
+    /// Minimum delay after a completed collection pass. Slow object storage I/O
+    /// does not consume this cooldown.
     pub interval: Duration,
 }
 impl Default for Options {
@@ -77,7 +79,21 @@ impl Collector {
         if tokio::time::Instant::now() < self.next_run {
             return Ok(());
         }
+        let result = self.collect_page(service, catalog, storage, budget).await;
+        // LIST/protection/DELETE can take longer than the configured interval.
+        // Starting the clock before that I/O makes every following publisher
+        // iteration eligible for another pass, starving materialization.
         self.next_run = tokio::time::Instant::now() + self.options.interval;
+        result
+    }
+
+    async fn collect_page(
+        &mut self,
+        service: &Service,
+        catalog: &materializer::Publisher,
+        storage: &Storage,
+        budget: &Arc<MergeMemoryBudget>,
+    ) -> Result<()> {
         let state = catalog.state().await?;
         // A retained plan must first finish exact recovery, including its old
         // base. Do not classify uncommitted files while such a plan exists.
