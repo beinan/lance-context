@@ -23,6 +23,8 @@ mod annotation_http;
 mod annotation_publication;
 #[cfg(feature = "materializer")]
 mod annotation_runtime;
+#[cfg(feature = "service")]
+mod annotation_storage_retry;
 #[cfg(feature = "materializer")]
 mod annotations;
 #[cfg(feature = "materializer")]
