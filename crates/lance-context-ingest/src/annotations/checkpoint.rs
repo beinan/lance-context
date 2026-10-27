@@ -5,6 +5,7 @@ use lance::Dataset;
 use lance_context_core::annotation_staging::{
     FrozenAnnotations, PreparedAnnotations, RejectionReason, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
+use lance_context_wal::replication::publication as p;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,20 +358,28 @@ pub(super) async fn open(
             .as_ref()
             .context("selected publication has no preparation")?;
         let original = load(ingress, storage, pending.plan.read_version).await?;
-        let selected = annotation_publication::selected_cut(
-            &base,
-            &original,
-            &prepared.descriptors,
-            &annotation_publication::Selection {
-                table: ingress.scope.table,
-                incarnation: ingress.scope.incarnation,
-                pending: (**pending).clone(),
-            },
-            record,
-            storage,
-        )
-        .await?;
-        ensure!(selected == through, "selected request result cut differs");
+        if pending.plan.is_maintenance() {
+            validate_compacted(&base, &original, pending, prepared, record).await?;
+            ensure!(
+                covered == through,
+                "compaction advanced annotation application cut"
+            );
+        } else {
+            let selected = annotation_publication::selected_cut(
+                &base,
+                &original,
+                &prepared.descriptors,
+                &annotation_publication::Selection {
+                    table: ingress.scope.table,
+                    incarnation: ingress.scope.incarnation,
+                    pending: (**pending).clone(),
+                },
+                record,
+                storage,
+            )
+            .await?;
+            ensure!(selected == through, "selected request result cut differs");
+        }
     } else {
         ensure!(
             covered == through && view.progress.minimum_read_version == base.version_id(),
@@ -380,7 +389,34 @@ pub(super) async fn open(
     Ok((base, Arc::new(snapshot)))
 }
 
-pub(super) async fn load(
+pub(super) async fn validate_compacted(
+    selected: &Dataset,
+    base: &Dataset,
+    pending: &p::PendingPlan,
+    prepared: &p::Prepared,
+    record: &p::ManifestRecord,
+) -> Result<()> {
+    let transaction = materializer::stage::annotation_compaction_transaction(
+        base,
+        pending,
+        &prepared.descriptors,
+    )
+    .await?;
+    ensure!(
+        selected.uri() == base.uri()
+            && selected.version_id() == pending.plan.target_version()?
+            && record.version == selected.version_id()
+            && record.transaction == pending.plan.transaction
+            && record.plan_index == pending.index
+            && record.prepared_index == prepared.index
+            && record.descriptor_digest == prepared.descriptors.digest
+            && selected.read_transaction().await?.as_ref() == Some(&transaction),
+        "selected annotation compaction differs from its retained preparation"
+    );
+    Ok(())
+}
+
+pub(crate) async fn load(
     ingress: &Ingress,
     storage: &Storage,
     version: u64,

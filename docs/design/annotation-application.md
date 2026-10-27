@@ -64,8 +64,30 @@ standalone config. Exactly one table and one virtual shard are supported.
 independent budgets. Publication needs capacity for the full bounded frozen
 generation and its checkpoint metadata. `worker.publication` controls maximum
 source records/bytes, minimum batch bytes, maximum batch wait, and retained
-manifests. Ingestion compaction, session indexing and remote preparation options
-are rejected for these annotation roles.
+manifests. Optional `worker.publication.compaction` uses the existing bounded
+native small-file rewrite, starting after the first annotation checkpoint. It
+preserves the cut and request results. After an annotation publication, it allows
+one compaction and starts further rewrites only within the smaller of
+`max_batch_wait` and one second while source updates are waiting. An already
+retained plan must finish even if its native rewrite exceeds that window; the
+window limits starting more work, not the duration of a rewrite. While idle,
+compaction can continue draining small files. Its configured workspace must fit
+the publication budget. `TryBinaryCopy` may
+fall back to re-encoding bodies for multi-file column layouts; this is not a
+zero-copy guarantee. Session indexing and remote preparation remain unsupported.
+
+Compaction recovery tests retain or SIGKILL the three local WAL replicas and
+annotation applier after the maintenance plan, prepared files, an unknown
+manifest-selection reply, and confirmation before retirement. Reopening checks
+the original successful and rejected request results, a concurrent score update,
+body bytes, ID-index coverage, later publications and file collection. These
+small indexed fixtures exercise recovery with retained disks; they do not qualify
+large fragmented tables or sustained production throughput. Native annotation
+preparations within the catalog's descriptor budget stay inline; larger ones use
+a scoped immutable reference to destination-store metadata, capped at 64 MiB of
+raw encoded bytes. That cap does not bound decoded engine memory. All voters and
+owners must support the reference descriptor before it is emitted; see
+`annotation-managed-publication.md` for recovery and collection requirements.
 
 The owner requires the same authorized etcd prefix on every candidate. It claims
 the table with the existing durable scope/owner/request tuple. Acquisition reads

@@ -8,7 +8,7 @@ use lance_context_wal::replication::{publication as p, source};
 use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
-mod compaction;
+pub(crate) mod compaction;
 pub mod observation;
 mod pipeline;
 mod read_policy;

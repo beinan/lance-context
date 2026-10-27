@@ -175,23 +175,28 @@ pub(crate) async fn publish(
     prepared
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
-    let operation = if pending.plan.is_maintenance() {
-        match prepared.descriptors.format {
-            2 => super::compaction::operation(&base, &prepared.descriptors).await?,
-            3 => super::session_index::operation(&base, &prepared.descriptors).await?,
-            _ => bail!("unexpected maintenance descriptor format"),
-        }
+    let transaction = if publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations {
+        annotation_compaction_transaction(&base, pending, &prepared.descriptors).await?
     } else {
-        ensure!(
-            prepared.descriptors.format == 1,
-            "unexpected append descriptor format"
-        );
-        let fragments: Vec<Fragment> = serde_json::from_slice(&prepared.descriptors.bytes)?;
-        ensure!(!fragments.is_empty(), "empty prepared fragment list");
-        Operation::Append { fragments }
+        let operation = if pending.plan.is_maintenance() {
+            match prepared.descriptors.format {
+                2 => super::compaction::operation(&base, &prepared.descriptors).await?,
+                3 => super::session_index::operation(&base, &prepared.descriptors).await?,
+                _ => bail!("unexpected maintenance descriptor format"),
+            }
+        } else {
+            ensure!(
+                prepared.descriptors.format == 1,
+                "unexpected append descriptor format"
+            );
+            let fragments: Vec<Fragment> = serde_json::from_slice(&prepared.descriptors.bytes)?;
+            ensure!(!fragments.is_empty(), "empty prepared fragment list");
+            Operation::Append { fragments }
+        };
+        let mut transaction = Transaction::new(pending.plan.read_version, operation, None);
+        transaction.uuid = pending.plan.transaction.to_string();
+        transaction
     };
-    let mut transaction = Transaction::new(pending.plan.read_version, operation, None);
-    transaction.uuid = pending.plan.transaction.to_string();
     let handler = p::lance::ManagedManifest::new(
         Arc::new(publisher.ingress.client.manifest_catalog()),
         publisher.storage.base.clone(),
@@ -214,4 +219,37 @@ pub(crate) async fn publish(
         .execute(transaction)
         .await?;
     Ok(())
+}
+
+/// A physical rewrite carries the last annotation checkpoint unchanged. Use
+/// the same reconstruction for publication and recovery of a selected target.
+pub(crate) async fn annotation_compaction_transaction(
+    base: &Dataset,
+    pending: &p::PendingPlan,
+    descriptors: &p::Descriptors,
+) -> Result<Transaction> {
+    ensure!(
+        pending.plan.is_maintenance(),
+        "annotation compaction has sources"
+    );
+    let mut transaction = Transaction::new(
+        pending.plan.read_version,
+        super::compaction::operation(base, descriptors).await?,
+        None,
+    );
+    transaction.uuid = pending.plan.transaction.to_string();
+    let original = base
+        .read_transaction()
+        .await?
+        .context("annotation compaction base has no transaction")?;
+    let properties = original
+        .transaction_properties
+        .context("annotation compaction base has no checkpoint")?;
+    ensure!(
+        properties.contains_key("lance-context.annotation-cut")
+            && properties.contains_key(lance_context_core::annotation_staging::RESULTS_PROPERTY),
+        "annotation compaction base has no cut or request results"
+    );
+    transaction.transaction_properties = Some(properties);
+    Ok(transaction)
 }

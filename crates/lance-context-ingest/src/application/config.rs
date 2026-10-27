@@ -209,7 +209,6 @@ impl Config {
                     && !a.owner_url.is_empty()
                     && a.owner_url.len() <= 8192
                     && self.preparation.is_none()
-                    && self.worker.publication.compaction.is_none()
                     && self.worker.publication.session_index.is_none()
                     && !self.worker.publication.pipeline_preparation,
                 "invalid annotation application options"

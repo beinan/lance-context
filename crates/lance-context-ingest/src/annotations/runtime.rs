@@ -6,6 +6,7 @@ use lance_context_core::annotation_staging::MAX_RESULTS_BYTES;
 use lance_context_wal::replication::publication as p;
 use std::collections::BTreeMap;
 
+mod compaction;
 pub mod reclamation;
 
 pub struct Configuration {
@@ -14,7 +15,8 @@ pub struct Configuration {
     pub apply_budget: Arc<MergeMemoryBudget>,
     pub publication_budget: Arc<MergeMemoryBudget>,
     /// Source thresholds and history bound use the existing publisher options.
-    /// Compaction, session indexing and remote preparation are not enabled here.
+    /// Compaction preserves the last annotation checkpoint; session indexing
+    /// and remote preparation are not enabled here.
     pub publication: materializer::Options,
 }
 
@@ -32,6 +34,7 @@ struct Publisher {
     options: materializer::Options,
     budget: Arc<MergeMemoryBudget>,
     batch_started: Option<tokio::time::Instant>,
+    compaction_started: Option<tokio::time::Instant>,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -69,10 +72,8 @@ impl Runtime {
     ) -> Result<(Service, Self)> {
         let c = configuration;
         ensure!(
-            c.publication.compaction.is_none()
-                && c.publication.session_index.is_none()
-                && !c.publication.pipeline_preparation,
-            "annotation runtime does not support ingestion maintenance options"
+            c.publication.session_index.is_none() && !c.publication.pipeline_preparation,
+            "annotation runtime does not support session indexing or remote preparation"
         );
         let workspace = c
             .limits
@@ -121,6 +122,7 @@ impl Runtime {
             options: c.publication.clone(),
             budget: c.publication_budget.clone(),
             batch_started: None,
+            compaction_started: None,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;
@@ -137,7 +139,12 @@ impl Runtime {
             c.publication.max_records,
             c.publication.max_source_bytes as u64,
         )?;
-        if let Some(pending) = view.progress.pending.as_ref() {
+        if let Some(pending) = view
+            .progress
+            .pending
+            .as_ref()
+            .filter(|p| !p.plan.is_maintenance())
+        {
             let selection = publisher.selection(pending);
             let (_, through) = selection.scope()?;
             let range = &pending.plan.sources[&service.ingress.group(0)?];
@@ -212,6 +219,9 @@ impl Publisher {
 
     async fn publish_next(&mut self) -> Result<()> {
         let mut view = self.catalog.state().await?;
+        if self.compact_next(&view).await? {
+            return Ok(());
+        }
         let frozen = if let Some(pending) = view.progress.pending.as_ref() {
             ensure!(
                 view.progress.prepared.is_none(),
@@ -281,6 +291,7 @@ impl Publisher {
             frozen
         };
         self.batch_started = None;
+        self.compaction_started = None;
         let pending = view
             .progress
             .pending
@@ -335,7 +346,9 @@ impl Publisher {
             .as_ref()
             .context("annotation preparation unavailable")?;
         let selection = self.selection(pending);
-        selection.scope()?;
+        if !pending.plan.is_maintenance() {
+            selection.scope()?;
+        }
         let base = checkpoint::load(
             &self.service.ingress,
             &self.storage,
@@ -352,25 +365,36 @@ impl Publisher {
                 .versions
                 .get(&pending.plan.read_version)
                 .context("annotation predecessor unavailable")?;
-            publication::publish(
-                Arc::new(self.service.ingress.client.manifest_catalog()),
-                &self.service.ingress.layout,
-                &self.storage,
-                p::lance::ManifestCommit {
-                    authority: self.catalog.authority().clone(),
-                    incarnation: self.service.ingress.scope.incarnation,
-                    transaction: pending.plan.transaction,
-                    plan_index: pending.index,
-                    prepared_index: prepared.index,
-                    descriptor_digest: prepared.descriptors.digest,
-                    predecessor: predecessor.identity,
-                    target,
-                },
-                &selection,
-                &prepared.descriptors,
-                base.clone(),
-            )
-            .await?;
+            if pending.plan.is_maintenance() {
+                materializer::stage::publish(
+                    &self.catalog,
+                    pending,
+                    prepared,
+                    predecessor,
+                    (*base).clone(),
+                )
+                .await?;
+            } else {
+                publication::publish(
+                    Arc::new(self.service.ingress.client.manifest_catalog()),
+                    &self.service.ingress.layout,
+                    &self.storage,
+                    p::lance::ManifestCommit {
+                        authority: self.catalog.authority().clone(),
+                        incarnation: self.service.ingress.scope.incarnation,
+                        transaction: pending.plan.transaction,
+                        plan_index: pending.index,
+                        prepared_index: prepared.index,
+                        descriptor_digest: prepared.descriptors.digest,
+                        predecessor: predecessor.identity,
+                        target,
+                    },
+                    &selection,
+                    &prepared.descriptors,
+                    base.clone(),
+                )
+                .await?;
+            }
         }
         let current = self.catalog.state().await?;
         let record = current
@@ -385,15 +409,19 @@ impl Publisher {
             "annotation preparation index differs"
         );
         let selected = checkpoint::load(&self.service.ingress, &self.storage, target).await?;
-        publication::selected_cut(
-            &selected,
-            &base,
-            &prepared.descriptors,
-            &selection,
-            record,
-            &self.storage,
-        )
-        .await?;
+        if pending.plan.is_maintenance() {
+            checkpoint::validate_compacted(&selected, &base, pending, prepared, record).await?;
+        } else {
+            publication::selected_cut(
+                &selected,
+                &base,
+                &prepared.descriptors,
+                &selection,
+                record,
+                &self.storage,
+            )
+            .await?;
+        }
         let reply = materializer::commit(
             &self.service.ingress.client,
             Command::Confirm(p::ConfirmPublication {
