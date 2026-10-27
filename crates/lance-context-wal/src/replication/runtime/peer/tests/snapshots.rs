@@ -526,11 +526,7 @@ async fn snapshot_file_worker_panic_stops_service_and_allows_original_engine_rec
         follower,
         TcpListener::bind(c.net.addresses[&follower]).await?,
     )?;
-    c.attach_with(
-        follower,
-        c.listener(follower)?,
-        Arc::new(PanicAdmission),
-    )?;
+    c.attach_with(follower, c.listener(follower)?, Arc::new(PanicAdmission))?;
     wait_for(|| {
         c.services[&follower]
             .statistics()
