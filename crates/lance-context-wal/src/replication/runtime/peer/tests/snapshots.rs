@@ -44,6 +44,10 @@ struct Images {
     net: Cluster,
     services: BTreeMap<u64, snapshot::Transport>,
     addresses: BTreeMap<u64, SocketAddr>,
+    // Keep ownership across follower downtime. Rebinding a released ephemeral
+    // port can collide with another fixture or an outgoing connection. No
+    // snapshot is accepted or acknowledged while its service is stopped.
+    listeners: BTreeMap<u64, std::net::TcpListener>,
     quotas: BTreeMap<u64, Arc<Quota>>,
 }
 impl Images {
@@ -55,19 +59,23 @@ impl Images {
         for id in 1..=3 {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             addresses.insert(id, listener.local_addr()?);
-            listeners.insert(id, listener);
+            listeners.insert(id, listener.into_std()?);
             quotas.insert(id, Arc::new(Quota::open(&root.join(id.to_string()))?));
         }
         let mut c = Self {
             net,
             services: BTreeMap::new(),
             addresses,
+            listeners,
             quotas,
         };
-        for (id, listener) in listeners {
-            c.attach(id, listener)?;
+        for id in 1..=3 {
+            c.attach(id, c.listener(id)?)?;
         }
         Ok(c)
+    }
+    fn listener(&self, id: u64) -> Result<TcpListener> {
+        Ok(TcpListener::from_std(self.listeners[&id].try_clone()?)?)
     }
     fn attach(&mut self, id: u64, listener: TcpListener) -> Result<()> {
         self.attach_with(id, listener, self.quotas[&id].clone())
@@ -126,7 +134,7 @@ impl Images {
     async fn start(&mut self, root: &Path, id: u64) -> Result<()> {
         self.net
             .start(root, id, TcpListener::bind(self.net.addresses[&id]).await?)?;
-        self.attach(id, TcpListener::bind(self.addresses[&id]).await?)
+        self.attach(id, self.listener(id)?)
     }
     async fn shutdown(mut self) -> Result<()> {
         while let Some((_, service)) = self.services.pop_first() {
@@ -190,6 +198,14 @@ async fn tls_snapshots_catch_up_two_compacted_groups_and_reopen_original_payload
         .find(|id| !leaders.values().any(|leader| leader == id))
         .unwrap();
     c.stop(follower).await?;
+    assert_eq!(
+        TcpListener::bind(c.addresses[&follower])
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AddrInUse,
+        "the stopped follower must retain its snapshot endpoint"
+    );
     let mut expected = Vec::new();
     for group in [10, 20] {
         for sequence in 1..=4 {
@@ -287,7 +303,7 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
         follower,
         TcpListener::bind(c.net.addresses[&follower]).await?,
     )?;
-    let listener = TcpListener::bind(c.addresses[&follower]).await?;
+    let listener = c.listener(follower)?;
     let acceptor = TlsAcceptor::from(image_tls(&c.net.tls[&follower]).1);
     let connected = Arc::new(AtomicBool::new(false));
     let observed = connected.clone();
@@ -313,7 +329,7 @@ async fn stalled_tls_snapshot_does_not_block_healthy_quorum_and_recovers_after_d
     assert!(!stalled.is_finished());
     stalled.abort();
     let _ = stalled.await;
-    c.attach(follower, TcpListener::bind(c.addresses[&follower]).await?)?;
+    c.attach(follower, c.listener(follower)?)?;
     wait_for(|| {
         c.net.nodes[&follower]
             .handle
@@ -512,7 +528,7 @@ async fn snapshot_file_worker_panic_stops_service_and_allows_original_engine_rec
     )?;
     c.attach_with(
         follower,
-        TcpListener::bind(c.addresses[&follower]).await?,
+        c.listener(follower)?,
         Arc::new(PanicAdmission),
     )?;
     wait_for(|| {
