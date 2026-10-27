@@ -7,6 +7,13 @@ use crate::{annotations::Service, tests::annotation_runtime as runtime};
 use lance::index::DatasetIndexExt;
 use object_store::ObjectStoreExt;
 
+// Each fixture owns an RF3 cluster and thousands of deliberately tiny files
+// to exceed inline preparation metadata limits. Bound independent fixtures
+// before starting their deadlines on small CI runners. Writes, reads, apply,
+// publication and collection still run concurrently within the admitted case;
+// this recovery suite is not a multi-owner throughput benchmark.
+static LARGE_FIXTURES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 fn large_binding() -> TableBinding {
     TableBinding {
         max_rows: 2048,
@@ -19,6 +26,15 @@ async fn owner(
     storage: &Storage,
     limits: &Limits,
 ) -> Result<(Service, Runtime)> {
+    owner_with_workspace(c, storage, limits, 8 << 20).await
+}
+
+async fn owner_with_workspace(
+    c: &network::Cluster,
+    storage: &Storage,
+    limits: &Limits,
+    publication_bytes: usize,
+) -> Result<(Service, Runtime)> {
     Runtime::connect(
         c.client.clone(),
         one_shard(),
@@ -28,7 +44,7 @@ async fn owner(
             limits: limits.clone(),
             upload_budget: MergeMemoryBudget::new(32 << 20),
             apply_budget: MergeMemoryBudget::new(16 << 20),
-            publication_budget: MergeMemoryBudget::new(8 << 20),
+            publication_budget: MergeMemoryBudget::new(publication_bytes),
             publication: Options {
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,
@@ -124,11 +140,51 @@ async fn large_annotation_preparation_respects_configured_catalog_limit() -> Res
 }
 
 async fn recover(stage: Stop, fragments: usize) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(180), recover_inner(stage, fragments)).await?
+    let _fixture = LARGE_FIXTURES.acquire().await?;
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(stage, fragments, false, false),
+    )
+    .await?
 }
 
-async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
-    let root = tempfile::tempdir()?;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_annotation_preparation_collects_metadata_after_recovery() -> Result<()> {
+    let _fixture = LARGE_FIXTURES.acquire().await?;
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(Stop::Prepared, 4096, true, false),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_annotation_collection_refusal_preserves_published_suffix() -> Result<()> {
+    let _fixture = LARGE_FIXTURES.acquire().await?;
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(Stop::Prepared, 4096, true, true),
+    )
+    .await?
+}
+
+async fn recover_inner(
+    stage: Stop,
+    fragments: usize,
+    collect: bool,
+    publish_suffix_first: bool,
+) -> Result<()> {
+    let mut directory = tempfile::Builder::new();
+    directory.prefix("annotation-large-");
+    let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
+        directory.disable_cleanup(true).tempdir_in(parent)?
+    } else {
+        directory.tempdir()?
+    };
+    eprintln!(
+        "annotation large fixture: {} fragments={fragments} collection={collect}",
+        root.path().display()
+    );
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
         Default::default(),
@@ -267,7 +323,98 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
         )
         .await?;
     }
-    let (service, runtime) = owner(&c, &storage, &limits).await?;
+    let (service, runtime) = if collect {
+        if publish_suffix_first {
+            // A listing slice can return no candidates, letting publication run
+            // before a later collection pass rejects its workspace. Exercise
+            // that valid ordering without depending on listing speed.
+            let (before, runtime) = owner(&c, &storage, &limits).await?;
+            let (stop, task) = runtime::run_owner(runtime);
+            runtime::drained(&before, suffix_result.index).await?;
+            assert_eq!(
+                before.submit(&suffix, Duration::from_secs(30)).await?,
+                suffix_result
+            );
+            assert_eq!(
+                before
+                    .get("t00000000", Duration::from_secs(30))
+                    .await?
+                    .unwrap(),
+                current
+            );
+            stop.send(()).unwrap();
+            task.await??;
+            drop(before);
+        }
+        // The 8 MiB preparation fixture cannot also admit a complete retained
+        // manifest plus the collection page. Keep this refusal as a tested
+        // boundary. Independent publication may already have covered the suffix;
+        // only an uncovered update still requires its original source record.
+        let (small, runtime) = owner(&c, &storage, &limits).await?;
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            collector(runtime)?.run(std::future::pending()),
+        )
+        .await?
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("annotation retained manifest exceeds collection workspace"),
+            "{error:#}"
+        );
+        assert_eq!(small.reclamation_observation().deleted, 0);
+        let prefix = storage.base.clone().join("_annotation_preparations");
+        assert!(base
+            .object_store(None)
+            .await?
+            .inner
+            .list(Some(&prefix))
+            .try_next()
+            .await?
+            .is_some());
+        let checkpoint = state(&c)
+            .await?
+            .progress
+            .checkpoint
+            .get(&10)
+            .copied()
+            .unwrap_or(0);
+        assert!(checkpoint >= last_result.index);
+        if checkpoint < suffix_result.index {
+            let query::Value::Accepted(page) = query(
+                &c,
+                query::Query::AcceptedBucket {
+                    table: large_binding().table,
+                    bucket: 0,
+                    after: checkpoint,
+                    limit: 1,
+                },
+            )
+            .await?
+            else {
+                bail!("unmaterialized suffix recovery source unavailable");
+            };
+            assert_eq!(
+                page.entries,
+                vec![(suffix_result.index, suffix_result.meta.clone())]
+            );
+        }
+        eprintln!(
+            "collection refusal: checkpoint={checkpoint} suffix={} forced_publication={publish_suffix_first}",
+            suffix_result.index
+        );
+        drop(small);
+        // A separate recovery configuration matches the existing 64 MiB
+        // publication workspace used by the executable blob experiment.
+        owner_with_workspace(&c, &storage, &limits, 64 << 20).await?
+    } else {
+        owner(&c, &storage, &limits).await?
+    };
+    let runtime = if collect {
+        collector(runtime)?
+    } else {
+        runtime
+    };
     let (stop, task) = runtime::run_owner(runtime);
     assert_eq!(
         service
@@ -287,6 +434,19 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
         current
     );
     runtime::drained(&service, suffix_result.index).await?;
+    if collect {
+        collected_metadata(&storage, &base).await?;
+        assert_eq!(
+            service
+                .submit(&last_request, Duration::from_secs(30))
+                .await?,
+            last_result
+        );
+        assert_eq!(
+            service.submit(&suffix, Duration::from_secs(30)).await?,
+            suffix_result
+        );
+    }
     let published = read(&c, &storage, Some(selection.pending.plan.target_version()?)).await?;
     assert_eq!(published.read_transaction().await?, Some(original));
     let selected = read(&c, &storage, None).await?;
@@ -386,9 +546,62 @@ async fn recover_inner(stage: Stop, fragments: usize) -> Result<()> {
             Reply::Record(None)
         ));
     }
+    if collect {
+        collected_metadata(&storage, &base).await?;
+        assert!(service.reclamation_observation().deleted > 0);
+        let fresh =
+            Storage::resolve(storage.uri.clone(), Default::default(), Arc::default()).await?;
+        let selected = read(&c, &fresh, None).await?;
+        assert_eq!(
+            selected
+                .count_rows(Some("status = 'round-3'".into()))
+                .await?,
+            fragments
+        );
+        let mut scan = selected.scan();
+        scan.project(&["body"])?;
+        let mut stream = scan.try_into_stream().await?;
+        let mut rows = 0;
+        while let Some(batch) = stream.try_next().await? {
+            let bodies = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap();
+            for body in bodies.iter() {
+                let body = body.context("missing original body after collection")?;
+                assert_eq!(body.len(), 1024);
+                assert!(body.iter().all(|b| *b == 0x5a));
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2 * fragments);
+    }
     stop.send(()).unwrap();
     task.await??;
     c.shutdown().await
+}
+
+async fn collected_metadata(storage: &Storage, base: &Dataset) -> Result<()> {
+    let prefix = storage.base.clone().join("_annotation_preparations");
+    let store = base.object_store(None).await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if store.inner.list(Some(&prefix)).try_next().await?.is_none() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
+}
+
+fn collector(runtime: Runtime) -> Result<Runtime> {
+    runtime.with_exclusive_reclamation(crate::annotations::runtime::reclamation::Options {
+        max_bytes: 256 << 10,
+        interval: Duration::from_millis(10),
+        ..Default::default()
+    })
 }
 
 async fn rejects_broken_metadata(
