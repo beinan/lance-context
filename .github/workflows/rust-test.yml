@@ -178,8 +178,7 @@ jobs:
 
   ha-tests:
     runs-on: ubuntu-24.04
-    # Cold feature builds and recovery tests can take 59 minutes before cache
-    # upload. Leave room for cleanup so passing tests do not end as cancelled.
+    # Keep cold feature builds and recovery tests within the existing job budget.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -191,6 +190,8 @@ jobs:
         with:
           shared-key: "lance-context-ha-deps"
           workspaces: "."
+          # Saving a PR-scoped cache must not time out already passing tests.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies
         timeout-minutes: 10
         run: |
