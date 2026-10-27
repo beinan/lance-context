@@ -44,6 +44,8 @@ struct Progress {
 }
 
 struct Shared {
+    #[cfg(test)]
+    apply_attempts: std::sync::atomic::AtomicU64,
     staging: AnnotationStaging,
     results: Mutex<checkpoint::Results>,
     window: Mutex<window::Window>,
@@ -75,6 +77,7 @@ struct Pending {
 pub struct Driver {
     service: Service,
     pending: Option<Pending>,
+    staging_pressure: Option<(u64, usize, usize)>,
 }
 
 /// Connect an authorized ingress without opening Lance or creating an applier.
@@ -103,6 +106,12 @@ pub async fn connect_ingress(
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn apply_attempts(&self) -> u64 {
+        self.shared
+            .apply_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn reclamation_observation(&self) -> runtime::reclamation::Observation {
         self.shared.reclamation.lock().unwrap().clone()
     }
@@ -223,6 +232,8 @@ impl Service {
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
                 reclamation: Mutex::new(Default::default()),
             }),
@@ -231,6 +242,7 @@ impl Service {
         let driver = Driver {
             service: service.clone(),
             pending: None,
+            staging_pressure: None,
         };
         Ok((service, driver))
     }
@@ -528,14 +540,6 @@ impl Driver {
             }
         }
         let pending = self.pending.as_ref().unwrap();
-        let mutations: Vec<_> = pending
-            .mutations
-            .iter()
-            .map(|m| Mutation {
-                turn: &m.turn,
-                patch: &m.patch,
-            })
-            .collect();
         let _ordered = service.shared.ordered.lock().await;
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
             service
@@ -544,6 +548,34 @@ impl Driver {
                 .send_modify(|p| p.backpressured = true);
             return Ok(());
         }
+        let observed = service.shared.staging.observation().await;
+        let capacity = (
+            observed.materialized,
+            observed.retained_bytes,
+            observed.retained_entries,
+        );
+        // This driver is the only applier. An unchanged base and retained
+        // capacity cannot admit a batch that was already backpressured. Keep
+        // the decoded request, but do not rebuild/discard its values every
+        // poll while the publisher needs CPU to release the frozen generation.
+        // Reader/old-handle release also changes these counters, independently
+        // of publication, so it can unblock the same pending batch.
+        if self.staging_pressure == Some(capacity) {
+            return Ok(());
+        }
+        let mutations: Vec<_> = pending
+            .mutations
+            .iter()
+            .map(|m| Mutation {
+                turn: &m.turn,
+                patch: &m.patch,
+            })
+            .collect();
+        #[cfg(test)]
+        service
+            .shared
+            .apply_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = match service
             .shared
             .staging
@@ -553,6 +585,7 @@ impl Driver {
             ApplyOutcome::Applied => MutationResult::Applied,
             ApplyOutcome::Rejected(rejected) => MutationResult::Rejected(rejected),
             ApplyOutcome::Backpressure => {
+                self.staging_pressure = Some(capacity);
                 service
                     .shared
                     .progress
@@ -563,6 +596,7 @@ impl Driver {
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
+        self.staging_pressure = None;
         let slot = slot(&pending.meta, ingress.client.producer_slots())?;
         service
             .shared
