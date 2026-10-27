@@ -402,10 +402,12 @@ jobs:
         run: |
           # Keep the feature union from the first workspace run. Re-selecting
           # packages with Cargo rebuilt native dependencies for each later step.
+          # show-env exports the Cargo metadata target directory. Set it before
+          # generating that environment, or it redirects indexing to target/.
+          export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR"
           cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
           source "$RUNNER_TEMP/coverage-env.sh"
-          export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR"
-          cargo test --workspace --all-features --no-run --message-format=json \
+          cargo test --tests --workspace --all-features --no-run --message-format=json \
             > "$RUNNER_TEMP/coverage-tests.jsonl"
       - name: Collect coverage (etcd-backed ignored tests)
         env:
