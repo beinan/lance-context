@@ -4215,6 +4215,7 @@ dependencies = [
  "lance",
  "lance-context-api",
  "lance-context-core",
+ "lance-context-metrics",
  "lance-context-wal",
  "lance-index",
  "lance-io",

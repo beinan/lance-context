@@ -11,6 +11,7 @@ service = ["worker", "http", "dep:reqwest", "dep:tokio-rustls", "tokio/rt-multi-
 worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
+lance-io-metrics = ["lance-context-core/lance-io-metrics", "dep:lance-context-metrics"]
 materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:prost", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
 
 [dependencies]
@@ -36,6 +37,7 @@ base64 = "0.22"
 bytes = "1"
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
+lance-context-metrics = { path = "../lance-context-metrics", optional = true }
 lance-context-wal = { version = "0.6.7", path = "../lance-context-wal", features = ["peer-transport", "ipc", "arrow-contract"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -65,3 +67,7 @@ required-features = ["service"]
 name = "annotation_probe"
 path = "examples/annotation_probe/main.rs"
 required-features = ["service", "http-client"]
+
+[[example]]
+name = "annotation_io_owner"
+required-features = ["service", "lance-io-metrics"]
