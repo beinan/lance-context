@@ -4377,7 +4377,7 @@ pub(crate) mod tests {
                 .header()
                 .unwrap()
                 .revision();
-            let (mut watcher, mut events) = observer
+            let mut events = observer
                 .watch(
                     format!("{}/", store.inner.prefix),
                     Some(
@@ -4425,7 +4425,7 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-            watcher.cancel().await.unwrap();
+            drop(events);
         }
         assert!(store.list().await.unwrap().is_empty());
     }
