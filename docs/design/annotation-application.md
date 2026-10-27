@@ -129,6 +129,14 @@ do not sum them into wall/CPU time or treat them as one atomic view. These fixed
 counters reset with the owner and are diagnostic only. They do not change
 admission limits, publication ordering or failure handling.
 
+The `annotation_io_owner` example also installs a stderr tracing subscriber.
+It defaults to warning-level logs and accepts `RUST_LOG`. To observe the object
+store SDK's existing retry reasons, attempt counts and backoff delays, run it
+with `RUST_LOG=warn,object_store::client::retry=info`. This changes diagnostic
+output only; the SDK retry policy and application failure handling stay the same.
+These events are not a per-request trace: concurrent operations can interleave.
+Transport errors can include object URLs, so sanitize logs before sharing them.
+
 ## Physical file collection
 
 For a table served exclusively by its annotation owner, set
