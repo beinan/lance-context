@@ -135,7 +135,7 @@ async fn large_annotation_preparation_respects_configured_catalog_limit() -> Res
 async fn recover(stage: Stop, fragments: usize) -> Result<()> {
     tokio::time::timeout(
         Duration::from_secs(180),
-        recover_inner(stage, fragments, false),
+        recover_inner(stage, fragments, false, false),
     )
     .await?
 }
@@ -144,12 +144,26 @@ async fn recover(stage: Stop, fragments: usize) -> Result<()> {
 async fn large_annotation_preparation_collects_metadata_after_recovery() -> Result<()> {
     tokio::time::timeout(
         Duration::from_secs(180),
-        recover_inner(Stop::Prepared, 4096, true),
+        recover_inner(Stop::Prepared, 4096, true, false),
     )
     .await?
 }
 
-async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_annotation_collection_refusal_preserves_published_suffix() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        recover_inner(Stop::Prepared, 4096, true, true),
+    )
+    .await?
+}
+
+async fn recover_inner(
+    stage: Stop,
+    fragments: usize,
+    collect: bool,
+    publish_suffix_first: bool,
+) -> Result<()> {
     let mut directory = tempfile::Builder::new();
     directory.prefix("annotation-large-");
     let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
@@ -300,9 +314,32 @@ async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<(
         .await?;
     }
     let (service, runtime) = if collect {
+        if publish_suffix_first {
+            // A listing slice can return no candidates, letting publication run
+            // before a later collection pass rejects its workspace. Exercise
+            // that valid ordering without depending on listing speed.
+            let (before, runtime) = owner(&c, &storage, &limits).await?;
+            let (stop, task) = runtime::run_owner(runtime);
+            runtime::drained(&before, suffix_result.index).await?;
+            assert_eq!(
+                before.submit(&suffix, Duration::from_secs(30)).await?,
+                suffix_result
+            );
+            assert_eq!(
+                before
+                    .get("t00000000", Duration::from_secs(30))
+                    .await?
+                    .unwrap(),
+                current
+            );
+            stop.send(()).unwrap();
+            task.await??;
+            drop(before);
+        }
         // The 8 MiB preparation fixture cannot also admit a complete retained
         // manifest plus the collection page. Keep this refusal as a tested
-        // boundary, including the acknowledged suffix's recovery dependency.
+        // boundary. Independent publication may already have covered the suffix;
+        // only an uncovered update still requires its original source record.
         let (small, runtime) = owner(&c, &storage, &limits).await?;
         let error = tokio::time::timeout(
             Duration::from_secs(30),
@@ -325,16 +362,37 @@ async fn recover_inner(stage: Stop, fragments: usize, collect: bool) -> Result<(
             .try_next()
             .await?
             .is_some());
-        assert!(matches!(
-            c.client
-                .request_routed(Request::Fetch {
-                    group: 10,
-                    index: suffix_result.index
-                })
-                .await?
-                .reply,
-            Reply::Record(Some(_))
-        ));
+        let checkpoint = state(&c)
+            .await?
+            .progress
+            .checkpoint
+            .get(&10)
+            .copied()
+            .unwrap_or(0);
+        assert!(checkpoint >= last_result.index);
+        if checkpoint < suffix_result.index {
+            let query::Value::Accepted(page) = query(
+                &c,
+                query::Query::AcceptedBucket {
+                    table: large_binding().table,
+                    bucket: 0,
+                    after: checkpoint,
+                    limit: 1,
+                },
+            )
+            .await?
+            else {
+                bail!("unmaterialized suffix recovery source unavailable");
+            };
+            assert_eq!(
+                page.entries,
+                vec![(suffix_result.index, suffix_result.meta.clone())]
+            );
+        }
+        eprintln!(
+            "collection refusal: checkpoint={checkpoint} suffix={} forced_publication={publish_suffix_first}",
+            suffix_result.index
+        );
         drop(small);
         // A separate recovery configuration matches the existing 64 MiB
         // publication workspace used by the executable blob experiment.

@@ -101,4 +101,7 @@ ACK's point-read value, bounded staging charges, final values and source drain.
 With exclusive reclamation enabled, it also verifies preparation-object removal,
 original request results and body bytes after recovery. An insufficient collection
 workspace is rejected before deleting anything, preserving the acknowledged
-suffix's recovery sources.
+suffix's recovery sources. A publication may finish before a later collection
+pass reaches that refusal. Tests require any uncovered suffix to remain in the
+quorum source catalog, and reopen to verify original request results and current
+values for both unpublished and already published suffixes.
