@@ -171,12 +171,15 @@ pub async fn serve_owner(
                 let (view, pressured) = service.observation().await;
                 let source = service.source_observation();
                 eprintln!("{}", serde_json::json!({"annotation": {
+                    "observed_unix_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()),
                     "table": table.binding.table,
                     "applied": view.applied, "materialized": view.materialized,
                     "active_entries": view.active_entries, "frozen_entries": view.frozen_entries,
                     "retained_bytes": view.retained_bytes, "source_records": source.records,
                     "source_bytes": source.bytes, "backpressured": pressured,
                     "reclamation": service.reclamation_observation(),
+                    "phases": service.phase_observation(),
                 }}));
             }
         };

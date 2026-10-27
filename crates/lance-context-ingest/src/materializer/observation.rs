@@ -22,8 +22,10 @@ pub enum Phase {
     DecodeValidate,
     BlobWrite,
     Admission,
+    Collect,
+    Compact,
 }
-const NAMES: [&str; 10] = [
+const NAMES: [&str; 12] = [
     "claim",
     "acquire",
     "state",
@@ -34,7 +36,10 @@ const NAMES: [&str; 10] = [
     "decode_validate",
     "blob_write",
     "admission",
+    "collect",
+    "compact",
 ];
+pub const PHASE_COUNT: usize = NAMES.len();
 
 #[derive(Default)]
 struct Counter {
@@ -43,10 +48,11 @@ struct Counter {
     failed: AtomicU64,
     cancelled: AtomicU64,
     elapsed_micros: AtomicU64,
+    max_elapsed_micros: AtomicU64,
 }
 
 #[derive(Default)]
-pub struct Counters([Counter; 10]);
+pub struct Counters([Counter; PHASE_COUNT]);
 
 /// Each field is sampled independently. Parent phases contain child phases;
 /// concurrent phase times overlap and must not be summed into elapsed or CPU time.
@@ -59,10 +65,12 @@ pub struct Observation {
     pub cancelled: u64,
     /// Includes failed/cancelled work, but not time still in flight.
     pub elapsed_micros: u64,
+    /// Longest finished interval, including failed/cancelled work.
+    pub max_elapsed_micros: u64,
 }
 
 impl Counters {
-    pub fn observation(&self) -> [Observation; 10] {
+    pub fn observation(&self) -> [Observation; PHASE_COUNT] {
         std::array::from_fn(|i| {
             let c = &self.0[i];
             Observation {
@@ -72,6 +80,7 @@ impl Counters {
                 failed: c.failed.load(Ordering::Relaxed),
                 cancelled: c.cancelled.load(Ordering::Relaxed),
                 elapsed_micros: c.elapsed_micros.load(Ordering::Relaxed),
+                max_elapsed_micros: c.max_elapsed_micros.load(Ordering::Relaxed),
             }
         })
     }
@@ -120,10 +129,9 @@ struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         let c = &self.counters.0[self.phase as usize];
-        c.elapsed_micros.fetch_add(
-            self.start.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        let elapsed = self.start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        c.elapsed_micros.fetch_add(elapsed, Ordering::Relaxed);
+        c.max_elapsed_micros.fetch_max(elapsed, Ordering::Relaxed);
         match self.success {
             Some(success) => {
                 if !success {
