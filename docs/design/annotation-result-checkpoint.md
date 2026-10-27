@@ -42,9 +42,11 @@ a completed publication, the native cut must match the durable catalog checkpoin
 Only then does application start at that cut and replay the WAL suffix. Missing
 result metadata cannot be treated as an all-success checkpoint.
 
-This is the checkpoint/publication integration, not automatic scheduling. The
-caller still owns plan selection, source pins, publication result resolution,
-confirmation and closure. An independently running view which falls behind source
-closure fails and must reconnect to the durable checkpoint; production owner routing
-and continuous publisher recovery remain to be wired. SIGKILL and sustained mixed
-pressure tests remain required before enabling the application path.
+The [publication runtime](annotation-runtime.md) supplies scheduling, plan
+selection, source pins, publication result resolution, confirmation and closure.
+An independently running view which falls behind source closure fails and must
+reconnect to the durable checkpoint. The
+[owner application](annotation-application.md) supplies fenced recovery and
+cross-ingress routing. Runtime and application process tests exercise SIGKILL
+recovery with retained storage; those correctness tests do not establish sustained
+mixed-load throughput or qualify multi-shard operation.

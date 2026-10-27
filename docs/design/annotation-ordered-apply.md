@@ -5,6 +5,9 @@ A background driver processes accepted records in order, retains the latest
 result per bounded producer slot, and signals waiters only after both the complete
 annotation state and the result are installed. Missing turns reject the whole
 batch and advance progress; temporary staging pressure retains the decoded batch.
+The driver skips rebuilding that batch while the materialized cut and retained
+byte/entry usage are unchanged. Publication or release of retained readers and
+old generation handles enables another attempt without submitting a new mutation.
 Storage or protocol errors stop the driver and make reads fail.
 
 The first binding has exactly one virtual shard and an explicit `TurnAnnotations`
@@ -19,7 +22,8 @@ The upload is validated before submission. The original IPC bytes are retained
 for exact retries and replicated opaquely. A background applier decodes each fetched
 batch once and retains its narrow patches through pressure; replicas do not decode
 Arrow. This is not end-to-end zero copy: turning patches into current owned values
-still allocates narrow strings/sets. No annotation operation copies a turn body.
+still allocates narrow strings/sets. Mutation uploads and patch application do not
+copy a turn body.
 Upload reservations and apply workspace use independent budgets: clients waiting
 for application cannot occupy the memory needed to complete their own writes.
 
@@ -30,23 +34,28 @@ requires retaining the original identity and bytes; it does not authorize moving
 to a new sequence. Results contain application status and a source position, not a
 historical annotation value.
 
-Each independently connected ingress has a bounded view and background driver.
-Point reads obtain an O(1) scoped quorum barrier, wait for the background applied
-position, then resolve active/frozen/Lance from a compatible view. The point-read
-path does not enumerate or fetch the WAL suffix. A lagging ingress waits or fails
-its deadline instead of returning its old base. This arrangement qualifies read
+An independently connected `Service` has a bounded view and background driver.
+Its point reads obtain an O(1) scoped quorum barrier, wait for the background
+applied position, then resolve active/frozen/Lance from a compatible view. The
+point-read path does not enumerate or fetch the WAL suffix. A lagging service
+view waits or fails its deadline instead of returning its old base. This qualifies read
 correctness; it does not establish the final multi-shard placement or throughput.
+The deployed HTTP ingresses forward to one fenced owner and hold no
+staging view. That owner's acquisition cut covers recovery, and every successful
+write waits for apply; see [HTTP routing](annotation-owner-http.md) for its read
+barriers and authority checks.
 
-## Remaining integration gates
+## Runtime and application integration
 
-This service is not enabled in the application registry. Native result checkpoints
-now bind values and request outcomes to one cut, including result-only batches.
+The `annotation-owner` application role runs this service with the publication
+runtime. Native result checkpoints bind values and request outcomes to one cut,
+including result-only batches.
 Recovery validates the catalog-selected checkpoint before replaying its WAL suffix.
 See [the result checkpoint protocol](annotation-result-checkpoint.md).
 
-Scheduling, publication takeover, confirmation and source closure still belong to
-the caller. Wire those into the running shard owner before claiming continuous
-draining. Existing staging/publication component tests do not substitute for that
-service test.
-Process SIGKILL, sustained mixed load, and publication/GC fault qualification remain
-outstanding. The RF3 restart test here uses orderly shutdown/reopen.
+The [runtime](annotation-runtime.md) drives publication, confirmation and source
+closure; [application ownership](annotation-application.md) fences takeover and
+routes multiple ingresses to the current owner. The service-level RF3 restart
+test uses orderly shutdown/reopen. Separate runtime and application process tests
+exercise SIGKILL recovery, unknown publication results and collection faults.
+Those correctness fixtures do not qualify sustained throughput or mixed ingestion.

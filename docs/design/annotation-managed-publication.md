@@ -27,11 +27,13 @@ can then build staging from that base and the WAL suffix, including before the
 catalog has completed confirmation and closure. Confirmation remains necessary
 before source GC. Uploaded files or a blob listing cannot establish selection.
 
-This adapter is not a mutation endpoint or a background applier. ACK timing,
-durable request outcomes, cross-ingress point reads and sustained draining under
-pressure remain separate single-shard integration gates. Its bounded Rust tests
-exercise real Lance files and three disk-backed WAL replicas over TLS; they do
-not establish production mutation capacity.
+The [ordered applier](annotation-ordered-apply.md) and
+[publication runtime](annotation-runtime.md) use this adapter to bind successful
+application, durable request results and source retirement to the selected cut.
+The [owner application](annotation-application.md) supplies cross-ingress routing
+and fenced recovery. The adapter's bounded Rust tests exercise real Lance files
+and three disk-backed WAL replicas over TLS; they do not establish production
+mutation capacity.
 
 The tests reopen every WAL runtime after durable preparation, after manifest
 selection with its reply discarded, and after confirmation before source closure.
@@ -41,7 +43,9 @@ key, retained staging charges and current file references are checked. Repeated
 updates in this fixture leave one body file and one current annotation file per
 fragment: native manifest construction removes fully superseded column-file
 references. Physical deletion of historical blob objects is a separate retention
-operation. Abrupt process-crash and sustained-load qualification remain pending.
+operation. Separate runtime and application process tests exercise SIGKILL and
+replacement with retained storage. Sustained-load qualification requires its own
+workload, latency and drain measurements.
 
 ## Preparations spanning many fragments
 

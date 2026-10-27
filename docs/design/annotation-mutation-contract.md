@@ -6,9 +6,11 @@ Related protocol: [#564](https://github.com/lance-format/lance-context/pull/564)
 The first implementation target is a single-shard loop: bounded staging,
 durable point updates, immediately visible point reads, batch publication, and
 recovery/backpressure. Mixed import, asynchronous filtering indexes and shard
-expansion follow that loop. This change supplies shared Rust value/mutation
-types and deterministic field semantics. It does not enable an HTTP endpoint or
-prove durability, concurrent application or staging retirement.
+expansion follow that loop. Shared Rust value/mutation types define deterministic
+field semantics. The [ordered applier](annotation-ordered-apply.md) and
+[owner application](annotation-application.md) implement the service integration;
+the value types alone do not prove durability, concurrent application or staging
+retirement.
 
 ## Values and operations
 
@@ -53,12 +55,13 @@ CAS is outside the first implementation.
 
 ## Required service and retry semantics
 
-The following remain requirements for the service integration:
+The service integration must preserve the following requirements:
 
 - Resolve the authorized table incarnation and stable session/turn key before
   admission. A point update changes an existing turn; it does not create a turn
   or replace its body. The service supplies byte/cardinality limits and reserves
-  capacity for the resulting annotation before accepting the write.
+  capacity for the resulting annotation before acknowledging successful
+  application. Durable WAL acceptance alone is not that acknowledgement.
 - Apply requests in the shard's committed order. If active has no value, use
   frozen and then the compatible Lance base before merging the patch. Two
   concurrent field updates must merge against that ordered current value, not

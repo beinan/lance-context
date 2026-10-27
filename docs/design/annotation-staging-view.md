@@ -6,8 +6,10 @@ Field contract: [#567](https://github.com/lance-format/lance-context/pull/567).
 
 `lance_context_core::annotation_staging` implements the local annotation view
 and native file preparation component. It has one active map and at most one
-frozen map, backed by a fixed Lance snapshot. It does not yet implement a durable
-mutation service. No existing HTTP or immutable ingestion route enables it.
+frozen map, backed by a fixed Lance snapshot. The
+[annotation owner runtime](annotation-runtime.md) supplies durable ordered apply,
+request results and publication. HTTP ingresses forward to that owner; see
+[Running one annotation shard](annotation-application.md) for role configuration.
 
 ## Ordered updates and point reads
 
@@ -33,8 +35,9 @@ same lock that switches the publication view. They never retain a whole staging
 map. A captured base miss resolves against that base, even if a new publication
 finishes before the I/O. An already captured staged value likewise survives
 retirement. There is no WAL-tail scan or body projection in this component.
-The service still needs a quorum barrier and application-progress wait before
-using it for cross-ingress reads.
+The service supplies the quorum/application barriers required for cross-ingress
+reads. The HTTP owner's recovery cut and authority checks are described in
+[annotation HTTP routing](annotation-owner-http.md).
 
 ## Frozen publication
 
@@ -87,17 +90,20 @@ workspace admission. These charges are not a claim to bound total process RSS.
 Preparation reserves a separate shared merge budget and retains its reservation
 with the prepared transaction, so old preparation handles also exert backpressure.
 
-## Remaining single-shard service gates
+## Service integration and validation
 
 The native tests exercise fields changed during publication, held old reads,
 same-value changes with distinct progress, field clearing, retained-generation
 and reader pressure, and repeated native publication/reopen. They are component
 tests with caller-supplied positions, not RF3 durability or sustained-load proof.
 
-Next connect admission, opaque WAL mutation records, ordered application and
-request results to the actual Rust service. Persist frozen coverage using the
-existing fenced publication protocol; reconstruct from selected Lance state and
-the WAL suffix; test unknown outcomes, process crashes and GC. Finally qualify
-sustained update/read/drain behavior before mixed ingestion, filtering indexes
-or more shards. In particular, native transaction properties alone do not supply
-request-result retention, producer fencing or crash recovery.
+The [ordered applier](annotation-ordered-apply.md),
+[result checkpoint](annotation-result-checkpoint.md) and
+[runtime](annotation-runtime.md) connect this view to the RF3 WAL and fenced
+publication/recovery flow. Native transaction properties alone do not supply
+request-result retention, producer fencing or crash recovery. The application
+process tests cover owner replacement and physical collection; their scope and
+operational restrictions are documented in
+[Running one annotation shard](annotation-application.md). Sustained throughput
+and drain claims still require workload-specific measurements. Mixed ingestion,
+filtering indexes and multiple shards remain later work.
