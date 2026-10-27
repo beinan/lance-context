@@ -112,6 +112,14 @@ impl ObjectStoreProvider for Provider {
 }
 
 pub(super) async fn storage(path: &std::path::Path, faults: Arc<Faults>) -> Result<Storage> {
+    storage_with_cache(path, faults, 1 << 20).await
+}
+
+pub(super) async fn storage_with_cache(
+    path: &std::path::Path,
+    faults: Arc<Faults>,
+    cache_bytes: usize,
+) -> Result<Storage> {
     let registry = Arc::new(ObjectStoreRegistry::default());
     registry.insert(
         "file-object-store",
@@ -123,7 +131,7 @@ pub(super) async fn storage(path: &std::path::Path, faults: Arc<Faults>) -> Resu
     Storage::resolve(
         format!("file-object-store://{}", path.display()),
         Default::default(),
-        Arc::new(lance::session::Session::new(1 << 20, 1 << 20, registry)),
+        Arc::new(lance::session::Session::new(1 << 20, cache_bytes, registry)),
     )
     .await
 }

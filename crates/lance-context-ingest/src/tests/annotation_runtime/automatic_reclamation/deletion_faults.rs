@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 
 mod fault_store;
 mod listing;
+mod manifest_cache;
 mod protected_page;
 use fault_store::{Action, Faults};
 

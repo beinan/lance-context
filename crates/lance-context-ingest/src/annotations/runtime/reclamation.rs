@@ -8,6 +8,7 @@ use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectMeta};
 
 mod deletion;
+mod manifest_cache;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -75,16 +76,29 @@ struct SealedPage {
 
 pub(super) struct Collector {
     options: Options,
+    metadata: lance::cache::LanceCache,
     next_run: tokio::time::Instant,
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
 }
 impl Collector {
-    pub(super) fn new(options: Options, budget: &Arc<MergeMemoryBudget>) -> Result<Self> {
+    pub(super) fn new(
+        options: Options,
+        budget: &Arc<MergeMemoryBudget>,
+        storage: &Storage,
+    ) -> Result<Self> {
         options.validate(budget.limit())?;
         Ok(Self {
             options,
+            // This collector has one fixed table/storage binding. A private
+            // namespace prevents cross-client reuse even for equal URI strings
+            // resolved through different endpoints in a shared Session.
+            metadata: storage
+                .session
+                .file_metadata_cache()
+                .with_key_prefix("lance-context.annotation-collection")
+                .with_key_prefix(&Uuid::new_v4().to_string()),
             next_run: tokio::time::Instant::now(),
             listing: None,
             deferred: None,
@@ -247,12 +261,8 @@ impl Collector {
             // encode the slash as %2F and address a different blob object.
             let name = record.object.path.strip_prefix("_versions/").unwrap();
             let path = storage.base.clone().join("_versions").join(name);
-            let manifest = lance_table::io::manifest::read_manifest(
-                &object_store,
-                &path,
-                Some(record.object.bytes),
-            )
-            .await?;
+            let manifest =
+                manifest_cache::read(&self.metadata, &object_store, &path, record).await?;
             ensure!(
                 manifest.version == record.version,
                 "retained manifest version mismatch"
