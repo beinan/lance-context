@@ -127,6 +127,15 @@ async fn owned_reads_remain_visible_during_cold_apply_and_old_publication() -> R
         Ok::<_, anyhow::Error>(())
     })
     .await;
+    // Both ingresses must still serve the just-published value after staging
+    // drains, even when the next real data GET cannot complete. The bounded
+    // published-value cache already contains this complete narrow annotation.
+    let blocked = gates.pause_get();
+    let published_reads = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(point(&client, &a), point(&client, &b))
+    })
+    .await;
+    blocked.release();
     let retried: MutationReply = update(&client, &b, &producer, 3, third.len())
         .body(third)
         .send()
@@ -210,5 +219,12 @@ async fn owned_reads_remain_visible_during_cold_apply_and_old_publication() -> R
     c.shutdown().await?;
     available?;
     consistent??;
+    let published_reads =
+        published_reads.context("published cross-ingress reads waited for blocked data IO")??;
+    for value in [published_reads.0, published_reads.1] {
+        let value = value.context("published annotation disappeared")?;
+        ensure!(value.status.as_deref() == Some("latest"));
+        ensure!(value.score == Some(0.9));
+    }
     Ok(())
 }

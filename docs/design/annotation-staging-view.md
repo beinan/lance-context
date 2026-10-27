@@ -32,9 +32,10 @@ left out of annotation input and point-read projection.
 
 Point reads capture either one staged value or the exact base handle under the
 same lock that switches the publication view. They never retain a whole staging
-map. A captured base miss resolves against that base, even if a new publication
-finishes before the I/O. An already captured staged value likewise survives
-retirement. There is no WAL-tail scan or body projection in this component.
+map. For a base-backed read, a compatible published-value cache entry can answer
+without storage I/O. A cache miss resolves against the captured base, even if a
+new publication finishes before the I/O. An already captured staged value also
+survives retirement. There is no WAL-tail scan or body projection in this component.
 The service supplies the quorum/application barriers required for cross-ingress
 reads. The HTTP owner's recovery cut and authority checks are described in
 [annotation HTTP routing](annotation-owner-http.md).
@@ -85,11 +86,20 @@ consumer must stop at that item until publication/read release permits progress.
 
 After confirming a selected publication, installation copies its complete narrow
 values into the existing, byte-bounded Lance session metadata cache. Later apply
-checks these values after active/frozen and before a cold Lance lookup. Each
-staging instance has its own cache namespace, including when instances share a
-Session and URI. The copies hold neither staging permits nor base handles;
-publication can release dirty capacity and reclaim old files normally. Point
-reads retain their existing compatible value/base capture path.
+and point reads check these values after active/frozen and before a cold Lance
+lookup. Each staging instance has its own cache namespace, including when
+instances share a Session and URI. The copies hold neither staging permits nor base handles;
+publication can release dirty capacity and reclaim old files normally.
+
+A cached value records its publication cut. A point read captures the base's
+materialized cut together with its base handle, then looks up the cache without
+holding the view lock. It accepts only an entry at or before that captured cut;
+a newer entry falls back to the original base. Cache replacement precedes each
+base handoff, so an older entry that remains present belongs to an unchanged
+turn. Each key still holds only its latest cached value. This also keeps an old
+reader correct when cache warming is cancelled before the view switch, or when
+it resolves after a later publication. Cache hits do not perform a WAL-tail scan
+or fetch annotation data files.
 
 Cache warming occurs while the same frozen generation is still installed and
 the mutation gate is held. Active/frozen values mask those keys until the atomic

@@ -4,10 +4,12 @@ use lance::cache::{CacheKey, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use std::borrow::Cow;
 
+#[derive(Clone)]
 pub(super) struct PublishedValues(Option<LanceCache>);
 
 pub(super) struct Cached {
     pub value: TurnAnnotation,
+    through: u64,
     charge: usize,
 }
 
@@ -52,7 +54,14 @@ impl PublishedValues {
         }
     }
 
-    pub async fn remember(&self, values: &Values) -> Result<()> {
+    pub async fn get_at(&self, turn: &str, materialized: u64) -> Option<Arc<Cached>> {
+        let value = self.get(turn).await?;
+        // Warming precedes the base switch, and an older read may resolve after
+        // later publications. Never substitute a future value for its base.
+        (value.through <= materialized).then_some(value)
+    }
+
+    pub async fn remember(&self, values: &Values, through: u64) -> Result<()> {
         let Some(cache) = &self.0 else {
             return Ok(());
         };
@@ -63,6 +72,7 @@ impl PublishedValues {
                     Arc::new(Cached {
                         charge: charge(turn, &stored.value)?,
                         value: stored.value.clone(),
+                        through,
                     }),
                 )
                 .await;

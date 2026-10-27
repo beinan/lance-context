@@ -5,6 +5,8 @@ use lance::{dataset::builder::DatasetBuilder, dataset::ReadParams, session::Sess
 use lance_io::object_store::ObjectStoreParams;
 use std::{sync::atomic::Ordering, time::Duration};
 
+mod reads;
+
 async fn opened(path: &std::path::Path, cache_bytes: usize) -> Result<(Arc<Dataset>, Throttle)> {
     fixture(path).await?;
     let throttle = Throttle::new(Duration::ZERO);
@@ -154,6 +156,12 @@ async fn eviction_and_disabled_cache_fall_back_to_the_selected_lance_values() ->
         session.file_metadata_cache().clear().await;
         assert!(staging.published_values.get("T").await.is_none());
         let before = throttle.ops.load(Ordering::Relaxed);
+        let published = current(&staging, "T").await?;
+        assert_eq!(published.status.as_deref(), Some("reviewed"));
+        assert_eq!(published.score, None);
+        assert!(throttle.ops.load(Ordering::Relaxed) > before);
+        session.file_metadata_cache().clear().await;
+        let before = throttle.ops.load(Ordering::Relaxed);
         staging
             .apply(
                 1,
@@ -192,6 +200,7 @@ async fn independent_views_sharing_a_session_do_not_reuse_each_others_values() -
         .await?;
     publish(&first).await?;
     let old = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    assert_eq!(current(&old, "T").await?.status.as_deref(), Some("pending"));
     old.apply(
         0,
         1,

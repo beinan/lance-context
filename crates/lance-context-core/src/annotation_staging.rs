@@ -491,7 +491,12 @@ impl AnnotationStaging {
             applied: state.applied,
             base_version: state.base.version_id(),
             source: value.map_or_else(
-                || PointSource::Base(state.base.clone(), turn.to_owned()),
+                || PointSource::Base {
+                    base: state.base.clone(),
+                    turn: turn.to_owned(),
+                    published: self.published_values.clone(),
+                    materialized: state.materialized,
+                },
                 PointSource::Staged,
             ),
             value_bytes: self.limits.value_bytes,
@@ -528,7 +533,12 @@ fn reject(row: usize, reason: RejectionReason) -> PendingBatch {
 
 enum PointSource {
     Staged(Arc<Stored>),
-    Base(Arc<views::Base>, String),
+    Base {
+        base: Arc<views::Base>,
+        turn: String,
+        published: published_values::PublishedValues,
+        materialized: u64,
+    },
 }
 pub struct PointRead {
     pub applied: u64,
@@ -544,7 +554,15 @@ impl PointRead {
     pub async fn resolve(&self) -> Result<Option<TurnAnnotation>> {
         match &self.source {
             PointSource::Staged(value) => Ok(Some(value.value.clone())),
-            PointSource::Base(base, turn) => read_base(base, turn, self.value_bytes).await,
+            PointSource::Base {
+                base,
+                turn,
+                published,
+                materialized,
+            } => match published.get_at(turn, *materialized).await {
+                Some(value) => Ok(Some(value.value.clone())),
+                None => read_base(base, turn, self.value_bytes).await,
+            },
         }
     }
 }
