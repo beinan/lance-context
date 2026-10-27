@@ -55,6 +55,11 @@ pub(super) async fn seed_fragments(
     limits: &Limits,
     fragments: usize,
 ) -> Result<()> {
+    let base = fragmented_base(storage, fragments).await?;
+    seed_base(c, Service::contract(&fixture_binding(), limits)?, &base).await
+}
+
+pub(super) async fn fragmented_base(storage: &Storage, fragments: usize) -> Result<Dataset> {
     let rows = fragments * 2;
     let ids: Vec<_> = (0..rows).map(|n| format!("t{n:08}")).collect();
     let mut labels = ListBuilder::new(StringBuilder::new());
@@ -102,7 +107,7 @@ pub(super) async fn seed_fragments(
     )
     .name("annotation_point_id".into())
     .await?;
-    seed_base(c, Service::contract(&fixture_binding(), limits)?, &base).await
+    Ok(base)
 }
 
 pub(super) fn collector(runtime: Runtime) -> Result<Runtime> {

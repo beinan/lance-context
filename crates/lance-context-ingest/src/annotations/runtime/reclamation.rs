@@ -155,6 +155,12 @@ impl Collector {
             .manifests
             .as_ref()
             .context("annotation manifests unavailable")?;
+        let boundary = manifests.history_boundary();
+        // A successor alone is not retirement. Once a gap exists, bootstrap
+        // remains an adoption receipt, not a permanently readable snapshot.
+        // Exclusive annotation reads can only capture the current local base;
+        // already captured old bases remain protected independently below.
+        let bootstrap_receipt_only = boundary.retained_from > manifests.initial_version + 1;
         let roots = service.shared.staging.protected_bases().await?;
         let base = roots
             .datasets()
@@ -235,6 +241,7 @@ impl Collector {
                 base.manifest(),
                 &base.manifest_location().path,
                 &storage.base,
+                true,
             )?;
         }
         for record in manifests.versions.values() {
@@ -267,12 +274,17 @@ impl Collector {
                 manifest.version == record.version,
                 "retained manifest version mismatch"
             );
-            protect(&mut candidates, &manifest, &path, &storage.base)?;
+            protect(
+                &mut candidates,
+                &manifest,
+                &path,
+                &storage.base,
+                record.version != manifests.initial_version || !bootstrap_receipt_only,
+            )?;
         }
         if candidates.is_empty() {
             return Ok(());
         }
-        let boundary = manifests.history_boundary();
         let reply = materializer::commit(
             &service.ingress.client,
             Command::RetireHistory(p::RetireManifestHistory {
@@ -422,6 +434,7 @@ fn protect(
     manifest: &lance_table::format::Manifest,
     manifest_path: &Path,
     base: &Path,
+    retain_data: bool,
 ) -> Result<()> {
     ensure!(
         manifest.base_paths.is_empty() && manifest.branch.is_none() && manifest.tag.is_none(),
@@ -441,6 +454,12 @@ fn protect(
                 .join("_transactions")
                 .join(transaction.as_str()),
         );
+    }
+    // Keep the bootstrap manifest and native transaction for exact adoption
+    // receipts. Current/retained snapshots and live readers protect any of its
+    // data they still use; obsolete initial files need not live forever.
+    if !retain_data {
+        return Ok(());
     }
     let prefix = base.clone().join("data");
     for file in manifest
