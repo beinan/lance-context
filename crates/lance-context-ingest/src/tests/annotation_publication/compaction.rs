@@ -8,6 +8,7 @@ use fixture::*;
 use lance::index::DatasetIndexExt;
 
 mod fixture;
+mod reclamation;
 use crate::{
     annotations::{Completed, MutationResult},
     materializer,

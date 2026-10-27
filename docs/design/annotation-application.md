@@ -162,6 +162,14 @@ other writers, tags, branches and reusing the destination URI for another table
 are outside this exclusive-ownership contract. A raw reader's retained version
 is not registered in the owner's reader protection.
 
+After managed history has actually retired older versions, the bootstrap anchor
+is retained as an adoption receipt: its manifest and native transaction remain,
+but it no longer pins initial data that compaction has superseded. Current and
+retained snapshots, plus captured annotation readers, still protect every data
+file they reference. Before that retirement, bootstrap data remains protected
+by the configured history window. Keeping the bootstrap receipt does not provide
+permanent time travel to its original rows under exclusive reclamation.
+
 `max_objects` and `max_bytes` bound each candidate page; `delete_parallelism`
 bounds concurrent deletes. The interval starts after a collection pass finishes.
 Page workspace must fit `materializer_memory_bytes`; invalid limits are rejected
