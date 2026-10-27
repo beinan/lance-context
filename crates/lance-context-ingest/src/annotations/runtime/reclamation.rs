@@ -224,6 +224,11 @@ impl Collector {
             )?;
         }
         for record in manifests.versions.values() {
+            // A fully protected page cannot delete anything. Further immutable
+            // manifests cannot change that; the next page captures fresh roots.
+            if candidates.is_empty() {
+                return Ok(());
+            }
             // Open one retained manifest at a time, including bootstrap and the
             // durable advancement receipt. Session metadata has its own bound.
             let charge = usize::try_from(record.object.bytes)?

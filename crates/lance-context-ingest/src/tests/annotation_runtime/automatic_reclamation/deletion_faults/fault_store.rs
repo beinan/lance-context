@@ -9,7 +9,10 @@ use object_store::{
     path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -34,6 +37,7 @@ pub(super) struct Faults {
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
     listing: Mutex<Option<PausedListing>>,
     pub data_listings: Mutex<Vec<Path>>,
+    pub manifest_reads: AtomicUsize,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -160,6 +164,9 @@ impl ObjectStore for FaultStore {
         self.inner.put_multipart_opts(path, opts).await
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+        if !opts.head && path.as_ref().contains("/_versions/") {
+            self.faults.manifest_reads.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.get_opts(path, opts).await
     }
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
