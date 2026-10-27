@@ -377,11 +377,17 @@ async fn annotation_delete_process_role() -> Result<()> {
     std::fs::write(root.join("request.arrow"), request.body())?;
     std::fs::write(root.join("ack.json"), serde_json::to_vec(&completed)?)?;
     std::fs::write(root.join("abandoned.json"), serde_json::to_vec(&abandoned)?)?;
+    // Expose one orphan, then hold the listing across the collector's time
+    // slice until SIGKILL. A one-shot failure on the other orphan is not a
+    // barrier: if listing splits the files into separate pages, it can be
+    // successfully retried before the crash marker is reached.
+    let (listed, _listing_entered) = oneshot::channel();
+    let (_release_listing, resume) = oneshot::channel();
+    faults.pause_listing(&path, Some(&abandoned[0]), listed, resume)?;
     faults.arm(
         &abandoned[0],
         Action::CrashAfter(root.join("delete-entered")),
     )?;
-    faults.arm(&abandoned[1], Action::FailBefore)?;
     let (_, runtime) = owned(&c, &storage, &limits()).await?;
     whole_page(runtime)?.run(std::future::pending()).await?;
     bail!("delete role stopped before SIGKILL")
@@ -395,6 +401,12 @@ async fn annotation_collector_corrupt_delete_reply_stops_without_reissuing() -> 
     let faults = Arc::new(Faults::default());
     let storage = fault_store::storage(&path, faults.clone()).await?;
     let (_, _, abandoned) = acknowledged_orphans(&c, &storage, &path).await?;
+    // A time-sliced listing can place the two orphans on separate pages. Pin
+    // this page to the corrupted response's object; later objects must remain
+    // untouched once the runtime rejects that response.
+    let (listed, _listing_entered) = oneshot::channel();
+    let (_release_listing, resume) = oneshot::channel();
+    faults.pause_listing(&path, Some(&abandoned[0]), listed, resume)?;
     faults.arm(&abandoned[0], Action::WrongReply)?;
     let (_, runtime) = owned(&c, &storage, &limits()).await?;
     let error = tokio::time::timeout(
@@ -404,7 +416,12 @@ async fn annotation_collector_corrupt_delete_reply_stops_without_reissuing() -> 
     .await?
     .unwrap_err();
     assert!(format!("{error:#}").contains("invalid sealed annotation deletion response"));
-    assert_eq!(faults.calls.lock().unwrap().len(), 2);
+    assert_eq!(
+        faults.calls.lock().unwrap().as_slice(),
+        &[object_store::path::Path::from_absolute_path(&abandoned[0])?]
+    );
+    assert!(!abandoned[0].exists());
+    assert!(abandoned[1].exists());
     c.shutdown().await
 }
 
@@ -444,6 +461,10 @@ async fn annotation_collector_recovers_after_delete_sigkill() -> Result<()> {
         serde_json::from_slice(&std::fs::read(root.path().join("ack.json"))?)?;
     let abandoned: Vec<PathBuf> =
         serde_json::from_slice(&std::fs::read(root.path().join("abandoned.json"))?)?;
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("delete-entered"))?,
+        object_store::path::Path::from_absolute_path(&abandoned[0])?.as_ref()
+    );
     assert!(!abandoned[0].exists());
     assert!(abandoned[1].exists());
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
