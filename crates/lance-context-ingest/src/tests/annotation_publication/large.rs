@@ -7,6 +7,13 @@ use crate::{annotations::Service, tests::annotation_runtime as runtime};
 use lance::index::DatasetIndexExt;
 use object_store::ObjectStoreExt;
 
+// Each fixture owns an RF3 cluster and thousands of deliberately tiny files
+// to exceed inline preparation metadata limits. Bound independent fixtures
+// before starting their deadlines on small CI runners. Writes, reads, apply,
+// publication and collection still run concurrently within the admitted case;
+// this recovery suite is not a multi-owner throughput benchmark.
+static LARGE_FIXTURES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 fn large_binding() -> TableBinding {
     TableBinding {
         max_rows: 2048,
@@ -133,6 +140,7 @@ async fn large_annotation_preparation_respects_configured_catalog_limit() -> Res
 }
 
 async fn recover(stage: Stop, fragments: usize) -> Result<()> {
+    let _fixture = LARGE_FIXTURES.acquire().await?;
     tokio::time::timeout(
         Duration::from_secs(180),
         recover_inner(stage, fragments, false, false),
@@ -142,6 +150,7 @@ async fn recover(stage: Stop, fragments: usize) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_annotation_preparation_collects_metadata_after_recovery() -> Result<()> {
+    let _fixture = LARGE_FIXTURES.acquire().await?;
     tokio::time::timeout(
         Duration::from_secs(180),
         recover_inner(Stop::Prepared, 4096, true, false),
@@ -151,6 +160,7 @@ async fn large_annotation_preparation_collects_metadata_after_recovery() -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_annotation_collection_refusal_preserves_published_suffix() -> Result<()> {
+    let _fixture = LARGE_FIXTURES.acquire().await?;
     tokio::time::timeout(
         Duration::from_secs(180),
         recover_inner(Stop::Prepared, 4096, true, true),
