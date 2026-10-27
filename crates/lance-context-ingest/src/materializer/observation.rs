@@ -24,8 +24,11 @@ pub enum Phase {
     Admission,
     Collect,
     Compact,
+    CollectList,
+    CollectProtect,
+    CollectDelete,
 }
-const NAMES: [&str; 12] = [
+const NAMES: [&str; 15] = [
     "claim",
     "acquire",
     "state",
@@ -38,6 +41,9 @@ const NAMES: [&str; 12] = [
     "admission",
     "collect",
     "compact",
+    "collect_list",
+    "collect_protect",
+    "collect_delete",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

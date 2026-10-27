@@ -139,6 +139,7 @@ impl Collector {
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
     ) -> Result<()> {
+        let phases = service.shared.phases.clone();
         let state = catalog.state().await?;
         // A retained plan must first finish exact recovery, including its old
         // base. Do not classify uncommitted files while such a plan exists.
@@ -176,58 +177,67 @@ impl Collector {
             lance::dataset::refs::base_branches_contents_path(&storage.base),
         ] {
             ensure!(
-                store.list(Some(&prefix)).try_next().await?.is_none(),
+                phases
+                    .measure(Phase::CollectList, store.list(Some(&prefix)).try_next())
+                    .await?
+                    .is_none(),
                 "annotation data collection requires a table without tags or branches"
             );
         }
         let page_charge = self.options.max_bytes * 3;
         let workspace = budget.reserve(page_charge).await;
-        if self.listing.is_none() {
-            self.listing = Some(store.list(Some(&storage.base)));
-        }
-        let mut candidates = BTreeMap::new();
-        let mut bytes = 0;
-        let mut examined = 0;
-        let until = tokio::time::Instant::now() + self.options.interval.min(Duration::from_secs(1));
-        for _ in 0..self.options.max_objects {
-            // Check even when the stream is immediately ready. Only stop polling
-            // this borrowed next-item future: the stream retains its in-flight
-            // request and continuation token across publications.
-            if tokio::time::Instant::now() >= until {
-                break;
-            }
-            let (path, size) = if let Some(deferred) = self.deferred.take() {
-                deferred
-            } else {
-                let next = self.listing.as_mut().unwrap().try_next();
-                let Ok(next) = tokio::time::timeout_at(until, next).await else {
-                    break;
-                };
-                let Some(meta) = next? else {
-                    self.listing = None;
-                    break;
-                };
-                examined += 1;
-                (meta.location, meta.size)
-            };
-            if !candidate(&path, &storage.base, service.ingress.scope.incarnation) {
-                continue;
-            }
-            // Charge string storage and map nodes conservatively. A deferred
-            // single item prevents dropping the first object of the next page.
-            let charge = 2 * path.as_ref().len() + 256;
-            if bytes + charge > self.options.max_bytes {
-                self.deferred = Some((path, size));
-                break;
-            }
-            bytes += charge;
-            candidates.insert(path, size);
-        }
-        {
-            let mut observed = service.shared.reclamation.lock().unwrap();
-            observed.passes += 1;
-            observed.examined += examined;
-        }
+        let mut candidates = phases
+            .measure(Phase::CollectList, async {
+                if self.listing.is_none() {
+                    self.listing = Some(store.list(Some(&storage.base)));
+                }
+                let mut candidates = BTreeMap::new();
+                let mut bytes = 0;
+                let mut examined = 0;
+                let until =
+                    tokio::time::Instant::now() + self.options.interval.min(Duration::from_secs(1));
+                for _ in 0..self.options.max_objects {
+                    // Check even when the stream is immediately ready. Only stop polling
+                    // this borrowed next-item future: the stream retains its in-flight
+                    // request and continuation token across publications.
+                    if tokio::time::Instant::now() >= until {
+                        break;
+                    }
+                    let (path, size) = if let Some(deferred) = self.deferred.take() {
+                        deferred
+                    } else {
+                        let next = self.listing.as_mut().unwrap().try_next();
+                        let Ok(next) = tokio::time::timeout_at(until, next).await else {
+                            break;
+                        };
+                        let Some(meta) = next? else {
+                            self.listing = None;
+                            break;
+                        };
+                        examined += 1;
+                        (meta.location, meta.size)
+                    };
+                    if !candidate(&path, &storage.base, service.ingress.scope.incarnation) {
+                        continue;
+                    }
+                    // Charge string storage and map nodes conservatively. A deferred
+                    // single item prevents dropping the first object of the next page.
+                    let charge = 2 * path.as_ref().len() + 256;
+                    if bytes + charge > self.options.max_bytes {
+                        self.deferred = Some((path, size));
+                        break;
+                    }
+                    bytes += charge;
+                    candidates.insert(path, size);
+                }
+                {
+                    let mut observed = service.shared.reclamation.lock().unwrap();
+                    observed.passes += 1;
+                    observed.examined += examined;
+                }
+                Ok::<_, anyhow::Error>(candidates)
+            })
+            .await?;
         if candidates.is_empty() {
             // Nothing to protect, seal or delete in this slice. The next pass
             // captures current roots before classifying further listing items.
@@ -235,53 +245,58 @@ impl Collector {
         }
         // This finite page is now closed. No more listing or candidate additions
         // occur after protection/sealing, even if a DELETE outlives this owner.
-        for base in roots.datasets() {
-            protect(
-                &mut candidates,
-                base.manifest(),
-                &base.manifest_location().path,
-                &storage.base,
-                true,
-            )?;
-        }
-        for record in manifests.versions.values() {
-            // A fully protected page cannot delete anything. Further immutable
-            // manifests cannot change that; the next page captures fresh roots.
-            if candidates.is_empty() {
-                return Ok(());
-            }
-            // Open one retained manifest at a time, including bootstrap and the
-            // durable advancement receipt. Session metadata has its own bound.
-            let charge = usize::try_from(record.object.bytes)?
-                .checked_mul(4)
-                .context("annotation manifest workspace overflow")?;
-            ensure!(
-                page_charge + charge <= budget.limit(),
-                "annotation retained manifest exceeds collection workspace"
-            );
-            let _manifest = budget.reserve(charge).await;
-            // The captured quorum state already names the selected immutable
-            // object. Read its metadata directly; reopening a Dataset here would
-            // issue redundant catalog queries for every retained version/page.
-            record.object.validate(record.version)?;
-            // join takes one path component: passing "_versions/name" would
-            // encode the slash as %2F and address a different blob object.
-            let name = record.object.path.strip_prefix("_versions/").unwrap();
-            let path = storage.base.clone().join("_versions").join(name);
-            let manifest =
-                manifest_cache::read(&self.metadata, &object_store, &path, record).await?;
-            ensure!(
-                manifest.version == record.version,
-                "retained manifest version mismatch"
-            );
-            protect(
-                &mut candidates,
-                &manifest,
-                &path,
-                &storage.base,
-                record.version != manifests.initial_version || !bootstrap_receipt_only,
-            )?;
-        }
+        phases
+            .measure(Phase::CollectProtect, async {
+                for base in roots.datasets() {
+                    protect(
+                        &mut candidates,
+                        base.manifest(),
+                        &base.manifest_location().path,
+                        &storage.base,
+                        true,
+                    )?;
+                }
+                for record in manifests.versions.values() {
+                    // A fully protected page cannot delete anything. Further immutable
+                    // manifests cannot change that; the next page captures fresh roots.
+                    if candidates.is_empty() {
+                        return Ok(());
+                    }
+                    // Open one retained manifest at a time, including bootstrap and the
+                    // durable advancement receipt. Session metadata has its own bound.
+                    let charge = usize::try_from(record.object.bytes)?
+                        .checked_mul(4)
+                        .context("annotation manifest workspace overflow")?;
+                    ensure!(
+                        page_charge + charge <= budget.limit(),
+                        "annotation retained manifest exceeds collection workspace"
+                    );
+                    let _manifest = budget.reserve(charge).await;
+                    // The captured quorum state already names the selected immutable
+                    // object. Read its metadata directly; reopening a Dataset here would
+                    // issue redundant catalog queries for every retained version/page.
+                    record.object.validate(record.version)?;
+                    // join takes one path component: passing "_versions/name" would
+                    // encode the slash as %2F and address a different blob object.
+                    let name = record.object.path.strip_prefix("_versions/").unwrap();
+                    let path = storage.base.clone().join("_versions").join(name);
+                    let manifest =
+                        manifest_cache::read(&self.metadata, &object_store, &path, record).await?;
+                    ensure!(
+                        manifest.version == record.version,
+                        "retained manifest version mismatch"
+                    );
+                    protect(
+                        &mut candidates,
+                        &manifest,
+                        &path,
+                        &storage.base,
+                        record.version != manifests.initial_version || !bootstrap_receipt_only,
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
         if candidates.is_empty() {
             return Ok(());
         }
@@ -319,6 +334,14 @@ impl Collector {
     }
 
     async fn delete_page(&mut self, service: &Service) -> Result<()> {
+        service
+            .shared
+            .phases
+            .measure(Phase::CollectDelete, self.delete_sealed_page(service))
+            .await
+    }
+
+    async fn delete_sealed_page(&mut self, service: &Service) -> Result<()> {
         let page = self.sealed.as_mut().unwrap();
         let outcomes = stream::iter(std::mem::take(&mut page.paths))
             .chunks(page.batch_size)
