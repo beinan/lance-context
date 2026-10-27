@@ -25,6 +25,7 @@ lance-table = "13.0.0"
 # Keep this direct dependency a path as well as a workspace patch so maturin
 # includes the backport when rebuilding Python wheels from a source archive.
 lance-io = { version = "13.0.0", path = "../../vendor/lance-io" }
+lance-core = { version = "13.0.0", path = "../../vendor/lance-core" }
 lance-file = "13.0.0"
 object_store = "0.14.2"
 base64 = "0.22"
@@ -36,7 +37,7 @@ arrow-schema = "58"
 arrow-select = "58"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 datafusion = { version = "54", default-features = false, features = ["nested_expressions"] }
-lance = "13.0.0"
+lance = { version = "13.0.0", path = "../../vendor/lance" }
 lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
 lance-index = "13.0.0"
 lance-namespace = "13.0.0"
