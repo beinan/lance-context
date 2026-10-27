@@ -4,6 +4,7 @@ use crate::{annotation_publication as publication, materializer};
 use lance::Dataset;
 use lance_context_core::annotation_staging::MAX_RESULTS_BYTES;
 use lance_context_wal::replication::publication as p;
+use materializer::observation::Phase;
 use std::collections::BTreeMap;
 
 mod compaction;
@@ -156,6 +157,9 @@ impl Runtime {
             );
             *service.shared.replay_cut.lock().unwrap() = Some(through);
         }
+        publisher
+            .catalog
+            .observe_with(service.shared.phases.clone());
         // Ownership was fenced before opening this view. An owned point read
         // must first replay every predecessor write, including ACKed updates
         // absent from Lance. Later successful writes already await local apply;
@@ -198,10 +202,14 @@ impl Publisher {
     }
 
     async fn run(&mut self) -> Result<()> {
+        let phases = self.service.shared.phases.clone();
         loop {
             if let Some(collector) = &mut self.reclamation {
-                let cleared = collector
-                    .step(&self.service, &self.catalog, &self.storage, &self.budget)
+                let cleared = phases
+                    .measure(
+                        Phase::Collect,
+                        collector.step(&self.service, &self.catalog, &self.storage, &self.budget),
+                    )
                     .await?;
                 if !cleared {
                     // Keep this owner and its applied read view alive, but do
@@ -218,8 +226,12 @@ impl Publisher {
     }
 
     async fn publish_next(&mut self) -> Result<()> {
+        let phases = self.service.shared.phases.clone();
         let mut view = self.catalog.state().await?;
-        if self.compact_next(&view).await? {
+        if phases
+            .measure(Phase::Compact, self.compact_next(&view))
+            .await?
+        {
             return Ok(());
         }
         let frozen = if let Some(pending) = view.progress.pending.as_ref() {
@@ -299,16 +311,22 @@ impl Publisher {
             .context("annotation plan unavailable")?;
         self.catalog.pin(pending).await?;
         let selection = self.selection(pending);
-        let prepared = frozen.prepare(&self.budget, 8192).await?;
+        let prepared = phases
+            .measure(Phase::Prepare, frozen.prepare(&self.budget, 8192))
+            .await?;
         // Preserve these exact bytes until Prepare is resolved. On any unknown
         // result this runtime stops; a fenced restart reads the retained result.
-        let descriptors = publication::persist_descriptors(
-            prepared.annotations(),
-            &selection,
-            &self.storage,
-            self.service.ingress.client.max_descriptor_bytes(),
-        )
-        .await?;
+        let descriptors = phases
+            .measure(
+                Phase::BlobWrite,
+                publication::persist_descriptors(
+                    prepared.annotations(),
+                    &selection,
+                    &self.storage,
+                    self.service.ingress.client.max_descriptor_bytes(),
+                ),
+            )
+            .await?;
         let reply = materializer::commit(
             &self.service.ingress.client,
             Command::Prepare(p::PrepareRequest {
@@ -335,6 +353,15 @@ impl Publisher {
     /// An exclusive borrow keeps the future Send: the collector's retained LIST
     /// stream is Send but need not be Sync.
     async fn resolve_prepared(&mut self, view: &p::Table) -> Result<Arc<Dataset>> {
+        self.service
+            .shared
+            .phases
+            .clone()
+            .measure(Phase::Commit, self.resolve_prepared_inner(view))
+            .await
+    }
+
+    async fn resolve_prepared_inner(&mut self, view: &p::Table) -> Result<Arc<Dataset>> {
         let pending = view
             .progress
             .pending

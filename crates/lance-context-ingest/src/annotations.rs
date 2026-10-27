@@ -54,6 +54,7 @@ struct Shared {
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
     reclamation: Mutex<runtime::reclamation::Observation>,
+    phases: Arc<crate::materializer::observation::Counters>,
 }
 
 /// Multiple independently connected ingresses may keep their own bounded view.
@@ -114,6 +115,12 @@ impl Service {
     }
     pub fn reclamation_observation(&self) -> runtime::reclamation::Observation {
         self.shared.reclamation.lock().unwrap().clone()
+    }
+    pub fn phase_observation(
+        &self,
+    ) -> [crate::materializer::observation::Observation;
+           crate::materializer::observation::PHASE_COUNT] {
+        self.shared.phases.observation()
     }
     #[cfg(feature = "http")]
     pub(crate) fn ingress(&self) -> &Ingress {
@@ -236,6 +243,7 @@ impl Service {
                 apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
                 reclamation: Mutex::new(Default::default()),
+                phases: Arc::default(),
             }),
         };
         service.barrier().await?;

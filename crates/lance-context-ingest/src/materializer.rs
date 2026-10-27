@@ -229,14 +229,13 @@ impl Publisher {
         value.state().await?;
         Ok(value)
     }
-    pub fn phase_observation(&self) -> [observation::Observation; 10] {
+    pub fn phase_observation(&self) -> [observation::Observation; observation::PHASE_COUNT] {
         self.phases.observation()
     }
     #[cfg(feature = "worker")]
     pub(crate) fn waiting_for_batch(&self) -> bool {
         self.batch_started.is_some()
     }
-    #[cfg(feature = "worker")]
     pub(crate) fn observe_with(&mut self, phases: Arc<PhaseCounters>) {
         self.phases = phases;
     }

@@ -111,6 +111,24 @@ replays the required suffix through the existing runtime. Owner observations
 report applied/materialized positions, retained staging bytes, active/frozen
 entries, source bytes/records, and application pressure once per second.
 
+Each observation includes `observed_unix_ms` and the existing cumulative phase
+counters under `phases`. `collect` measures the collector step, `compact` the
+maintenance check/rewrite, `prepare` native preparation, `blob_write` descriptor
+persistence or a compaction task's file writes, and `commit` managed publication
+resolution. The shared catalog also reports `state`, `prepare`, and `retire`
+work. This distinguishes a full source window waiting on maintenance from one
+waiting on native preparation or publication without logging individual turns.
+
+Counters report starts, completions, failures, cancellations, total elapsed
+microseconds and the longest finished interval. Time still in flight is not
+included in elapsed/max counters. A completed interval only means that measured
+method returned; it is not proof of durable publication. Collection and compaction
+checks may do no work, so their counts are not physical delete/rewrite counts.
+Parent phases include child phases and observations are sampled independently;
+do not sum them into wall/CPU time or treat them as one atomic view. These fixed
+counters reset with the owner and are diagnostic only. They do not change
+admission limits, publication ordering or failure handling.
+
 ## Physical file collection
 
 For a table served exclusively by its annotation owner, set

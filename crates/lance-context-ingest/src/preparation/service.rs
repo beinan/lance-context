@@ -44,7 +44,8 @@ pub struct Observation {
     pub completed: u64,
     pub failed: u64,
     pub draining: bool,
-    pub phases: [crate::materializer::observation::Observation; 10],
+    pub phases: [crate::materializer::observation::Observation;
+        crate::materializer::observation::PHASE_COUNT],
 }
 impl Service {
     pub fn new(
