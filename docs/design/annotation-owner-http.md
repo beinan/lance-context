@@ -48,6 +48,15 @@ are bounded separately, request/reply memory is reserved, and response bytes hol
 admission until released by HTTP. Both routers require the application's existing
 authentication boundary; credentials alone do not authorize a table.
 
+A quorum-confirmed WAL capacity refusal returns HTTP 503 with `error=wal_capacity`
+and `operation_outcome=rejected`. The update was not accepted and its producer
+sequence was not consumed. After capacity is reclaimed, the caller may submit
+the same identity and bytes. Exact retained requests still return their original
+result at capacity because WAL deduplication precedes the capacity decision.
+Transport failures and apply timeouts remain unknown outcomes; the server does
+not automatically retry either case. This distinction does not eliminate waits
+for updates already accepted while native publication is stalled.
+
 The RF3/Lance integration test uses two independent forwarding listeners and one
 owner listener. It checks cross-ingress visibility, original Arrow payload
 identity, control traffic during a partial upload, definite overload rejection,

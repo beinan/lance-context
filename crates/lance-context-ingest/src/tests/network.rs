@@ -110,10 +110,18 @@ impl Cluster {
             .collect()
     }
     pub async fn open(root: &Path, layout: Arc<Layout>) -> Result<Self> {
-        Self::open_inner(root, layout, None).await
+        Self::open_inner(root, layout, None, Limits::default().max_records).await
     }
     #[cfg(feature = "materializer")]
     pub async fn open_signed(root: &Path, layout: Arc<Layout>) -> Result<Self> {
+        Self::open_signed_with_record_limit(root, layout, Limits::default().max_records).await
+    }
+    #[cfg(feature = "materializer")]
+    pub async fn open_signed_with_record_limit(
+        root: &Path,
+        layout: Arc<Layout>,
+        max_records: u64,
+    ) -> Result<Self> {
         use lance_context_wal::replication::source::{CatalogSigner, SourceSigner};
         fn key(path: &Path) -> Result<Vec<u8>> {
             if !path.exists() {
@@ -138,15 +146,17 @@ impl Cluster {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        Self::open_inner(root, layout, Some((catalog, sources))).await
+        Self::open_inner(root, layout, Some((catalog, sources)), max_records).await
     }
     async fn open_inner(
         root: &Path,
         layout: Arc<Layout>,
         signers: Option<Signers>,
+        max_records: u64,
     ) -> Result<Self> {
         let tls = certificates(root)?;
         let limits = Limits {
+            max_records,
             producer_slots: 16,
             catalog_key: signers.as_ref().map(|s| s.0.public_key()),
             source_keys: signers
