@@ -108,6 +108,17 @@ pub async fn connect_ingress(
 
 impl Service {
     #[cfg(test)]
+    pub(crate) async fn capture_read_for_test(
+        &self,
+        turn: &str,
+    ) -> Result<lance_context_core::annotation_staging::PointRead> {
+        // Pause a real admitted point read immediately before its storage I/O.
+        let through = self.barrier().await?;
+        self.wait_through(through).await?;
+        Ok(self.shared.staging.capture(turn).await?)
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_attempts(&self) -> u64 {
         self.shared
             .apply_attempts

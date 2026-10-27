@@ -50,6 +50,7 @@ impl Runtime {
         self.publisher.reclamation = Some(reclamation::Collector::new(
             options,
             &self.publisher.budget,
+            &self.publisher.storage,
         )?);
         Ok(self)
     }

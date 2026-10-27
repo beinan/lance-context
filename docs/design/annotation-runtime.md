@@ -65,6 +65,16 @@ pauses publication. Reference checks, protection reads and DELETE are not covere
 by this data-listing slice. Prolonged listing delays can temporarily increase
 obsolete blob files; bounded working memory is not a bound on total blob garbage.
 
+Protection reads reuse selected immutable manifests in the existing weighted
+Lance session metadata cache. Entries are scoped to one collector's fixed table
+and storage binding and include the immutable catalog identity, path and size;
+a version number alone is not a cache key. Independent collectors use separate
+namespaces even when they share a Session and equal destination URI strings.
+Each page still captures fresh reader roots and quorum history and obtains its
+own deletion fence. Cached metadata neither pins files nor authorizes deletion.
+Cache eviction, clearing or zero capacity falls back to the same selected
+manifest read, under the existing publication workspace check.
+
 The Rust tests exercise plan-only recovery, prepared-file reuse, lost selected
 manifest replies, automatic timed result-only publication, and repeated concurrent
 status/score updates with complete drain between cycles. A separate Rust child
