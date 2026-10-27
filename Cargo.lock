@@ -4230,6 +4230,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]

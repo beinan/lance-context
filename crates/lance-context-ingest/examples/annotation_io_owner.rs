@@ -7,6 +7,14 @@ use tokio::{net::TcpListener, sync::oneshot};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() != 2 {
         bail!("usage: annotation_io_owner CONFIG LOOPBACK_METRICS_ADDRESS");
