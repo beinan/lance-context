@@ -132,7 +132,7 @@ impl AnnotationStaging {
             ));
         }
         let _mutation = self.mutation.lock().await;
-        let mut state = self.state.write().await;
+        let state = self.state.read().await;
         if !state
             .frozen
             .as_ref()
@@ -140,6 +140,14 @@ impl AnnotationStaging {
         {
             return Err(invalid("annotation frozen generation is no longer current"));
         }
+        // These keys are still masked by frozen (or newer active) values.
+        // Cancellation during cache insertion therefore leaves the old view
+        // valid. Only this installation writes the cache: a delayed read of an
+        // old base must never replace a newer published value. Cached copies
+        // own no staging permits or base handles.
+        self.published_values.remember(&generation.values).await?;
+        drop(state);
+        let mut state = self.state.write().await;
         state.base = state.views.install(selected);
         state.materialized = generation.through;
         state.frozen = None;
