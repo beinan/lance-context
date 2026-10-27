@@ -145,7 +145,9 @@ impl AnnotationStaging {
         // valid. Only this installation writes the cache: a delayed read of an
         // old base must never replace a newer published value. Cached copies
         // own no staging permits or base handles.
-        self.published_values.remember(&generation.values).await?;
+        self.published_values
+            .remember(&generation.values, generation.through)
+            .await?;
         drop(state);
         let mut state = self.state.write().await;
         state.base = state.views.install(selected);
