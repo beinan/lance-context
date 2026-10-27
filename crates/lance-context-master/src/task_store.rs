@@ -4356,7 +4356,20 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .is_none());
-            // Repeated obsolete scanner pages create no replicated writes.
+            // Lease cleanup elsewhere can advance the cluster revision even
+            // while every obsolete enqueue remains read-only.
+            let unrelated_key = format!("/unrelated-recovery-test/{}", generate_id());
+            let unrelated_lease = observer.lease_grant(60, None).await.unwrap().id();
+            observer
+                .put(
+                    unrelated_key,
+                    "unrelated",
+                    Some(PutOptions::new().with_lease(unrelated_lease)),
+                )
+                .await
+                .unwrap();
+            // Watch only this fixture's keys, including transient writes that
+            // a before/after key snapshot would miss.
             let revision = observer
                 .get(key.clone(), None)
                 .await
@@ -4364,6 +4377,17 @@ pub(crate) mod tests {
                 .header()
                 .unwrap()
                 .revision();
+            let mut events = observer
+                .watch(
+                    format!("{}/", store.inner.prefix),
+                    Some(
+                        etcd_client::WatchOptions::new()
+                            .with_prefix()
+                            .with_start_revision(revision + 1),
+                    ),
+                )
+                .await
+                .unwrap();
             for _ in 0..20 {
                 assert!(store
                     .enqueue_execution_recovery(TaskKind::MergeWal, &observed)
@@ -4371,16 +4395,37 @@ pub(crate) mod tests {
                     .unwrap()
                     .is_none());
             }
-            assert_eq!(
-                observer
-                    .get(key, None)
-                    .await
-                    .unwrap()
-                    .header()
-                    .unwrap()
-                    .revision(),
-                revision
-            );
+            observer.lease_revoke(unrelated_lease).await.unwrap();
+            // A sentinel after the attempts closes the observation window.
+            // Ordered delivery must contain only this event, even though the
+            // unrelated lease deletion advanced the global revision.
+            let sentinel = format!("{}/no-write-boundary/{replace}", store.inner.prefix);
+            let boundary = observer
+                .put(sentinel.clone(), "done", None)
+                .await
+                .unwrap()
+                .header()
+                .unwrap()
+                .revision();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = events.message().await.unwrap().unwrap();
+                    assert!(!response.canceled());
+                    if response.events().is_empty() {
+                        continue;
+                    }
+                    assert_eq!(response.events().len(), 1);
+                    let event = &response.events()[0];
+                    assert_eq!(event.event_type(), etcd_client::EventType::Put);
+                    let kv = event.kv().unwrap();
+                    assert_eq!(kv.key(), sentinel.as_bytes());
+                    assert_eq!(kv.mod_revision(), boundary);
+                    break;
+                }
+            })
+            .await
+            .unwrap();
+            drop(events);
         }
         assert!(store.list().await.unwrap().is_empty());
     }
