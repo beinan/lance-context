@@ -73,7 +73,9 @@ an unmaterialized suffix, and is killed with SIGKILL. Its parent reopens the rea
 and Lance state, checks the original response and current values, then drains the
 suffix. This process-crash test does not simulate loss of the backing storage.
 
-Production registry/HTTP wiring, shard-owner routing, and sustained load with
-latency, refusal and backlog measurements remain required before rollout. Tiny
-correctness fixtures do not qualify annotation throughput. Mixed ingestion, filter
+The [application roles](annotation-application.md) supply authenticated HTTP,
+etcd ownership and routing through a configured owner address. Deployments must
+follow their explicit table handoff and reclamation requirements. Tiny correctness
+fixtures do not qualify annotation throughput: sustained-load results need their
+workload, latency, refusal and backlog measurements. Mixed ingestion, filter
 indexing and multi-shard scale are later work.

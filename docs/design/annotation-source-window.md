@@ -24,4 +24,7 @@ Real TLS/RF3/Lance tests separately force the record cap and byte cap with repea
 updates of one turn. They hold an unapplied request under pressure, publish the old
 prefix while the suffix applies, confirm the exact retry result, then publish the
 suffix. Three cycles verify that value and metadata retention return to zero.
-This supplies bounded prefixes; automatic publisher scheduling is separate work.
+The [publication runtime](annotation-runtime.md) uses source pressure, value
+pressure and the configured batch timer to schedule these bounded prefixes.
+The tests above isolate the source-window behavior; they do not establish
+sustained throughput for the complete application.
