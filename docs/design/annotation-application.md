@@ -119,6 +119,19 @@ resolution. The shared catalog also reports `state`, `prepare`, and `retire`
 work. This distinguishes a full source window waiting on maintenance from one
 waiting on native preparation or publication without logging individual turns.
 
+Collection also reports three nested phases. `collect_list` measures each
+tag/branch probe and the bounded data-listing slice, including continuation waits;
+its counts are not cloud request counts. `collect_protect` measures retained
+manifest reads and removal of live-reader/snapshot references from the candidate
+page, including their bounded workspace admission. `collect_delete` measures a
+sealed page's concurrent DELETE calls and result
+handling, including retries of unresolved paths. Its completion does not mean all
+paths were deleted: `reclamation.delete_failures` and `pending_objects` retain
+that distinction. These phases leave catalog/history fencing and page-workspace
+admission in the parent `collect` phase. They identify which part of collection
+delays the serial publisher without adding per-object labels or changing its
+ordering.
+
 Counters report starts, completions, failures, cancellations, total elapsed
 microseconds and the longest finished interval. Time still in flight is not
 included in elapsed/max counters. A completed interval only means that measured
