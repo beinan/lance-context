@@ -79,9 +79,27 @@ row-preserving rewrite validation and durable publication protocol.
 Allocation charges include owned strings and conservative map/set/Arc node
 overhead. Both maps, held frozen handles and captured old staged values retain
 their byte/entry charges until dropped. Point-read admission separately limits
-old base handles. There is no clean-value cache or queue of extra frozen maps.
+old base handles. There is no queue of extra frozen maps.
 A capacity rejection leaves the value and applied cursor unchanged. The WAL
 consumer must stop at that item until publication/read release permits progress.
+
+After confirming a selected publication, installation copies its complete narrow
+values into the existing, byte-bounded Lance session metadata cache. Later apply
+checks these values after active/frozen and before a cold Lance lookup. Each
+staging instance has its own cache namespace, including when instances share a
+Session and URI. The copies hold neither staging permits nor base handles;
+publication can release dirty capacity and reclaim old files normally. Point
+reads retain their existing compatible value/base capture path.
+
+Cache warming occurs while the same frozen generation is still installed and
+the mutation gate is held. Active/frozen values mask those keys until the atomic
+base handoff, so cancellation during warming leaves the previous view valid.
+Only this installation writes the cache: delayed reads of old snapshots cannot
+overwrite newer values. Row-preserving compaction keeps cached annotations valid.
+Eviction, cache clearing, a disabled cache, or a backend without a reported byte
+capacity falls back to Lance. This shares the existing metadata budget and can
+compete with native metadata; it does not reserve additional cache capacity or
+replace reconstruction from the selected Lance state and WAL suffix.
 
 The serialized apply operation may temporarily hold an old and new narrow
 value; per-value/input bounds limit that scratch allocation. Read outputs and

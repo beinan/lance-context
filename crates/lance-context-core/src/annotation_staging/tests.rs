@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 mod compaction;
 mod concurrent_reads;
+mod published_values;
 mod reclamation;
 mod views;
 

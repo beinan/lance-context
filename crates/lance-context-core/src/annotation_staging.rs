@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 mod compaction;
 mod preserve_id;
 mod publication;
+mod published_values;
 mod views;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
@@ -125,7 +126,8 @@ struct State {
     frozen: Option<Arc<publication::Generation>>,
 }
 
-/// One active generation, at most one frozen generation, and no clean cache.
+/// One active generation and at most one frozen generation. Published narrow
+/// values may share the existing, bounded Lance session cache for later apply.
 /// Point reads retain only a selected value or a base handle, never whole maps.
 pub struct AnnotationStaging {
     scope: Scope,
@@ -140,6 +142,7 @@ pub struct AnnotationStaging {
     readers: Arc<Semaphore>,
     metadata: Arc<Semaphore>,
     root_snapshot: Arc<Semaphore>,
+    published_values: published_values::PublishedValues,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,6 +227,7 @@ impl AnnotationStaging {
         {
             return Err(invalid("invalid annotation staging scope or limits"));
         }
+        let published_values = published_values::PublishedValues::new(&base);
         let (base, views) = views::Registry::new(base);
         Ok(Self {
             scope,
@@ -232,6 +236,7 @@ impl AnnotationStaging {
             readers: Arc::new(Semaphore::new(limits.readers)),
             metadata: Arc::new(Semaphore::new(publication::METADATA_BUDGET)),
             root_snapshot: Arc::new(Semaphore::new(1)),
+            published_values,
             limits,
             mutation: Mutex::new(()),
             state: RwLock::new(State {
@@ -353,7 +358,7 @@ impl AnnotationStaging {
         let mut pending = Values::new();
         let mut batch_bytes = 0;
         for (chunk_index, chunk) in mutations.chunks(COLD_LOOKUP_KEYS).enumerate() {
-            let keys = chunk
+            let mut keys = chunk
                 .iter()
                 .map(|m| m.turn)
                 .filter(|turn| {
@@ -365,6 +370,13 @@ impl AnnotationStaging {
                             .is_some_and(|f| f.values.contains_key(*turn))
                 })
                 .collect::<std::collections::BTreeSet<_>>();
+            let mut cached = BTreeMap::new();
+            for turn in &keys {
+                if let Some(value) = self.published_values.get(turn).await {
+                    cached.insert(*turn, value);
+                }
+            }
+            keys.retain(|turn| !cached.contains_key(turn));
             let mut cold = read_bases(&state.base, &keys).await?;
             for (offset, Mutation { turn, patch }) in chunk.iter().enumerate() {
                 let row = chunk_index * COLD_LOOKUP_KEYS + offset;
@@ -380,6 +392,7 @@ impl AnnotationStaging {
                     });
                 let mut current = match &previous {
                     Some(value) => value.value.clone(),
+                    None if cached.contains_key(*turn) => cached[*turn].value.clone(),
                     None => match cold.remove(*turn) {
                         Some(batch) => decode_base_row(&batch, 0, turn, self.limits.value_bytes)?,
                         None => return Ok(reject(row, RejectionReason::MissingTurn)),

@@ -13,7 +13,10 @@ with one Lance `IN` filter against the same base snapshot. Only `id`, `labels`,
 holds Arrow row slices sharing the returned buffers. It does not preconstruct a
 second map of owned annotation strings. Values are decoded when their mutations
 are applied, in source order; later mutations of the same turn use pending state.
-There is no clean-value cache after the batch.
+These measurements predate published-value reuse. The current staging component
+can retain published narrow values within the existing bounded session cache;
+see [the staging cache contract](annotation-staging-view.md#bounds). Evicted or
+uncached keys still use the cold lookup path measured here.
 
 This retains the existing serialized apply and publication lock. The whole WAL
 batch is installed only after every window succeeds. Missing rows and invalid
