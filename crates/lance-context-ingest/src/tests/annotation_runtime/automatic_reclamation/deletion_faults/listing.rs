@@ -3,18 +3,29 @@ use super::*;
 
 #[tokio::test]
 async fn annotation_collector_pending_listing_yields_before_any_candidate() -> Result<()> {
-    pending_listing(false).await
+    pending_listing(false, false).await
 }
 
 #[tokio::test]
 async fn annotation_collector_pending_listing_preserves_partial_page() -> Result<()> {
-    pending_listing(true).await
+    pending_listing(true, false).await
 }
 
-async fn pending_listing(partial: bool) -> Result<()> {
+#[tokio::test]
+async fn annotation_collector_pending_listing_drains_source_window() -> Result<()> {
+    pending_listing(false, true).await
+}
+
+#[tokio::test]
+async fn annotation_collector_pending_listing_drains_source_window_and_partial_page() -> Result<()>
+{
+    pending_listing(true, true).await
+}
+
+async fn pending_listing(partial: bool, burst: bool) -> Result<()> {
     let root = root()?;
     eprintln!(
-        "pending LIST fixture: {} partial={partial}",
+        "pending LIST fixture: {} partial={partial} burst={burst}",
         root.path().display()
     );
     let path = root.path().join("turns.lance");
@@ -31,14 +42,25 @@ async fn pending_listing(partial: bool) -> Result<()> {
         entered,
         resumed,
     )?;
-    let (stop, task) = run_owner(whole_page(runtime)?);
+    let runtime = if burst {
+        runtime.with_exclusive_reclamation(crate::annotations::runtime::reclamation::Options {
+            max_objects: 16,
+            max_bytes: 16 << 10,
+            delete_parallelism: 2,
+            interval: Duration::from_secs(1),
+        })?
+    } else {
+        whole_page(runtime)?
+    };
+    let (stop, task) = run_owner(runtime);
     tokio::time::timeout(Duration::from_secs(30), reached).await??;
     let producer = producer(&service, 2).await?;
     let mut last = completed.index;
     let mut score = None;
     let progress = async {
-        // More updates than the two-record source window, with a full drain
-        // between them. No response is released and no request is resent.
+        // More updates than the two-record source window. A burst does not
+        // wait for drains between requests, exercising admission under pressure.
+        // No listing response is released and no request is resent.
         for sequence in 1..=4 {
             let update = request(
                 &service,
@@ -53,9 +75,11 @@ async fn pending_listing(partial: bool) -> Result<()> {
             let current = service.get("T", Duration::from_secs(30)).await?.unwrap();
             ensure!(current.status.as_deref() == Some("acknowledged"));
             ensure!(current.score == score);
-            tokio::time::timeout(Duration::from_secs(5), drained(&service, last))
-                .await
-                .context("publication remained blocked on the held listing")??;
+            if !burst || sequence == 4 {
+                tokio::time::timeout(Duration::from_secs(5), drained(&service, last))
+                    .await
+                    .context("publication remained blocked on the held listing")??;
+            }
             let (observed, _) = service.observation().await;
             ensure!(observed.retained_bytes <= limits().retained_bytes);
             ensure!(

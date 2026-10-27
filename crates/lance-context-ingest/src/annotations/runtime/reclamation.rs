@@ -8,6 +8,8 @@ use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectMeta};
 
 mod deletion;
+#[cfg(test)]
+mod listing_tests;
 mod manifest_cache;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,7 +22,8 @@ pub struct Options {
     pub delete_parallelism: usize,
     /// Minimum delay after a completed collection pass. Slow object storage I/O
     /// does not consume this cooldown. Data listing yields after at most this
-    /// interval (capped at one second), retaining the same listing stream.
+    /// interval (capped at one second), or when pending under write backpressure,
+    /// retaining the same listing stream.
     pub interval: Duration,
 }
 impl Default for Options {
@@ -192,6 +195,7 @@ impl Collector {
                     self.listing = Some(store.list(Some(&storage.base)));
                 }
                 let mut candidates = BTreeMap::new();
+                let mut progress = service.shared.progress.subscribe();
                 let mut bytes = 0;
                 let mut examined = 0;
                 let until =
@@ -206,8 +210,10 @@ impl Collector {
                     let (path, size) = if let Some(deferred) = self.deferred.take() {
                         deferred
                     } else {
-                        let next = self.listing.as_mut().unwrap().try_next();
-                        let Ok(next) = tokio::time::timeout_at(until, next).await else {
+                        let Some(next) =
+                            next_listing(self.listing.as_mut().unwrap(), &mut progress, until)
+                                .await
+                        else {
                             break;
                         };
                         let Some(meta) = next? else {
@@ -398,6 +404,21 @@ impl Collector {
             self.sealed = None;
         }
         Ok(())
+    }
+}
+
+async fn next_listing(
+    listing: &mut BoxStream<'static, object_store::Result<ObjectMeta>>,
+    progress: &mut watch::Receiver<Progress>,
+    until: tokio::time::Instant,
+) -> Option<object_store::Result<Option<ObjectMeta>>> {
+    tokio::select! {
+        // Consume ready data/EOF/errors even under pressure so collection can
+        // progress. Yield only a pending response, retaining the listing stream
+        // while the serial publisher frees source/staging capacity.
+        biased;
+        next = tokio::time::timeout_at(until, listing.try_next()) => next.ok(),
+        _ = progress.wait_for(|p| p.backpressured) => None,
     }
 }
 
