@@ -68,7 +68,11 @@ before the existing fenced handoff selects version 3.
 Rows flow directly from the native projected scanner into the native writer;
 there is no whole-table batch collection or body copying. Scanner I/O, output
 batches and writer buffering use slices of `materializer_memory_bytes` (at least
-1 MiB); oversized output batches fail instead of accumulating. File size uses
+1 MiB). Up to four source fragments overlap their I/O through the shared scan
+buffer; oversized output batches fail instead of accumulating. Existing decode
+settings are retained. For plain Lance 13 v2 scans, `batch_readahead(1)` alone
+does not enforce single-batch decoding: the native path uses the compute-thread
+and execution-partition limits. File size uses
 the workspace as a soft target. Native decode, manifest metadata, index-building
 memory and process RSS are not hard-bounded by these buffer settings. In
 particular, this is not a large-scale index-build or recovery-cost qualification.
