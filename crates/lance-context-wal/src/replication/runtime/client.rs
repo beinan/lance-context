@@ -694,7 +694,8 @@ impl Client {
     }
     /// Follow configured-voter hints only when the remote confirms it did not
     /// submit the request. Unknown mutation outcomes require explicit exact retry.
-    /// Read-only pooled disconnects may reconnect once per target, within this
+    /// During an election, refresh exhausted hints within the original deadline.
+    /// Read-only pooled disconnects may reconnect once per exchange, within this
     /// method's single overall deadline.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
         timeout(self.options.timeout, async {
@@ -714,7 +715,7 @@ impl Client {
                 .copied()
                 .unwrap_or(voters[0]);
             let mut visited = BTreeSet::new();
-            for _ in 0..voters.len() {
+            loop {
                 visited.insert(node);
                 let response = match self.exchange(node, request.clone()).await {
                     Ok(response) => response,
@@ -726,13 +727,22 @@ impl Client {
                     }
                 };
                 if let Reply::Redirect { leader } = response.reply {
+                    drop(response);
                     node = if voters.contains(&leader) && !visited.contains(&leader) {
                         leader
+                    } else if let Some(&next) = voters.iter().find(|n| !visited.contains(n)) {
+                        next
                     } else {
-                        *voters
-                            .iter()
-                            .find(|n| !visited.contains(n))
-                            .context("leader hint loop")?
+                        // Every voter explicitly declined before execution.
+                        // Release reply credits and wait before refreshing the
+                        // hints; a transient election is not a protocol fault.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        visited.clear();
+                        if voters.contains(&leader) {
+                            leader
+                        } else {
+                            voters[0]
+                        }
                     };
                     self.leaders.lock().unwrap().insert(group, node);
                 } else {
@@ -754,7 +764,6 @@ impl Client {
                     return Ok(response);
                 }
             }
-            anyhow::bail!("leader not resolved; retain the original request identity")
         })
         .await
         .context("routed exchange timed out; outcome unknown")?
