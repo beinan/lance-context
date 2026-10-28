@@ -191,6 +191,10 @@ pub enum Reply {
     Redirect {
         leader: u64,
     },
+    /// This append attempt was refused by disk admission before Raft proposal.
+    /// An earlier attempt with the same identity may already have committed.
+    /// This does not resolve that attempt or permit changing its identity/bytes.
+    AppendNotSubmittedDiskBudget,
 }
 /// Holds receive credit through consumption of metadata and a fetched payload.
 /// Cloning body Bytes transfers shared ownership, so callers retaining clones
@@ -455,13 +459,22 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
         ensure!(body_len == 0, "unexpected request payload");
     }
     let body = receive(io, body_len).await?;
-    let observation =
-        matches!(request, WireRequest::Append { .. }).then(|| handle.shared.appends.start());
+    let append = matches!(request, WireRequest::Append { .. });
+    let observation = append.then(|| handle.shared.appends.start());
     let executed = execute(handle, request, body).await;
     if let Some(observation) = observation {
         observation.finish(&executed);
     }
-    let (reply, body) = executed.unwrap_or((Reply::Unknown, Bytes::new()));
+    let (reply, body) = match executed {
+        Ok(response) => response,
+        // Node::propose reserves disk before calling Raft::step. Restrict this
+        // proof to append execution; transport cancellation and other failures
+        // do not prove that the request was never submitted.
+        Err(error) if append && error.is::<crate::admission::DiskBudgetExhausted>() => {
+            (Reply::AppendNotSubmittedDiskBudget, Bytes::new())
+        }
+        Err(_) => (Reply::Unknown, Bytes::new()),
+    };
     let metadata = codec().serialize(&(scope(handle), reply))?;
     send(io, id, &metadata, &body).await
 }
@@ -779,6 +792,7 @@ impl Client {
             WireRequest::Query { .. } | WireRequest::Fetch { .. } | WireRequest::Status { .. }
         );
         let fetch = matches!(wire, WireRequest::Fetch { .. });
+        let append = matches!(wire, WireRequest::Append { .. });
         let reply_kind = match &wire {
             WireRequest::Append { .. } | WireRequest::Control(_) => 0,
             WireRequest::Query { .. } => 1,
@@ -850,6 +864,7 @@ impl Client {
                 ensure!(observed == expected, "foreign client response scope");
                 ensure!(
                     matches!(reply, Reply::Unknown | Reply::Redirect { .. })
+                        || (append && matches!(reply, Reply::AppendNotSubmittedDiskBudget))
                         || matches!(
                             (&reply, reply_kind),
                             (Reply::Commit(_), 0)
