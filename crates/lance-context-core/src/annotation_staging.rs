@@ -15,12 +15,14 @@ use lance::{Dataset, Error, Result};
 use lance_context_api::annotation::{TurnAnnotation, TurnAnnotationPatch};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
+mod body;
 mod compaction;
 mod preserve_id;
 mod publication;
 mod published_values;
 mod registration;
 mod views;
+pub use body::{BodySnapshot, BODY_SNAPSHOT_PROPERTY};
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
 };
