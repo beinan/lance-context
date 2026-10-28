@@ -197,6 +197,7 @@ impl Forwarder {
             .await
             .map_err(|_| Failure::unavailable("annotation_owner_unavailable", "unknown"))?;
         let status = upstream.status();
+        let retry_after = upstream.headers().get(header::RETRY_AFTER).cloned();
         let is_empty = status == StatusCode::NO_CONTENT;
         if !is_empty
             && upstream
@@ -224,7 +225,7 @@ impl Forwarder {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let response = if is_empty {
+        let mut response = if is_empty {
             status.into_response()
         } else {
             (
@@ -234,6 +235,9 @@ impl Forwarder {
             )
                 .into_response()
         };
+        if let Some(delay) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, delay);
+        }
         Ok((response, reservation))
     }
 }
