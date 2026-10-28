@@ -2,6 +2,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+mod close;
 mod proxy;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
