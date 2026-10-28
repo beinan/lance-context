@@ -59,6 +59,12 @@ impl Forwarder {
             ingresses.insert(name, ingress);
         }
         let client = reqwest::Client::builder()
+            // An owner can reject before consuming a streamed upload. HTTP/2
+            // cancels that stream without closing a connection while another
+            // request body is being written. Owners accept HTTP/1 and HTTP/2;
+            // forwarding ingresses require an HTTP/2-capable owner endpoint.
+            .http2_prior_knowledge()
+            .retry(reqwest::retry::never())
             .timeout(options.body_total_timeout)
             .connect_timeout(options.admission_timeout)
             .redirect(reqwest::redirect::Policy::none())

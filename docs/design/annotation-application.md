@@ -165,6 +165,16 @@ narrower end-user permissions. `GET /api/v1/health` uses the same authentication
 Owner health checks the running runtime and catalog epoch; each point read still
 waits for its apply barrier. Frontend health checks local draining state.
 
+Annotation forwarding uses HTTP/2 to the owner, including cleartext HTTP/2 for
+an `http://` owner URL. An early admission refusal can cancel one upload stream
+without closing a connection while the ingress is still writing its body.
+Owners and forwarding ingress listeners continue accepting HTTP/1 clients.
+Upgrade owners before forwarding ingresses; any proxy at `owner_url` must support
+HTTP/2. There is no automatic HTTP/1 fallback or mutation replay after a transport
+failure. Such failures still report an unknown outcome and retain the original
+request identity for explicit resolution. Forwarding shares Arrow body frames
+without decoding or coalescing the complete upload.
+
 Graceful shutdown closes admission, lets admitted requests finish while the
 applier runs, then joins the listener and runtime before releasing the claim.
 A crash leaves the claim to expire. A replacement reconciles publication and

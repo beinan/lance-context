@@ -18,6 +18,7 @@ mod batches;
 mod cold_io;
 mod pressure;
 mod read_cut;
+mod transport;
 
 struct Server {
     address: std::net::SocketAddr,
