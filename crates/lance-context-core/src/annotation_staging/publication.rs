@@ -31,6 +31,7 @@ pub(super) struct Generation {
 }
 struct Prepared {
     merge: UncommittedMergeInsert,
+    body: Option<BodySnapshot>,
     _workspace: MergeReservation,
 }
 
@@ -183,16 +184,74 @@ impl FrozenAnnotations {
         workspace: &Arc<MergeMemoryBudget>,
         batch_rows: usize,
     ) -> Result<PreparedAnnotations> {
+        self.prepare_inner(workspace, batch_rows, None).await
+    }
+
+    /// Bind an authorized native body snapshot before creating immutable
+    /// preparation metadata. The caller must prove body/source coverage for
+    /// this frozen cut and retain recovery evidence for both datasets.
+    /// Changing or dropping the body reference after preparation is rejected.
+    pub async fn prepare_with_body(
+        &self,
+        workspace: &Arc<MergeMemoryBudget>,
+        batch_rows: usize,
+        body: BodySnapshot,
+    ) -> Result<PreparedAnnotations> {
+        self.prepare_inner(workspace, batch_rows, Some(body)).await
+    }
+
+    async fn prepare_inner(
+        &self,
+        workspace: &Arc<MergeMemoryBudget>,
+        batch_rows: usize,
+        body: Option<BodySnapshot>,
+    ) -> Result<PreparedAnnotations> {
         if !(1..=65_536).contains(&batch_rows) {
             return Err(invalid("invalid annotation publication batch rows"));
         }
         let mut prepared = self.0.prepared.lock().await;
         if let Some(prepared) = prepared.as_ref() {
+            if prepared.body != body {
+                return Err(invalid("body reference differs from immutable preparation"));
+            }
             return Ok(PreparedAnnotations {
                 generation: self.0.clone(),
                 prepared: prepared.clone(),
             });
         }
+        let encoded_body = if let Some(body) = &body {
+            registration::validate_target(&self.0.base)?;
+            if body.table_instance != self.0.scope.table_instance
+                || body.uri == self.0.base.uri()
+                || self.0.through == 0
+                || self.0.through == u64::MAX
+            {
+                return Err(invalid(
+                    "body reference differs from frozen annotation scope",
+                ));
+            }
+            Some(body.encode()?)
+        } else {
+            None
+        };
+        if let Some(prior) = BodySnapshot::read(&self.0.base).await? {
+            let current = body
+                .as_ref()
+                .ok_or_else(|| invalid("cannot drop selected body reference"))?;
+            if prior.uri != current.uri
+                || prior.table_instance != current.table_instance
+                || (prior.version == current.version && prior.transaction != current.transaction)
+            {
+                return Err(invalid(
+                    "body reference changes its bound destination or identity",
+                ));
+            }
+        }
+        let body_bytes = body
+            .as_ref()
+            .map(BodySnapshot::retained_bytes)
+            .transpose()?
+            .unwrap_or(0);
         let bytes = self
             .0
             .values
@@ -206,6 +265,8 @@ impl FrozenAnnotations {
             })?
             .checked_mul(2)
             .and_then(|n| n.checked_add(self.0.results.as_ref().map_or(0, |s| s.len() * 2)))
+            .and_then(|n| n.checked_add(body_bytes))
+            .and_then(|n| n.checked_add(encoded_body.as_ref().map_or(0, |s| s.capacity() * 2)))
             .ok_or_else(|| invalid("publication workspace overflow"))?;
         if bytes > workspace.limit() {
             return Err(invalid(
@@ -295,9 +356,13 @@ impl FrozenAnnotations {
         if let Some(results) = &self.0.results {
             properties.insert(RESULTS_PROPERTY.into(), results.clone());
         }
+        if let Some(encoded) = encoded_body {
+            properties.insert(BODY_SNAPSHOT_PROPERTY.into(), encoded);
+        }
         merge.transaction.transaction_properties = Some(Arc::new(properties));
         let result = Arc::new(Prepared {
             merge,
+            body,
             _workspace: reservation,
         });
         *prepared = Some(result.clone());

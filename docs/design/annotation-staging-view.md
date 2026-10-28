@@ -112,6 +112,30 @@ and application progress intact. Captured readers keep their old base registered
 for reclamation until released. This view check complements the publisher's
 row-preserving rewrite validation and durable publication protocol.
 
+## Binding a separate body snapshot
+
+`prepare_with_body` binds a `BodySnapshot` to the original native preparation.
+It records the authorized body URI, native version and transaction identity,
+and the logical table incarnation alongside the frozen annotation cut. Capturing
+this identity does not scan or copy body rows. Body references and their encoded
+metadata consume the existing preparation workspace.
+
+A repeated preparation must use the same reference. A later annotation
+publication must retain an explicit body reference with the same destination
+and incarnation; it cannot silently drop the reference or change the transaction
+identity of an existing body version. Narrow compaction preserves this property
+together with the annotation cut and request results. Exact-transaction checks
+still apply when installing the selected snapshot, so modifying the reference
+after preparation is not permitted.
+
+This is a component for mixed-ingestion integration. The caller must establish
+body coverage of the selected source cut, durably retain the original combined
+preparation, and protect both datasets' files and reader dependencies before
+source retirement or collection. A URI read from metadata is not authorization
+to access that destination. The current patch-only managed publisher explicitly
+rejects paired body metadata; this API does not enable mixed-ingestion ACKs,
+body reads, or a two-dataset collector.
+
 ## Bounds
 
 Allocation charges include owned strings and conservative map/set/Arc node
