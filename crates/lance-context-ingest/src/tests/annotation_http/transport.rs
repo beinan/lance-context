@@ -50,7 +50,14 @@ async fn exercise() -> Result<()> {
                 assert_eq!(request.version(), axum::http::Version::HTTP_2);
                 observed.fetch_add(1, Ordering::SeqCst);
                 let update = request.uri().path().ends_with("/update");
-                let response = next.run(request).await;
+                let mut response = next.run(request).await;
+                if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    // Use a distinct owner delay to detect a lost or replaced
+                    // header at the forwarding ingress.
+                    response
+                        .headers_mut()
+                        .insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+                }
                 if update
                     && response.status() == StatusCode::OK
                     && fault.swap(false, Ordering::SeqCst)
@@ -109,6 +116,7 @@ async fn exercise() -> Result<()> {
             .send()
             .await?;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[reqwest::header::RETRY_AFTER], "3");
         let reply: serde_json::Value = response.json().await?;
         assert_eq!(reply["operation_outcome"], "not_submitted");
         assert_eq!(reply["error"], "request_capacity");
