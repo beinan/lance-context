@@ -707,7 +707,13 @@ async fn read_existing<'a>(
     // A valid table returns at most one row per requested key. One extra row
     // proves a duplicate without retaining an unbounded corrupt result set.
     scan.limit(Some(turns.len() as i64 + 1), None)?;
-    scan.batch_size(COLD_LOOKUP_ROWS);
+    // Existence probes decode only IDs. Amortize scanning a growing base over
+    // the existing key window without increasing annotation/body projections.
+    scan.batch_size(if projection == ["id"] {
+        COLD_LOOKUP_KEYS
+    } else {
+        COLD_LOOKUP_ROWS
+    });
     let mut stream = scan.try_into_stream().await?;
     while let Some(batch) = stream.try_next().await? {
         let ids = batch
