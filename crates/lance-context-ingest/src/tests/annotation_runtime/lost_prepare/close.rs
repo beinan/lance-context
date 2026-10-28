@@ -108,7 +108,7 @@ async fn exercise() -> Result<()> {
         service.get("T", Duration::from_secs(30)).await?,
         Some(current.clone())
     );
-    drained(&service, suffix_result.index).await?;
+    drained(&c, &service, suffix_result.index).await?;
     for (request, result) in [(&first, &first_result), (&suffix, &suffix_result)] {
         assert_eq!(
             &service.submit(request, Duration::from_secs(30)).await?,
