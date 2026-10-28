@@ -248,7 +248,9 @@ pub(crate) async fn project(
     scan.batch_size(8192.min(buffer / 128))
         .batch_size_bytes((buffer / 2) as u64)
         .batch_readahead(1)
-        .fragment_readahead(1)
+        // Overlap fragment I/O through the scan's shared byte budget while
+        // retaining one decoded batch at a time.
+        .fragment_readahead(4)
         .io_buffer_size(buffer as u64);
     let output_schema = schema.clone();
     let stream = scan

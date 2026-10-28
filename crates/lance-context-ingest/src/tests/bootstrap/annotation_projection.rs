@@ -284,10 +284,12 @@ async fn annotation_projection_streams_multiple_batches_without_retaining_bodies
         &bodies.uri,
         Some(WriteParams {
             enable_stable_row_ids: true,
+            max_rows_per_file: 1024,
             ..Default::default()
         }),
     )
     .await?;
+    assert_eq!(base.fragments().len(), rows / 1024);
     let scope = scope(&annotation_publication::one_shard())?;
     let projected = projection::project(
         &base,
@@ -312,6 +314,20 @@ async fn annotation_projection_streams_multiple_batches_without_retaining_bodies
             .sum::<usize>()
             > 1 << 20
     );
+    let mut next = 0;
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for id in ids.iter() {
+            assert_eq!(id.unwrap(), format!("turn-{next:06}"));
+            next += 1;
+        }
+    }
+    assert_eq!(next, rows);
     assert_eq!(Dataset::open(&bodies.uri).await?.version_id(), 1);
     Ok(())
 }
