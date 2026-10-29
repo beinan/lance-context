@@ -35,10 +35,7 @@ pub(super) async fn verify(
             1 => changed.read_version += 1,
             2 => changed.tag = Some("foreign".into()),
             3 => {
-                changed
-                    .transaction_properties
-                    .as_mut()
-                    .unwrap()
+                Arc::make_mut(changed.transaction_properties.as_mut().unwrap())
                     .remove(lance_context_core::annotation_staging::RESULTS_PROPERTY);
             }
             _ => {
