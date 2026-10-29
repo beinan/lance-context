@@ -159,7 +159,11 @@ pub(super) async fn seed_contract(
     seed_base(c, contract, &base).await
 }
 
-async fn seed_base(c: &network::Cluster, contract: IngestContract, base: &Dataset) -> Result<()> {
+pub(super) async fn seed_base(
+    c: &network::Cluster,
+    contract: IngestContract,
+    base: &Dataset,
+) -> Result<()> {
     let Applied::Publisher(p::Reply::Acquired(authority)) = command(
         c,
         Command::Acquire(p::Acquire {
@@ -418,7 +422,7 @@ pub(super) async fn save(
     })
 }
 
-async fn confirm(c: &network::Cluster) -> Result<Arc<p::Published>> {
+pub(super) async fn confirm(c: &network::Cluster) -> Result<Arc<p::Published>> {
     let view = state(c).await?;
     let pending = view.progress.pending.as_ref().unwrap();
     let prepared = view.progress.prepared.as_ref().unwrap();

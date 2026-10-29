@@ -40,7 +40,7 @@ pub(super) async fn publish(
     let commit = annotation_publication::save(c, &selection, descriptors.clone()).await?;
     let selected = crate::annotation_publication::mixed::publish(
         Arc::new(c.client.manifest_catalog()),
-        &c.layout,
+        &annotation_publication::one_shard(),
         narrow,
         body,
         commit,

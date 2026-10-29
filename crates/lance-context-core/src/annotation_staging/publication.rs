@@ -164,6 +164,11 @@ impl AnnotationStaging {
 }
 
 impl FrozenAnnotations {
+    /// The compatible Lance base captured when this generation was frozen.
+    pub fn base(&self) -> &Arc<Dataset> {
+        &self.0.base.dataset
+    }
+
     /// First-create source rows still absent from this generation's base.
     /// Borrowing this iterator retains the frozen generation; it does not
     /// independently pin source records or authorize body ingestion.
