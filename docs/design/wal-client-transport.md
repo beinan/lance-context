@@ -40,8 +40,15 @@ cannot decode the new reply and conservatively sees a transport error/unknown
 outcome; it must not treat that error as a successful append or definite rejection.
 
 Routing follows only configured-voter hints returned before command submission.
-A cached hint is never treated as an ACK. Unknown outcomes are returned to the
-caller instead of automatically advancing/reissuing logical operations. The
+A cached hint is never treated as an ACK. Unknown mutation outcomes are returned
+to the caller instead of automatically advancing/reissuing logical operations.
+An election can invalidate a pending read-index query and return `Query(Unknown)`.
+For this reply to a read-only `Request::Query`, routing releases the response
+credits, waits 20 milliseconds, and reissues the unchanged query through configured
+voters within the original overall deadline. Success still requires a fresh
+quorum observation. Persistent unavailability expires that deadline; it does not
+extend it on each attempt. Generic unknown replies and mutation outcomes retain
+their existing handling. The
 source-fetch API returns local committed data; a quorum-confirmed source pin and
 matching metadata are required before materialization. Missing local data does
 not prove that an uncertain append was rejected.

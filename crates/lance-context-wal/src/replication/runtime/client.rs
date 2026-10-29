@@ -695,6 +695,8 @@ impl Client {
     /// Follow configured-voter hints only when the remote confirms it did not
     /// submit the request. Unknown mutation outcomes require explicit exact retry.
     /// During an election, refresh exhausted hints within the original deadline.
+    /// A Query(Unknown) read-index result reissues the same read-only query with
+    /// backoff, also within that deadline. Mutation outcomes are never replayed.
     /// Read-only pooled disconnects may reconnect once per exchange, within this
     /// method's single overall deadline.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
@@ -755,6 +757,19 @@ impl Client {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
                             % voters.len()];
                         self.leaders.lock().unwrap().insert(group, next);
+                        if matches!(&request, Request::Query { .. })
+                            && matches!(response.reply, Reply::Query(query::Outcome::Unknown))
+                        {
+                            // An election can invalidate a pending read-index
+                            // observation. Reissue only this read-only query,
+                            // within the original outer deadline. Release its
+                            // reply credits before waiting for another leader.
+                            drop(response);
+                            node = next;
+                            visited.clear();
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
                     } else if matches!(
                         request,
                         Request::Append { .. } | Request::Commit(_) | Request::Query { .. }

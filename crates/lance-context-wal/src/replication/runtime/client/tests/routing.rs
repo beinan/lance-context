@@ -6,6 +6,9 @@ enum AfterRedirect {
     Unknown,
     Disconnect,
     KeepRedirecting,
+    QueryUnknownThenExecute,
+    KeepQueryUnknown,
+    CommitUnknown,
 }
 
 // One authenticated endpoint temporarily withholds the real leader's hint.
@@ -65,7 +68,8 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
                 assert!(matches!(&request, WireRequest::Query { group: 10, .. }));
                 assert!(body.is_empty());
             }
-            let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+            let call = observed.fetch_add(1, Ordering::SeqCst);
+            let first = call == 0;
             let (reply, body) = if first || matches!(after, AfterRedirect::KeepRedirecting) {
                 (Reply::Redirect { leader: 0 }, Bytes::new())
             } else {
@@ -74,6 +78,17 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
                     AfterRedirect::Unknown => (Reply::Unknown, Bytes::new()),
                     AfterRedirect::Disconnect => break,
                     AfterRedirect::KeepRedirecting => unreachable!(),
+                    AfterRedirect::QueryUnknownThenExecute if call > 1 => {
+                        execute(&handle, request, body).await?
+                    }
+                    AfterRedirect::QueryUnknownThenExecute | AfterRedirect::KeepQueryUnknown => {
+                        assert!(!append);
+                        (Reply::Query(query::Outcome::Unknown), Bytes::new())
+                    }
+                    AfterRedirect::CommitUnknown => {
+                        assert!(append);
+                        (Reply::Commit(Outcome::Unknown), Bytes::new())
+                    }
                 }
             };
             send(
@@ -83,7 +98,13 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
                 &body,
             )
             .await?;
-            if !first && !matches!(after, AfterRedirect::KeepRedirecting) {
+            if !first
+                && !matches!(
+                    after,
+                    AfterRedirect::KeepRedirecting | AfterRedirect::KeepQueryUnknown
+                )
+                && !(matches!(after, AfterRedirect::QueryUnknownThenExecute) && call == 1)
+            {
                 break;
             }
         }
@@ -106,7 +127,10 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
     };
     let started = tokio::time::Instant::now();
     let result = client.request_routed(request).await;
-    if matches!(after, AfterRedirect::KeepRedirecting) {
+    if matches!(
+        after,
+        AfterRedirect::KeepRedirecting | AfterRedirect::KeepQueryUnknown
+    ) {
         server.abort();
         let _ = server.await;
         let error = result
@@ -124,7 +148,14 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
                 anyhow::bail!("routing stopped before the second leader probe");
             }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if matches!(after, AfterRedirect::QueryUnknownThenExecute) {
+                3
+            } else {
+                2
+            }
+        );
         match after {
             AfterRedirect::Execute if append => {
                 let response = result?;
@@ -154,6 +185,17 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
             AfterRedirect::Unknown => assert!(matches!(result?.reply, Reply::Unknown)),
             AfterRedirect::Disconnect => assert!(result.is_err()),
             AfterRedirect::KeepRedirecting => unreachable!(),
+            AfterRedirect::QueryUnknownThenExecute => {
+                assert!(matches!(
+                    result?.reply,
+                    Reply::Query(query::Outcome::Observed { .. })
+                ));
+                assert!(started.elapsed() >= Duration::from_millis(40));
+            }
+            AfterRedirect::KeepQueryUnknown => unreachable!(),
+            AfterRedirect::CommitUnknown => {
+                assert!(matches!(result?.reply, Reply::Commit(Outcome::Unknown)));
+            }
         }
     }
     if !append || !matches!(after, AfterRedirect::Execute) {
@@ -185,4 +227,11 @@ async fn refreshed_routing_stops_on_unknown_or_disconnected_mutations() -> Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unavailable_leader_keeps_the_original_deadline_and_releases_credits() -> Result<()> {
     routed(false, AfterRedirect::KeepRedirecting).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_read_index_is_reobserved_without_replaying_mutations() -> Result<()> {
+    routed(false, AfterRedirect::QueryUnknownThenExecute).await?;
+    routed(false, AfterRedirect::KeepQueryUnknown).await?;
+    routed(true, AfterRedirect::CommitUnknown).await
 }

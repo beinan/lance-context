@@ -178,8 +178,8 @@ jobs:
 
   ha-tests:
     runs-on: ubuntu-24.04
-    # Keep cold feature builds and recovery tests within the existing job budget.
-    timeout-minutes: 75
+    # Allow the final cold service-feature build to reach the recovery tests.
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
