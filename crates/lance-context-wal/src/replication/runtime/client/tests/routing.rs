@@ -8,6 +8,8 @@ enum AfterRedirect {
     KeepRedirecting,
     QueryUnknownThenExecute,
     KeepQueryUnknown,
+    GenericUnknownThenExecute,
+    KeepGenericUnknown,
     CommitUnknown,
 }
 
@@ -78,12 +80,20 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
                     AfterRedirect::Unknown => (Reply::Unknown, Bytes::new()),
                     AfterRedirect::Disconnect => break,
                     AfterRedirect::KeepRedirecting => unreachable!(),
-                    AfterRedirect::QueryUnknownThenExecute if call > 1 => {
+                    AfterRedirect::QueryUnknownThenExecute
+                    | AfterRedirect::GenericUnknownThenExecute
+                        if call > 1 =>
+                    {
                         execute(&handle, request, body).await?
                     }
                     AfterRedirect::QueryUnknownThenExecute | AfterRedirect::KeepQueryUnknown => {
                         assert!(!append);
                         (Reply::Query(query::Outcome::Unknown), Bytes::new())
+                    }
+                    AfterRedirect::GenericUnknownThenExecute
+                    | AfterRedirect::KeepGenericUnknown => {
+                        assert!(!append);
+                        (Reply::Unknown, Bytes::new())
                     }
                     AfterRedirect::CommitUnknown => {
                         assert!(append);
@@ -101,9 +111,15 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
             if !first
                 && !matches!(
                     after,
-                    AfterRedirect::KeepRedirecting | AfterRedirect::KeepQueryUnknown
+                    AfterRedirect::KeepRedirecting
+                        | AfterRedirect::KeepQueryUnknown
+                        | AfterRedirect::KeepGenericUnknown
                 )
-                && !(matches!(after, AfterRedirect::QueryUnknownThenExecute) && call == 1)
+                && !(matches!(
+                    after,
+                    AfterRedirect::QueryUnknownThenExecute
+                        | AfterRedirect::GenericUnknownThenExecute
+                ) && call == 1)
             {
                 break;
             }
@@ -129,7 +145,9 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
     let result = client.request_routed(request).await;
     if matches!(
         after,
-        AfterRedirect::KeepRedirecting | AfterRedirect::KeepQueryUnknown
+        AfterRedirect::KeepRedirecting
+            | AfterRedirect::KeepQueryUnknown
+            | AfterRedirect::KeepGenericUnknown
     ) {
         server.abort();
         let _ = server.await;
@@ -150,7 +168,10 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            if matches!(after, AfterRedirect::QueryUnknownThenExecute) {
+            if matches!(
+                after,
+                AfterRedirect::QueryUnknownThenExecute | AfterRedirect::GenericUnknownThenExecute
+            ) {
                 3
             } else {
                 2
@@ -185,14 +206,14 @@ async fn routed(append: bool, after: AfterRedirect) -> Result<()> {
             AfterRedirect::Unknown => assert!(matches!(result?.reply, Reply::Unknown)),
             AfterRedirect::Disconnect => assert!(result.is_err()),
             AfterRedirect::KeepRedirecting => unreachable!(),
-            AfterRedirect::QueryUnknownThenExecute => {
+            AfterRedirect::QueryUnknownThenExecute | AfterRedirect::GenericUnknownThenExecute => {
                 assert!(matches!(
                     result?.reply,
                     Reply::Query(query::Outcome::Observed { .. })
                 ));
                 assert!(started.elapsed() >= Duration::from_millis(40));
             }
-            AfterRedirect::KeepQueryUnknown => unreachable!(),
+            AfterRedirect::KeepQueryUnknown | AfterRedirect::KeepGenericUnknown => unreachable!(),
             AfterRedirect::CommitUnknown => {
                 assert!(matches!(result?.reply, Reply::Commit(Outcome::Unknown)));
             }
@@ -234,4 +255,12 @@ async fn unavailable_read_index_is_reobserved_without_replaying_mutations() -> R
     routed(false, AfterRedirect::QueryUnknownThenExecute).await?;
     routed(false, AfterRedirect::KeepQueryUnknown).await?;
     routed(true, AfterRedirect::CommitUnknown).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_unknown_query_keeps_its_deadline_and_releases_credits() -> Result<()> {
+    // A leader can change between the server's routing observation and query
+    // execution. The server reports such execution errors as generic Unknown.
+    routed(false, AfterRedirect::GenericUnknownThenExecute).await?;
+    routed(false, AfterRedirect::KeepGenericUnknown).await
 }
