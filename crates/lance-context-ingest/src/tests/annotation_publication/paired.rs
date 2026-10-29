@@ -124,8 +124,16 @@ async fn recover(lose_publication_reply: bool, maintenance_stage: Option<u8>) ->
         Arc::default(),
     )
     .await?;
+    let mut body_path = root.path().to_path_buf();
+    if maintenance_stage.is_some() {
+        // The body URI alone must exceed the 512-byte inline descriptor cap.
+        // Otherwise short CI temporary paths silently select the inline format.
+        for _ in 0..5 {
+            body_path.push("body-reference-".repeat(8));
+        }
+    }
     let body = Storage::resolve(
-        root.path().join("body.lance").to_str().unwrap().into(),
+        body_path.join("body.lance").to_str().unwrap().into(),
         Default::default(),
         narrow.session.clone(),
     )
