@@ -25,6 +25,10 @@ pub enum WritePolicy {
     /// binding, not permission to reinterpret an immutable append stream.
     /// Enable only after all voters and application workers support it.
     TurnAnnotations,
+    /// Ordered first-create body ingestion and narrow annotation patches under
+    /// one shard owner/source cut. Requires an explicit mixed Arrow schema and
+    /// paired publication support; old bindings retain their original meaning.
+    TurnIngestion,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
