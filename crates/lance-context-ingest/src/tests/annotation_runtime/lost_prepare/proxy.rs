@@ -32,6 +32,7 @@ pub(in crate::tests) struct Proxy {
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
     pub advances: Arc<AtomicUsize>,
+    pub appends: Arc<AtomicUsize>,
     pub committed: Arc<Notify>,
     pub release: Arc<Notify>,
     _tasks: JoinSet<Result<()>>,
@@ -51,17 +52,19 @@ fn certificates(path: &FsPath) -> Result<Vec<CertificateDer<'static>>> {
 struct Frame {
     fixed: [u8; 24],
     meta: Vec<u8>,
+    body: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
 enum Point {
     Prepare,
+    Append { execute: bool },
     Close,
     Plan { execute: bool },
     Advance { execute: bool },
 }
 impl Frame {
-    async fn read(io: &mut (impl AsyncRead + Unpin)) -> Result<Option<Self>> {
+    async fn read(io: &mut (impl AsyncRead + Unpin), data: bool) -> Result<Option<Self>> {
         let mut fixed = [0; 24];
         match io.read_exact(&mut fixed[..1]).await {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -73,23 +76,58 @@ impl Frame {
         ensure!(&fixed[..8] == b"LCWCLNT1", "foreign proxy protocol");
         let size = u32::from_le_bytes(fixed[16..20].try_into()?) as usize;
         ensure!(
-            (1..=2 << 20).contains(&size) && fixed[20..24] == [0; 4],
+            (1..=2 << 20).contains(&size)
+                && if data {
+                    u32::from_le_bytes(fixed[20..24].try_into()?) <= 16 << 20
+                } else {
+                    fixed[20..24] == [0; 4]
+                },
             "invalid control frame"
         );
         let mut meta = vec![0; size];
         io.read_exact(&mut meta).await?;
-        Ok(Some(Self { fixed, meta }))
+        Ok(Some(Self {
+            fixed,
+            meta,
+            body: Vec::new(),
+        }))
     }
     async fn write(&self, io: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
         io.write_all(&self.fixed).await?;
         io.write_all(&self.meta).await?;
+        io.write_all(&self.body).await?;
         io.flush().await?;
+        Ok(())
+    }
+    async fn payload(&mut self, io: &mut (impl AsyncRead + Unpin), request: bool) -> Result<()> {
+        let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        let bytes = if request && kind == 0 {
+            let (_, _, _, meta): (WireScope, u32, u64, BatchMeta) =
+                codec().reject_trailing_bytes().deserialize(&self.meta)?;
+            meta.body_bytes
+        } else if !request && kind == 2 {
+            let (_, _, meta): (WireScope, u32, Option<BatchMeta>) =
+                codec().reject_trailing_bytes().deserialize(&self.meta)?;
+            meta.map_or(0, |m| m.body_bytes)
+        } else {
+            0
+        };
+        ensure!(
+            bytes <= 16 << 20
+                && bytes == u64::from(u32::from_le_bytes(self.fixed[20..24].try_into()?)),
+            "invalid test proxy body length"
+        );
+        self.body.resize(bytes as usize, 0);
+        io.read_exact(&mut self.body).await?;
         Ok(())
     }
     fn matches_command(&self, point: Point) -> Result<bool> {
         // The fixed-int wire enum's control discriminant is 1. Decode all of
         // that command, forwarding original bytes without re-encoding them.
         let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        if matches!(point, Point::Append { .. }) {
+            return Ok(kind == 0);
+        }
         if kind != 1 {
             return Ok(false);
         }
@@ -109,7 +147,12 @@ impl Frame {
         let meta = codec().serialize(&(scope, Reply::Commit(Outcome::Unknown)))?;
         let mut fixed = self.fixed;
         fixed[16..20].copy_from_slice(&u32::try_from(meta.len())?.to_le_bytes());
-        Ok(Self { fixed, meta })
+        fixed[20..24].fill(0);
+        Ok(Self {
+            fixed,
+            meta,
+            body: Vec::new(),
+        })
     }
     fn successful_reply(&self, point: Point) -> Result<bool> {
         let (_, reply): (WireScope, Reply) =
@@ -117,6 +160,9 @@ impl Frame {
         Ok(matches!(
             (point, reply),
             (
+                Point::Append { .. },
+                Reply::Commit(Outcome::Committed(Applied::Accepted { .. }))
+            ) | (
                 Point::Prepare,
                 Reply::Commit(Outcome::Committed(Applied::Publisher(
                     p::Reply::Prepared { .. }
@@ -142,6 +188,9 @@ impl Frame {
 }
 
 impl Proxy {
+    pub async fn open_append(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Append { execute }).await
+    }
     pub async fn open(c: &network::Cluster, root: &FsPath) -> Result<Self> {
         Self::open_at(c, root, Point::Prepare).await
     }
@@ -181,13 +230,19 @@ impl Proxy {
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
         let advances = Arc::new(AtomicUsize::new(0));
+        let appends = Arc::new(AtomicUsize::new(0));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut tasks = JoinSet::new();
         for (&id, endpoint) in &mut config.endpoints {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let address = endpoint.control_address.clone();
-            endpoint.control_address = listener.local_addr()?.to_string();
+            let destination = if matches!(point, Point::Append { .. }) {
+                &mut endpoint.data_address
+            } else {
+                &mut endpoint.control_address
+            };
+            let address = destination.clone();
+            *destination = listener.local_addr()?.to_string();
             let name = ServerName::try_from(endpoint.server_name.clone())?;
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 roots.clone(),
@@ -211,6 +266,7 @@ impl Proxy {
             let dropped = dropped.clone();
             let plans = plans.clone();
             let advances = advances.clone();
+            let appends = appends.clone();
             let committed = committed.clone();
             let release = release.clone();
             tasks.spawn(async move {
@@ -223,11 +279,19 @@ impl Proxy {
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
                             let advances = advances.clone();
+                            let appends = appends.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
-                                while let Some(request) = Frame::read(&mut downstream).await? {
+                                while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
+                                    if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Append { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                        committed.notify_one(); release.notified().await;
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        continue;
+                                    }
                                     if hold && matches!(point, Point::Plan { .. } | Point::Advance { .. }) {
                                         let submissions = if matches!(point, Point::Plan { .. }) { &plans } else { &advances };
                                         submissions.fetch_add(1, Ordering::SeqCst);
@@ -238,13 +302,17 @@ impl Proxy {
                                         }
                                     }
                                     request.write(&mut upstream).await?;
-                                    let response = Frame::read(&mut upstream).await?.context("upstream response missing")?;
+                                    let mut response = Frame::read(&mut upstream, matches!(point, Point::Append { .. })).await?.context("upstream response missing")?;
+                                    if matches!(point, Point::Append { .. }) {
+                                        response.payload(&mut upstream, false).await?;
+                                        if hold && response.successful_reply(point)? { appends.fetch_add(1, Ordering::SeqCst); }
+                                    }
                                     ensure!(response.fixed[8..16] == request.fixed[8..16], "proxy response ID changed");
                                     if hold && response.successful_reply(point)? && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Append { .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -293,6 +361,7 @@ impl Proxy {
             dropped,
             plans,
             advances,
+            appends,
             committed,
             release,
             _tasks: tasks,
