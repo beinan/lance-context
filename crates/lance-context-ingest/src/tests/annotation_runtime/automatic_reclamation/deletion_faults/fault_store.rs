@@ -111,7 +111,10 @@ impl ObjectStoreProvider for Provider {
     }
 }
 
-pub(in crate::tests) async fn storage(path: &std::path::Path, faults: Arc<Faults>) -> Result<Storage> {
+pub(in crate::tests) async fn storage(
+    path: &std::path::Path,
+    faults: Arc<Faults>,
+) -> Result<Storage> {
     storage_with_cache(path, faults, 1 << 20).await
 }
 
