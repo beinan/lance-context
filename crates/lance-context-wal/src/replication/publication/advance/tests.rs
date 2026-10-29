@@ -162,6 +162,13 @@ fn all_source_closures_advance_independent_cursors_and_free_next_plan() -> Resul
     let Reply::Advanced(advanced) = f.apply(request.clone(), 30)? else {
         anyhow::bail!("not advanced")
     };
+    assert!(request.matches_receipt(&advanced)?);
+    let mut different = request.clone();
+    different.published_index += 1;
+    assert!(!different.matches_receipt(&advanced)?);
+    different = request.clone();
+    different.proofs.remove(&10);
+    assert!(!different.matches_receipt(&advanced)?);
     assert_eq!(advanced.index, 30);
     assert_eq!(advanced.sources, BTreeMap::from([(10, 2), (20, 20)]));
     assert_eq!(f.table().progress.checkpoint, advanced.sources);
@@ -183,6 +190,7 @@ fn all_source_closures_advance_independent_cursors_and_free_next_plan() -> Resul
         request.proofs[&20].source_cut(),
         refreshed.proofs[&20].source_cut()
     );
+    assert!(refreshed.matches_receipt(&advanced)?);
     assert_eq!(f.apply(refreshed, 32)?, Reply::Advanced(advanced.clone()));
 
     let mut takeover = super::super::tests::input();

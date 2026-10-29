@@ -17,6 +17,14 @@ pub struct AdvancePublication {
 }
 
 impl AdvancePublication {
+    /// Match the original operation against an already validated catalog receipt.
+    /// The caller must separately verify the catalog's table, incarnation and
+    /// current authority. This match does not authorize a new advancement.
+    pub fn matches_receipt(&self, receipt: &Advanced) -> Result<bool> {
+        Ok(receipt.publication.index == self.published_index
+            && receipt.closure_digest == self.digest()?)
+    }
+
     pub(in crate::replication) fn batch(self, layout: &Layout, limits: &Limits) -> Result<Batch> {
         self.validate(layout, limits)?;
         Command::AdvancePublication(Box::new(self)).batch(layout)
