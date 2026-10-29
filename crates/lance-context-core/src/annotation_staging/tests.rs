@@ -11,6 +11,7 @@ use lance_index::{scalar::ScalarIndexParams, IndexType};
 use std::collections::BTreeSet;
 
 mod compaction;
+mod compaction_body;
 mod concurrent_reads;
 mod published_values;
 mod reclamation;
