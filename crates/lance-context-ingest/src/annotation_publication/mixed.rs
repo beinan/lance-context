@@ -85,19 +85,6 @@ async fn validate(
     body: &Storage,
 ) -> Result<()> {
     if selection.pending.plan.is_maintenance() {
-        if matches!(transaction.operation, Operation::Rewrite { .. }) {
-            super::compaction::validate(base, transaction, selection).await?;
-            validate_narrow(base, transaction)?;
-            let reference = BodySnapshot::read(base)
-                .await?
-                .context("missing body reference")?;
-            ensure!(
-                reference.uri == body.uri
-                    && reference.table_instance == selection.incarnation.to_string(),
-                "narrow maintenance has foreign body destination"
-            );
-            return Ok(());
-        }
         return maintenance::validate(base, transaction, selection, body).await;
     }
     validate_native(base, transaction, selection, true)?;
