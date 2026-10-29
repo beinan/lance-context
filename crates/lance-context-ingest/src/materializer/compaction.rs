@@ -189,6 +189,14 @@ pub(super) async fn prepare(
         })
         .await?;
     let phases = publisher.phases.clone();
+    let selection = crate::annotation_publication::Selection {
+        table: publisher.authority.table,
+        incarnation: publisher.ingress.scope.incarnation,
+        pending: pending.clone(),
+    };
+    let storage = publisher.storage.clone();
+    let maximum = publisher.ingress.client.max_descriptor_bytes();
+    let annotations = publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations;
     // The detached task retains admission if the scheduling caller is dropped.
     // No prepared output is deleted on an error or an ambiguous later commit.
     tokio::spawn(async move {
@@ -209,12 +217,20 @@ pub(super) async fn prepare(
             }
         }
         validate_result(&dataset, &result).await?;
-        p::Descriptors::lance_compaction(Bytes::from(serde_json::to_vec(&result)?))
+        let bytes = serde_json::to_vec(&result)?;
+        if annotations && bytes.len() as u64 > maximum {
+            crate::annotation_publication::compaction::descriptors(
+                &dataset, result, &selection, &storage, maximum,
+            )
+            .await
+        } else {
+            p::Descriptors::lance_compaction(Bytes::from(bytes))
+        }
     })
     .await?
 }
 
-async fn validate_result(dataset: &Dataset, result: &RewriteResult) -> Result<()> {
+pub(crate) async fn validate_result(dataset: &Dataset, result: &RewriteResult) -> Result<()> {
     ensure!(
         result.read_version == dataset.version().version
             && result.original_fragments.len() >= 2

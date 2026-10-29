@@ -63,6 +63,10 @@ impl Descriptors {
     pub(super) fn matches_plan(&self, plan: &Plan, policy: &WritePolicy) -> bool {
         if plan.is_maintenance() {
             matches!(self.format, 2 | 3)
+                || (matches!(
+                    policy,
+                    WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+                ) && matches!(self.format, 4 | 5))
         } else {
             match policy {
                 WritePolicy::ImmutableUniqueIds => self.format == 1,

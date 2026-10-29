@@ -219,6 +219,10 @@ fn annotation_descriptors_require_an_annotation_binding_and_a_source_prefix() ->
                 );
                 let accepted = if maintenance {
                     matches!(format, 2 | 3)
+                        || (matches!(
+                            policy,
+                            WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+                        ) && matches!(format, 4 | 5))
                 } else {
                     match policy {
                         WritePolicy::ImmutableUniqueIds => format == 1,

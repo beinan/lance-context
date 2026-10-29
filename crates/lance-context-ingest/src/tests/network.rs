@@ -110,7 +110,14 @@ impl Cluster {
             .collect()
     }
     pub async fn open(root: &Path, layout: Arc<Layout>) -> Result<Self> {
-        Self::open_inner(root, layout, None, Limits::default().max_records).await
+        Self::open_inner(
+            root,
+            layout,
+            None,
+            Limits::default().max_records,
+            Limits::default().max_descriptor_bytes,
+        )
+        .await
     }
     #[cfg(feature = "materializer")]
     pub async fn open_signed(root: &Path, layout: Arc<Layout>) -> Result<Self> {
@@ -121,6 +128,21 @@ impl Cluster {
         root: &Path,
         layout: Arc<Layout>,
         max_records: u64,
+    ) -> Result<Self> {
+        Self::open_signed_with_limits(
+            root,
+            layout,
+            max_records,
+            Limits::default().max_descriptor_bytes,
+        )
+        .await
+    }
+    #[cfg(feature = "materializer")]
+    pub async fn open_signed_with_limits(
+        root: &Path,
+        layout: Arc<Layout>,
+        max_records: u64,
+        max_descriptor_bytes: u64,
     ) -> Result<Self> {
         use lance_context_wal::replication::source::{CatalogSigner, SourceSigner};
         fn key(path: &Path) -> Result<Vec<u8>> {
@@ -146,17 +168,26 @@ impl Cluster {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        Self::open_inner(root, layout, Some((catalog, sources)), max_records).await
+        Self::open_inner(
+            root,
+            layout,
+            Some((catalog, sources)),
+            max_records,
+            max_descriptor_bytes,
+        )
+        .await
     }
     async fn open_inner(
         root: &Path,
         layout: Arc<Layout>,
         signers: Option<Signers>,
         max_records: u64,
+        max_descriptor_bytes: u64,
     ) -> Result<Self> {
         let tls = certificates(root)?;
         let limits = Limits {
             max_records,
+            max_descriptor_bytes,
             producer_slots: 16,
             catalog_key: signers.as_ref().map(|s| s.0.public_key()),
             source_keys: signers

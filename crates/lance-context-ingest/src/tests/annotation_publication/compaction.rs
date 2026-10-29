@@ -8,6 +8,7 @@ use fixture::*;
 use lance::index::DatasetIndexExt;
 
 mod fixture;
+mod native_metadata;
 mod reclamation;
 use crate::{
     annotations::{Completed, MutationResult},
@@ -21,6 +22,7 @@ mod process;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Expected {
+    descriptor_limit: u64,
     progress: p::Progress,
     manifest_head: u64,
     bodies: [Vec<u8>; 3],
@@ -108,6 +110,19 @@ async fn annotation_compaction_recovers_after_confirmation_before_retirement() -
     recover(3).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_compaction_reference_recovers_prepared_files() -> Result<()> {
+    recover(5).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_compaction_reference_recovers_unknown_selection() -> Result<()> {
+    recover(6).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn annotation_compaction_reference_recovers_confirmed_cut() -> Result<()> {
+    recover(7).await
+}
+
 async fn recover(stage: u8) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(90), recover_inner(stage)).await?
 }
@@ -130,7 +145,19 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
     );
     let storage = fixture_storage(root).await?;
     let limits = fixture_limits();
-    let c = network::Cluster::open_signed(root, one_shard()).await?;
+    let descriptor_limit = if stage >= 4 {
+        512
+    } else {
+        lance_context_wal::replication::Limits::default().max_descriptor_bytes
+    };
+    let stage = stage % 4;
+    let c = network::Cluster::open_signed_with_limits(
+        root,
+        one_shard(),
+        lance_context_wal::replication::Limits::default().max_records,
+        descriptor_limit,
+    )
+    .await?;
     seed_fragments(&c, &storage, &limits, 8).await?;
     let (service, owner) = owner(&c, &storage, &limits).await?;
     let (stop, task) = runtime::run_owner(owner);
@@ -210,6 +237,9 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
     } else {
         None
     };
+    if descriptor_limit == 512 {
+        assert_eq!(prepared.as_ref().unwrap().descriptors.format, 5);
+    }
     let suffix = request(
         &service,
         &d,
@@ -225,16 +255,40 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
     assert_eq!(current.status.as_deref(), Some("reviewed"));
     assert_eq!(current.score, Some(0.9));
     let base = read(&c, &storage, Some(read_version)).await?;
+    if descriptor_limit > 512 && stage == 1 && !crash_boundary {
+        let view = state(&c).await?;
+        native_metadata::verify(
+            &base,
+            &storage,
+            view.progress.pending.as_ref().unwrap(),
+            &prepared.as_ref().unwrap().descriptors,
+        )
+        .await?;
+    }
     if stage >= 2 {
         let view = state(&c).await?;
         let pending = view.progress.pending.as_ref().unwrap();
         let prepared = prepared.as_ref().unwrap();
-        let original = materializer::stage::annotation_compaction_transaction(
-            &base,
-            pending,
-            &prepared.descriptors,
-        )
-        .await?;
+        let original = if prepared.descriptors.format == 5 {
+            annotations::resolve_transaction(
+                &base,
+                &prepared.descriptors,
+                &annotations::Selection {
+                    table: fixture_binding().table,
+                    incarnation: fixture_binding().incarnation,
+                    pending: (**pending).clone(),
+                },
+                &storage,
+            )
+            .await?
+        } else {
+            materializer::stage::annotation_compaction_transaction(
+                &base,
+                pending,
+                &prepared.descriptors,
+            )
+            .await?
+        };
         let handler = p::lance::ManagedManifest::new(
             Arc::new(LostReply(Arc::new(c.client.manifest_catalog()))),
             storage.base.clone(),
@@ -263,6 +317,7 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
     }
     let before_exit = state(&c).await?;
     let expected = Expected {
+        descriptor_limit,
         progress: before_exit.progress.clone(),
         manifest_head: before_exit.manifests.as_ref().unwrap().head,
         bodies: [
@@ -291,12 +346,33 @@ async fn recover_at(stage: u8, root: &Path, crash_boundary: bool) -> Result<()> 
 }
 
 async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
+    let metadata = if expected.descriptor_limit == 512 {
+        let prepared = expected.progress.prepared.as_ref().unwrap();
+        let directory = root
+            .join("turns.lance/_annotation_preparations")
+            .join(fixture_binding().incarnation.to_string())
+            .join(prepared.transaction.to_string());
+        let paths = std::fs::read_dir(directory)?
+            .map(|e| Ok(e?.path()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(paths.len(), 1);
+        assert!(std::fs::metadata(&paths[0])?.len() > 512);
+        paths
+    } else {
+        Vec::new()
+    };
+
     // Fresh sessions prevent a warm reader cache from hiding missing blob files.
     let storage = fixture_storage(root).await?;
     let limits = fixture_limits();
-    let c = network::Cluster::open_signed(root, one_shard())
-        .await
-        .context("reopening compaction replica cluster")?;
+    let c = network::Cluster::open_signed_with_limits(
+        root,
+        one_shard(),
+        lance_context_wal::replication::Limits::default().max_records,
+        expected.descriptor_limit,
+    )
+    .await
+    .context("reopening compaction replica cluster")?;
     let recovered = state(&c)
         .await
         .context("reading the reopened compaction catalog")?;
@@ -392,6 +468,13 @@ async fn verify_recovery(root: &Path, expected: Expected) -> Result<()> {
         }
     })
     .await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while metadata.iter().any(|path| path.exists()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("completed preparation metadata did not retire")?;
     let rejected = request(&service, &b, 1, Bytes::from(rejected_body)).await?;
     assert_eq!(
         service.submit(&rejected, Duration::from_secs(30)).await?,

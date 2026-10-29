@@ -358,7 +358,7 @@ pub(super) async fn open(
             .as_ref()
             .context("selected publication has no preparation")?;
         let original = load(ingress, storage, pending.plan.read_version).await?;
-        if pending.plan.is_maintenance() {
+        if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
             validate_compacted(&base, &original, pending, prepared, record).await?;
             ensure!(
                 covered == through,

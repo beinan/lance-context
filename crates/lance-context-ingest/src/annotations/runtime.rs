@@ -387,7 +387,7 @@ impl Publisher {
                 .versions
                 .get(&pending.plan.read_version)
                 .context("annotation predecessor unavailable")?;
-            if pending.plan.is_maintenance() {
+            if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
                 materializer::stage::publish(
                     &self.catalog,
                     pending,
@@ -431,7 +431,7 @@ impl Publisher {
             "annotation preparation index differs"
         );
         let selected = checkpoint::load(&self.service.ingress, &self.storage, target).await?;
-        if pending.plan.is_maintenance() {
+        if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
             checkpoint::validate_compacted(&selected, &base, pending, prepared, record).await?;
         } else {
             publication::selected_cut(

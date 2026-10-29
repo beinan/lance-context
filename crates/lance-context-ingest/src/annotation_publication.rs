@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::materializer::Storage;
 
+pub(crate) mod compaction;
 mod metadata;
 pub mod mixed;
 
@@ -187,23 +188,34 @@ fn decode(base: &Dataset, bytes: Bytes, selection: &Selection) -> Result<Transac
     Ok(transaction)
 }
 
-async fn resolve_transaction(
+pub(crate) async fn resolve_transaction(
     base: &Dataset,
     descriptors: &p::Descriptors,
     selection: &Selection,
     storage: &Storage,
 ) -> Result<Transaction> {
-    if descriptors.format == 4 {
-        transaction(base, descriptors, selection)
-    } else {
-        ensure!(descriptors.format == 5, "not annotation descriptors");
-        descriptors.validate(p::MAX_DESCRIPTOR_BYTES as u64)?;
-        decode(
-            base,
-            metadata::load(base, storage, selection, descriptors).await?,
-            selection,
-        )
+    descriptors.validate(p::MAX_DESCRIPTOR_BYTES as u64)?;
+    let bytes = match descriptors.format {
+        4 => descriptors.bytes.clone(),
+        5 => metadata::load(base, storage, selection, descriptors).await?,
+        _ => anyhow::bail!("not annotation descriptors"),
+    };
+    if !selection.pending.plan.is_maintenance() {
+        return decode(base, bytes, selection);
     }
+    ensure!(
+        bytes.len() <= metadata::MAX_NATIVE_BYTES,
+        "native annotation metadata too large"
+    );
+    let transaction = Transaction::try_from(pb::Transaction::decode(bytes)?)?;
+    ensure!(
+        !transaction.transaction_properties.as_ref().is_some_and(
+            |p| p.contains_key(lance_context_core::annotation_staging::BODY_SNAPSHOT_PROPERTY)
+        ),
+        "paired body metadata requires a mixed-ingestion publication contract"
+    );
+    compaction::validate(base, &transaction, selection).await?;
+    Ok(transaction)
 }
 
 /// Resolve a pending publication that already selected its manifest, including
@@ -248,7 +260,16 @@ async fn selected_identity(
             && selected.read_transaction().await?.as_ref() == Some(expected),
         "selected annotation snapshot differs from durable preparation"
     );
-    Ok(selection.scope()?.1)
+    if selection.pending.plan.is_maintenance() {
+        let cut = expected
+            .transaction_properties
+            .as_ref()
+            .and_then(|p| p.get("lance-context.annotation-cut"))
+            .context("maintenance has no preserved application cut")?;
+        Ok(serde_json::from_str::<(Scope, u64)>(cut)?.1)
+    } else {
+        Ok(selection.scope()?.1)
+    }
 }
 
 fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) -> Result<()> {
