@@ -96,11 +96,24 @@ pub struct Annotations {
     /// with the same-table `source` handoff; only annotation-bootstrap uses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<bootstrap::annotations::projection::Source>,
+    /// Authorized immutable-body destination for an already provisioned mixed
+    /// generation. Selects the mixed Arrow contract; existing bindings are not
+    /// migrated by owner/ingress startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Body>,
     /// Opt into physical collection for a table served exclusively by its
     /// annotation owner. Raw Dataset readers, other writers, tags, branches and
     /// URI reuse are outside this contract. Forwarders never run collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusive_reclamation: Option<crate::annotations::runtime::reclamation::Options>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Body {
+    pub uri: String,
+    #[serde(default)]
+    pub storage_options: HashMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -223,6 +236,14 @@ impl Config {
             if let Some(projection) = &a.projection {
                 ensure!(a.source.is_none(), "choose source or projection, not both");
                 projection.validate(self.materializer_memory_bytes)?;
+            }
+            if let Some(body) = &a.body {
+                ensure!(
+                    a.source.is_none() && a.projection.is_none()
+                        && !body.uri.is_empty() && body.uri.len() <= 8192
+                        && body.uri != self.tables[0].uri && body.storage_options.len() <= 128,
+                    "mixed annotations require a separate authorized body destination and provisioned binding"
+                );
             }
         }
         let (mut names, mut ids, mut destinations) =

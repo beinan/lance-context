@@ -392,6 +392,7 @@ async fn annotation_projection_application_config_routes_bootstrap_and_rejects_b
         staging: limits(),
         source: Some(source.snapshot.clone()),
         projection: Some(source),
+        body: None,
         exclusive_reclamation: None,
     });
     assert!(application::annotations::provision(&config).await.is_err());
