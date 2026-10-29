@@ -33,6 +33,8 @@ mod bootstrap;
 mod http;
 #[cfg(feature = "materializer")]
 mod materializer;
+#[cfg(feature = "materializer")]
+mod mixed_annotations;
 mod network;
 #[cfg(feature = "service")]
 mod preparation;

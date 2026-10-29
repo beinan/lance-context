@@ -155,16 +155,20 @@ impl Results {
 }
 
 pub struct FrozenCheckpoint {
-    origin: Arc<Shared>,
-    annotations: FrozenAnnotations,
+    pub(super) origin: Arc<Shared>,
+    pub(super) annotations: FrozenAnnotations,
     results: Arc<Snapshot>,
     sources: lance_context_wal::replication::publication::SourceRange,
+    pub(super) bodies: mixed::frames::Frozen,
+    pub(super) body_preparation:
+        tokio::sync::Mutex<Option<lance_context_core::annotation_staging::BodySnapshot>>,
     _source_generation: tokio::sync::OwnedSemaphorePermit,
 }
 pub struct PreparedCheckpoint {
     origin: Arc<Shared>,
     annotations: PreparedAnnotations,
     results: Arc<Snapshot>,
+    bodies: mixed::frames::Frozen,
 }
 impl FrozenCheckpoint {
     /// Complete source metadata captured under the same gate as values/results.
@@ -183,10 +187,36 @@ impl FrozenCheckpoint {
         workspace: &Arc<MergeMemoryBudget>,
         batch_rows: usize,
     ) -> Result<PreparedCheckpoint> {
+        ensure!(
+            self.origin.body.is_none(),
+            "mixed checkpoint requires an explicit body preparation"
+        );
         Ok(PreparedCheckpoint {
             origin: self.origin.clone(),
             annotations: self.annotations.prepare(workspace, batch_rows).await?,
             results: self.results.clone(),
+            bodies: self.bodies.clone(),
+        })
+    }
+
+    pub(super) async fn prepare_with_body(
+        &self,
+        workspace: &Arc<MergeMemoryBudget>,
+        batch_rows: usize,
+        body: lance_context_core::annotation_staging::BodySnapshot,
+    ) -> Result<PreparedCheckpoint> {
+        ensure!(
+            self.origin.body.as_ref().is_some_and(|s| s.uri == body.uri),
+            "body preparation differs from the authorized storage"
+        );
+        Ok(PreparedCheckpoint {
+            origin: self.origin.clone(),
+            annotations: self
+                .annotations
+                .prepare_with_body(workspace, batch_rows, body)
+                .await?,
+            results: self.results.clone(),
+            bodies: self.bodies.clone(),
         })
     }
 }
@@ -248,6 +278,8 @@ impl Service {
             annotations,
             results: Arc::new(snapshot),
             sources: self.shared.window.lock().unwrap().freeze(through),
+            bodies: self.shared.frames.lock().unwrap().freeze(),
+            body_preparation: tokio::sync::Mutex::new(None),
             _source_generation: source_generation,
         };
         *self.shared.replay_cut.lock().unwrap() = None;
@@ -266,10 +298,19 @@ impl Service {
             "foreign application checkpoint"
         );
         let _ordered = self.shared.ordered.lock().await;
+        ensure!(
+            self.shared
+                .frames
+                .lock()
+                .unwrap()
+                .is_current(&prepared.bodies),
+            "body source generation differs from prepared checkpoint"
+        );
         self.shared
             .staging
             .install_published(&prepared.annotations, selected)
             .await?;
+        self.shared.frames.lock().unwrap().retire(&prepared.bodies);
         self.shared.results.lock().unwrap().base = prepared.results.clone();
         Ok(())
     }
@@ -278,6 +319,7 @@ impl Service {
 pub(super) async fn open(
     ingress: &Ingress,
     storage: &Storage,
+    body: Option<&Storage>,
 ) -> Result<(Arc<Dataset>, Arc<Snapshot>)> {
     let query::Value::Publisher(Some(view)) = materializer::query(
         ingress,
@@ -338,6 +380,25 @@ pub(super) async fn open(
             }),
         "foreign annotation application cut"
     );
+    if through == 0 {
+        ensure!(
+            ingress.scope.contract.policy == WritePolicy::TurnIngestion
+                && covered == 0
+                && record.plan_index == 0
+                && properties.is_some_and(|p| !p.contains_key(RESULTS_PROPERTY)),
+            "zero-cut body binding is only valid for a mixed bootstrap"
+        );
+        ensure!(
+            lance_context_core::annotation_staging::BodySnapshot::read(&base)
+                .await?
+                .is_some(),
+            "mixed bootstrap has no body reference"
+        );
+        return Ok((
+            base,
+            Arc::new(Snapshot::empty(ingress.client.producer_slots())),
+        ));
+    }
     let results = properties
         .and_then(|p| p.get(RESULTS_PROPERTY))
         .context("annotation publication has no request results")?;
@@ -365,20 +426,40 @@ pub(super) async fn open(
                 "compaction advanced annotation application cut"
             );
         } else {
-            let selected = annotation_publication::selected_cut(
-                &base,
-                &original,
-                &prepared.descriptors,
-                &annotation_publication::Selection {
-                    table: ingress.scope.table,
-                    incarnation: ingress.scope.incarnation,
-                    pending: (**pending).clone(),
-                },
-                record,
-                storage,
-            )
-            .await?;
+            let selection = annotation_publication::Selection {
+                table: ingress.scope.table,
+                incarnation: ingress.scope.incarnation,
+                pending: (**pending).clone(),
+            };
+            let selected = if let Some(body) = body {
+                annotation_publication::mixed::selected_cut(
+                    &base,
+                    &original,
+                    &prepared.descriptors,
+                    &selection,
+                    record,
+                    storage,
+                    body,
+                )
+                .await?
+            } else {
+                annotation_publication::selected_cut(
+                    &base,
+                    &original,
+                    &prepared.descriptors,
+                    &selection,
+                    record,
+                    storage,
+                )
+                .await?
+            };
             ensure!(selected == through, "selected request result cut differs");
+            if pending.plan.is_maintenance() {
+                ensure!(
+                    covered == through,
+                    "body maintenance advanced the application cut"
+                );
+            }
         }
     } else {
         ensure!(
@@ -421,6 +502,15 @@ pub(crate) async fn load(
     storage: &Storage,
     version: u64,
 ) -> Result<Arc<Dataset>> {
+    load_with_read_params(ingress, storage, version, Default::default()).await
+}
+
+pub(crate) async fn load_with_read_params(
+    ingress: &Ingress,
+    storage: &Storage,
+    version: u64,
+    read_params: lance::dataset::ReadParams,
+) -> Result<Arc<Dataset>> {
     let handler = ManagedManifest::reader(
         Arc::new(ingress.client.manifest_catalog()),
         storage.base.clone(),
@@ -430,6 +520,7 @@ pub(crate) async fn load(
     )?;
     Ok(Arc::new(
         DatasetBuilder::from_uri(&storage.uri)
+            .with_read_params(read_params)
             .with_version(version)
             .with_storage_options(storage.options.clone())
             .with_session(storage.session.clone())
