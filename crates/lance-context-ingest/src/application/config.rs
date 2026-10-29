@@ -239,9 +239,12 @@ impl Config {
             }
             if let Some(body) = &a.body {
                 ensure!(
-                    a.source.is_none() && a.projection.is_none()
-                        && !body.uri.is_empty() && body.uri.len() <= 8192
-                        && body.uri != self.tables[0].uri && body.storage_options.len() <= 128,
+                    a.source.is_none()
+                        && a.projection.is_none()
+                        && !body.uri.is_empty()
+                        && body.uri.len() <= 8192
+                        && body.uri != self.tables[0].uri
+                        && body.storage_options.len() <= 128,
                     "mixed annotations require a separate authorized body destination"
                 );
             }
