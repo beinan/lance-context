@@ -28,8 +28,10 @@ impl Forwarder {
         let mut ingresses = BTreeMap::new();
         for (ingress, address) in tables {
             ensure!(
-                ingress.scope.contract.policy == WritePolicy::TurnAnnotations
-                    && ingress.layout.buckets.len() == 1,
+                matches!(
+                    ingress.scope.contract.policy,
+                    WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+                ) && ingress.layout.buckets.len() == 1,
                 "annotation route requires a single-shard annotation binding"
             );
             let reply = reply_limit(&ingress)?;

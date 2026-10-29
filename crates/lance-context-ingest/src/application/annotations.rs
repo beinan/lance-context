@@ -13,6 +13,10 @@ pub async fn provision(config: &Config) -> Result<()> {
         .annotations
         .as_ref()
         .context("annotation configuration missing")?;
+    ensure!(
+        a.body.is_none(),
+        "mixed bootstrap requires an explicitly provisioned paired snapshot"
+    );
     let table = &config.tables[0];
     let storage = Storage::resolve(
         table.uri.clone(),
@@ -57,14 +61,15 @@ async fn connect(config: &Config) -> Result<Ingress> {
         .annotations
         .as_ref()
         .context("annotation configuration missing")?;
-    annotations::connect_ingress(
-        config.client()?,
-        Arc::new(config.layout.clone()),
-        config.tables[0].binding.clone(),
-        &options.staging,
-        MergeMemoryBudget::new(config.ingress_memory_bytes),
-    )
-    .await
+    let client = config.client()?;
+    let layout = Arc::new(config.layout.clone());
+    let binding = config.tables[0].binding.clone();
+    let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
+    if options.body.is_some() {
+        annotations::mixed::connect_ingress(client, layout, binding, &options.staging, budget).await
+    } else {
+        annotations::connect_ingress(client, layout, binding, &options.staging, budget).await
+    }
 }
 
 /// Ingress opens neither Lance nor a staging view, and never takes an owner lease.
@@ -144,20 +149,25 @@ pub async fn serve_owner(
                 Arc::default(),
             )),
         ).await?;
-        let (service, runtime) = runtime::Runtime::connect(
-            ingress.client.clone(),
-            ingress.layout.clone(),
-            table.binding.clone(),
-            storage,
-            runtime::Configuration {
+        let configuration = runtime::Configuration {
                 limits: a.staging.clone(),
                 upload_budget: ingress.budget.clone(),
                 apply_budget: MergeMemoryBudget::new(a.apply_memory_bytes),
                 publication_budget: MergeMemoryBudget::new(config.materializer_memory_bytes),
                 publication: config.worker.publication.clone(),
-            },
-            acquisition,
-        ).await?;
+            };
+        let (service, runtime) = if let Some(body) = &a.body {
+            let body = Storage::resolve(body.uri.clone(), body.storage_options.clone(), storage.session.clone()).await?;
+            runtime::Runtime::connect_mixed(
+                ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
+                storage, body, configuration, acquisition,
+            ).await?
+        } else {
+            runtime::Runtime::connect(
+                ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
+                storage, configuration, acquisition,
+            ).await?
+        };
         let runtime = match &a.exclusive_reclamation {
             Some(options) => runtime.with_exclusive_reclamation(options.clone())?,
             None => runtime,

@@ -1,3 +1,4 @@
+mod mixed;
 use super::*;
 use crate::{
     http::annotations::{MutationReply, PointRequest},
@@ -167,6 +168,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         staging: limits.clone(),
         source: Some(source),
         projection: None,
+        body: None,
         exclusive_reclamation: None,
     });
     let encoded = serde_json::to_value(config.annotations.as_ref().unwrap())?;

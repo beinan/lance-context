@@ -16,6 +16,7 @@ const TOKEN: &str = "annotation-test-workload-token-00000000";
 
 mod batches;
 mod cold_io;
+mod mixed;
 mod pressure;
 mod read_cut;
 mod transport;
