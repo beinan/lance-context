@@ -41,18 +41,7 @@ impl Publisher {
             self.compaction_started
                 .get_or_insert_with(tokio::time::Instant::now);
             self.catalog.retire_history(view).await?;
-            let reply = materializer::commit(
-                &self.service.ingress.client,
-                Command::Plan(p::PlanRequest {
-                    authority: self.catalog.authority().clone(),
-                    plan,
-                }),
-            )
-            .await?;
-            ensure!(
-                matches!(reply, Applied::Publisher(p::Reply::Planned { .. })),
-                "annotation compaction plan rejected: {reply:?}"
-            );
+            self.catalog.record_plan(plan).await?;
         }
         // A maintenance plan already exists, so the ordinary publisher only
         // prepares that exact plan. It cannot select an ingestion append here.

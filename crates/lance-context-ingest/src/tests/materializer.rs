@@ -5,6 +5,8 @@ use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
 mod compaction;
+#[cfg(feature = "service")]
+mod plan;
 mod session_index;
 mod source_rotation;
 

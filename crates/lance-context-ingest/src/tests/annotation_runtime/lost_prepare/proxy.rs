@@ -19,7 +19,7 @@ use tokio_rustls::{
     TlsAcceptor, TlsConnector,
 };
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct WireScope {
     _cluster: Uuid,
     _layout: [u8; 32],
@@ -27,9 +27,10 @@ struct WireScope {
     _node: u64,
 }
 
-pub(super) struct Proxy {
+pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
+    pub plans: Arc<AtomicUsize>,
     pub committed: Arc<Notify>,
     pub release: Arc<Notify>,
     _tasks: JoinSet<Result<()>>,
@@ -55,6 +56,7 @@ struct Frame {
 enum Point {
     Prepare,
     Close,
+    Plan { execute: bool },
 }
 impl Frame {
     async fn read(io: &mut (impl AsyncRead + Unpin)) -> Result<Option<Self>> {
@@ -93,8 +95,18 @@ impl Frame {
             codec().reject_trailing_bytes().deserialize(&self.meta)?;
         Ok(matches!(
             (point, command),
-            (Point::Prepare, Command::Prepare(_)) | (Point::Close, Command::Close(_))
+            (Point::Prepare, Command::Prepare(_))
+                | (Point::Close, Command::Close(_))
+                | (Point::Plan { .. }, Command::Plan(_))
         ))
+    }
+    fn unknown_reply(&self) -> Result<Self> {
+        let (scope, _): (WireScope, u32) =
+            codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        let meta = codec().serialize(&(scope, Reply::Commit(Outcome::Unknown)))?;
+        let mut fixed = self.fixed;
+        fixed[16..20].copy_from_slice(&u32::try_from(meta.len())?.to_le_bytes());
+        Ok(Self { fixed, meta })
     }
     fn successful_reply(&self, point: Point) -> Result<bool> {
         let (_, reply): (WireScope, Reply) =
@@ -105,6 +117,11 @@ impl Frame {
                 Point::Prepare,
                 Reply::Commit(Outcome::Committed(Applied::Publisher(
                     p::Reply::Prepared { .. }
+                )))
+            ) | (
+                Point::Plan { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::Planned { .. }
                 )))
             ) | (
                 Point::Close,
@@ -123,6 +140,10 @@ impl Proxy {
 
     pub async fn open_close(c: &network::Cluster, root: &FsPath) -> Result<Self> {
         Self::open_at(c, root, Point::Close).await
+    }
+
+    pub async fn open_plan(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Plan { execute }).await
     }
 
     async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
@@ -146,6 +167,7 @@ impl Proxy {
         let mut config = c.application.clone();
         let armed = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let plans = Arc::new(AtomicUsize::new(0));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut tasks = JoinSet::new();
@@ -174,6 +196,7 @@ impl Proxy {
             let connector = connector.clone();
             let armed = armed.clone();
             let dropped = dropped.clone();
+            let plans = plans.clone();
             let committed = committed.clone();
             let release = release.clone();
             tasks.spawn(async move {
@@ -184,11 +207,20 @@ impl Proxy {
                             let (socket, _) = accepted?;
                             let (acceptor, connector, name, address, armed, dropped, committed, release) =
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
+                            let plans = plans.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(request) = Frame::read(&mut downstream).await? {
                                     let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Plan { .. }) {
+                                        plans.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
                                     request.write(&mut upstream).await?;
                                     let response = Frame::read(&mut upstream).await?.context("upstream response missing")?;
                                     ensure!(response.fixed[8..16] == request.fixed[8..16], "proxy response ID changed");
@@ -196,6 +228,10 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Plan { .. }) {
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
                                         return Ok::<_, anyhow::Error>(());
                                     }
                                     response.write(&mut downstream).await?;
@@ -239,6 +275,7 @@ impl Proxy {
                 lance_context_wal::replication::runtime::client::Options::default(),
             )?),
             dropped,
+            plans,
             committed,
             release,
             _tasks: tasks,
