@@ -13,10 +13,6 @@ pub async fn provision(config: &Config) -> Result<()> {
         .annotations
         .as_ref()
         .context("annotation configuration missing")?;
-    ensure!(
-        a.body.is_none(),
-        "mixed bootstrap requires an explicitly provisioned paired snapshot"
-    );
     let table = &config.tables[0];
     let storage = Storage::resolve(
         table.uri.clone(),
@@ -24,6 +20,25 @@ pub async fn provision(config: &Config) -> Result<()> {
         Arc::new(lance::session::Session::default()),
     )
     .await?;
+    if let Some(body) = &a.body {
+        let body = Storage::resolve(
+            body.uri.clone(),
+            body.storage_options.clone(),
+            storage.session.clone(),
+        )
+        .await?;
+        bootstrap::annotations::mixed::provision(
+            config.client()?,
+            Arc::new(config.layout.clone()),
+            table.binding.clone(),
+            storage,
+            body,
+            table.bootstrap.clone(),
+            a.staging.clone(),
+        )
+        .await?;
+        return Ok(());
+    }
     if let Some(source) = &a.projection {
         bootstrap::annotations::projection::provision(
             config.client()?,

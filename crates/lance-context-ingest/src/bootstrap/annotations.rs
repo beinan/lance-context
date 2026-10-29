@@ -17,6 +17,7 @@ use object_store::path::Path;
 
 const HANDOFF: &str = "lance-context.annotation-handoff.v1";
 
+pub mod mixed;
 pub mod projection;
 
 // Lance can rebase even on its first attempt with max_retries=0. Check the

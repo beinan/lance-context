@@ -9,6 +9,7 @@ use lance_table::io::commit::ConditionalPutCommitHandler;
 use std::collections::HashMap;
 
 mod annotation_projection;
+mod mixed;
 pub(super) mod annotations;
 
 pub(super) fn identity() -> Identity {
