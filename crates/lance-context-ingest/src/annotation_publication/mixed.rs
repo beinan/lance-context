@@ -3,6 +3,8 @@ use super::*;
 use lance_context_core::annotation_staging::{BodySnapshot, BODY_SNAPSHOT_PROPERTY};
 use lance_table::format::Fragment;
 
+pub mod maintenance;
+
 fn inserts(transaction: &Transaction) -> &[Fragment] {
     match &transaction.operation {
         Operation::Append { fragments } => fragments,
@@ -82,10 +84,22 @@ async fn validate(
     selection: &Selection,
     body: &Storage,
 ) -> Result<()> {
-    ensure!(
-        !selection.pending.plan.is_maintenance(),
-        "paired body maintenance requires its own publication adapter"
-    );
+    if selection.pending.plan.is_maintenance() {
+        if matches!(transaction.operation, Operation::Rewrite { .. }) {
+            super::compaction::validate(base, transaction, selection).await?;
+            validate_narrow(base, transaction)?;
+            let reference = BodySnapshot::read(base)
+                .await?
+                .context("missing body reference")?;
+            ensure!(
+                reference.uri == body.uri
+                    && reference.table_instance == selection.incarnation.to_string(),
+                "narrow maintenance has foreign body destination"
+            );
+            return Ok(());
+        }
+        return maintenance::validate(base, transaction, selection, body).await;
+    }
     validate_native(base, transaction, selection, true)?;
     let encoded = transaction
         .transaction_properties
