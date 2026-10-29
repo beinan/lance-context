@@ -115,18 +115,33 @@ async fn exercise(case: Case) -> Result<()> {
         } else {
             assert_eq!(completed.result, MutationResult::Applied);
             assert_eq!(
-                service.get(turn, Duration::from_secs(10)).await?.unwrap().status.as_deref(),
+                service
+                    .get(turn, Duration::from_secs(10))
+                    .await?
+                    .unwrap()
+                    .status
+                    .as_deref(),
                 Some("reviewed")
             );
         }
     } else {
         let error = result.unwrap_err();
         assert!(
-            matches!(error.downcast_ref::<AppendFailure>(), Some(AppendFailure::Unknown)),
+            matches!(
+                error.downcast_ref::<AppendFailure>(),
+                Some(AppendFailure::Unknown)
+            ),
             "{error:#}"
         );
         let current = service.get(turn, Duration::from_secs(10)).await?.unwrap();
-        assert_eq!(current.status.as_deref(), if case == Case::DifferentBytes { Some("other") } else { Some("pending") });
+        assert_eq!(
+            current.status.as_deref(),
+            if case == Case::DifferentBytes {
+                Some("other")
+            } else {
+                Some("pending")
+            }
+        );
     }
     assert_eq!(proxy.appends.load(Ordering::SeqCst), usize::from(execute));
     assert_eq!(proxy.dropped.load(Ordering::SeqCst), 1);
