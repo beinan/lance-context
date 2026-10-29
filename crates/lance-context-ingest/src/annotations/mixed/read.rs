@@ -24,6 +24,12 @@ impl Turn {
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) async fn capture_turn_for_test(&self, turn: &str) -> Result<TurnRead> {
+        let _ordered = self.shared.ordered.lock().await;
+        Ok(self.shared.staging.capture_turn(turn).await?)
+    }
+
     pub async fn get_turn(&self, turn: &str, deadline: Duration) -> Result<Option<Turn>> {
         ensure!(
             self.shared.body.is_some(),
