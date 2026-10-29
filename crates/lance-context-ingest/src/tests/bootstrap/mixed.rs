@@ -140,7 +140,7 @@ async fn mixed_bootstrap_refuses_foreign_empty_body_without_selecting_narrow() -
     let narrow = fixture::storage(root.path(), "annotations.lance").await?;
     let body = fixture::storage(root.path(), "body.lance").await?;
     let schema = Arc::new(rollout_schema());
-    let original = Dataset::write(
+    Dataset::write(
         RecordBatchIterator::new(vec![Ok(RecordBatch::new_empty(schema.clone()))], schema),
         &body.uri,
         Some(WriteParams {
@@ -150,7 +150,9 @@ async fn mixed_bootstrap_refuses_foreign_empty_body_without_selecting_narrow() -
         }),
     )
     .await?;
-    let original_transaction = original.read_transaction().await?;
+    // Compare persisted transactions on both sides: the newly written Dataset
+    // can cache dictionary values that are absent from a reopened transaction.
+    let original_transaction = Dataset::open(&body.uri).await?.read_transaction().await?;
     assert!(provision(&c, &narrow, &body).await.is_err());
     assert!(view(&c, binding().table).await?.manifests.is_none());
     assert!(!root.path().join("annotations.lance").exists());
