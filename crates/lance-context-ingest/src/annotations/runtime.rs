@@ -7,6 +7,7 @@ use lance_context_wal::replication::publication as p;
 use materializer::observation::Phase;
 use std::collections::BTreeMap;
 
+mod body_compaction;
 mod compaction;
 pub mod reclamation;
 
@@ -41,12 +42,22 @@ struct Publisher {
 
 impl Runtime {
     /// Enable data/manifest/transaction collection for an exclusively owned, unbranched
-    /// table. Readers must check ownership after materializing their response,
+    /// table (both destinations for mixed ingestion). Readers must check ownership after materializing their response,
     /// as the annotation HTTP Owner does. Independently served Services, raw
     /// Dataset readers, shared files and URI reuse are outside this contract.
     /// Only this runtime may prepare/publish files. The ordinary constructor
     /// keeps physical collection disabled.
     pub fn with_exclusive_reclamation(mut self, options: reclamation::Options) -> Result<Self> {
+        if let Some(body) = &self.publisher.service.shared.body {
+            let narrow = self.publisher.storage.base.as_ref();
+            let body = body.base.as_ref();
+            ensure!(
+                narrow != body
+                    && !narrow.starts_with(&format!("{body}/"))
+                    && !body.starts_with(&format!("{narrow}/")),
+                "paired collection requires disjoint destination paths"
+            );
+        }
         self.publisher.reclamation = Some(reclamation::Collector::new(
             options,
             &self.publisher.budget,
@@ -72,6 +83,50 @@ impl Runtime {
         configuration: Configuration,
         acquisition: materializer::Acquisition,
     ) -> Result<(Service, Self)> {
+        Self::connect_mode(
+            client,
+            layout,
+            binding,
+            storage,
+            None,
+            configuration,
+            acquisition,
+        )
+        .await
+    }
+
+    /// One owner and one fenced selection for both native tables. The narrow
+    /// bootstrap must already contain the authorized initial body identity.
+    pub async fn connect_mixed(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        storage: Storage,
+        body: Storage,
+        configuration: Configuration,
+        acquisition: materializer::Acquisition,
+    ) -> Result<(Service, Self)> {
+        Self::connect_mode(
+            client,
+            layout,
+            binding,
+            storage,
+            Some(body),
+            configuration,
+            acquisition,
+        )
+        .await
+    }
+
+    async fn connect_mode(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        storage: Storage,
+        body: Option<Storage>,
+        configuration: Configuration,
+        acquisition: materializer::Acquisition,
+    ) -> Result<(Service, Self)> {
         let c = configuration;
         ensure!(
             c.publication.session_index.is_none() && !c.publication.pipeline_preparation,
@@ -89,19 +144,21 @@ impl Runtime {
                 && !Arc::ptr_eq(&c.publication_budget, &c.apply_budget),
             "annotation publication requires independent capacity for a full frozen generation"
         );
-        let ingress = Service::validated_ingress(
+        let ingress = Service::validated_ingress_mode(
             client,
             layout,
             binding,
             &c.limits,
             c.upload_budget.clone(),
             &c.apply_budget,
+            body.is_some(),
         )
         .await?;
         let connect = || {
-            Service::open(
+            Service::open_mode(
                 ingress.clone(),
                 &storage,
+                body.clone(),
                 c.limits.clone(),
                 c.apply_budget.clone(),
             )
@@ -302,20 +359,38 @@ impl Publisher {
         self.catalog.pin(pending).await?;
         let selection = self.selection(pending);
         let prepared = phases
-            .measure(Phase::Prepare, frozen.prepare(&self.budget, 8192))
+            .measure(Phase::Prepare, async {
+                if self.service.shared.body.is_some() {
+                    frozen.prepare_mixed(&self.budget, 8192).await
+                } else {
+                    frozen.prepare(&self.budget, 8192).await
+                }
+            })
             .await?;
         // Preserve these exact bytes until Prepare is resolved. On any unknown
         // result this runtime stops; a fenced restart reads the retained result.
         let descriptors = phases
-            .measure(
-                Phase::BlobWrite,
-                publication::persist_descriptors(
-                    prepared.annotations(),
-                    &selection,
-                    &self.storage,
-                    self.service.ingress.client.max_descriptor_bytes(),
-                ),
-            )
+            .measure(Phase::BlobWrite, async {
+                let maximum = self.service.ingress.client.max_descriptor_bytes();
+                if let Some(body) = &self.service.shared.body {
+                    publication::mixed::persist_descriptors(
+                        prepared.annotations(),
+                        &selection,
+                        &self.storage,
+                        body,
+                        maximum,
+                    )
+                    .await
+                } else {
+                    publication::persist_descriptors(
+                        prepared.annotations(),
+                        &selection,
+                        &self.storage,
+                        maximum,
+                    )
+                    .await
+                }
+            })
             .await?;
         let reply = materializer::commit(
             &self.service.ingress.client,
@@ -397,25 +472,41 @@ impl Publisher {
                 )
                 .await?;
             } else {
-                publication::publish(
-                    Arc::new(self.service.ingress.client.manifest_catalog()),
-                    &self.service.ingress.layout,
-                    &self.storage,
-                    p::lance::ManifestCommit {
-                        authority: self.catalog.authority().clone(),
-                        incarnation: self.service.ingress.scope.incarnation,
-                        transaction: pending.plan.transaction,
-                        plan_index: pending.index,
-                        prepared_index: prepared.index,
-                        descriptor_digest: prepared.descriptors.digest,
-                        predecessor: predecessor.identity,
-                        target,
-                    },
-                    &selection,
-                    &prepared.descriptors,
-                    base.clone(),
-                )
-                .await?;
+                let commit = p::lance::ManifestCommit {
+                    authority: self.catalog.authority().clone(),
+                    incarnation: self.service.ingress.scope.incarnation,
+                    transaction: pending.plan.transaction,
+                    plan_index: pending.index,
+                    prepared_index: prepared.index,
+                    descriptor_digest: prepared.descriptors.digest,
+                    predecessor: predecessor.identity,
+                    target,
+                };
+                let catalog = Arc::new(self.service.ingress.client.manifest_catalog());
+                if let Some(body) = &self.service.shared.body {
+                    publication::mixed::publish(
+                        catalog,
+                        &self.service.ingress.layout,
+                        &self.storage,
+                        body,
+                        commit,
+                        &selection,
+                        &prepared.descriptors,
+                        base.clone(),
+                    )
+                    .await?;
+                } else {
+                    publication::publish(
+                        catalog,
+                        &self.service.ingress.layout,
+                        &self.storage,
+                        commit,
+                        &selection,
+                        &prepared.descriptors,
+                        base.clone(),
+                    )
+                    .await?;
+                }
             }
         }
         let current = self.catalog.state().await?;
@@ -433,6 +524,17 @@ impl Publisher {
         let selected = checkpoint::load(&self.service.ingress, &self.storage, target).await?;
         if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
             checkpoint::validate_compacted(&selected, &base, pending, prepared, record).await?;
+        } else if let Some(body) = &self.service.shared.body {
+            publication::mixed::selected_cut(
+                &selected,
+                &base,
+                &prepared.descriptors,
+                &selection,
+                record,
+                &self.storage,
+                body,
+            )
+            .await?;
         } else {
             publication::selected_cut(
                 &selected,

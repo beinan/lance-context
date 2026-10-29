@@ -33,7 +33,21 @@ impl Publisher {
             {
                 return Ok(false);
             }
-            let Some(plan) = materializer::compaction::plan(&self.catalog, view).await? else {
+            let plan = if self
+                .body_compaction_candidate(view.progress.minimum_read_version)
+                .await?
+                .is_some()
+            {
+                Some(p::Plan {
+                    transaction: Uuid::new_v4(),
+                    read_version: view.progress.minimum_read_version,
+                    sources: BTreeMap::new(),
+                    next_group: self.service.ingress.group(0)?,
+                })
+            } else {
+                materializer::compaction::plan(&self.catalog, view).await?
+            };
+            let Some(plan) = plan else {
                 return Ok(false);
             };
             // One slow rewrite can exceed the window. Its durable plan must
@@ -45,10 +59,18 @@ impl Publisher {
         }
         // A maintenance plan already exists, so the ordinary publisher only
         // prepares that exact plan. It cannot select an ingestion append here.
-        self.catalog
-            .prepare_next()
-            .await?
-            .context("annotation compaction preparation missing")?;
+        let current = self.catalog.state().await?;
+        let pending = current
+            .progress
+            .pending
+            .as_ref()
+            .context("maintenance plan missing")?;
+        if current.progress.prepared.is_none() && !self.prepare_body_compaction(pending).await? {
+            self.catalog
+                .prepare_next()
+                .await?
+                .context("annotation compaction preparation missing")?;
+        }
         let ready = self.catalog.state().await?;
         let selected = self.resolve_prepared(&ready).await?;
         let transaction = selected
@@ -57,11 +79,22 @@ impl Publisher {
             .context("selected compaction has no transaction")?;
         {
             let _ordered = self.service.shared.ordered.lock().await;
-            self.service
-                .shared
-                .staging
-                .install_compacted(&transaction, selected)
-                .await?;
+            if matches!(
+                transaction.operation,
+                lance_table::transaction::Operation::Rewrite { .. }
+            ) {
+                self.service
+                    .shared
+                    .staging
+                    .install_compacted(&transaction, selected)
+                    .await?;
+            } else {
+                self.service
+                    .shared
+                    .staging
+                    .install_body_compacted(&transaction, selected)
+                    .await?;
+            }
         }
         // An empty-source maintenance completion changes neither the source
         // checkpoint nor the in-memory result snapshot or active source window.

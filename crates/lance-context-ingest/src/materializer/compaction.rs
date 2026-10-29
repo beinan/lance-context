@@ -105,7 +105,10 @@ async fn supported_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>>
 }
 
 async fn read_compaction_base(publisher: &Publisher, version: u64) -> Result<Dataset> {
-    if publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations {
+    if matches!(
+        publisher.ingress.scope.contract.policy,
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+    ) {
         // Annotation bases contain the original turn schema plus narrow columns;
         // they do not have the immutable rollout ingress's exact Arrow schema.
         Ok(
@@ -129,6 +132,11 @@ pub(super) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool
     let dataset = read_compaction_base(publisher, version).await?;
     let indices = supported_indices(&dataset).await?;
     Ok(options.fragments(&dataset, &indices).is_some())
+}
+
+pub(crate) async fn has_work_on(dataset: &Dataset, options: &SmallFileCompaction) -> Result<bool> {
+    let indices = supported_indices(dataset).await?;
+    Ok(options.fragments(dataset, &indices).is_some())
 }
 
 pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
@@ -196,7 +204,10 @@ pub(super) async fn prepare(
     };
     let storage = publisher.storage.clone();
     let maximum = publisher.ingress.client.max_descriptor_bytes();
-    let annotations = publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations;
+    let annotations = matches!(
+        publisher.ingress.scope.contract.policy,
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+    );
     // The detached task retains admission if the scheduling caller is dropped.
     // No prepared output is deleted on an error or an ambiguous later commit.
     tokio::spawn(async move {
@@ -226,6 +237,65 @@ pub(super) async fn prepare(
         } else {
             p::Descriptors::lance_compaction(Bytes::from(bytes))
         }
+    })
+    .await?
+}
+
+/// Keep the returned admission guard through native body selection and
+/// descriptor persistence; returning the rewrite does not release its budget.
+pub(crate) async fn prepare_body_dataset(
+    dataset: Dataset,
+    options: SmallFileCompaction,
+    record_bytes: usize,
+    budget: Arc<MergeMemoryBudget>,
+    phases: Arc<PhaseCounters>,
+) -> Result<(RewriteResult, MergeReservation)> {
+    options.validate(record_bytes, budget.limit())?;
+    let indices = supported_indices(&dataset).await?;
+    let fragments = options
+        .fragments(&dataset, &indices)
+        .context("pending compaction has no eligible fragments under configured limits")?;
+    let rows = fragments
+        .iter()
+        .try_fold(0usize, |n, f| n.checked_add(f.physical_rows?))
+        .context("compaction row count overflow")?;
+    let task = CompactionTask {
+        task: TaskData { fragments },
+        read_version: dataset.version_id(),
+        options: CompactionOptions {
+            target_rows_per_fragment: rows,
+            max_bytes_per_file: Some(options.target_file_bytes),
+            num_threads: Some(1),
+            batch_size: Some(1),
+            io_buffer_size: Some(record_bytes as u64),
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            binary_copy_read_batch_bytes: Some(record_bytes),
+            ..Default::default()
+        },
+    };
+    let reservation = phases
+        .measure(Phase::Admission, async {
+            Ok::<_, anyhow::Error>(budget.reserve(options.workspace(record_bytes)?).await)
+        })
+        .await?;
+    // The detached task retains admission if the scheduling caller is dropped.
+    // No prepared output is deleted on an error or an ambiguous later commit.
+    tokio::spawn(async move {
+        let mut result = phases
+            .measure(Phase::BlobWrite, task.execute(&dataset))
+            .await?;
+        // The catalog fixes the read and target versions and fences other
+        // writers. Persist real IDs now so bitmap maintenance sees the same
+        // IDs as the selected manifest, without a separate reservation commit.
+        for (ordinal, fragment) in result.new_fragments.iter_mut().enumerate() {
+            ensure!(
+                fragment.id == 0,
+                "native compaction assigned unexpected fragment IDs"
+            );
+            fragment.id = next_fragment_id(&dataset, ordinal)?;
+        }
+        validate_result(&dataset, &result).await?;
+        Ok((result, reservation))
     })
     .await?
 }

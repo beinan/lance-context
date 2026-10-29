@@ -1,10 +1,14 @@
 use super::annotations::{producer, request, run};
 use super::*;
+mod compaction;
+#[cfg(feature = "service")]
+mod lost_prepare;
 mod pressure;
 mod replay;
+mod runtime;
 use crate::{
     annotations::{self as service, mixed, Service},
-    materializer::Storage,
+    materializer::{Acquisition, Options, Storage},
 };
 use arrow_array::{Float32Array, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
@@ -352,4 +356,38 @@ fn artifact_root() -> Result<tempfile::TempDir> {
     } else {
         Ok(tempfile::tempdir()?)
     }
+}
+
+pub(super) async fn owner(
+    c: &network::Cluster,
+    narrow: &Storage,
+    body: &Storage,
+) -> Result<(Service, service::runtime::Runtime)> {
+    let state = annotation_publication::state(c).await?;
+    service::runtime::Runtime::connect_mixed(
+        c.client.clone(),
+        c.layout.clone(),
+        binding(),
+        narrow.clone(),
+        body.clone(),
+        service::runtime::Configuration {
+            limits: limits(),
+            upload_budget: MergeMemoryBudget::new(8 << 20),
+            apply_budget: MergeMemoryBudget::new(8 << 20),
+            publication_budget: MergeMemoryBudget::new(8 << 20),
+            publication: Options {
+                max_source_bytes: 1 << 20,
+                min_source_bytes: 1 << 20,
+                max_records: 4,
+                max_batch_wait: Duration::from_millis(20),
+                ..Default::default()
+            },
+        },
+        Acquisition {
+            owner: Uuid::new_v4(),
+            request: Uuid::new_v4(),
+            expected_epoch: state.authority.epoch,
+        },
+    )
+    .await
 }
