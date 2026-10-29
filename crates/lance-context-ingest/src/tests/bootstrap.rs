@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 mod annotation_projection;
 pub(super) mod annotations;
+mod mixed;
 
 pub(super) fn identity() -> Identity {
     Identity {

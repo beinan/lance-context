@@ -18,9 +18,6 @@ async fn exercise() -> Result<()> {
     let c = network::Cluster::open_signed(&root, annotation_publication::one_shard()).await?;
     let narrow = fixture::storage(&root, "annotations.lance").await?;
     let body = fixture::storage(&root, "body.lance").await?;
-    fixture::seed(&c, &narrow, &body)
-        .await
-        .context("provisioning empty paired fixture")?;
     let mut config = c.application.clone();
     config.ingress_memory_bytes = 8 << 20;
     config.materializer_memory_bytes = 8 << 20;
@@ -103,6 +100,18 @@ async fn exercise() -> Result<()> {
                 .uri = "unsupported://ingress-must-not-open-body".into();
         }
         std::fs::write(file, serde_json::to_vec(&role)?)?;
+    }
+    // Use the real provisioning entry point, including repeated invocation.
+    // No test fixture creates the paired snapshots for these processes.
+    for i in 0..2 {
+        Process::spawn(
+            &binary,
+            &files[0],
+            "annotation-bootstrap",
+            &root.join(format!("bootstrap-{i}.log")),
+        )?
+        .wait_success()
+        .await?;
     }
     drop(reserves);
     let mut owner = Process::spawn(
@@ -279,5 +288,15 @@ async fn exercise() -> Result<()> {
     a.stop().await?;
     b.stop().await?;
     replacement.stop().await?;
+    let before = annotation_publication::state(&c).await?;
+    Process::spawn(
+        &binary,
+        &files[0],
+        "annotation-bootstrap",
+        &root.join("bootstrap-after-publication.log"),
+    )?
+    .wait_success()
+    .await?;
+    assert_eq!(annotation_publication::state(&c).await?, before);
     c.shutdown().await
 }

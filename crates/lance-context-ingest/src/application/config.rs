@@ -96,9 +96,9 @@ pub struct Annotations {
     /// with the same-table `source` handoff; only annotation-bootstrap uses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<bootstrap::annotations::projection::Source>,
-    /// Authorized immutable-body destination for an already provisioned mixed
-    /// generation. Selects the mixed Arrow contract; existing bindings are not
-    /// migrated by owner/ingress startup.
+    /// Authorized immutable-body destination. Explicit annotation-bootstrap
+    /// creates a fresh body/narrow pair; owner/ingress only open its mixed
+    /// binding. Existing generations are never migrated by role startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Body>,
     /// Opt into physical collection for a table served exclusively by its
@@ -239,10 +239,13 @@ impl Config {
             }
             if let Some(body) = &a.body {
                 ensure!(
-                    a.source.is_none() && a.projection.is_none()
-                        && !body.uri.is_empty() && body.uri.len() <= 8192
-                        && body.uri != self.tables[0].uri && body.storage_options.len() <= 128,
-                    "mixed annotations require a separate authorized body destination and provisioned binding"
+                    a.source.is_none()
+                        && a.projection.is_none()
+                        && !body.uri.is_empty()
+                        && body.uri.len() <= 8192
+                        && body.uri != self.tables[0].uri
+                        && body.storage_options.len() <= 128,
+                    "mixed annotations require a separate authorized body destination"
                 );
             }
         }
