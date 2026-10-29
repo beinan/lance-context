@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) mod compaction;
 pub mod observation;
 mod pipeline;
+mod plan;
 mod read_policy;
 mod session_index;
 pub(crate) mod stage;
@@ -335,18 +336,7 @@ impl Publisher {
             let Some(plan) = self.plan_attempt.clone() else {
                 return Ok(None);
             };
-            let reply = commit(
-                &self.ingress.client,
-                Command::Plan(p::PlanRequest {
-                    authority: self.authority.clone(),
-                    plan,
-                }),
-            )
-            .await?;
-            ensure!(
-                matches!(reply, Applied::Publisher(p::Reply::Planned { .. })),
-                "publication selection rejected: {reply:?}"
-            );
+            self.record_plan(plan).await?;
             view = self.state().await?;
         }
         self.plan_attempt = None;

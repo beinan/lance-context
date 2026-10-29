@@ -3,7 +3,7 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 mod close;
-mod proxy;
+pub(in crate::tests) mod proxy;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn annotation_unknown_prepare_preserves_acked_suffix_and_reuses_original_files() -> Result<()>

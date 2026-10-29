@@ -288,18 +288,7 @@ impl Publisher {
                 sources: BTreeMap::from([(group, frozen.sources().clone())]),
                 next_group: group,
             };
-            let reply = materializer::commit(
-                &self.service.ingress.client,
-                Command::Plan(p::PlanRequest {
-                    authority: self.catalog.authority().clone(),
-                    plan,
-                }),
-            )
-            .await?;
-            ensure!(
-                matches!(reply, Applied::Publisher(p::Reply::Planned { .. })),
-                "annotation plan rejected: {reply:?}"
-            );
+            self.catalog.record_plan(plan).await?;
             view = self.catalog.state().await?;
             frozen
         };

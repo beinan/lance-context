@@ -38,8 +38,14 @@ Startup handles the durable states explicitly:
 - **Completed publication:** restore its exact value/result checkpoint and replay
   the remaining WAL suffix.
 
-A publication/protocol error, including an unknown RPC result, stops this runtime
-and its read barriers. A fenced restart reconciles the retained operation. The runtime
+An unknown Plan result first gets one bounded quorum observation. Publication
+continues only if the current authority, table binding and incarnation still match
+and the entire original pending plan is recorded. The command is not resubmitted;
+absence or different plan content remains unresolved. Concurrent updates stay in
+the active generation while the original frozen generation completes.
+
+Other unresolved publication/protocol errors stop this runtime and its read
+barriers. A fenced restart reconciles the retained operation. The runtime
 does not generate a replacement mutation identity, guess a publication result, or
 blindly retry application errors. Acquisition retries retain the caller's existing
 durable scheduler identity as required by the catalog protocol.

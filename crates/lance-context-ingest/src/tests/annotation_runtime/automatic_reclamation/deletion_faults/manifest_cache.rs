@@ -84,6 +84,14 @@ async fn orphan_pages(cache_bytes: usize, clear: bool, expected_reads: usize) ->
     }
     resume.send(()).unwrap();
     wait_files(&path, original.len()).await?;
+    // The store can unlink a file before the collector receives its DELETE
+    // reply. Let both replies be accounted before shutdown cancels the runtime.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while service.reclamation_observation().deleted < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
     stop.send(()).unwrap();
     task.await??;
     let all_page_reads = faults.manifest_reads.load(Ordering::Relaxed);
