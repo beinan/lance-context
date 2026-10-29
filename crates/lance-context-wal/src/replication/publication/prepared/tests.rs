@@ -60,6 +60,7 @@ fn descriptors_keep_original_index_and_shared_bytes_through_takeover() -> Result
     for policy in [
         WritePolicy::ImmutableUniqueIds,
         WritePolicy::TurnAnnotations,
+        WritePolicy::TurnIngestion,
     ] {
         takeover(policy)?;
     }
@@ -70,7 +71,9 @@ fn takeover(policy: WritePolicy) -> Result<()> {
     let (mut catalog, plan) = fixture_with_policy(policy.clone())?;
     let descriptors = |bytes| match policy {
         WritePolicy::ImmutableUniqueIds => Descriptors::lance_fragments(bytes),
-        WritePolicy::TurnAnnotations => Descriptors::lance_annotations(bytes),
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion => {
+            Descriptors::lance_annotations(bytes)
+        }
     };
     let layout = crate::replication::tests::layout();
     let limits = Limits {
@@ -163,7 +166,9 @@ fn takeover(policy: WritePolicy) -> Result<()> {
         .ingest
         .policy = match policy {
         WritePolicy::ImmutableUniqueIds => WritePolicy::TurnAnnotations,
-        WritePolicy::TurnAnnotations => WritePolicy::ImmutableUniqueIds,
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion => {
+            WritePolicy::ImmutableUniqueIds
+        }
     };
     assert!(wrong_policy.validate(&layout, 10, 11, &limits).is_err());
     for mutation in 0..5 {
@@ -199,6 +204,7 @@ fn annotation_descriptors_require_an_annotation_binding_and_a_source_prefix() ->
     for policy in [
         WritePolicy::ImmutableUniqueIds,
         WritePolicy::TurnAnnotations,
+        WritePolicy::TurnIngestion,
     ] {
         for maintenance in [false, true] {
             for format in 1..=5 {
@@ -216,7 +222,9 @@ fn annotation_descriptors_require_an_annotation_binding_and_a_source_prefix() ->
                 } else {
                     match policy {
                         WritePolicy::ImmutableUniqueIds => format == 1,
-                        WritePolicy::TurnAnnotations => matches!(format, 4 | 5),
+                        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion => {
+                            matches!(format, 4 | 5)
+                        }
                     }
                 };
                 let before = catalog.clone();

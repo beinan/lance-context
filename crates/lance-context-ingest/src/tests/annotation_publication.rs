@@ -19,6 +19,7 @@ use lance_table::{
 use prost::Message;
 
 mod large;
+mod paired;
 
 pub(super) fn one_shard() -> Arc<Layout> {
     let mut value = (*layout()).clone();

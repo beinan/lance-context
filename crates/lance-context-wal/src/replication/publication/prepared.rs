@@ -66,7 +66,9 @@ impl Descriptors {
         } else {
             match policy {
                 WritePolicy::ImmutableUniqueIds => self.format == 1,
-                WritePolicy::TurnAnnotations => matches!(self.format, 4 | 5),
+                WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion => {
+                    matches!(self.format, 4 | 5)
+                }
             }
         }
     }

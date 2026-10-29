@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::materializer::Storage;
 
 mod metadata;
+pub mod mixed;
 
 /// The first annotation publisher covers one shard in one source group. A
 /// source pin must prove this plan contains every relevant record in its range;
@@ -30,18 +31,27 @@ pub struct Selection {
     pub pending: p::PendingPlan,
 }
 impl Selection {
-    pub(crate) fn scope(&self) -> Result<(Scope, u64)> {
+    fn identity(&self) -> Result<()> {
         let plan = &self.pending.plan;
         ensure!(
             !self.table.is_nil()
                 && !self.incarnation.is_nil()
                 && self.pending.index > 0
                 && self.pending.index < u64::MAX
-                && !plan.transaction.is_nil()
-                && plan.sources.len() == 1,
-            "annotation publication requires one scoped source selection"
+                && !plan.transaction.is_nil(),
+            "invalid annotation publication identity"
         );
         plan.target_version()?;
+        Ok(())
+    }
+
+    pub(crate) fn scope(&self) -> Result<(Scope, u64)> {
+        self.identity()?;
+        let plan = &self.pending.plan;
+        ensure!(
+            plan.sources.len() == 1,
+            "annotation publication requires one scoped source selection"
+        );
         let (&group, range) = plan.sources.first_key_value().unwrap();
         let (_, first) = range.records.first().context("empty annotation prefix")?;
         ensure!(
@@ -108,10 +118,40 @@ pub async fn persist_descriptors(
     );
     let transaction = &prepared.merge().transaction;
     validate(prepared.base(), transaction, selection)?;
+    persist_native(prepared, selection, storage, maximum).await
+}
+
+async fn persist_native(
+    prepared: &PreparedAnnotations,
+    selection: &Selection,
+    storage: &Storage,
+    maximum: u64,
+) -> Result<p::Descriptors> {
+    ensure!(
+        (1..=p::MAX_DESCRIPTOR_BYTES as u64).contains(&maximum)
+            && prepared.base().uri() == storage.uri,
+        "invalid native descriptor destination/budget"
+    );
+    let transaction = &prepared.merge().transaction;
     ensure!(
         prepared.through() == selection.scope()?.1,
         "foreign metadata cut"
     );
+    persist_transaction(prepared.base(), transaction, selection, storage, maximum).await
+}
+
+async fn persist_transaction(
+    base: &Dataset,
+    transaction: &Transaction,
+    selection: &Selection,
+    storage: &Storage,
+    maximum: u64,
+) -> Result<p::Descriptors> {
+    ensure!(
+        (1..=p::MAX_DESCRIPTOR_BYTES as u64).contains(&maximum) && base.uri() == storage.uri,
+        "invalid native descriptor destination/budget"
+    );
+    selection.identity()?;
     let native = pb::Transaction::from(transaction);
     ensure!(
         native.encoded_len() <= metadata::MAX_NATIVE_BYTES,
@@ -121,7 +161,7 @@ pub async fn persist_descriptors(
     if bytes.len() as u64 <= maximum {
         p::Descriptors::lance_annotations(bytes)
     } else {
-        metadata::persist(prepared.base(), storage, selection, bytes, maximum).await
+        metadata::persist(base, storage, selection, bytes, maximum).await
     }
 }
 
@@ -178,6 +218,25 @@ pub async fn selected_cut(
     storage: &Storage,
 ) -> Result<u64> {
     let expected = resolve_transaction(original_base, descriptors, selection, storage).await?;
+    selected_identity(
+        selected,
+        original_base,
+        descriptors,
+        selection,
+        record,
+        &expected,
+    )
+    .await
+}
+
+async fn selected_identity(
+    selected: &Dataset,
+    original_base: &Dataset,
+    descriptors: &p::Descriptors,
+    selection: &Selection,
+    record: &p::ManifestRecord,
+    expected: &Transaction,
+) -> Result<u64> {
     ensure!(
         selected.uri() == original_base.uri()
             && selected.version_id() == selection.pending.plan.target_version()?
@@ -186,7 +245,7 @@ pub async fn selected_cut(
             && record.plan_index == selection.pending.index
             && record.prepared_index > selection.pending.index
             && record.descriptor_digest == descriptors.digest
-            && selected.read_transaction().await?.as_ref() == Some(&expected),
+            && selected.read_transaction().await?.as_ref() == Some(expected),
         "selected annotation snapshot differs from durable preparation"
     );
     Ok(selection.scope()?.1)
@@ -199,6 +258,15 @@ fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) ->
         ),
         "paired body metadata requires a mixed-ingestion publication contract"
     );
+    validate_native(base, transaction, selection, false)
+}
+
+fn validate_native(
+    base: &Dataset,
+    transaction: &Transaction,
+    selection: &Selection,
+    inserts: bool,
+) -> Result<()> {
     ensure!(
         transaction.read_version == base.version_id()
             && transaction.read_version == selection.pending.plan.read_version
@@ -221,6 +289,17 @@ fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) ->
         .and_then(|p| p.get(lance_context_core::annotation_staging::RESULTS_PROPERTY));
     if let Some(results) = results {
         crate::annotations::checkpoint::Snapshot::decode(results, selection.scope()?.1)?;
+    }
+    if inserts {
+        mixed::validate_narrow(base, transaction)?;
+        ensure!(
+            results.is_some(),
+            "mixed publication must retain application results"
+        );
+    }
+    if let Operation::Append { .. } = &transaction.operation {
+        ensure!(inserts, "patch-only annotations cannot insert rows");
+        return Ok(());
     }
     if let Operation::UpdateConfig {
         config_updates,
@@ -255,7 +334,7 @@ fn validate(base: &Dataset, transaction: &Transaction, selection: &Selection) ->
     };
     ensure!(
         removed_fragment_ids.is_empty()
-            && new_fragments.is_empty()
+            && (inserts || new_fragments.is_empty())
             && !updated_fragments.is_empty()
             && compacted_sstables.is_empty()
             && fields_for_preserving_frag_bitmap.is_empty()
