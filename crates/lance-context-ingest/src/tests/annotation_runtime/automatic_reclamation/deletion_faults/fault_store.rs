@@ -146,7 +146,7 @@ pub(in crate::tests) async fn storage(
     storage_with_cache(path, faults, 1 << 20).await
 }
 
-pub(super) async fn storage_with_cache(
+pub(in crate::tests) async fn storage_with_cache(
     path: &std::path::Path,
     faults: Arc<Faults>,
     cache_bytes: usize,

@@ -33,6 +33,12 @@ impl Publisher {
             {
                 return Ok(false);
             }
+            // Both datasets and their index coverage are fixed by this selected
+            // narrow version. Recheck after publication, not on every idle poll.
+            // A retained plan above always resolves, regardless of this hint.
+            if self.compaction_checked_version == Some(view.progress.minimum_read_version) {
+                return Ok(false);
+            }
             let plan = if self
                 .body_compaction_candidate(view.progress.minimum_read_version)
                 .await?
@@ -48,6 +54,9 @@ impl Publisher {
                 materializer::compaction::plan(&self.catalog, view).await?
             };
             let Some(plan) = plan else {
+                // Remember only a completed no-candidate check, never a budget
+                // skip, a failed read, or a plan that still needs to finish.
+                self.compaction_checked_version = Some(view.progress.minimum_read_version);
                 return Ok(false);
             };
             // One slow rewrite can exceed the window. Its durable plan must
