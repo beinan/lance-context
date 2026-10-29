@@ -53,20 +53,30 @@ struct PausedListing {
 #[derive(Clone, Debug)]
 struct FailedListing {
     prefix: Path,
-    first: Option<Path>,
+    first: Option<ObjectMeta>,
     active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Faults {
-    pub fn fail_listing(
+    pub async fn fail_listing(
         &self,
         prefix: &std::path::Path,
         first: Option<&std::path::Path>,
         active: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
+        // Keep the response metadata fixed while this fault is active. A
+        // collector may already have sealed and deleted the yielded orphan.
+        let first = match first {
+            Some(path) => Some(
+                object_store::local::LocalFileSystem::new()
+                    .head(&Path::from_absolute_path(path)?)
+                    .await?,
+            ),
+            None => None,
+        };
         let failure = FailedListing {
             prefix: Path::from_absolute_path(prefix)?,
-            first: first.map(Path::from_absolute_path).transpose()?,
+            first,
             active,
         };
         assert!(self
@@ -185,6 +195,57 @@ fn failure() -> object_store::Error {
     }
 }
 
+#[tokio::test]
+async fn failed_listing_retains_metadata_after_sealed_prefix_deletion() -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    let root = root()?;
+    let directory = root.path().join("turns.lance");
+    let orphan_file = directory.join("orphan.lance");
+    let prefix = Path::from_absolute_path(&directory)?;
+    let orphan = Path::from_absolute_path(&orphan_file)?;
+    let protected = Path::from_absolute_path(directory.join("protected.lance"))?;
+    let inner = Arc::new(object_store::local::LocalFileSystem::new());
+    for path in [&orphan, &protected] {
+        inner
+            .put(path, bytes::Bytes::from_static(b"object").into())
+            .await?;
+    }
+    let metadata = inner.head(&orphan).await?;
+    let faults = Arc::new(Faults::default());
+    let active = Arc::new(AtomicBool::new(true));
+    faults
+        .fail_listing(&directory, Some(&orphan_file), active.clone())
+        .await?;
+    let store = FaultStore { inner, faults };
+
+    let mut first = store.list(Some(&prefix));
+    assert_eq!(first.next().await.unwrap()?, metadata);
+    // The collector can seal a prefix at its deadline, then delete that
+    // orphan before consuming the failed response's remaining body.
+    store.inner.delete(&orphan).await?;
+    let error = first.next().await.unwrap().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected LIST response body timeout"));
+    assert!(first.next().await.is_none());
+
+    // Repeated injected responses retain their selected metadata even after
+    // that valid deletion; an injector panic must not replace the LIST error.
+    let mut repeated = store.list(Some(&prefix));
+    assert_eq!(repeated.next().await.unwrap()?, metadata);
+    let error = repeated.next().await.unwrap().unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected LIST response body timeout"));
+    assert!(repeated.next().await.is_none());
+
+    active.store(false, Ordering::SeqCst);
+    let recovered = store.list(Some(&prefix)).try_collect::<Vec<_>>().await?;
+    assert_eq!(recovered, vec![store.inner.head(&protected).await?]);
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for FaultStore {
     async fn put_opts(
@@ -232,12 +293,9 @@ impl ObjectStore for FaultStore {
             .filter(|f| Some(&f.prefix) == prefix && f.active.load(Ordering::SeqCst))
             .cloned();
         if let Some(failed) = failed {
-            let listing = self.inner.list(prefix);
             return async_stream::try_stream! {
                 if let Some(first) = failed.first {
-                    let objects = listing.try_collect::<Vec<_>>().await?;
-                    yield objects.into_iter().find(|o| o.location == first)
-                        .expect("failed listing candidate missing");
+                    yield first;
                 }
                 Err(object_store::Error::Generic {
                     store: "annotation-list-test",

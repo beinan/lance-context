@@ -7,7 +7,7 @@ async fn annotation_collector_recovers_failed_listing() -> Result<()> {
 }
 
 #[tokio::test]
-async fn annotation_collector_discards_failed_partial_listing() -> Result<()> {
+async fn annotation_collector_recovers_failed_partial_listing() -> Result<()> {
     failed_listing(None, true).await
 }
 
@@ -32,11 +32,13 @@ async fn failed_listing(suffix: Option<&str>, partial: bool) -> Result<()> {
     let (service, runtime) = owned(&c, &storage, &limits()).await?;
     let active = Arc::new(AtomicBool::new(true));
     let prefix = suffix.map_or_else(|| path.clone(), |suffix| path.join(suffix));
-    faults.fail_listing(
-        &prefix,
-        partial.then_some(abandoned[0].as_path()),
-        active.clone(),
-    )?;
+    faults
+        .fail_listing(
+            &prefix,
+            partial.then_some(abandoned[0].as_path()),
+            active.clone(),
+        )
+        .await?;
     let (stop, task) = run_owner(whole_page(runtime)?);
     let progress = async {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -65,8 +67,13 @@ async fn failed_listing(suffix: Option<&str>, partial: bool) -> Result<()> {
             "failed LIST killed the applied read view"
         );
         ensure!(
-            abandoned.iter().all(|p| p.exists()),
-            "partial failed page was deleted"
+            // A deadline may seal the yielded prefix before its later error.
+            // That sealed orphan can be deleted; unlisted objects cannot.
+            abandoned
+                .iter()
+                .skip(usize::from(partial))
+                .all(|p| p.exists()),
+            "unlisted orphan was deleted during the failed response"
         );
         let (staging, _) = service.observation().await;
         ensure!(staging.retained_bytes <= limits().retained_bytes);
