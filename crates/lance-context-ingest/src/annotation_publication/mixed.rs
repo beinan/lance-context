@@ -186,7 +186,7 @@ pub async fn persist_descriptors(
     persist_native(prepared, selection, storage, maximum).await
 }
 
-async fn resolve(
+pub(crate) async fn resolve(
     base: &Dataset,
     descriptors: &p::Descriptors,
     selection: &Selection,
