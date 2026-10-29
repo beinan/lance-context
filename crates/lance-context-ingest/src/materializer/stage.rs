@@ -176,7 +176,21 @@ pub(crate) async fn publish(
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
     let transaction = if publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations {
-        annotation_compaction_transaction(&base, pending, &prepared.descriptors).await?
+        if matches!(prepared.descriptors.format, 4 | 5) {
+            crate::annotation_publication::resolve_transaction(
+                &base,
+                &prepared.descriptors,
+                &crate::annotation_publication::Selection {
+                    table: publisher.authority.table,
+                    incarnation: publisher.ingress.scope.incarnation,
+                    pending: pending.clone(),
+                },
+                &publisher.storage,
+            )
+            .await?
+        } else {
+            annotation_compaction_transaction(&base, pending, &prepared.descriptors).await?
+        }
     } else {
         let operation = if pending.plan.is_maintenance() {
             match prepared.descriptors.format {

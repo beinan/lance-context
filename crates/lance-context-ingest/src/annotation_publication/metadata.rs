@@ -24,7 +24,11 @@ fn checksum(bytes: &[u8]) -> [u8; 32] {
 
 impl Reference {
     fn path(&self, storage: &Storage, selection: &Selection) -> Result<Path> {
-        selection.scope()?;
+        if selection.pending.plan.is_maintenance() {
+            selection.identity()?;
+        } else {
+            selection.scope()?;
+        }
         ensure!(
             self.table == selection.table
                 && self.incarnation == selection.incarnation
