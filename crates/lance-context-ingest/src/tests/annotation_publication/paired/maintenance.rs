@@ -206,10 +206,13 @@ pub(super) async fn recover(
         }
     }
     let saved = state(&c).await?.progress.prepared.as_ref().unwrap().clone();
-    drop((staged, held, rewritten));
+    drop((staged, held, rewritten, base));
     c.shutdown().await?;
 
     let c = network::Cluster::open_signed(root, one_shard()).await?;
+    // Reopen the original version with the restarted cluster's catalog client.
+    // The pre-restart Dataset retains the old managed handler and endpoints.
+    let base = read(&c, narrow, Some(selection.pending.plan.read_version)).await?;
     let recovered = state(&c).await?;
     assert_eq!(recovered.progress.prepared.as_ref().unwrap(), &saved);
     let selected = if stage == 0 {
