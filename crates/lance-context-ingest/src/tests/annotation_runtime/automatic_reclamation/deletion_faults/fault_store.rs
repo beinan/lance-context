@@ -16,7 +16,7 @@ use std::sync::{
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
-pub(super) enum Action {
+pub(in crate::tests) enum Action {
     Pause {
         entered: oneshot::Sender<()>,
         resume: oneshot::Receiver<()>,
@@ -31,7 +31,7 @@ pub(super) enum Action {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct Faults {
+pub(in crate::tests) struct Faults {
     actions: Mutex<BTreeMap<Path, Action>>,
     pub calls: Mutex<Vec<Path>>,
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
@@ -111,7 +111,7 @@ impl ObjectStoreProvider for Provider {
     }
 }
 
-pub(super) async fn storage(path: &std::path::Path, faults: Arc<Faults>) -> Result<Storage> {
+pub(in crate::tests) async fn storage(path: &std::path::Path, faults: Arc<Faults>) -> Result<Storage> {
     storage_with_cache(path, faults, 1 << 20).await
 }
 

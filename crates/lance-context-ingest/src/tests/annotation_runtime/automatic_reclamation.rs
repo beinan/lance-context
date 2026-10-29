@@ -264,4 +264,4 @@ async fn annotation_owner_refuses_collection_when_a_native_tag_exists() -> Resul
     c.shutdown().await
 }
 
-mod deletion_faults;
+pub(in crate::tests) mod deletion_faults;
