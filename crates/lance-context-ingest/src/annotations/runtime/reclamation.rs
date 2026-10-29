@@ -11,6 +11,7 @@ mod deletion;
 #[cfg(test)]
 mod listing_tests;
 mod manifest_cache;
+mod paired;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -84,6 +85,12 @@ pub(super) struct Collector {
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
+    // At most one retained SDK stream/deferred object per destination, but only
+    // one candidate/sealed page in total. Alternate resolved pages so a large
+    // table listing cannot starve collection of the other destination.
+    other_listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
+    other_deferred: Option<(Path, u64)>,
+    body: bool,
 }
 impl Collector {
     pub(super) fn new(
@@ -106,6 +113,9 @@ impl Collector {
             listing: None,
             deferred: None,
             sealed: None,
+            other_listing: None,
+            other_deferred: None,
+            body: false,
         })
     }
 
@@ -132,6 +142,11 @@ impl Collector {
         // Starting the clock before that I/O makes every following publisher
         // iteration eligible for another pass, starving materialization.
         self.next_run = tokio::time::Instant::now() + self.options.interval;
+        if result.is_ok() && self.sealed.is_none() && service.shared.body.is_some() {
+            std::mem::swap(&mut self.listing, &mut self.other_listing);
+            std::mem::swap(&mut self.deferred, &mut self.other_deferred);
+            self.body = !self.body;
+        }
         result.map(|()| self.sealed.is_none())
     }
 
@@ -170,14 +185,20 @@ impl Collector {
             .datasets()
             .next()
             .context("annotation local base missing")?;
-        let object_store = base.object_store(None).await?;
+        let body_storage = service.shared.body.as_ref().filter(|_| self.body);
+        let destination = body_storage.unwrap_or(storage);
+        let object_store = if let Some(body) = body_storage {
+            paired::store(body).await?
+        } else {
+            base.object_store(None).await?
+        };
         let store = object_store.inner.clone();
         // Inspect at most the first reference. Do not enumerate arbitrary tag
         // or branch histories into memory. External writers are prohibited by
         // the exclusive-ownership contract, including during this check.
         for prefix in [
-            lance::dataset::refs::base_tags_path(&storage.base),
-            lance::dataset::refs::base_branches_contents_path(&storage.base),
+            lance::dataset::refs::base_tags_path(&destination.base),
+            lance::dataset::refs::base_branches_contents_path(&destination.base),
         ] {
             ensure!(
                 phases
@@ -192,7 +213,7 @@ impl Collector {
         let mut candidates = phases
             .measure(Phase::CollectList, async {
                 if self.listing.is_none() {
-                    self.listing = Some(store.list(Some(&storage.base)));
+                    self.listing = Some(store.list(Some(&destination.base)));
                 }
                 let mut candidates = BTreeMap::new();
                 let mut progress = service.shared.progress.subscribe();
@@ -223,7 +244,7 @@ impl Collector {
                         examined += 1;
                         (meta.location, meta.size)
                     };
-                    if !candidate(&path, &storage.base, service.ingress.scope.incarnation) {
+                    if !candidate(&path, &destination.base, service.ingress.scope.incarnation) {
                         continue;
                     }
                     // Charge string storage and map nodes conservatively. A deferred
@@ -254,13 +275,27 @@ impl Collector {
         phases
             .measure(Phase::CollectProtect, async {
                 for base in roots.datasets() {
-                    protect(
-                        &mut candidates,
-                        base.manifest(),
-                        &base.manifest_location().path,
-                        &storage.base,
-                        true,
-                    )?;
+                    if let Some(body) = body_storage {
+                        paired::protect_body(
+                            &mut candidates,
+                            base,
+                            body,
+                            &object_store,
+                            service.ingress.scope.incarnation,
+                            budget,
+                            page_charge,
+                            true,
+                        )
+                        .await?;
+                    } else {
+                        protect(
+                            &mut candidates,
+                            base.manifest(),
+                            &base.manifest_location().path,
+                            &storage.base,
+                            true,
+                        )?;
+                    }
                 }
                 for record in manifests.versions.values() {
                     // A fully protected page cannot delete anything. Further immutable
@@ -286,6 +321,31 @@ impl Collector {
                     // encode the slash as %2F and address a different blob object.
                     let name = record.object.path.strip_prefix("_versions/").unwrap();
                     let path = storage.base.clone().join("_versions").join(name);
+                    let retain_data =
+                        record.version != manifests.initial_version || !bootstrap_receipt_only;
+                    if let Some(body) = body_storage {
+                        // The same finite durable narrow history selects the body
+                        // roots. Never infer liveness from the body table's latest
+                        // mainline or from detached-version numeric ordering.
+                        let narrow =
+                            checkpoint::load(&service.ingress, storage, record.version).await?;
+                        ensure!(
+                            narrow.manifest_location().path == path,
+                            "retained narrow manifest identity changed"
+                        );
+                        paired::protect_body(
+                            &mut candidates,
+                            &narrow,
+                            body,
+                            &object_store,
+                            service.ingress.scope.incarnation,
+                            budget,
+                            page_charge + charge,
+                            retain_data,
+                        )
+                        .await?;
+                        continue;
+                    }
                     let manifest =
                         manifest_cache::read(&self.metadata, &object_store, &path, record).await?;
                     ensure!(
@@ -297,7 +357,7 @@ impl Collector {
                         &manifest,
                         &path,
                         &storage.base,
-                        record.version != manifests.initial_version || !bootstrap_receipt_only,
+                        retain_data,
                     )?;
                 }
                 Ok::<_, anyhow::Error>(())

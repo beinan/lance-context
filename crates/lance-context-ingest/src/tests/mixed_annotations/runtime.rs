@@ -1,0 +1,191 @@
+use super::*;
+#[tokio::test]
+async fn mixed_replays_an_unprepared_cut_then_drains_bodies_and_annotations() -> Result<()> {
+    resume(0).await
+}
+
+#[tokio::test]
+async fn mixed_recovers_exact_prepared_pair_without_reimporting_turns() -> Result<()> {
+    resume(1).await
+}
+
+#[tokio::test]
+async fn mixed_resolves_unknown_selection_and_replays_only_its_suffix() -> Result<()> {
+    resume(2).await
+}
+
+async fn resume(stage: u8) -> Result<()> {
+    let root = artifact_root()?;
+    let mut c =
+        network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let narrow = storage(root.path(), "annotations.lance").await?;
+    let body = storage(root.path(), "body.lance").await?;
+    seed(&c, &narrow, &body).await?;
+    let (a, driver) = connect(&c, &narrow, &body).await?;
+    let (stop, task) = run(driver);
+    let p = producer(&a, 1).await?;
+    let initial = request(
+        &a,
+        &p,
+        1,
+        encoded(create(&["A", "A", "B"], &["s", "wrong", "s"], &[1, 9, 2])?)?,
+    )
+    .await?;
+    a.submit(&initial, Duration::from_secs(10)).await?;
+    check(&a, "A", "s", 1, "pending", None).await?;
+    let (other, driver) = connect(&c, &narrow, &body).await?;
+    let (stop_other, other_task) = run(driver);
+    check(&other, "A", "s", 1, "pending", None).await?;
+    stop_other.send(()).unwrap();
+    other_task.await??;
+    drop(other);
+    let update = request(
+        &a,
+        &p,
+        2,
+        encoded(mixed::wire::patches(
+            &patch(&["A"], Some("reviewed"), None)?,
+            &limits(),
+        )?)?,
+    )
+    .await?;
+    let outcome = a.submit(&update, Duration::from_secs(10)).await?;
+    let frozen = a.freeze(Uuid::new_v4()).await?.unwrap();
+    let selection = annotation_publication::select_range(
+        &c,
+        frozen.sources().records.clone(),
+        frozen.through(),
+        Uuid::parse_str(frozen.identity())?,
+    )
+    .await?;
+    let original = if stage > 0 {
+        let prepared = frozen
+            .prepare_mixed(&MergeMemoryBudget::new(8 << 20), 8192)
+            .await?;
+        let transaction = prepared.annotations().merge().transaction.clone();
+        let repeated = frozen
+            .prepare_mixed(&MergeMemoryBudget::new(8 << 20), 8192)
+            .await?;
+        assert_eq!(repeated.annotations().merge().transaction, transaction);
+        let descriptors = crate::annotation_publication::mixed::persist_descriptors(
+            prepared.annotations(),
+            &selection,
+            &narrow,
+            &body,
+            c.client.max_descriptor_bytes(),
+        )
+        .await?;
+        let commit = annotation_publication::save(&c, &selection, descriptors.clone()).await?;
+        if stage == 2 {
+            let result = crate::annotation_publication::mixed::publish(
+                Arc::new(annotation_publication::LostReply(Arc::new(
+                    c.client.manifest_catalog(),
+                ))),
+                &annotation_publication::one_shard(),
+                &narrow,
+                &body,
+                commit,
+                &selection,
+                &descriptors,
+                prepared.annotations().base().clone(),
+            )
+            .await;
+            assert!(result.is_err(), "selected-manifest reply must be lost");
+        }
+        Some(transaction)
+    } else {
+        None
+    };
+    let q = producer(&a, 2).await?;
+    let suffix = request(
+        &a,
+        &q,
+        1,
+        encoded(mixed::wire::patches(
+            &patch(&["A"], None, Some(0.9))?,
+            &limits(),
+        )?)?,
+    )
+    .await?;
+    let suffix_outcome = a.submit(&suffix, Duration::from_secs(10)).await?;
+    let reimport = request(
+        &a,
+        &q,
+        2,
+        encoded(create(
+            &["A", "C", "C"],
+            &["wrong", "t", "wrong"],
+            &[9, 3, 8],
+        )?)?,
+    )
+    .await?;
+    let reimport_outcome = a.submit(&reimport, Duration::from_secs(10)).await?;
+    check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
+    stop.send(()).unwrap();
+    task.await??;
+    drop((frozen, a));
+    c.shutdown().await?;
+    c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let (a, runtime) = owner(&c, &narrow, &body).await?;
+    let (stop, task) = annotation_runtime::run_owner(runtime);
+    assert_eq!(a.submit(&update, Duration::from_secs(30)).await?, outcome);
+    assert_eq!(
+        a.submit(&reimport, Duration::from_secs(30)).await?,
+        reimport_outcome
+    );
+    check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
+    check(&a, "C", "t", 3, "pending", None).await?;
+    annotation_runtime::drained(&c, &a, reimport_outcome.index).await?;
+    assert_eq!(a.retained_body_frames(), (0, 0));
+    assert!(reimport_outcome.index > suffix_outcome.index);
+    if let Some(original) = original {
+        let first = annotation_publication::read(
+            &c,
+            &narrow,
+            Some(selection.pending.plan.target_version()?),
+        )
+        .await?;
+        assert_eq!(first.read_transaction().await?.as_ref(), Some(&original));
+    }
+    let selected = annotation_publication::read(&c, &narrow, None).await?;
+    assert_eq!(selected.count_rows(None).await?, 3);
+    let reference = BodySnapshot::read(&selected).await?.unwrap();
+    let selected_body =
+        mixed::load_body(&body, &reference, &binding().incarnation.to_string()).await?;
+    assert_eq!(selected_body.count_rows(None).await?, 3);
+    stop.send(()).unwrap();
+    task.await??;
+    drop(a);
+    let (a, runtime) = owner(&c, &narrow, &body).await?;
+    let (stop, task) = annotation_runtime::run_owner(runtime);
+    check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
+    assert_eq!(
+        a.submit(&reimport, Duration::from_secs(10)).await?,
+        reimport_outcome
+    );
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_single_low_rate_import_drains_without_a_following_record() -> Result<()> {
+    let root = artifact_root()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let narrow = storage(root.path(), "annotations.lance").await?;
+    let body = storage(root.path(), "body.lance").await?;
+    seed(&c, &narrow, &body).await?;
+    let (a, runtime) = owner(&c, &narrow, &body).await?;
+    let (stop, task) = annotation_runtime::run_owner(runtime);
+    let p = producer(&a, 1).await?;
+    let first = request(&a, &p, 1, encoded(create(&["A"], &["s"], &[1])?)?).await?;
+    let result = a.submit(&first, Duration::from_secs(10)).await?;
+    annotation_runtime::drained(&c, &a, result.index).await?;
+    assert_eq!(a.retained_body_frames(), (0, 0));
+    check(&a, "A", "s", 1, "pending", None).await?;
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await?;
+    Ok(())
+}

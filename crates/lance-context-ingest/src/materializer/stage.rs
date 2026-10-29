@@ -172,11 +172,23 @@ pub(crate) async fn publish(
     predecessor: &p::ManifestRecord,
     base: Dataset,
 ) -> Result<()> {
+    ensure!(
+        publisher.ingress.scope.contract.policy != WritePolicy::TurnIngestion
+            || pending.plan.is_maintenance(),
+        "mixed ingestion requires its paired publication path"
+    );
     prepared
         .descriptors
         .validate(publisher.ingress.client.max_descriptor_bytes())?;
-    let transaction = if publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations {
+    let transaction = if matches!(
+        publisher.ingress.scope.contract.policy,
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+    ) {
         if matches!(prepared.descriptors.format, 4 | 5) {
+            ensure!(
+                publisher.ingress.scope.contract.policy == WritePolicy::TurnAnnotations,
+                "mixed native maintenance requires its paired publication path"
+            );
             crate::annotation_publication::resolve_transaction(
                 &base,
                 &prepared.descriptors,
