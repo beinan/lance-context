@@ -1,5 +1,5 @@
 //! The paired adapter preserves a prepared body identity and the later WAL suffix.
-//! HTTP ingestion, automatic collection, and body compaction are separate integrations.
+//! HTTP ingestion and automatic collection are separate integrations.
 use super::*;
 use lance::dataset::{
     transaction::{Operation, Transaction},
@@ -8,6 +8,8 @@ use lance::dataset::{
 use lance_context_api::annotation::TurnAnnotation;
 use lance_context_core::annotation_staging::{BodySnapshot, Registration, BODY_SNAPSHOT_PROPERTY};
 use std::collections::HashMap;
+
+mod maintenance;
 
 fn scope() -> AnnotationScope {
     AnnotationScope {
@@ -95,16 +97,23 @@ async fn seed_pair(c: &network::Cluster, narrow: &Storage, body: &Storage) -> Re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_preparation_survives_restart_before_publication() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), recover(false)).await?
+    tokio::time::timeout(Duration::from_secs(60), recover(false, None)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_unknown_publication_preserves_concurrent_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), recover(true)).await?
+    tokio::time::timeout(Duration::from_secs(60), recover(true, None)).await?
 }
 
-async fn recover(lose_publication_reply: bool) -> Result<()> {
-    let root = tempfile::tempdir()?;
+async fn recover(lose_publication_reply: bool, maintenance_stage: Option<u8>) -> Result<()> {
+    let root = if let Ok(parent) = std::env::var("INGEST_TEST_ARTIFACTS") {
+        tempfile::Builder::new()
+            .prefix("paired-maintenance-")
+            .disable_cleanup(true)
+            .tempdir_in(parent)?
+    } else {
+        tempfile::tempdir()?
+    };
     let narrow = Storage::resolve(
         root.path()
             .join("annotations.lance")
@@ -115,8 +124,16 @@ async fn recover(lose_publication_reply: bool) -> Result<()> {
         Arc::default(),
     )
     .await?;
+    let mut body_path = root.path().to_path_buf();
+    if maintenance_stage.is_some() {
+        // The body URI alone must exceed the 512-byte inline descriptor cap.
+        // Otherwise short CI temporary paths silently select the inline format.
+        for _ in 0..5 {
+            body_path.push("body-reference-".repeat(8));
+        }
+    }
     let body = Storage::resolve(
-        root.path().join("body.lance").to_str().unwrap().into(),
+        body_path.join("body.lance").to_str().unwrap().into(),
         Default::default(),
         narrow.session.clone(),
     )
@@ -175,6 +192,11 @@ async fn recover(lose_publication_reply: bool) -> Result<()> {
     let mut transaction = InsertBuilder::new(body_base.clone())
         .with_params(&WriteParams {
             mode: WriteMode::Append,
+            max_rows_per_file: if maintenance_stage.is_some() {
+                1
+            } else {
+                WriteParams::default().max_rows_per_file
+            },
             skip_auto_cleanup: true,
             ..Default::default()
         })
@@ -355,5 +377,9 @@ async fn recover(lose_publication_reply: bool) -> Result<()> {
         })
         .await?;
     assert!(matches!(suffix.reply, Reply::Record(Some(meta)) if meta == second.1));
-    c.shutdown().await
+    if let Some(stage) = maintenance_stage {
+        maintenance::recover(root.path(), c, &narrow, &body, staged, &second, stage).await
+    } else {
+        c.shutdown().await
+    }
 }
