@@ -344,3 +344,6 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
     task.await??;
     c.shutdown().await
 }
+
+#[cfg(feature = "service")]
+mod uncertain_append;

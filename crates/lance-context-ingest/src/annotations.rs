@@ -14,6 +14,7 @@ use lance_context_wal::replication::publication::lance::ManagedManifest;
 use std::{future::Future, sync::Mutex};
 use tokio::sync::watch;
 
+mod accepted;
 pub(crate) mod checkpoint;
 pub mod runtime;
 mod window;
@@ -351,7 +352,7 @@ impl Service {
     /// outcome is retained. Older identities are rejected, never re-executed.
     pub async fn submit(&self, prepared: &PreparedAppend, deadline: Duration) -> Result<Completed> {
         tokio::time::timeout(deadline, async {
-            let accepted = self.ingress.append(prepared).await?;
+            let accepted = self.append_observed(prepared).await?;
             self.wait_through(accepted.position.index).await?;
             let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;
             self.shared.results.lock().unwrap().resolve(&accepted, slot)
