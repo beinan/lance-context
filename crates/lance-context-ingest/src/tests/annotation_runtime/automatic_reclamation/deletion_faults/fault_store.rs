@@ -36,6 +36,7 @@ pub(in crate::tests) struct Faults {
     pub calls: Mutex<Vec<Path>>,
     pub collection_starts: Mutex<Vec<tokio::time::Instant>>,
     listing: Mutex<Option<PausedListing>>,
+    failed_listing: Mutex<Option<FailedListing>>,
     pub data_listings: Mutex<Vec<Path>>,
     pub manifest_reads: AtomicUsize,
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -49,7 +50,34 @@ struct PausedListing {
     resume: oneshot::Receiver<()>,
 }
 
+#[derive(Clone, Debug)]
+struct FailedListing {
+    prefix: Path,
+    first: Option<Path>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
 impl Faults {
+    pub fn fail_listing(
+        &self,
+        prefix: &std::path::Path,
+        first: Option<&std::path::Path>,
+        active: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        let failure = FailedListing {
+            prefix: Path::from_absolute_path(prefix)?,
+            first: first.map(Path::from_absolute_path).transpose()?,
+            active,
+        };
+        assert!(self
+            .failed_listing
+            .lock()
+            .unwrap()
+            .replace(failure)
+            .is_none());
+        Ok(())
+    }
+
     pub fn pause_listing(
         &self,
         prefix: &std::path::Path,
@@ -194,6 +222,28 @@ impl ObjectStore for FaultStore {
                 .lock()
                 .unwrap()
                 .push(prefix.clone());
+        }
+        let failed = self
+            .faults
+            .failed_listing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|f| Some(&f.prefix) == prefix && f.active.load(Ordering::SeqCst))
+            .cloned();
+        if let Some(failed) = failed {
+            let listing = self.inner.list(prefix);
+            return async_stream::try_stream! {
+                if let Some(first) = failed.first {
+                    let objects = listing.try_collect::<Vec<_>>().await?;
+                    yield objects.into_iter().find(|o| o.location == first)
+                        .expect("failed listing candidate missing");
+                }
+                Err(object_store::Error::Generic {
+                    store: "annotation-list-test",
+                    source: std::io::Error::new(std::io::ErrorKind::TimedOut, "injected LIST response body timeout").into(),
+                })?;
+            }.boxed();
         }
         let pause = self
             .faults

@@ -13,6 +13,15 @@ mod listing_tests;
 mod manifest_cache;
 mod paired;
 
+#[derive(Debug)]
+struct ListingFailure;
+
+impl std::fmt::Display for ListingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("annotation collection LIST failed")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
@@ -64,6 +73,12 @@ pub struct Observation {
     /// Failed DELETE attempts, including unknown replies. Not failed mutations.
     #[serde(default)]
     pub delete_failures: u64,
+    /// Failed read-only LIST attempts; no candidates from these attempts are deleted.
+    #[serde(default)]
+    pub list_failures: u64,
+    /// Publication is paused until a fresh listing attempt succeeds.
+    #[serde(default)]
+    pub listing_blocked: bool,
     /// Unresolved immutable paths in the one sealed page blocking publication.
     #[serde(default)]
     pub pending_objects: usize,
@@ -85,6 +100,7 @@ pub(super) struct Collector {
     listing: Option<BoxStream<'static, object_store::Result<ObjectMeta>>>,
     deferred: Option<(Path, u64)>,
     sealed: Option<SealedPage>,
+    listing_blocked: bool,
     // At most one retained SDK stream/deferred object per destination, but only
     // one candidate/sealed page in total. Alternate resolved pages so a large
     // table listing cannot starve collection of the other destination.
@@ -113,6 +129,7 @@ impl Collector {
             listing: None,
             deferred: None,
             sealed: None,
+            listing_blocked: false,
             other_listing: None,
             other_deferred: None,
             body: false,
@@ -127,7 +144,7 @@ impl Collector {
         budget: &Arc<MergeMemoryBudget>,
     ) -> Result<bool> {
         if tokio::time::Instant::now() < self.next_run {
-            return Ok(self.sealed.is_none());
+            return Ok(self.sealed.is_none() && !self.listing_blocked);
         }
         let result = if self.sealed.is_some() {
             // Reissue only unresolved immutable DELETE requests from the original,
@@ -142,12 +159,31 @@ impl Collector {
         // Starting the clock before that I/O makes every following publisher
         // iteration eligible for another pass, starving materialization.
         self.next_run = tokio::time::Instant::now() + self.options.interval;
-        if result.is_ok() && self.sealed.is_none() && service.shared.body.is_some() {
+        if let Err(error) = &result {
+            if error.is::<ListingFailure>() {
+                // The failed stream may have advanced its SDK continuation or
+                // yielded a partial candidate page. Discard both and enumerate
+                // this destination anew. No protection fence or DELETE has run.
+                self.listing = None;
+                self.deferred = None;
+                self.listing_blocked = true;
+                let mut observed = service.shared.reclamation.lock().unwrap();
+                observed.list_failures += 1;
+                observed.listing_blocked = true;
+                eprintln!("{error:#}");
+                return Ok(false);
+            }
+        }
+        if result.is_ok()
+            && self.sealed.is_none()
+            && !self.listing_blocked
+            && service.shared.body.is_some()
+        {
             std::mem::swap(&mut self.listing, &mut self.other_listing);
             std::mem::swap(&mut self.deferred, &mut self.other_deferred);
             self.body = !self.body;
         }
-        result.map(|()| self.sealed.is_none())
+        result.map(|()| self.sealed.is_none() && !self.listing_blocked)
     }
 
     async fn collect_page(
@@ -203,7 +239,8 @@ impl Collector {
             ensure!(
                 phases
                     .measure(Phase::CollectList, store.list(Some(&prefix)).try_next())
-                    .await?
+                    .await
+                    .context(ListingFailure)?
                     .is_none(),
                 "annotation data collection requires a table without tags or branches"
             );
@@ -237,7 +274,10 @@ impl Collector {
                         else {
                             break;
                         };
-                        let Some(meta) = next? else {
+                        let next = next.context(ListingFailure)?;
+                        self.listing_blocked = false;
+                        service.shared.reclamation.lock().unwrap().listing_blocked = false;
+                        let Some(meta) = next else {
                             self.listing = None;
                             break;
                         };
