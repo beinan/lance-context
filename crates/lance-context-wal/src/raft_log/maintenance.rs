@@ -37,6 +37,26 @@ impl LogMaintenance {
             .write()
             .map_err(|_| anyhow::anyhow!("append gate poisoned"))?;
         self.node.check()?;
+        let groups = self.run_pass(false)?;
+        if self.node.budget.get().is_some_and(|budget| {
+            let observed = budget.snapshot();
+            observed
+                .accounted_disk_bytes
+                .saturating_add(observed.reserved_proposal_bytes)
+                .saturating_add(self.node.target_file_bytes.saturating_mul(2))
+                > observed.data_limit
+        }) {
+            // Native rewrite eligibility counts dead entries, not their bytes.
+            // A few compacted large records can keep admission closed while
+            // many tiny live metadata values suppress the normal heuristic.
+            // Reserve fresh headroom against the first pass's measured result;
+            // never assume that two rewrites fit one reservation.
+            self.run_pass(true)?;
+        }
+        Ok(groups)
+    }
+
+    fn run_pass(&self, force_rewrite: bool) -> Result<Vec<u64>> {
         // Admission failure occurs before touching native storage and must not
         // fence a healthy node. Existing accepted traffic still owns its window.
         // Exclude writes while sizing live entries. Dead segments need deletion,
@@ -60,14 +80,14 @@ impl LogMaintenance {
                 budget.reserve(bytes, false)
             })
             .transpose()?;
-        let result = self.run_locked();
+        let result = self.run_locked(force_rewrite);
         if result.is_err() {
             self.node.failed.store(true, Ordering::Release);
         }
         result
     }
 
-    fn run_locked(&self) -> Result<Vec<u64>> {
+    fn run_locked(&self, force_rewrite: bool) -> Result<Vec<u64>> {
         // The maintenance gate drained pending appends and checkpoint writes.
         // Establish an explicit durable marker before the native rewrite too.
         self.node.sync_locked()?;
@@ -77,7 +97,12 @@ impl LogMaintenance {
             .write()
             .map_err(|_| anyhow::anyhow!("filesystem lifecycle lock poisoned"))?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.node.engine.purge_expired_files()
+            if force_rewrite {
+                self.node.engine.purge_manager().reclaim_rewrite_queue()?;
+                Ok(Vec::new())
+            } else {
+                self.node.engine.purge_expired_files()
+            }
         }));
         let mut groups = match outcome {
             Ok(Ok(groups)) => groups,

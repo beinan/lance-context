@@ -1,0 +1,79 @@
+use super::*;
+
+#[test]
+fn compacted_large_records_release_admission_despite_many_small_live_values() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
+    let group = log.group(10)?;
+    let sibling = log.group(20)?;
+    group.bind_application(b"maintenance-test/v1")?;
+    append(&sibling, 1, 4)?;
+    // Native rewrite eligibility counts entries, including metadata keys. A
+    // small number of large expired entries can dominate disk bytes while
+    // these live values keep the entry-count garbage ratio below its trigger.
+    let mut metadata = LogBatch::default();
+    for key in 0u32..2000 {
+        metadata.put(20, key.to_be_bytes().to_vec(), vec![7; 8])?;
+    }
+    group.node.write(&mut metadata)?;
+    for index in 1..=16 {
+        let mut record = entry(10, index);
+        record.data = vec![index as u8; 256 << 10].into();
+        group.persist(
+            &[record],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: index,
+                ..Default::default()
+            }),
+        )?;
+    }
+    let maintenance = group.maintenance();
+    for _ in 0..4 {
+        maintenance.run()?;
+    }
+    assert!(
+        files(root.path())?
+            .keys()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rewrite"))
+            .count()
+            > 1
+    );
+    let snapshot = checkpoint(&group, 16)?;
+    group.configure_disk(DiskOptions {
+        max_bytes: 32 << 20,
+        data_bytes: 2 << 20,
+        headroom_bytes: 16 << 20,
+    })?;
+    let budget = group.disk_budget().unwrap();
+    let before = budget.snapshot().accounted_disk_bytes;
+    assert!(before > 2 << 20, "fixture did not fill admission: {before}");
+    assert!(budget.reserve(256 << 10, true).is_err());
+    for _ in 0..4 {
+        maintenance.run()?;
+    }
+    let after = budget.snapshot().accounted_disk_bytes;
+    eprintln!("compacted payload disk bytes: before={before}, after={after}");
+    assert!(
+        after < 1 << 20,
+        "compacted payloads still occupy {after} bytes"
+    );
+    assert!(budget.reserve(256 << 10, true).is_ok());
+    verify(&sibling, 1, 4)?;
+    drop((maintenance, group, sibling, log));
+    let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
+    let group = reopened.group(10)?;
+    assert_eq!(group.snapshot(16, 2)?, snapshot);
+    assert_eq!(group.first_index()?, 17);
+    assert_eq!(group.last_index()?, 16);
+    verify(&reopened.group(20)?, 1, 4)?;
+    for key in 0u32..2000 {
+        assert_eq!(
+            group.node.engine.get(20, &key.to_be_bytes()),
+            Some(vec![7; 8])
+        );
+    }
+    Ok(())
+}
