@@ -25,7 +25,7 @@ pub(in crate::tests) async fn compact_owner(
     let state = annotation_publication::state(c).await?;
     service::runtime::Runtime::connect_mixed(
         c.client.clone(),
-        c.layout.clone(),
+        annotation_publication::one_shard(),
         compact_binding(),
         narrow.clone(),
         body.clone(),
@@ -106,7 +106,7 @@ pub(in crate::tests) async fn fragmented_with_slot(
     seed_with_binding(c, narrow, body, compact_binding()).await?;
     let (a, driver) = Service::connect_mixed(
         c.client.clone(),
-        c.layout.clone(),
+        annotation_publication::one_shard(),
         compact_binding(),
         narrow,
         body.clone(),

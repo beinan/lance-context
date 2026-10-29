@@ -366,7 +366,7 @@ pub(super) async fn owner(
     let state = annotation_publication::state(c).await?;
     service::runtime::Runtime::connect_mixed(
         c.client.clone(),
-        c.layout.clone(),
+        annotation_publication::one_shard(),
         binding(),
         narrow.clone(),
         body.clone(),

@@ -41,7 +41,7 @@ async fn exercise(selected: bool) -> Result<()> {
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let ingress = mixed::connect_ingress(
         c.client.clone(),
-        c.layout.clone(),
+        annotation_publication::one_shard(),
         compact_binding(),
         &limits(),
         MergeMemoryBudget::new(8 << 20),
@@ -70,7 +70,7 @@ async fn exercise(selected: bool) -> Result<()> {
     .await?;
     let (a, driver) = Service::connect_mixed(
         c.client.clone(),
-        c.layout.clone(),
+        annotation_publication::one_shard(),
         compact_binding(),
         &narrow,
         body.clone(),
@@ -200,7 +200,7 @@ async fn exercise(selected: bool) -> Result<()> {
             Arc::new(annotation_publication::LostReply(Arc::new(
                 c.client.manifest_catalog()
             ))),
-            &c.layout,
+            &annotation_publication::one_shard(),
             &narrow,
             &body,
             commit,
