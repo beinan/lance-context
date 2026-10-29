@@ -4,6 +4,8 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use std::collections::HashMap;
 
+#[cfg(feature = "service")]
+mod advance;
 mod compaction;
 #[cfg(feature = "service")]
 mod plan;

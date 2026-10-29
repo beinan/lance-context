@@ -1,5 +1,5 @@
 //! Test-only TLS proxy: forward the actual command, read its quorum result,
-//! hold one successful Prepare or Close reply until released, then disconnect.
+//! withhold one completion reply or return an uncertain control outcome.
 use super::*;
 use bincode::Options as _;
 use std::path::Path as FsPath;
@@ -31,6 +31,7 @@ pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
+    pub advances: Arc<AtomicUsize>,
     pub committed: Arc<Notify>,
     pub release: Arc<Notify>,
     _tasks: JoinSet<Result<()>>,
@@ -57,6 +58,7 @@ enum Point {
     Prepare,
     Close,
     Plan { execute: bool },
+    Advance { execute: bool },
 }
 impl Frame {
     async fn read(io: &mut (impl AsyncRead + Unpin)) -> Result<Option<Self>> {
@@ -98,6 +100,7 @@ impl Frame {
             (Point::Prepare, Command::Prepare(_))
                 | (Point::Close, Command::Close(_))
                 | (Point::Plan { .. }, Command::Plan(_))
+                | (Point::Advance { .. }, Command::Advance(_))
         ))
     }
     fn unknown_reply(&self) -> Result<Self> {
@@ -124,6 +127,11 @@ impl Frame {
                     p::Reply::Planned { .. }
                 )))
             ) | (
+                Point::Advance { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Advanced(
+                    _
+                ))))
+            ) | (
                 Point::Close,
                 Reply::Commit(Outcome::Committed(Applied::Source(
                     lance_context_wal::replication::source::Reply::Closed { .. }
@@ -144,6 +152,10 @@ impl Proxy {
 
     pub async fn open_plan(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
         Self::open_at(c, root, Point::Plan { execute }).await
+    }
+
+    pub async fn open_advance(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Advance { execute }).await
     }
 
     async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
@@ -168,6 +180,7 @@ impl Proxy {
         let armed = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
+        let advances = Arc::new(AtomicUsize::new(0));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let mut tasks = JoinSet::new();
@@ -197,6 +210,7 @@ impl Proxy {
             let armed = armed.clone();
             let dropped = dropped.clone();
             let plans = plans.clone();
+            let advances = advances.clone();
             let committed = committed.clone();
             let release = release.clone();
             tasks.spawn(async move {
@@ -208,14 +222,16 @@ impl Proxy {
                             let (acceptor, connector, name, address, armed, dropped, committed, release) =
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
+                            let advances = advances.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
                                 let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
                                 while let Some(request) = Frame::read(&mut downstream).await? {
                                     let hold = request.matches_command(point)?;
-                                    if hold && matches!(point, Point::Plan { .. }) {
-                                        plans.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                    if hold && matches!(point, Point::Plan { .. } | Point::Advance { .. }) {
+                                        let submissions = if matches!(point, Point::Plan { .. }) { &plans } else { &advances };
+                                        submissions.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Plan { execute: false } | Point::Advance { execute: false }) && armed.swap(false, Ordering::SeqCst) {
                                             dropped.fetch_add(1, Ordering::SeqCst);
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
@@ -228,7 +244,7 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { .. }) {
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. }) {
                                             request.unknown_reply()?.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -276,6 +292,7 @@ impl Proxy {
             )?),
             dropped,
             plans,
+            advances,
             committed,
             release,
             _tasks: tasks,

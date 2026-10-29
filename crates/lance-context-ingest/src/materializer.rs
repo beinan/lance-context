@@ -8,6 +8,7 @@ use lance_context_wal::replication::{publication as p, source};
 use object_store::path::Path as ObjectPath;
 use std::collections::{BTreeMap, HashMap};
 
+mod advance;
 pub(crate) mod compaction;
 pub mod observation;
 mod pipeline;
@@ -587,18 +588,13 @@ impl Publisher {
         .buffer_unordered(self.options.fetch_parallelism)
         .try_collect::<BTreeMap<_, _>>()
         .await?;
-        let reply = commit(
-            &self.ingress.client,
-            Command::Advance(p::AdvancePublication {
+        let advanced = self
+            .record_advance(p::AdvancePublication {
                 authority: self.authority.clone(),
                 published_index: published.index,
                 proofs,
-            }),
-        )
-        .await?;
-        let Applied::Publisher(p::Reply::Advanced(advanced)) = reply else {
-            bail!("publication advancement rejected: {reply:?}");
-        };
+            })
+            .await?;
         Ok(Some(advanced))
     }
     pub async fn run_once(&mut self) -> Result<Option<Arc<p::Advanced>>> {
