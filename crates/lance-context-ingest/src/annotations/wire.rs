@@ -83,6 +83,14 @@ pub(super) fn decode(
     value_bytes: usize,
 ) -> Result<Vec<Mutation>> {
     let batches = ipc::decode(body, schema)?;
+    decode_batches(&batches, max_rows, value_bytes)
+}
+
+pub(super) fn decode_batches(
+    batches: &[RecordBatch],
+    max_rows: u32,
+    value_bytes: usize,
+) -> Result<Vec<Mutation>> {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     ensure!(
         rows > 0 && rows <= max_rows as usize,
@@ -97,13 +105,13 @@ pub(super) fn decode(
                 "null annotation input field"
             );
         }
-        let ids: &StringArray = column(&batch, 0)?;
-        let adds: &ListArray = column(&batch, 1)?;
-        let removes: &ListArray = column(&batch, 2)?;
-        let status_ops: &UInt8Array = column(&batch, 3)?;
-        let statuses: &StringArray = column(&batch, 4)?;
-        let score_ops: &UInt8Array = column(&batch, 5)?;
-        let scores: &Float32Array = column(&batch, 6)?;
+        let ids: &StringArray = column(batch, 0)?;
+        let adds: &ListArray = column(batch, 1)?;
+        let removes: &ListArray = column(batch, 2)?;
+        let status_ops: &UInt8Array = column(batch, 3)?;
+        let statuses: &StringArray = column(batch, 4)?;
+        let score_ops: &UInt8Array = column(batch, 5)?;
+        let scores: &Float32Array = column(batch, 6)?;
         for row in 0..batch.num_rows() {
             let turn = ids.value(row);
             ensure!(!turn.is_empty(), "empty annotation turn");

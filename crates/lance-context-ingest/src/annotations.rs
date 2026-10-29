@@ -16,6 +16,7 @@ use tokio::sync::watch;
 
 mod accepted;
 pub(crate) mod checkpoint;
+pub mod mixed;
 pub mod runtime;
 mod window;
 pub mod wire;
@@ -45,6 +46,8 @@ struct Progress {
 }
 
 struct Shared {
+    body: Option<Storage>,
+    frames: Mutex<mixed::frames::Window>,
     #[cfg(test)]
     apply_attempts: std::sync::atomic::AtomicU64,
     staging: AnnotationStaging,
@@ -72,7 +75,7 @@ pub struct Service {
 struct Pending {
     index: u64,
     meta: BatchMeta,
-    mutations: Vec<wire::Mutation>,
+    decoded: mixed::Decoded,
     _reservation: MergeReservation,
 }
 
@@ -194,12 +197,33 @@ impl Service {
         budget: Arc<MergeMemoryBudget>,
         apply_budget: &Arc<MergeMemoryBudget>,
     ) -> Result<Ingress> {
+        Self::validated_ingress_mode(client, layout, binding, limits, budget, apply_budget, false)
+            .await
+    }
+
+    async fn validated_ingress_mode(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        limits: &Limits,
+        budget: Arc<MergeMemoryBudget>,
+        apply_budget: &Arc<MergeMemoryBudget>,
+        mixed: bool,
+    ) -> Result<Ingress> {
         ensure!(
             layout.buckets.len() == 1,
             "annotation service requires one shard"
         );
-        let schema = wire::schema(limits);
-        let contract = Self::contract(&binding, limits)?;
+        let schema = if mixed {
+            mixed::wire::schema(limits)
+        } else {
+            wire::schema(limits)
+        };
+        let contract = if mixed {
+            Self::mixed_contract(&binding, limits)?
+        } else {
+            Self::contract(&binding, limits)?
+        };
         ensure!(
             decode_workspace(&contract, limits, contract.max_record_bytes as usize)?
                 <= budget.limit(),
@@ -218,7 +242,24 @@ impl Service {
         limits: Limits,
         apply_budget: Arc<MergeMemoryBudget>,
     ) -> Result<(Self, Driver)> {
-        let (base, snapshot) = checkpoint::open(&ingress, storage).await?;
+        Self::open_mode(ingress, storage, None, limits, apply_budget).await
+    }
+
+    async fn open_mode(
+        ingress: Ingress,
+        storage: &Storage,
+        body: Option<Storage>,
+        limits: Limits,
+        apply_budget: Arc<MergeMemoryBudget>,
+    ) -> Result<(Self, Driver)> {
+        let (base, snapshot) = checkpoint::open(&ingress, storage, body.as_ref()).await?;
+        ensure!(
+            body.is_some() == (ingress.scope.contract.policy == WritePolicy::TurnIngestion),
+            "body storage differs from the ingestion contract"
+        );
+        if let Some(storage) = &body {
+            mixed::open_body(storage, &base, &ingress.scope.incarnation.to_string()).await?;
+        }
         let through = snapshot.through;
         let staging = AnnotationStaging::new(
             base,
@@ -242,6 +283,8 @@ impl Service {
             limits,
             apply_budget,
             shared: Arc::new(Shared {
+                body,
+                frames: Mutex::new(mixed::frames::Window::default()),
                 staging,
                 results: Mutex::new(checkpoint::Results {
                     base: snapshot,
@@ -322,15 +365,25 @@ impl Service {
         let schema = self.ingress.schema.clone();
         let producer = producer.id();
         let value_bytes = self.limits.value_bytes;
+        let mixed = self.ingress.scope.contract.policy == WritePolicy::TurnIngestion;
         tokio::task::spawn_blocking(move || {
-            let mutations = wire::decode(
-                body.clone(),
-                schema,
-                upload.scope.contract.max_rows,
-                value_bytes,
-            )?;
-            let rows = mutations.len() as u32;
-            drop(mutations);
+            let rows = if mixed {
+                mixed::wire::decode(
+                    body.clone(),
+                    schema,
+                    upload.scope.contract.max_rows,
+                    value_bytes,
+                )?
+                .rows()
+            } else {
+                wire::decode(
+                    body.clone(),
+                    schema,
+                    upload.scope.contract.max_rows,
+                    value_bytes,
+                )?
+                .len()
+            } as u32;
             // Validation owns decoded patches only inside this blocking task.
             // Keep the existing encoded-body allowance through WAL submission
             // and applied visibility, but release the discarded decode workspace.
@@ -505,14 +558,21 @@ impl Driver {
                     bytes <= ingress.scope.contract.max_record_bytes as usize,
                     "oversized annotation WAL record"
                 );
-                let reservation = service
-                    .apply_budget
-                    .reserve(decode_workspace(
-                        &ingress.scope.contract,
-                        &service.limits,
-                        bytes,
-                    )?)
-                    .await;
+                // Mixed imports retain decoded frames until publication. Never
+                // wait for capacity while those frames need this owner's
+                // publisher to drain. Signal pressure even below its normal
+                // batching threshold, and fetch only after admission succeeds.
+                let Some(reservation) = service.apply_budget.try_reserve(decode_workspace(
+                    &ingress.scope.contract,
+                    &service.limits,
+                    bytes,
+                )?) else {
+                    service
+                        .shared
+                        .progress
+                        .send_modify(|p| p.backpressured = true);
+                    return Ok(());
+                };
                 let group = ingress.group(0)?;
                 let response = ingress
                     .client
@@ -529,13 +589,23 @@ impl Driver {
                 let schema = ingress.schema.clone();
                 let max_rows = ingress.scope.contract.max_rows;
                 let value_bytes = service.limits.value_bytes;
+                let mixed = ingress.scope.contract.policy == WritePolicy::TurnIngestion;
                 self.pending = Some(
                     tokio::task::spawn_blocking(move || -> Result<Pending> {
-                        let mutations = wire::decode(response.body, schema, max_rows, value_bytes)?;
+                        let decoded = if mixed {
+                            mixed::wire::decode(response.body, schema, max_rows, value_bytes)?
+                        } else {
+                            mixed::Decoded::Patches(wire::decode(
+                                response.body,
+                                schema,
+                                max_rows,
+                                value_bytes,
+                            )?)
+                        };
                         Ok(Pending {
                             index,
                             meta,
-                            mutations,
+                            decoded,
                             _reservation: reservation,
                         })
                     })
@@ -583,25 +653,43 @@ impl Driver {
         if self.staging_pressure == Some(capacity) {
             return Ok(());
         }
-        let mutations: Vec<_> = pending
-            .mutations
-            .iter()
-            .map(|m| Mutation {
-                turn: &m.turn,
-                patch: &m.patch,
-            })
-            .collect();
         #[cfg(test)]
         service
             .shared
             .apply_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let result = match service
-            .shared
-            .staging
-            .apply_committed(after, pending.index, &mutations)
-            .await?
-        {
+        let applied = match &pending.decoded {
+            mixed::Decoded::Patches(rows) => {
+                let mutations = rows
+                    .iter()
+                    .map(|m| Mutation {
+                        turn: &m.turn,
+                        patch: &m.patch,
+                    })
+                    .collect::<Vec<_>>();
+                service
+                    .shared
+                    .staging
+                    .apply_committed(after, pending.index, &mutations)
+                    .await?
+            }
+            mixed::Decoded::Creates { rows, .. } => {
+                let registrations = rows
+                    .iter()
+                    .map(|r| lance_context_core::annotation_staging::Registration {
+                        turn: &r.turn,
+                        rollout_id: &r.rollout_id,
+                        annotation: &r.annotation,
+                    })
+                    .collect::<Vec<_>>();
+                service
+                    .shared
+                    .staging
+                    .register_committed(after, pending.index, &registrations)
+                    .await?
+            }
+        };
+        let result = match applied {
             ApplyOutcome::Applied => MutationResult::Applied,
             ApplyOutcome::Rejected(rejected) => MutationResult::Rejected(rejected),
             ApplyOutcome::Backpressure => {
@@ -616,6 +704,15 @@ impl Driver {
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();
+        if let mixed::Decoded::Creates { bodies, .. } = pending.decoded {
+            if result == MutationResult::Applied {
+                service.shared.frames.lock().unwrap().record(
+                    pending.index,
+                    bodies,
+                    pending._reservation,
+                );
+            }
+        }
         self.staging_pressure = None;
         let slot = slot(&pending.meta, ingress.client.producer_slots())?;
         service
