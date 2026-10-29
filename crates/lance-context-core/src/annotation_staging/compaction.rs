@@ -17,6 +17,27 @@ impl AnnotationStaging {
         transaction: &Transaction,
         selected: Arc<Dataset>,
     ) -> Result<()> {
+        self.install_maintenance(transaction, selected, false).await
+    }
+
+    /// Install a confirmed body-only rewrite selected by a native metadata
+    /// transaction. The caller verifies the exact row-preserving body rewrite
+    /// and fenced publication. Narrow files, cut and results remain unchanged;
+    /// active updates and already captured body readers keep their own views.
+    pub async fn install_body_compacted(
+        &self,
+        transaction: &Transaction,
+        selected: Arc<Dataset>,
+    ) -> Result<()> {
+        self.install_maintenance(transaction, selected, true).await
+    }
+
+    async fn install_maintenance(
+        &self,
+        transaction: &Transaction,
+        selected: Arc<Dataset>,
+        body_only: bool,
+    ) -> Result<()> {
         let (base, materialized) = {
             let state = self.state.read().await;
             if state.frozen.is_some() {
@@ -26,7 +47,18 @@ impl AnnotationStaging {
             }
             (state.base.clone(), state.materialized)
         };
-        if !matches!(&transaction.operation, Operation::Rewrite { groups, .. } if !groups.is_empty())
+        let operation = if body_only {
+            matches!(&transaction.operation, Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates,
+            } if field_metadata_updates.is_empty())
+                && selected.manifest().fragments == base.manifest().fragments
+        } else {
+            matches!(&transaction.operation, Operation::Rewrite { groups, .. } if !groups.is_empty())
+        };
+        if !operation
             || transaction.read_version != base.version_id()
             || selected.uri() != base.uri()
             || selected.version_id() != base.version_id() + 1
@@ -53,6 +85,9 @@ impl AnnotationStaging {
             RESULTS_PROPERTY,
             BODY_SNAPSHOT_PROPERTY,
         ] {
+            if body_only && key == BODY_SNAPSHOT_PROPERTY {
+                continue;
+            }
             if properties.and_then(|p| p.get(key))
                 != transaction
                     .transaction_properties
@@ -61,6 +96,24 @@ impl AnnotationStaging {
             {
                 return Err(invalid(
                     "compaction changed annotation cut, request results or body reference",
+                ));
+            }
+        }
+        if body_only {
+            let prior = BodySnapshot::read(&base)
+                .await?
+                .ok_or_else(|| invalid("body maintenance base has no body reference"))?;
+            let next = BodySnapshot::read(&selected)
+                .await?
+                .ok_or_else(|| invalid("body maintenance dropped its body reference"))?;
+            if next.uri != prior.uri
+                || next.table_instance != prior.table_instance
+                || next.version == prior.version
+                || !lance_table::format::is_detached_version(next.version)
+                || next.transaction != transaction.uuid
+            {
+                return Err(invalid(
+                    "body maintenance changed its binding or native identity",
                 ));
             }
         }
