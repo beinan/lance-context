@@ -26,7 +26,7 @@ fn binary_contract_fixture_preserves_field_order_policy_and_limits() {
         contract()
     );
     let mut foreign_policy = fixture;
-    foreign_policy[50] = 2;
+    foreign_policy[50..54].copy_from_slice(&3u32.to_le_bytes());
     assert!(bincode::deserialize::<IngestContract>(&foreign_policy).is_err());
     let mut invalid_limit = fixture;
     invalid_limit[54..58].fill(0);
@@ -51,6 +51,20 @@ fn annotation_binding_has_a_distinct_policy_without_changing_append_bytes() {
         annotation
     );
     assert_ne!(annotation, contract());
+}
+
+#[test]
+fn mixed_binding_appends_its_policy_without_changing_existing_discriminants() {
+    let mut mixed = contract();
+    mixed.policy = WritePolicy::TurnIngestion;
+    mixed.validate().unwrap();
+    let mut expected = bincode::serialize(&contract()).unwrap();
+    expected[50..54].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(bincode::serialize(&mixed).unwrap(), expected);
+    assert_eq!(
+        bincode::deserialize::<IngestContract>(&expected).unwrap(),
+        mixed
+    );
 }
 
 #[test]
