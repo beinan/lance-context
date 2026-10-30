@@ -209,8 +209,8 @@ async fn annotation_shards_reject_foreign_batches_and_drain_independently_across
     let tb = b.turn(&layout);
     assert_ne!(ta, tb);
     // Both owners hold their ACKed WAL prefix until explicitly resumed below.
-    let (sa, ra) = a.owner(&c, &layout, Duration::from_secs(3600)).await?;
-    let (sb, rb) = b.owner(&c, &layout, Duration::from_secs(3600)).await?;
+    let (sa, ra) = a.owner(&c, &layout, Duration::from_secs(60)).await?;
+    let (sb, rb) = b.owner(&c, &layout, Duration::from_secs(60)).await?;
     let (_stop_a, task_a) = annotation_runtime::run_owner(ra);
     let (stop_b, task_b) = annotation_runtime::run_owner(rb);
     let pa = producer(&sa).await?;
