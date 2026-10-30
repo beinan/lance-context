@@ -36,8 +36,18 @@ pub enum Phase {
     AnnotationAppend,
     /// Waiting for the local ordered applier to reach an accepted WAL position.
     AnnotationApplyWait,
+    /// Upload validation and workspace reservation before reading its body.
+    AnnotationUploadAdmission,
+    /// Reading the HTTP owner's exact request body after upload admission.
+    AnnotationUploadRead,
+    /// Request validation and Arrow preparation, including blocking-worker wait.
+    AnnotationUploadPrepare,
+    /// Owned point lookup and recovery-cut wait, excluding the authority fence.
+    AnnotationPointRead,
+    /// Quorum publisher-binding lookup and validation, including HTTP health checks.
+    AnnotationOwnerFence,
 }
-const NAMES: [&str; 22] = [
+const NAMES: [&str; 27] = [
     "claim",
     "acquire",
     "state",
@@ -60,6 +70,11 @@ const NAMES: [&str; 22] = [
     "annotation_patch",
     "annotation_append",
     "annotation_apply_wait",
+    "annotation_upload_admission",
+    "annotation_upload_read",
+    "annotation_upload_prepare",
+    "annotation_point_read",
+    "annotation_owner_fence",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

@@ -162,11 +162,29 @@ impl Service {
         self.shared.phases.observation()
     }
     #[cfg(feature = "http")]
+    pub(crate) fn phase_counters(&self) -> &Arc<crate::materializer::observation::Counters> {
+        &self.shared.phases
+    }
+
+    #[cfg(feature = "http")]
     pub(crate) fn ingress(&self) -> &Ingress {
         &self.ingress
     }
 
     pub(crate) async fn check_owner(
+        &self,
+        authority: &lance_context_wal::replication::publication::Authority,
+    ) -> Result<()> {
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationOwnerFence,
+                self.check_owner_observed(authority),
+            )
+            .await
+    }
+
+    async fn check_owner_observed(
         &self,
         authority: &lance_context_wal::replication::publication::Authority,
     ) -> Result<()> {
@@ -377,6 +395,16 @@ impl Service {
     /// Reserve before buffering an upload; preparation retains this allocation
     /// through its exact-byte retries. Narrow patch allocations are budgeted too.
     pub async fn reserve_upload(&self, bytes: usize) -> Result<Upload> {
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationUploadAdmission,
+                self.reserve_upload_observed(bytes),
+            )
+            .await
+    }
+
+    async fn reserve_upload_observed(&self, bytes: usize) -> Result<Upload> {
         let contract = &self.ingress.scope.contract;
         ensure!(
             bytes > 0 && bytes <= contract.max_record_bytes as usize,
@@ -394,6 +422,22 @@ impl Service {
     }
 
     pub async fn prepare(
+        &self,
+        upload: Upload,
+        body: Bytes,
+        producer: &Producer,
+        sequence: u64,
+    ) -> Result<PreparedAppend> {
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationUploadPrepare,
+                self.prepare_observed(upload, body, producer, sequence),
+            )
+            .await
+    }
+
+    async fn prepare_observed(
         &self,
         upload: Upload,
         body: Bytes,
@@ -503,6 +547,22 @@ impl Service {
     /// A later unacknowledged proposal must not block reading applied values.
     #[cfg(feature = "http")]
     pub(crate) async fn get_owned(
+        &self,
+        turn: &str,
+        recovery_cut: u64,
+        deadline: Duration,
+    ) -> Result<Option<TurnAnnotation>> {
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationPointRead,
+                self.get_owned_observed(turn, recovery_cut, deadline),
+            )
+            .await
+    }
+
+    #[cfg(feature = "http")]
+    async fn get_owned_observed(
         &self,
         turn: &str,
         recovery_cut: u64,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::materializer::observation::Phase;
 
 #[derive(Clone)]
 pub struct Owner {
@@ -100,7 +101,14 @@ impl Owner {
             .await
             .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
             .map_err(|_| Failure::bad("invalid_upload_size"))?;
-            let bytes = body::read_exact(request, length, options).await?;
+            let bytes = self
+                .service
+                .phase_counters()
+                .measure(
+                    Phase::AnnotationUploadRead,
+                    body::read_exact(request, length, options),
+                )
+                .await?;
             let prepared = self
                 .service
                 .prepare(upload, bytes, &producer, sequence)
