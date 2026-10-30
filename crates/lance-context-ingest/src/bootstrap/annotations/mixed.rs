@@ -18,17 +18,65 @@ pub async fn provision(
     identity: Identity,
     limits: Limits,
 ) -> Result<Storage> {
+    provision_mode(
+        client, layout, binding, narrow, body, identity, limits, None,
+    )
+    .await
+}
+
+/// Provision an independent physical table pair for one immutable WAL bucket.
+#[allow(clippy::too_many_arguments)] // Same bootstrap identities plus an explicit shard.
+pub async fn provision_shard(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    narrow: Storage,
+    body: Storage,
+    identity: Identity,
+    limits: Limits,
+    shard: crate::annotations::Shard,
+) -> Result<Storage> {
+    provision_mode(
+        client,
+        layout,
+        binding,
+        narrow,
+        body,
+        identity,
+        limits,
+        Some(shard),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn provision_mode(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    narrow: Storage,
+    body: Storage,
+    identity: Identity,
+    limits: Limits,
+    shard: Option<crate::annotations::Shard>,
+) -> Result<Storage> {
     ensure!(
-        layout.buckets.len() == 1,
-        "mixed bootstrap requires one shard"
+        shard.is_some() || layout.buckets.len() == 1,
+        "mixed bootstrap requires an explicit shard"
     );
+    let bucket = shard.map_or(0, |shard| shard.bucket);
+    let group = layout.group_for_bucket(bucket)?;
     let scope = Scope {
         cluster: layout.cluster,
         layout: layout.fingerprint()?,
         table: binding.table,
         destination: binding.destination.clone(),
         incarnation: binding.incarnation,
-        contract: Service::mixed_contract(&binding, &limits)?,
+        contract: if let Some(shard) = shard {
+            shard.contract(&binding, &limits, true)?
+        } else {
+            Service::mixed_contract(&binding, &limits)?
+        },
     };
     ensure!(
         client.identity() == (scope.cluster, scope.layout)
@@ -110,7 +158,7 @@ pub async fn provision(
     let Applied::Publisher(p::Reply::Acquired(authority)) = acquired else {
         bail!("mixed bootstrap acquisition rejected: {acquired:?}");
     };
-    let selected = create_pair(&narrow, &body, &scope, &identity, layout.buckets[0]).await?;
+    let selected = create_pair_for_shard(&narrow, &body, &scope, &identity, group, bucket).await?;
     let transaction = selected
         .read_transaction()
         .await?
@@ -152,12 +200,24 @@ pub async fn provision(
     Ok(narrow)
 }
 
+#[cfg(test)]
 pub(crate) async fn create_pair(
     narrow: &Storage,
     body: &Storage,
     scope: &Scope,
     identity: &Identity,
     group: u64,
+) -> Result<Dataset> {
+    create_pair_for_shard(narrow, body, scope, identity, group, 0).await
+}
+
+async fn create_pair_for_shard(
+    narrow: &Storage,
+    body: &Storage,
+    scope: &Scope,
+    identity: &Identity,
+    group: u64,
+    bucket: u32,
 ) -> Result<Dataset> {
     let marker = serde_json::to_string(&(scope, identity, &narrow.uri, &body.uri))?;
     let properties = HashMap::from([(GENESIS.to_owned(), marker.clone())]);
@@ -192,7 +252,7 @@ pub(crate) async fn create_pair(
             AnnotationScope {
                 table_instance: scope.incarnation.to_string(),
                 source_group: group,
-                shard: 0,
+                shard: bucket,
             },
             0u64,
         ))?,

@@ -21,9 +21,11 @@ mod accepted;
 pub(crate) mod checkpoint;
 pub mod mixed;
 pub mod runtime;
+mod shard;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
+pub use shard::Shard;
 pub use window::SourceObservation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +72,7 @@ struct Shared {
 #[derive(Clone)]
 pub struct Service {
     ingress: Ingress,
+    shard: Option<Shard>,
     limits: Limits,
     shared: Arc<Shared>,
     apply_budget: Arc<MergeMemoryBudget>,
@@ -115,6 +118,21 @@ pub async fn connect_ingress(
 }
 
 impl Service {
+    pub fn bucket(&self) -> u32 {
+        self.shard.map_or(0, |shard| shard.bucket)
+    }
+
+    fn group(&self) -> Result<u64> {
+        self.ingress.group(self.bucket())
+    }
+
+    fn validate_turn(&self, turn: &str) -> Result<()> {
+        if let Some(shard) = self.shard {
+            shard.validate_turn(&self.ingress.layout, &self.ingress.scope.contract, turn)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn capture_read_for_test(
         &self,
@@ -201,10 +219,20 @@ impl Service {
         budget: Arc<MergeMemoryBudget>,
         apply_budget: &Arc<MergeMemoryBudget>,
     ) -> Result<Ingress> {
-        Self::validated_ingress_mode(client, layout, binding, limits, budget, apply_budget, false)
-            .await
+        Self::validated_ingress_mode(
+            client,
+            layout,
+            binding,
+            limits,
+            budget,
+            apply_budget,
+            false,
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Explicit routing augments the existing owned connection.
     async fn validated_ingress_mode(
         client: Arc<Client>,
         layout: Arc<Layout>,
@@ -213,17 +241,25 @@ impl Service {
         budget: Arc<MergeMemoryBudget>,
         apply_budget: &Arc<MergeMemoryBudget>,
         mixed: bool,
+        shard: Option<Shard>,
     ) -> Result<Ingress> {
         ensure!(
-            layout.buckets.len() == 1,
-            "annotation service requires one shard"
+            shard.is_some() || layout.buckets.len() == 1,
+            "annotation service requires an explicit shard"
         );
-        let schema = if mixed {
+        if let Some(shard) = shard {
+            layout.group_for_bucket(shard.bucket)?;
+        }
+        let schema = if let Some(shard) = shard {
+            shard.wire_schema(limits, mixed)?
+        } else if mixed {
             mixed::wire::schema(limits)
         } else {
             wire::schema(limits)
         };
-        let contract = if mixed {
+        let contract = if let Some(shard) = shard {
+            shard.contract(&binding, limits, mixed)?
+        } else if mixed {
             Self::mixed_contract(&binding, limits)?
         } else {
             Self::contract(&binding, limits)?
@@ -256,7 +292,9 @@ impl Service {
         limits: Limits,
         apply_budget: Arc<MergeMemoryBudget>,
     ) -> Result<(Self, Driver)> {
-        let (base, snapshot) = checkpoint::open(&ingress, storage, body.as_ref()).await?;
+        let shard = Shard::from_ingress(&ingress)?;
+        let bucket = shard.map_or(0, |shard| shard.bucket);
+        let (base, snapshot) = checkpoint::open(&ingress, storage, body.as_ref(), bucket).await?;
         ensure!(
             body.is_some() == (ingress.scope.contract.policy == WritePolicy::TurnIngestion),
             "body storage differs from the ingestion contract"
@@ -269,8 +307,8 @@ impl Service {
             base,
             StagingScope {
                 table_instance: ingress.scope.incarnation.to_string(),
-                source_group: ingress.group(0)?,
-                shard: 0,
+                source_group: ingress.group(bucket)?,
+                shard: bucket,
             },
             through,
             limits.clone(),
@@ -284,6 +322,7 @@ impl Service {
         let window = window::Window::new(through, ingress.client.max_plan_source_bytes());
         let service = Self {
             ingress,
+            shard,
             limits,
             apply_budget,
             shared: Arc::new(Shared {
@@ -326,7 +365,7 @@ impl Service {
 
     pub async fn open_producer(&self, open: ProducerOpen) -> Result<Producer> {
         ensure!(
-            open.bucket == 0,
+            open.bucket == self.bucket(),
             "annotation producer belongs to another shard"
         );
         self.ingress.open_producer(open).await
@@ -361,7 +400,7 @@ impl Service {
         ensure!(
             *upload.scope == *self.ingress.scope
                 && *producer.scope == *self.ingress.scope
-                && producer.bucket() == 0
+                && producer.bucket() == self.bucket()
                 && sequence > 0
                 && sequence < u64::MAX
                 && upload.bytes == body.len(),
@@ -371,31 +410,35 @@ impl Service {
         let producer = producer.id();
         let value_bytes = self.limits.value_bytes;
         let mixed = self.ingress.scope.contract.policy == WritePolicy::TurnIngestion;
+        let shard = self.shard;
+        let layout = self.ingress.layout.clone();
+        let bucket = self.bucket();
         tokio::task::spawn_blocking(move || {
-            let rows = if mixed {
+            let decoded = if mixed {
                 mixed::wire::decode(
                     body.clone(),
                     schema,
                     upload.scope.contract.max_rows,
                     value_bytes,
                 )?
-                .rows()
             } else {
-                wire::decode(
+                mixed::Decoded::Patches(wire::decode(
                     body.clone(),
                     schema,
                     upload.scope.contract.max_rows,
                     value_bytes,
-                )?
-                .len()
-            } as u32;
+                )?)
+            };
+            decoded.validate_shard(shard, &layout, &upload.scope.contract)?;
+            let rows = decoded.rows() as u32;
+            drop(decoded);
             // Validation owns decoded patches only inside this blocking task.
             // Keep the existing encoded-body allowance through WAL submission
             // and applied visibility, but release the discarded decode workspace.
             let mut reservation = upload.reservation;
             reservation.shrink_to(body.len() * 3);
             Ok(PreparedAppend {
-                batch: Batch::new(upload.scope.table, 0, producer, sequence, body),
+                batch: Batch::new(upload.scope.table, bucket, producer, sequence, body),
                 rows,
                 scope: upload.scope,
                 _reservation: reservation,
@@ -420,6 +463,7 @@ impl Service {
     }
 
     pub async fn get(&self, turn: &str, deadline: Duration) -> Result<Option<TurnAnnotation>> {
+        self.validate_turn(turn)?;
         tokio::time::timeout(deadline, async {
             let through = self.barrier().await?;
             self.wait_through(through).await?;
@@ -439,6 +483,7 @@ impl Service {
         recovery_cut: u64,
         deadline: Duration,
     ) -> Result<Option<TurnAnnotation>> {
+        self.validate_turn(turn)?;
         tokio::time::timeout(deadline, async {
             self.wait_through(recovery_cut).await?;
             Ok(self.shared.staging.capture(turn).await?.resolve().await?)
@@ -450,7 +495,7 @@ impl Service {
     async fn barrier(&self) -> Result<u64> {
         let (cut, value) = reader::observe(
             &self.ingress,
-            self.ingress.group(0)?,
+            self.group()?,
             query::Query::SourceClosure {
                 table: self.ingress.scope.table,
             },
@@ -464,7 +509,7 @@ impl Service {
             ensure!(
                 closure.table == self.ingress.scope.table
                     && closure.incarnation == self.ingress.scope.incarnation
-                    && closure.group == self.ingress.group(0)?
+                    && closure.group == self.group()?
                     && closure.through <= self.shared.results.lock().unwrap().base.through,
                 "annotation view is behind source closure; reconnect to its durable checkpoint"
             );
@@ -548,10 +593,10 @@ impl Driver {
                         service.barrier().await?;
                         reader::observe(
                             ingress,
-                            ingress.group(0)?,
+                            service.group()?,
                             query::Query::AcceptedBucket {
                                 table: ingress.scope.table,
-                                bucket: 0,
+                                bucket: service.bucket(),
                                 after,
                                 limit: 32,
                             },
@@ -589,7 +634,7 @@ impl Driver {
                     index > after
                         && index <= page.through
                         && meta.stream == ingress.scope.table
-                        && meta.bucket == 0
+                        && meta.bucket == service.bucket()
                         && meta.kind == RecordKind::Data,
                     "foreign annotation source"
                 );
@@ -614,7 +659,7 @@ impl Driver {
                         .send_modify(|p| p.backpressured = true);
                     return Ok(());
                 };
-                let group = ingress.group(0)?;
+                let group = service.group()?;
                 let response = service
                     .shared
                     .phases
@@ -637,6 +682,9 @@ impl Driver {
                 let max_rows = ingress.scope.contract.max_rows;
                 let value_bytes = service.limits.value_bytes;
                 let mixed = ingress.scope.contract.policy == WritePolicy::TurnIngestion;
+                let shard = service.shard;
+                let layout = ingress.layout.clone();
+                let scope = ingress.scope.clone();
                 self.pending = Some(
                     service
                         .shared
@@ -658,6 +706,7 @@ impl Driver {
                                         value_bytes,
                                     )?)
                                 };
+                                decoded.validate_shard(shard, &layout, &scope.contract)?;
                                 Ok(Pending {
                                     index,
                                     meta,

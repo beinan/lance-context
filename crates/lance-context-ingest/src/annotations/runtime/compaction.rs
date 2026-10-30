@@ -22,7 +22,7 @@ impl Publisher {
                 || view
                     .progress
                     .checkpoint
-                    .get(&self.service.ingress.group(0)?)
+                    .get(&self.service.group()?)
                     .copied()
                     .unwrap_or(0)
                     == 0
@@ -56,7 +56,7 @@ impl Publisher {
                     transaction: Uuid::new_v4(),
                     read_version: view.progress.minimum_read_version,
                     sources: BTreeMap::new(),
-                    next_group: self.service.ingress.group(0)?,
+                    next_group: self.service.group()?,
                 })
             } else {
                 self.catalog.maintenance_plan(view).await?

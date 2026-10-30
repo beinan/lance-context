@@ -92,6 +92,7 @@ impl Runtime {
             None,
             configuration,
             acquisition,
+            None,
         )
         .await
     }
@@ -115,10 +116,38 @@ impl Runtime {
             Some(body),
             configuration,
             acquisition,
+            None,
         )
         .await
     }
 
+    /// Own one explicitly bound bucket and its independent body/narrow tables.
+    /// A physical binding cannot be reused for a different bucket after restart.
+    #[allow(clippy::too_many_arguments)] // The shard augments the existing mixed connection.
+    pub async fn connect_mixed_shard(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        storage: Storage,
+        body: Storage,
+        configuration: Configuration,
+        acquisition: materializer::Acquisition,
+        shard: Shard,
+    ) -> Result<(Service, Self)> {
+        Self::connect_mode(
+            client,
+            layout,
+            binding,
+            storage,
+            Some(body),
+            configuration,
+            acquisition,
+            Some(shard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Explicit routing augments the existing owned connection.
     async fn connect_mode(
         client: Arc<Client>,
         layout: Arc<Layout>,
@@ -127,6 +156,7 @@ impl Runtime {
         body: Option<Storage>,
         configuration: Configuration,
         acquisition: materializer::Acquisition,
+        shard: Option<Shard>,
     ) -> Result<(Service, Self)> {
         let c = configuration;
         ensure!(
@@ -158,6 +188,7 @@ impl Runtime {
             c.upload_budget.clone(),
             &c.apply_budget,
             body.is_some(),
+            shard,
         )
         .await?;
         let connect = || {
@@ -224,7 +255,7 @@ impl Runtime {
         {
             let selection = publisher.selection(pending);
             let (_, through) = selection.scope()?;
-            let range = &pending.plan.sources[&service.ingress.group(0)?];
+            let range = &pending.plan.sources[&service.group()?];
             ensure!(
                 range.after == service.source_observation().after
                     && range.records.len() <= c.publication.max_records
@@ -324,7 +355,7 @@ impl Publisher {
                 .await?
                 .context("retained plan has no application checkpoint")?;
             ensure!(
-                frozen.sources() == &pending.plan.sources[&self.service.ingress.group(0)?],
+                frozen.sources() == &pending.plan.sources[&self.service.group()?],
                 "replayed annotation prefix differs from its retained plan"
             );
             frozen
@@ -350,7 +381,7 @@ impl Publisher {
                 .freeze(Uuid::new_v4())
                 .await?
                 .context("nonempty annotation source window has no checkpoint")?;
-            let group = self.service.ingress.group(0)?;
+            let group = self.service.group()?;
             let plan = p::Plan {
                 transaction: Uuid::parse_str(frozen.identity())?,
                 // A handoff can start above version one. The progress value is
