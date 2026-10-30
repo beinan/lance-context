@@ -47,6 +47,14 @@ struct ProducerClaims {
 }
 
 impl ReceiptKeys {
+    /// An authenticated routing hint inside the already authorized logical
+    /// table. The owner still restores and validates the complete credential.
+    #[cfg(feature = "service")]
+    pub(crate) fn producer_route(&self, token: &str) -> Result<([u8; 32], u32)> {
+        let claims: ProducerClaims = self.verify(PRODUCER_DOMAIN, token)?;
+        Ok((claims.scope, claims.open.bucket))
+    }
+
     pub fn new(active: u32, keys: impl IntoIterator<Item = (u32, [u8; 32])>) -> Result<Self> {
         let mut configured = BTreeMap::new();
         for (id, key) in keys {

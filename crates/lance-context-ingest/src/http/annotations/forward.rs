@@ -4,10 +4,13 @@ use futures::stream;
 use http_body_util::BodyExt;
 use tokio::time::{timeout_at, Instant};
 
+mod routes;
+use routes::Routes;
+
 #[derive(Clone)]
 pub struct Forwarder {
     gate: Gateway,
-    routes: Arc<BTreeMap<String, reqwest::Url>>,
+    routes: Arc<BTreeMap<String, Routes>>,
     client: reqwest::Client,
     token: Arc<String>,
 }
@@ -21,18 +24,22 @@ impl Forwarder {
         token: String,
     ) -> Result<Self> {
         ensure!(
+            !tables.is_empty() && tables.len() <= 4096,
+            "invalid annotation route count"
+        );
+        ensure!(
             (32..=1024).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic()),
             "invalid annotation owner workload token"
         );
-        let mut routes = BTreeMap::new();
+        let mut routes = BTreeMap::<String, Routes>::new();
         let mut ingresses = BTreeMap::new();
         for (ingress, address) in tables {
             ensure!(
                 matches!(
                     ingress.scope.contract.policy,
                     WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
-                ) && ingress.layout.buckets.len() == 1,
-                "annotation route requires a single-shard annotation binding"
+                ),
+                "annotation route requires an annotation binding"
             );
             let reply = reply_limit(&ingress)?;
             let required = reply
@@ -54,11 +61,15 @@ impl Forwarder {
                 "invalid annotation owner address"
             );
             let name = ingress.scope.contract.qualified_table.clone();
-            ensure!(
-                routes.insert(name.clone(), url).is_none(),
-                "duplicate annotation route"
-            );
-            ingresses.insert(name, ingress);
+            if let Some(existing) = routes.get_mut(&name) {
+                existing.insert(ingress, url)?;
+            } else {
+                ingresses.insert(name.clone(), ingress.clone());
+                routes.insert(name, Routes::new(ingress, url)?);
+            }
+        }
+        for route in routes.values() {
+            route.validate()?;
         }
         let client = reqwest::Client::builder()
             // An owner can reject before consuming a streamed upload. HTTP/2
@@ -140,7 +151,10 @@ impl Forwarder {
         )
         .await
         .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?;
-        let mut url = self.routes[table].clone();
+        let deadline = Instant::now() + options.body_total_timeout;
+        let (request, mut url) = self.routes[table]
+            .select(request, operation, length, &self.gate.0.keys, options)
+            .await?;
         url.path_segments_mut()
             .map_err(|_| Failure::bad("invalid_owner_route"))?
             .extend(["api", "v1", "annotations", table, operation.suffix()]);
@@ -149,7 +163,8 @@ impl Forwarder {
             .post(url)
             .bearer_auth(self.token.as_str())
             .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, length);
+            .header(header::CONTENT_LENGTH, length)
+            .timeout(deadline.saturating_duration_since(Instant::now()));
         if matches!(operation, Operation::Update) {
             // Forward these credentials unchanged. The owner validates them.
             for name in [PRODUCER, SEQUENCE] {
@@ -159,7 +174,6 @@ impl Forwarder {
                 outgoing = outgoing.header(name, request.headers()[name].clone());
             }
         }
-        let deadline = Instant::now() + options.body_total_timeout;
         let idle = options.body_idle_timeout;
         let frames = stream::try_unfold(
             (request.into_body(), length),

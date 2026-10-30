@@ -28,6 +28,28 @@ pub async fn connect_ingress(
     .await
 }
 
+/// Resolve one configured physical shard without opening a Lance read view.
+pub async fn connect_shard_ingress(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    limits: &Limits,
+    budget: Arc<MergeMemoryBudget>,
+    shard: Shard,
+) -> Result<Ingress> {
+    layout.group_for_bucket(shard.bucket)?;
+    let contract = shard.contract(&binding, limits, true)?;
+    Ingress::connect_with_schema(
+        client,
+        layout,
+        binding,
+        budget,
+        contract,
+        shard.wire_schema(limits, true)?,
+    )
+    .await
+}
+
 pub(super) struct Created {
     pub turn: String,
     pub rollout_id: String,
