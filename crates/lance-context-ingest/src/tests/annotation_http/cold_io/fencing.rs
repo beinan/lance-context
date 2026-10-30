@@ -45,7 +45,15 @@ async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner()
     assert!(!pending.is_finished());
     // Keep the old runtime alive but unpolled from here. It cannot detect the
     // takeover and stop its applier on our behalf: the HTTP result must fence.
-    let (new_service, runtime) = annotation_runtime::owner(&c, &storage, &limits).await?;
+    // Independent owner processes have independent native metadata caches.
+    // Sharing the old Session would let its deliberately paused metadata GET
+    // stall the successor's read of the same file before it can apply a write.
+    let successor_storage = store::storage(
+        &root.path().join("turns.lance"),
+        Arc::new(store::Gates::default()),
+    )
+    .await?;
+    let (new_service, runtime) = annotation_runtime::owner(&c, &successor_storage, &limits).await?;
     let new_owner = Owner::new(&runtime, keys()?, options())?;
     let new_server = Server::start(new_owner.router(), None).await?;
     let (new_gateway, new_ingress) = frontend(&c, &limits, &new_server.uri()).await?;
@@ -71,7 +79,7 @@ async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner()
         annotations::MutationResult::Applied
     ));
     cold.release();
-    let in_flight = pending.await??;
+    let in_flight = pending.await?.context("in-flight predecessor point read")?;
     let in_flight_status = in_flight.status();
     let in_flight_body: serde_json::Value = in_flight.json().await?;
     // Another request begins only after the successor's write ACK. The old
@@ -83,7 +91,10 @@ async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner()
         .await?;
     let stale_status = stale.status();
     let stale_body: serde_json::Value = stale.json().await?;
-    let current = point(&client, &new_ingress).await?.unwrap();
+    let current = point(&client, &new_ingress)
+        .await
+        .context("successor point read")?
+        .unwrap();
     annotation_runtime::drained(&c, &new_service, reply.completion.index).await?;
 
     let _ = stop_old.send(());
