@@ -43,12 +43,15 @@ impl LogMaintenance {
             observed
                 .accounted_disk_bytes
                 .saturating_add(observed.reserved_proposal_bytes)
+                .saturating_add(observed.reserved_file_bytes)
                 .saturating_add(self.node.target_file_bytes.saturating_mul(2))
                 > observed.data_limit
         }) {
             // Native rewrite eligibility counts dead entries, not their bytes.
             // A few compacted large records can keep admission closed while
             // many tiny live metadata values suppress the normal heuristic.
+            // Pending image files share producer admission's disk charge even
+            // before their writes become measured retained bytes.
             // Reserve fresh headroom against the first pass's measured result;
             // never assume that two rewrites fit one reservation.
             self.run_pass(true)?;
