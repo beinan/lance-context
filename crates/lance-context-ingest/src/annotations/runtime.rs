@@ -37,6 +37,7 @@ struct Publisher {
     budget: Arc<MergeMemoryBudget>,
     batch_started: Option<tokio::time::Instant>,
     compaction_started: Option<tokio::time::Instant>,
+    compaction_checked_version: Option<u64>,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -182,6 +183,7 @@ impl Runtime {
             budget: c.publication_budget.clone(),
             batch_started: None,
             compaction_started: None,
+            compaction_checked_version: None,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;

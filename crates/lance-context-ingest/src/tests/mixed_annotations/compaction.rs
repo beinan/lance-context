@@ -7,6 +7,7 @@ mod narrow_metadata;
 mod reclamation;
 #[cfg(feature = "service")]
 mod recovery;
+mod unchanged;
 
 pub(in crate::tests) fn compact_binding() -> TableBinding {
     // Keep the existing 8 MiB budgets; reduce the admitted record bound so the
