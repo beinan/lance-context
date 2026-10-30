@@ -240,6 +240,30 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
         !submit.is_finished(),
         "quorum persistence alone must not return application success"
     );
+    // Let the submitting task receive its durable reply. The paused applier
+    // must leave only the apply wait in flight, not the append interval.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let phases = a.phase_observation();
+            let append = phases
+                .iter()
+                .find(|p| p.phase == "annotation_append")
+                .unwrap();
+            let apply = phases
+                .iter()
+                .find(|p| p.phase == "annotation_apply_wait")
+                .unwrap();
+            if apply.started == 1 {
+                assert_eq!(append.started, 1);
+                assert_eq!(append.completed, 1);
+                assert_eq!(append.failed + append.cancelled, 0);
+                assert_eq!(apply.completed + apply.failed + apply.cancelled, 0);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     assert!(
         b.get("T", Duration::from_millis(20)).await.is_err(),
         "lagging ingress must not serve its old base"
@@ -248,6 +272,14 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
     let (stop_b, task_b) = run(driver_b);
     let accepted = submit.await??;
     assert_eq!(accepted.result, MutationResult::Applied);
+    let phases = a.phase_observation();
+    let apply = phases
+        .iter()
+        .find(|p| p.phase == "annotation_apply_wait")
+        .unwrap();
+    assert_eq!(apply.started, 1);
+    assert_eq!(apply.completed, 1);
+    assert_eq!(apply.failed + apply.cancelled, 0);
     assert_eq!(
         b.get("T", Duration::from_secs(5))
             .await?
