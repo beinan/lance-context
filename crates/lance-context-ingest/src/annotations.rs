@@ -429,7 +429,7 @@ impl Service {
         .context("annotation read barrier deadline expired")?
     }
 
-    /// The HTTP owner fences both sides of this read. Its acquisition cut
+    /// The HTTP owner fences the result after this read. Its acquisition cut
     /// covers all predecessor writes; this owner's ACKs already await apply.
     /// A later unacknowledged proposal must not block reading applied values.
     #[cfg(feature = "http")]
