@@ -6,6 +6,7 @@ use lance_table::{
     format::{IndexMetadata, Manifest},
     io::commit::ManifestLocation,
 };
+use object_store::ObjectStoreExt;
 use std::{borrow::Cow, collections::BTreeSet};
 
 /// Native single-segment builds/merges write these two files. Leave unfamiliar
