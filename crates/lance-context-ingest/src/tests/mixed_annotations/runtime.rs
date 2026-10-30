@@ -38,6 +38,16 @@ async fn resume(stage: u8) -> Result<()> {
     check(&other, "A", "s", 1, "pending", None).await?;
     stop_other.send(()).unwrap();
     other_task.await??;
+    assert_eq!(
+        other
+            .phase_observation()
+            .iter()
+            .find(|p| p.phase == "annotation_fetch")
+            .unwrap()
+            .completed,
+        1,
+        "another service must fetch the original committed create"
+    );
     drop(other);
     let update = request(
         &a,
@@ -124,11 +134,12 @@ async fn resume(stage: u8) -> Result<()> {
     stop.send(()).unwrap();
     task.await??;
     // Two creates (including re-import), two patches and point reads above.
-    // Observe can poll idle/control progress; only the four data records are
-    // fetched/decoded/applied, and point reads do not perform that work again.
+    // Observe can poll idle/control progress. The submitting service shares
+    // all four uploads, still decodes/applies each exactly once, and point
+    // reads do not repeat that work. The separate service above fetches WAL.
     let phases = a.phase_observation();
     for (name, count) in [
-        ("annotation_fetch", 4),
+        ("annotation_fetch", 0),
         ("annotation_decode", 4),
         ("annotation_create", 2),
         ("annotation_patch", 2),
