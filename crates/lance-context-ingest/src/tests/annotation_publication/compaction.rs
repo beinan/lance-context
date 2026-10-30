@@ -7,6 +7,7 @@ use crate::{annotations::Service, tests::annotation_runtime as runtime};
 use fixture::*;
 use lance::index::DatasetIndexExt;
 
+mod batching;
 mod fixture;
 mod native_metadata;
 mod reclamation;
