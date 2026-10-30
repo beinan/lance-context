@@ -29,7 +29,7 @@ impl Publisher {
         // This is derived from the fixed base, including after a plan-only
         // restart; continuous imports must not starve either table's rewrite.
         if dataset.manifest().fragments.len() < base.manifest().fragments.len()
-            && materializer::compaction::has_work_on(&base, options).await?
+            && materializer::compaction::has_work(&self.catalog, version).await?
         {
             return Ok(None);
         }

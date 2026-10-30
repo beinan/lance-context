@@ -1,6 +1,7 @@
 use super::annotations::{producer, request, run};
 use super::*;
 mod compaction;
+mod id_index;
 #[cfg(feature = "service")]
 mod lost_prepare;
 mod pressure;

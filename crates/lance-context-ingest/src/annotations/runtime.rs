@@ -133,6 +133,11 @@ impl Runtime {
             c.publication.session_index.is_none() && !c.publication.pipeline_preparation,
             "annotation runtime does not support session indexing or remote preparation"
         );
+        ensure!(
+            c.publication.turn_id_index.is_none()
+                || c.limits.retained_entries <= materializer::turn_id_index::MAX_BUILD_ROWS,
+            "turn ID indexing requires at most 1048576 retained annotation entries"
+        );
         let workspace = c
             .limits
             .retained_bytes
@@ -195,6 +200,15 @@ impl Runtime {
             (service, driver) = connect().await?;
             publisher.service = service.clone();
             view = publisher.catalog.state().await?;
+        }
+        if c.publication.turn_id_index.is_some() {
+            let base = checkpoint::load(
+                &service.ingress,
+                &storage,
+                view.progress.minimum_read_version,
+            )
+            .await?;
+            materializer::TurnIdIndex::validate_base(&base)?;
         }
         driver = driver.with_publication_limits(
             c.publication.max_records,
