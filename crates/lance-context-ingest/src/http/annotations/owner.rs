@@ -135,7 +135,7 @@ impl Owner {
                     cluster: ingress.scope.cluster,
                     layout: ingress.scope.layout,
                     group: ingress
-                        .group(0)
+                        .group(self.service.bucket())
                         .map_err(|_| Failure::bad("invalid_shard"))?,
                     index: completion.index,
                 },

@@ -31,6 +31,7 @@ impl Service {
     }
 
     pub async fn get_turn(&self, turn: &str, deadline: Duration) -> Result<Option<Turn>> {
+        self.validate_turn(turn)?;
         ensure!(
             self.shared.body.is_some(),
             "full mixed reads require body storage"

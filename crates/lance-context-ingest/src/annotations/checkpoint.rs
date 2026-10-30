@@ -320,6 +320,7 @@ pub(super) async fn open(
     ingress: &Ingress,
     storage: &Storage,
     body: Option<&Storage>,
+    bucket: u32,
 ) -> Result<(Arc<Dataset>, Arc<Snapshot>)> {
     let query::Value::Publisher(Some(view)) = materializer::query(
         ingress,
@@ -357,7 +358,7 @@ pub(super) async fn open(
     let covered = view
         .progress
         .checkpoint
-        .get(&ingress.group(0)?)
+        .get(&ingress.group(bucket)?)
         .copied()
         .unwrap_or(0);
     let Some(cut) = cut else {
@@ -375,8 +376,8 @@ pub(super) async fn open(
         scope
             == (StagingScope {
                 table_instance: ingress.scope.incarnation.to_string(),
-                source_group: ingress.group(0)?,
-                shard: 0
+                source_group: ingress.group(bucket)?,
+                shard: bucket
             }),
         "foreign annotation application cut"
     );
