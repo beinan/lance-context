@@ -26,6 +26,7 @@ enum Request {
     Start {
         peers: BTreeMap<u64, SocketAddr>,
         images: BTreeMap<u64, SocketAddr>,
+        pipeline_replication: bool,
     },
     Checkpoint(u64),
     ImageStatus,
@@ -144,6 +145,7 @@ async fn tls_peer_process_fixture() -> Result<()> {
     let Request::Start {
         peers: addresses,
         images: image_addresses,
+        pipeline_replication,
     } = receive(&mut stream).await?
     else {
         anyhow::bail!("missing startup configuration");
@@ -156,7 +158,13 @@ async fn tls_peer_process_fixture() -> Result<()> {
         Limits::default(),
     )?
     .with_disk_budget(super::disk_options())?;
-    let (runtime, outbox) = Runtime::spawn(node, super::super::super::Options::default())?;
+    let (runtime, outbox) = Runtime::spawn(
+        node,
+        super::super::super::Options {
+            pipeline_replication,
+            ..Default::default()
+        },
+    )?;
     let handle = runtime.handle();
     let mut rpc_tls = (*server).clone();
     rpc_tls.alpn_protocols = vec![rpc::ALPN.to_vec()];
@@ -412,6 +420,7 @@ struct Processes {
     nodes: BTreeMap<u64, Process>,
     root: PathBuf,
     incarnation: u64,
+    pipeline_replication: bool,
 }
 impl Processes {
     fn start_all(&mut self) -> Result<()> {
@@ -439,7 +448,8 @@ impl Processes {
                 matches!(
                     node.call(Request::Start {
                         peers: addresses.clone(),
-                        images: images.clone()
+                        images: images.clone(),
+                        pipeline_replication: self.pipeline_replication,
                     })?,
                     Reply::Ready
                 ),
@@ -517,6 +527,15 @@ impl Processes {
 
 #[test]
 fn tls_process_leader_crash_full_restart_and_exact_retries_preserve_all_payloads() -> Result<()> {
+    leader_crash_full_restart(false)
+}
+
+#[test]
+fn pipelined_tls_process_leader_crash_full_restart_preserves_all_payloads() -> Result<()> {
+    leader_crash_full_restart(true)
+}
+
+fn leader_crash_full_restart(pipeline_replication: bool) -> Result<()> {
     let root = tempfile::tempdir()?.keep();
     eprintln!("TLS process qualification artifacts: {}", root.display());
     provision(&root)?;
@@ -524,6 +543,7 @@ fn tls_process_leader_crash_full_restart_and_exact_retries_preserve_all_payloads
         nodes: BTreeMap::new(),
         root: root.clone(),
         incarnation: 0,
+        pipeline_replication,
     };
     c.start_all()?;
     c.nodes.get_mut(&1).unwrap().call(Request::Campaign(10))?;
@@ -575,6 +595,15 @@ fn tls_process_leader_crash_full_restart_and_exact_retries_preserve_all_payloads
 #[test]
 fn tls_snapshot_process_kill_mid_file_preserves_payloads_after_rejoin_and_full_restart(
 ) -> Result<()> {
+    snapshot_process_kill_mid_file(false)
+}
+
+#[test]
+fn pipelined_tls_snapshot_process_kill_mid_file_preserves_payloads_after_restart() -> Result<()> {
+    snapshot_process_kill_mid_file(true)
+}
+
+fn snapshot_process_kill_mid_file(pipeline_replication: bool) -> Result<()> {
     let root = tempfile::tempdir()?.keep();
     eprintln!(
         "TLS snapshot process qualification artifacts: {}",
@@ -585,6 +614,7 @@ fn tls_snapshot_process_kill_mid_file_preserves_payloads_after_rejoin_and_full_r
         nodes: BTreeMap::new(),
         root: root.clone(),
         incarnation: 0,
+        pipeline_replication,
     };
     c.start_all()?;
     c.nodes.get_mut(&1).unwrap().call(Request::Campaign(10))?;
@@ -709,10 +739,11 @@ fn restart_follower(
         .map(|(&id, n)| (id, n.image_address))
         .collect();
     assert!(matches!(
-        c.nodes
-            .get_mut(&id)
-            .unwrap()
-            .call(Request::Start { peers, images })?,
+        c.nodes.get_mut(&id).unwrap().call(Request::Start {
+            peers,
+            images,
+            pipeline_replication: c.pipeline_replication,
+        })?,
         Reply::Ready
     ));
     Ok(())
@@ -720,12 +751,22 @@ fn restart_follower(
 
 #[test]
 fn client_rpc_survives_leader_sigkill_and_full_original_directory_restart() -> Result<()> {
+    client_rpc_leader_sigkill(false)
+}
+
+#[test]
+fn pipelined_client_rpc_survives_leader_sigkill_and_original_directory_restart() -> Result<()> {
+    client_rpc_leader_sigkill(true)
+}
+
+fn client_rpc_leader_sigkill(pipeline_replication: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     provision(directory.path())?;
     let mut processes = Processes {
         nodes: BTreeMap::new(),
         root: directory.path().to_owned(),
         incarnation: 0,
+        pipeline_replication,
     };
     processes.start_all()?;
     let executor = tokio::runtime::Builder::new_multi_thread()
