@@ -3,6 +3,7 @@ use super::*;
 use arrow_array::Array;
 use futures::TryStreamExt;
 
+mod fencing;
 mod store;
 mod upload_failure;
 mod wal_capacity;

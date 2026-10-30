@@ -77,10 +77,14 @@ impl Owner {
                 outcome: "not_submitted",
             });
         }
-        self.service
-            .check_owner(&self.authority)
-            .await
-            .map_err(|_| Failure::unavailable("annotation_owner_unavailable", "not_submitted"))?;
+        if operation.is_write() {
+            self.service
+                .check_owner(&self.authority)
+                .await
+                .map_err(|_| {
+                    Failure::unavailable("annotation_owner_unavailable", "not_submitted")
+                })?;
+        }
         let options = &self.gate.0.options;
         let response = if matches!(operation, Operation::Update) {
             let (producer, sequence) = producer(ingress, &self.gate.0.keys, &request)?;
@@ -216,6 +220,11 @@ impl Owner {
                 Operation::Update => unreachable!(),
             }
         };
+        // Reads need one quorum fence after resolving their captured view. A
+        // successor cannot restore this owner's epoch, so this rejects both
+        // an already stale owner and a takeover during storage IO. Checking
+        // before a read as well would add a redundant network round trip.
+        // Writes retain the earlier check before any mutation is submitted.
         self.service
             .check_owner(&self.authority)
             .await
