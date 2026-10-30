@@ -19,6 +19,7 @@ use tokio::sync::watch;
 
 mod accepted;
 pub(crate) mod checkpoint;
+mod local_payload;
 pub mod mixed;
 pub mod runtime;
 mod shard;
@@ -52,6 +53,7 @@ struct Progress {
 
 struct Shared {
     body: Option<Storage>,
+    local_payloads: local_payload::Registry,
     frames: Mutex<mixed::frames::Window>,
     #[cfg(test)]
     apply_attempts: std::sync::atomic::AtomicU64,
@@ -327,6 +329,7 @@ impl Service {
             apply_budget,
             shared: Arc::new(Shared {
                 body,
+                local_payloads: local_payload::Registry::default(),
                 frames: Mutex::new(mixed::frames::Window::default()),
                 staging,
                 results: Mutex::new(checkpoint::Results {
@@ -452,6 +455,18 @@ impl Service {
     /// sequence. A producer has at most one unresolved request; only its latest
     /// outcome is retained. Older identities are rejected, never re-executed.
     pub async fn submit(&self, prepared: &PreparedAppend, deadline: Duration) -> Result<Completed> {
+        ensure!(
+            *prepared.scope == *self.ingress.scope && prepared.meta().bucket == self.bucket(),
+            "prepared annotation belongs to another shard"
+        );
+        let producer_slot = slot(prepared.meta(), self.ingress.client.producer_slots())?;
+        // Share the upload only while its caller awaits apply. This registration
+        // proves neither acceptance nor ordering; the driver still observes both
+        // quorum barriers and reserves its workspace before using these bytes.
+        let _local = self
+            .shared
+            .local_payloads
+            .register(producer_slot, &prepared.batch);
         tokio::time::timeout(deadline, async {
             let accepted = self
                 .shared
@@ -653,7 +668,7 @@ impl Driver {
                         && meta.kind == RecordKind::Data,
                     "foreign annotation source"
                 );
-                slot(&meta, ingress.client.producer_slots())?;
+                let producer_slot = slot(&meta, ingress.client.producer_slots())?;
                 let bytes = usize::try_from(meta.body_bytes)?;
                 ensure!(
                     bytes <= ingress.scope.contract.max_record_bytes as usize,
@@ -674,23 +689,29 @@ impl Driver {
                         .send_modify(|p| p.backpressured = true);
                     return Ok(());
                 };
-                let group = service.group()?;
-                let response = service
-                    .shared
-                    .phases
-                    .measure(
-                        Phase::AnnotationFetch,
-                        ingress
-                            .client
-                            .request_routed(Request::Fetch { group, index }),
-                    )
-                    .await?;
-                ensure!(
-                    matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
-                    "committed annotation payload unavailable"
-                );
+                let body = match service.shared.local_payloads.body(producer_slot, &meta) {
+                    Some(body) => body,
+                    None => {
+                        let group = service.group()?;
+                        let response = service
+                            .shared
+                            .phases
+                            .measure(
+                                Phase::AnnotationFetch,
+                                ingress
+                                    .client
+                                    .request_routed(Request::Fetch { group, index }),
+                            )
+                            .await?;
+                        ensure!(
+                            matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
+                            "committed annotation payload unavailable"
+                        );
+                        response.body
+                    }
+                };
                 meta.check_body_length(
-                    response.body.len(),
+                    body.len(),
                     ingress.scope.contract.max_record_bytes as usize,
                 )?;
                 let schema = ingress.schema.clone();
@@ -707,15 +728,10 @@ impl Driver {
                         .measure(Phase::AnnotationDecode, async {
                             tokio::task::spawn_blocking(move || -> Result<Pending> {
                                 let decoded = if mixed {
-                                    mixed::wire::decode(
-                                        response.body,
-                                        schema,
-                                        max_rows,
-                                        value_bytes,
-                                    )?
+                                    mixed::wire::decode(body, schema, max_rows, value_bytes)?
                                 } else {
                                     mixed::Decoded::Patches(wire::decode(
-                                        response.body,
+                                        body,
                                         schema,
                                         max_rows,
                                         value_bytes,
