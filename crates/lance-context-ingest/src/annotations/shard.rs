@@ -40,7 +40,7 @@ impl Shard {
         } else {
             Service::contract(binding, limits)?
         };
-        contract.schema = arrow_schema_fingerprint(&self.wire_schema(limits, mixed)?)?;
+        contract.schema = arrow_schema_fingerprint(self.wire_schema(limits, mixed)?.as_ref())?;
         Ok(contract)
     }
 
