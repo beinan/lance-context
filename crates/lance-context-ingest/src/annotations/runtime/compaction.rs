@@ -2,7 +2,7 @@
 use super::*;
 
 impl Publisher {
-    async fn prefer_id_index(&self, version: u64) -> Result<bool> {
+    async fn prefer_id_index(&mut self, version: u64) -> Result<bool> {
         Ok(!materializer::Publisher::compaction_first(version)
             && materializer::turn_id_index::has_work(&self.catalog, version).await?)
     }
