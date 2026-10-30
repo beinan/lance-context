@@ -27,6 +27,20 @@ pub async fn provision(config: &Config) -> Result<()> {
             storage.session.clone(),
         )
         .await?;
+        if let Some(shard) = a.shard {
+            bootstrap::annotations::mixed::provision_shard(
+                config.client()?,
+                Arc::new(config.layout.clone()),
+                table.binding.clone(),
+                storage,
+                body,
+                table.bootstrap.clone(),
+                a.staging.clone(),
+                shard,
+            )
+            .await?;
+            return Ok(());
+        }
         bootstrap::annotations::mixed::provision(
             config.client()?,
             Arc::new(config.layout.clone()),
@@ -80,11 +94,53 @@ async fn connect(config: &Config) -> Result<Ingress> {
     let layout = Arc::new(config.layout.clone());
     let binding = config.tables[0].binding.clone();
     let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
-    if options.body.is_some() {
+    if let Some(shard) = options.shard {
+        annotations::mixed::connect_shard_ingress(
+            client,
+            layout,
+            binding,
+            &options.staging,
+            budget,
+            shard,
+        )
+        .await
+    } else if options.body.is_some() {
         annotations::mixed::connect_ingress(client, layout, binding, &options.staging, budget).await
     } else {
         annotations::connect_ingress(client, layout, binding, &options.staging, budget).await
     }
+}
+
+async fn connect_routes(config: &Config) -> Result<Vec<(Ingress, String)>> {
+    config.validate()?;
+    let a = config
+        .annotations
+        .as_ref()
+        .context("annotation configuration missing")?;
+    if a.routes.is_empty() {
+        ensure!(
+            config.layout.buckets.len() == 1,
+            "shared annotation ingress requires complete owner routes"
+        );
+        return Ok(vec![(connect(config).await?, a.owner_url.clone())]);
+    }
+    let client = config.client()?;
+    let layout = Arc::new(config.layout.clone());
+    let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
+    let mut routes = Vec::with_capacity(a.routes.len());
+    for route in &a.routes {
+        let ingress = annotations::mixed::connect_shard_ingress(
+            client.clone(),
+            layout.clone(),
+            route.binding.clone(),
+            &a.staging,
+            budget.clone(),
+            route.shard,
+        )
+        .await?;
+        routes.push((ingress, route.owner_url.clone()));
+    }
+    Ok(routes)
 }
 
 /// Ingress opens neither Lance nor a staging view, and never takes an owner lease.
@@ -93,7 +149,7 @@ pub async fn serve_ingress(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let ingress = connect(config).await?;
+    let routes = connect_routes(config).await?;
     let options = config
         .http
         .as_ref()
@@ -101,10 +157,7 @@ pub async fn serve_ingress(
     let auth = Arc::new(Authorization::load(&options.bearer_token_file)?);
     let token = config::read(&options.bearer_token_file, 4096)?;
     let gateway = Forwarder::new(
-        vec![(
-            ingress,
-            config.annotations.as_ref().unwrap().owner_url.clone(),
-        )],
+        routes,
         receipt_keys(options)?,
         options.options.clone(),
         std::str::from_utf8(&token)?.trim().to_owned(),
@@ -173,10 +226,17 @@ pub async fn serve_owner(
             };
         let (service, runtime) = if let Some(body) = &a.body {
             let body = Storage::resolve(body.uri.clone(), body.storage_options.clone(), storage.session.clone()).await?;
-            runtime::Runtime::connect_mixed(
-                ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
-                storage, body, configuration, acquisition,
-            ).await?
+            if let Some(shard) = a.shard {
+                runtime::Runtime::connect_mixed_shard(
+                    ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
+                    storage, body, configuration, acquisition, shard,
+                ).await?
+            } else {
+                runtime::Runtime::connect_mixed(
+                    ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
+                    storage, body, configuration, acquisition,
+                ).await?
+            }
         } else {
             runtime::Runtime::connect(
                 ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),

@@ -80,6 +80,8 @@ async fn frontend_with_settings(
         options: settings.http,
     });
     config.annotations = Some(config::Annotations {
+        shard: None,
+        routes: vec![],
         owner_url: uri.into(),
         apply_memory_bytes: 8 << 20,
         staging: settings.limits,

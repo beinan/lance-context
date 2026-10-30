@@ -1,5 +1,6 @@
 use super::*;
 use crate::tests::{annotation_shards::Physical, mixed_annotations as fixture};
+mod application;
 
 async fn routes(
     c: &network::Cluster,
@@ -74,13 +75,32 @@ async fn read(client: &reqwest::Client, server: &Server, turn: &str) -> Result<T
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sharded_forwarders_route_original_batches_and_points_across_owner_replacement(
 ) -> Result<()> {
+    exercise(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_shard_ingresses_and_bootstrap_preserve_routing_across_owner_replacement(
+) -> Result<()> {
+    exercise(true).await
+}
+
+async fn exercise(application_roles: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut definition = (*layout()).clone();
     definition.buckets = vec![10, 20];
     let layout = Arc::new(definition);
     let c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
-    let a = Physical::provision(&c, &layout, root.path(), 0).await?;
-    let b = Physical::provision(&c, &layout, root.path(), 1).await?;
+    let (a, b) = if application_roles {
+        (
+            application::provision(&c, root.path(), 0).await?,
+            application::provision(&c, root.path(), 1).await?,
+        )
+    } else {
+        (
+            Physical::provision(&c, &layout, root.path(), 0).await?,
+            Physical::provision(&c, &layout, root.path(), 1).await?,
+        )
+    };
     let ta = a.turn(&layout);
     let tb = b.turn(&layout);
     let (sa, ra) = a.owner(&c, &layout, Duration::from_secs(60)).await?;
@@ -116,8 +136,16 @@ async fn sharded_forwarders_route_original_batches_and_points_across_owner_repla
         options(),
         TOKEN.into(),
     )?;
-    let ingress_a = Server::start(ga.router(), None).await?;
-    let ingress_b = Server::start(gb.router(), None).await?;
+    let ingress_a = if application_roles {
+        application::frontend(&c, root.path(), &[(&a, &owner_a), (&b, &owner_b)]).await?
+    } else {
+        Server::start(ga.router(), None).await?
+    };
+    let ingress_b = if application_roles {
+        application::frontend(&c, root.path(), &[(&b, &owner_b), (&a, &owner_a)]).await?
+    } else {
+        Server::start(gb.router(), None).await?
+    };
     let client = reqwest::Client::builder()
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))

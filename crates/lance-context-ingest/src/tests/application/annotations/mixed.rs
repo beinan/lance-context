@@ -60,6 +60,8 @@ async fn exercise() -> Result<()> {
         },
     });
     config.annotations = Some(config::Annotations {
+        shard: None,
+        routes: vec![],
         owner_url: bases[0].clone(),
         apply_memory_bytes: 8 << 20,
         staging: fixture::limits(),
