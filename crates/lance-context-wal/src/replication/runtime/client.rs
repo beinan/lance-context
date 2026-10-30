@@ -441,11 +441,16 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
     (id, meta_len, body_len): (u64, usize, usize),
 ) -> Result<()> {
     // Reserve reply capacity too, before reading any variable-length allocation.
+    // Only Fetch can return a body, and it must have an empty request body.
+    // Nonempty bodies are accepted only for Append by the validation below;
+    // malformed Fetch requests cannot execute under an append-sized reservation.
+    let reply_body = if data && body_len == 0 {
+        handle.max_record
+    } else {
+        0
+    };
     let _credit = budgets
-        .reserve(
-            data,
-            2 * meta_len + body_len + 2 * MAX_META + if data { handle.max_record } else { 0 },
-        )
+        .reserve(data, 2 * meta_len + body_len + 2 * MAX_META + reply_body)
         .await?;
     let metadata = receive(io, meta_len).await?;
     let (request_scope, request): (Scope, WireRequest) = codec().deserialize(&metadata)?;

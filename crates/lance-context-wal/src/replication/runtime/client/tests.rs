@@ -6,6 +6,7 @@ use crate::replication::{
 };
 use tokio::time::sleep;
 
+mod admission;
 mod deadline;
 mod observation;
 mod reconnect;
