@@ -135,7 +135,14 @@ window limits starting more work, not the duration of a rewrite. While idle,
 compaction can continue draining small files. Its configured workspace must fit
 the publication budget. `TryBinaryCopy` may
 fall back to re-encoding bodies for multi-file column layouts; this is not a
-zero-copy guarantee. Session indexing and remote preparation remain unsupported.
+zero-copy guarantee. For inline columns in modern files without overlays,
+maintenance readers use the existing `max_record_bytes` as an approximate decoded
+batch byte target, allowing multiple small rows per batch. Legacy V1 files,
+native blob columns and overlays retain the single-row ceiling because byte-based
+output splitting does not bound their earlier read/materialization work. A byte
+target does not bound an oversized row or total engine RSS; the existing shared
+workspace admission still applies. Session indexing and remote preparation remain
+unsupported.
 
 Compaction recovery tests retain or SIGKILL the three local WAL replicas and
 annotation applier after the maintenance plan, prepared files, an unknown

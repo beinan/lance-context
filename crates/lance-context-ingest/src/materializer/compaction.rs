@@ -6,6 +6,7 @@ use lance::dataset::{
     transaction::{Operation, RewriteGroup},
 };
 use lance::index::DatasetIndexExt;
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{Fragment, IndexMetadata};
 use std::collections::BTreeSet;
 
@@ -104,22 +105,28 @@ async fn supported_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>>
     Ok(indices)
 }
 
-async fn read_compaction_base(publisher: &Publisher, version: u64) -> Result<Dataset> {
+pub(crate) async fn read_compaction_base(publisher: &Publisher, version: u64) -> Result<Dataset> {
     if matches!(
         publisher.ingress.scope.contract.policy,
         WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
     ) {
         // Annotation bases contain the original turn schema plus narrow columns;
         // they do not have the immutable rollout ingress's exact Arrow schema.
-        Ok(
-            (*crate::annotations::checkpoint::load(
-                &publisher.ingress,
-                &publisher.storage,
-                version,
-            )
-            .await?)
-                .clone(),
+        // This byte target belongs only to maintenance readers. The live read
+        // view and the existing publication workspace reservation are unchanged.
+        let mut read_params = lance::dataset::ReadParams::default();
+        read_params
+            .file_reader_options
+            .get_or_insert_with(Default::default)
+            .batch_size_bytes = Some(u64::from(publisher.ingress.scope.contract.max_record_bytes));
+        Ok((*crate::annotations::checkpoint::load_with_read_params(
+            &publisher.ingress,
+            &publisher.storage,
+            version,
+            read_params,
         )
+        .await?)
+            .clone())
     } else {
         publisher.read_dataset(Some(version)).await
     }
@@ -171,6 +178,17 @@ pub(super) async fn prepare(
         .try_fold(0usize, |n, f| n.checked_add(f.physical_rows?))
         .context("compaction row count overflow")?;
     let record_bytes = publisher.ingress.scope.contract.max_record_bytes as usize;
+    // V1, blob materialization and overlays may collect rows before byte-based
+    // output splitting. Keep the prior row ceiling for those paths and for
+    // non-annotation readers, which do not configure the byte target above.
+    let mut single_row = !matches!(
+        publisher.ingress.scope.contract.policy,
+        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+    ) || dataset.schema().fields_pre_order().any(|f| f.is_blob())
+        || fragments.iter().any(|f| !f.overlays.is_empty());
+    for file in fragments.iter().flat_map(|f| f.referenced_lance_files()) {
+        single_row |= file.file_version()? == ConcreteFileVersion::V1;
+    }
     let task = CompactionTask {
         task: TaskData { fragments },
         read_version: pending.plan.read_version,
@@ -178,7 +196,7 @@ pub(super) async fn prepare(
             target_rows_per_fragment: rows,
             max_bytes_per_file: Some(options.target_file_bytes),
             num_threads: Some(1),
-            batch_size: Some(1),
+            batch_size: single_row.then_some(1),
             io_buffer_size: Some(record_bytes as u64),
             compaction_mode: Some(CompactionMode::TryBinaryCopy),
             binary_copy_read_batch_bytes: Some(record_bytes),
