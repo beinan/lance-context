@@ -1,4 +1,5 @@
 mod mixed;
+mod shards;
 use super::*;
 use crate::{
     http::annotations::{MutationReply, PointRequest},
