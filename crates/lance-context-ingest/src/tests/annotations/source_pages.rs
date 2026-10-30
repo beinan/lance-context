@@ -40,6 +40,8 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
         budget.clone(),
     )
     .await?;
+    let (stale, mut stale_driver) = connect(&c, &storage, &limits).await?;
+    let stale_initial = stale.observation().await.0.applied;
     let producer = producer(&service, 1).await?;
     let mut indices = Vec::new();
     for sequence in 1..=67 {
@@ -107,6 +109,15 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
         .await?;
     annotation_publication::finish(&c).await?;
     drop((prepared, frozen));
+
+    // A successful metadata read cannot authorize advancing an obsolete base
+    // after its required source prefix has been retired. Check this even when
+    // the two quorum observations can finish in either order.
+    let error = stale_driver.step_for_test().await.unwrap_err();
+    assert!(format!("{error:#}").contains("view is behind source closure"));
+    assert_eq!(stale.observation().await.0.applied, stale_initial);
+    assert_eq!(completed(&stale, "annotation_fetch"), 0);
+    drop((stale_driver, stale));
 
     for (offset, index) in indices.iter().enumerate().skip(2) {
         if offset == 32 {
