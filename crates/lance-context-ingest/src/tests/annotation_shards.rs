@@ -14,15 +14,15 @@ use crate::{
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
-struct Physical {
-    shard: Shard,
-    binding: TableBinding,
-    narrow: Storage,
-    body: Storage,
+pub(super) struct Physical {
+    pub(super) shard: Shard,
+    pub(super) binding: TableBinding,
+    pub(super) narrow: Storage,
+    pub(super) body: Storage,
 }
 
 impl Physical {
-    async fn provision(
+    pub(super) async fn provision(
         c: &network::Cluster,
         layout: &Arc<Layout>,
         root: &std::path::Path,
@@ -78,7 +78,7 @@ impl Physical {
         Ok(view)
     }
 
-    async fn owner(
+    pub(super) async fn owner(
         &self,
         c: &network::Cluster,
         layout: &Arc<Layout>,
@@ -123,14 +123,14 @@ impl Physical {
         .await
     }
 
-    fn turn(&self, layout: &Layout) -> String {
+    pub(super) fn turn(&self, layout: &Layout) -> String {
         (0..1000)
             .map(|i| format!("turn-{i}"))
             .find(|id| Shard::for_turn(layout, &self.binding, id).unwrap() == self.shard)
             .unwrap()
     }
 
-    fn encode(&self, batch: RecordBatch) -> Result<Bytes> {
+    pub(super) fn encode(&self, batch: RecordBatch) -> Result<Bytes> {
         let bound = self.shard.bind_batch(&batch)?;
         for (old, new) in batch.columns().iter().zip(bound.columns()) {
             assert!(
@@ -141,14 +141,19 @@ impl Physical {
         fixture::encoded(bound)
     }
 
-    fn patch(&self, id: &str, status: Option<&str>, score: Option<f32>) -> Result<Bytes> {
+    pub(super) fn patch(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        score: Option<f32>,
+    ) -> Result<Bytes> {
         self.encode(mixed::wire::patches(
             &fixture::patch(&[id], status, score)?,
             &fixture::limits(),
         )?)
     }
 
-    async fn drained(
+    pub(super) async fn drained(
         &self,
         c: &network::Cluster,
         layout: &Layout,

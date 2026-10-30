@@ -77,7 +77,7 @@ impl Shard {
         )))
     }
 
-    pub(super) fn from_ingress(ingress: &Ingress) -> Result<Option<Self>> {
+    pub(crate) fn from_ingress(ingress: &Ingress) -> Result<Option<Self>> {
         let Some(value) = ingress.schema.metadata().get(KEY) else {
             ensure!(
                 ingress.layout.buckets.len() == 1,
@@ -92,6 +92,15 @@ impl Shard {
         );
         ingress.group(bucket)?;
         Ok(Some(Self { bucket }))
+    }
+
+    #[cfg(feature = "service")]
+    pub(crate) fn same_wire_family(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -> bool {
+        a.fields() == b.fields()
+            && a.metadata().len() == b.metadata().len()
+            && a.metadata()
+                .iter()
+                .all(|(key, value)| key == KEY || b.metadata().get(key) == Some(value))
     }
 
     pub(super) fn validate_turn(

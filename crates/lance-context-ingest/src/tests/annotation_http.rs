@@ -19,6 +19,7 @@ mod cold_io;
 mod mixed;
 mod pressure;
 mod read_cut;
+mod shards;
 mod transport;
 
 struct Server {
