@@ -4,7 +4,10 @@
 //! `runtime` composes the applier with continuous publication and recovery. The
 //! application still supplies scheduling ownership and ingress routing.
 use super::*;
-use crate::{materializer::Storage, reader};
+use crate::{
+    materializer::{observation::Phase, Storage},
+    reader,
+};
 use lance::dataset::builder::DatasetBuilder;
 use lance_context_api::annotation::TurnAnnotation;
 use lance_context_core::annotation_staging::{
@@ -523,18 +526,24 @@ impl Driver {
             return Ok(());
         }
         if self.pending.is_none() {
-            service.barrier().await?;
-            let (_, value) = reader::observe(
-                ingress,
-                ingress.group(0)?,
-                query::Query::AcceptedBucket {
-                    table: ingress.scope.table,
-                    bucket: 0,
-                    after,
-                    limit: 1,
-                },
-            )
-            .await?;
+            let (_, value) = service
+                .shared
+                .phases
+                .measure(Phase::AnnotationObserve, async {
+                    service.barrier().await?;
+                    reader::observe(
+                        ingress,
+                        ingress.group(0)?,
+                        query::Query::AcceptedBucket {
+                            table: ingress.scope.table,
+                            bucket: 0,
+                            after,
+                            limit: 1,
+                        },
+                    )
+                    .await
+                })
+                .await?;
             let query::Value::Accepted(mut page) = value else {
                 bail!("annotation source page unavailable");
             };
@@ -574,9 +583,15 @@ impl Driver {
                     return Ok(());
                 };
                 let group = ingress.group(0)?;
-                let response = ingress
-                    .client
-                    .request_routed(Request::Fetch { group, index })
+                let response = service
+                    .shared
+                    .phases
+                    .measure(
+                        Phase::AnnotationFetch,
+                        ingress
+                            .client
+                            .request_routed(Request::Fetch { group, index }),
+                    )
                     .await?;
                 ensure!(
                     matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
@@ -591,25 +606,36 @@ impl Driver {
                 let value_bytes = service.limits.value_bytes;
                 let mixed = ingress.scope.contract.policy == WritePolicy::TurnIngestion;
                 self.pending = Some(
-                    tokio::task::spawn_blocking(move || -> Result<Pending> {
-                        let decoded = if mixed {
-                            mixed::wire::decode(response.body, schema, max_rows, value_bytes)?
-                        } else {
-                            mixed::Decoded::Patches(wire::decode(
-                                response.body,
-                                schema,
-                                max_rows,
-                                value_bytes,
-                            )?)
-                        };
-                        Ok(Pending {
-                            index,
-                            meta,
-                            decoded,
-                            _reservation: reservation,
+                    service
+                        .shared
+                        .phases
+                        .measure(Phase::AnnotationDecode, async {
+                            tokio::task::spawn_blocking(move || -> Result<Pending> {
+                                let decoded = if mixed {
+                                    mixed::wire::decode(
+                                        response.body,
+                                        schema,
+                                        max_rows,
+                                        value_bytes,
+                                    )?
+                                } else {
+                                    mixed::Decoded::Patches(wire::decode(
+                                        response.body,
+                                        schema,
+                                        max_rows,
+                                        value_bytes,
+                                    )?)
+                                };
+                                Ok(Pending {
+                                    index,
+                                    meta,
+                                    decoded,
+                                    _reservation: reservation,
+                                })
+                            })
+                            .await?
                         })
-                    })
-                    .await??,
+                        .await?,
                 );
             } else {
                 if page.through > after {
@@ -669,8 +695,14 @@ impl Driver {
                     .collect::<Vec<_>>();
                 service
                     .shared
-                    .staging
-                    .apply_committed(after, pending.index, &mutations)
+                    .phases
+                    .measure(
+                        Phase::AnnotationPatch,
+                        service
+                            .shared
+                            .staging
+                            .apply_committed(after, pending.index, &mutations),
+                    )
                     .await?
             }
             mixed::Decoded::Creates { rows, .. } => {
@@ -684,8 +716,15 @@ impl Driver {
                     .collect::<Vec<_>>();
                 service
                     .shared
-                    .staging
-                    .register_committed(after, pending.index, &registrations)
+                    .phases
+                    .measure(
+                        Phase::AnnotationCreate,
+                        service.shared.staging.register_committed(
+                            after,
+                            pending.index,
+                            &registrations,
+                        ),
+                    )
                     .await?
             }
         };

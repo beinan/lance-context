@@ -27,8 +27,13 @@ pub enum Phase {
     CollectList,
     CollectProtect,
     CollectDelete,
+    AnnotationObserve,
+    AnnotationFetch,
+    AnnotationDecode,
+    AnnotationCreate,
+    AnnotationPatch,
 }
-const NAMES: [&str; 15] = [
+const NAMES: [&str; 20] = [
     "claim",
     "acquire",
     "state",
@@ -44,6 +49,11 @@ const NAMES: [&str; 15] = [
     "collect_list",
     "collect_protect",
     "collect_delete",
+    "annotation_observe",
+    "annotation_fetch",
+    "annotation_decode",
+    "annotation_create",
+    "annotation_patch",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

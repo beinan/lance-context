@@ -37,3 +37,22 @@ the enclosing preparation future.
 
 This instrumentation is for locating waits and expensive phases. It is not a
 throughput improvement and provides no proof of a disk, CPU, or network ceiling.
+
+The annotation owner also reports five apply-path phases. `annotation_observe`
+includes its quorum barrier and accepted-source query, including idle/control
+polls. `annotation_fetch` times retrieval of one committed record. Unlike the
+materializer's `decode_validate`, `annotation_decode` includes blocking-pool
+queueing as well as IPC decoding and validation. `annotation_create` and
+`annotation_patch` cover the respective staging operations after acquiring the
+owner's ordered gate, including any cold Lance lookup and staging admission.
+They count attempts: an ordinary backpressure or business rejection result is
+not a returned error and does not mean a write was acknowledged. A retained
+decoded request can make multiple apply attempts without another fetch/decode.
+The decode interval follows the awaited blocking task; shutdown can cancel that
+interval while already-started blocking work finishes independently.
+
+These owner phases do not measure ingress-side append/quorum durability latency,
+time waiting for the owner's ordered gate, or end-to-end ACK queueing. They can
+overlap the publisher's phases. Compare their counts and elapsed deltas with the
+client's create/patch ACK timing; do not treat phase sums as a latency percentile
+or interpret an absent phase sample as zero I/O cost.
