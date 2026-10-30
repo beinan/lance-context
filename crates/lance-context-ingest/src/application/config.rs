@@ -86,6 +86,12 @@ pub struct Http {
 pub struct Annotations {
     /// Stable deployment-authorized service address; never supplied by a client.
     pub owner_url: String,
+    /// Explicit physical bucket for this table. Only fresh mixed bindings opt in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<crate::annotations::Shard>,
+    /// Complete authorized owner map for a shared ingress. Owners may omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<AnnotationRoute>,
     pub apply_memory_bytes: usize,
     #[serde(default)]
     pub staging: lance_context_core::annotation_staging::Limits,
@@ -106,6 +112,71 @@ pub struct Annotations {
     /// URI reuse are outside this contract. Forwarders never run collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusive_reclamation: Option<crate::annotations::runtime::reclamation::Options>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnnotationRoute {
+    pub binding: TableBinding,
+    pub shard: crate::annotations::Shard,
+    pub owner_url: String,
+}
+
+impl Annotations {
+    fn validate_shards(&self, layout: &Layout, local: &TableBinding) -> Result<()> {
+        let Some(shard) = self.shard else {
+            ensure!(
+                layout.buckets.len() == 1 && self.routes.is_empty(),
+                "legacy annotation configuration requires one shard"
+            );
+            return Ok(());
+        };
+        layout.group_for_bucket(shard.bucket)?;
+        ensure!(
+            self.body.is_some(),
+            "explicit annotation shards require mixed body storage"
+        );
+        if self.routes.is_empty() {
+            return Ok(());
+        }
+        ensure!(
+            self.routes.len() <= 4096 && self.routes.len() == layout.buckets.len(),
+            "incomplete annotation owner routes"
+        );
+        let contract = local.contract()?;
+        let (mut buckets, mut tables, mut destinations) =
+            (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut includes_local = false;
+        for route in &self.routes {
+            layout.group_for_bucket(route.shard.bucket)?;
+            ensure!(
+                route.binding.contract()? == contract
+                    && !route.binding.table.is_nil()
+                    && !route.binding.incarnation.is_nil()
+                    && !route.owner_url.is_empty()
+                    && route.owner_url.len() <= 8192
+                    && buckets.insert(route.shard.bucket)
+                    && tables.insert(route.binding.table)
+                    && destinations.insert((
+                        &route.binding.destination.namespace,
+                        &route.binding.destination.dataset
+                    )),
+                "inconsistent or duplicate annotation owner route"
+            );
+            if route.shard == shard {
+                ensure!(
+                    route.binding.table == local.table
+                        && route.binding.incarnation == local.incarnation
+                        && route.binding.destination == local.destination
+                        && route.owner_url == self.owner_url,
+                    "local annotation route differs from its physical binding"
+                );
+                includes_local = true;
+            }
+        }
+        ensure!(includes_local, "local annotation route missing");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -218,9 +289,10 @@ impl Config {
         );
         if let Some(a) = &self.annotations {
             ensure!(
-                self.tables.len() == 1 && self.layout.buckets.len() == 1,
-                "annotation application requires exactly one table and one shard"
+                self.tables.len() == 1,
+                "annotation application requires exactly one local physical table"
             );
+            a.validate_shards(&self.layout, &self.tables[0].binding)?;
             ensure!(
                 a.apply_memory_bytes > 0
                     && !a.owner_url.is_empty()

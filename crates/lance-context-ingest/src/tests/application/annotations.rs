@@ -1,4 +1,5 @@
 mod mixed;
+mod shards;
 use super::*;
 use crate::{
     http::annotations::{MutationReply, PointRequest},
@@ -163,6 +164,8 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         },
     });
     config.annotations = Some(config::Annotations {
+        shard: None,
+        routes: vec![],
         owner_url: bases[0].clone(),
         apply_memory_bytes: 8 << 20,
         staging: limits.clone(),
