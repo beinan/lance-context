@@ -48,7 +48,7 @@ async fn partial_appends_share_data_credit_without_reserving_fetch_bodies() -> R
     let handle = c.net.nodes[&leader].handle.clone();
     let budgets = Arc::new(Budgets::new(&Options::default()));
     let available = budgets.data.available_permits();
-    let before = handle.append_observation()["started"].clone();
+    let before = handle.append_observation()["started"];
     let original = Batch::new(
         batch(1).meta.stream,
         0,
@@ -94,7 +94,7 @@ async fn partial_appends_share_data_credit_without_reserving_fetch_bodies() -> R
     })
     .await;
     let held = budgets.data.available_permits();
-    let submitted = handle.append_observation()["started"].clone();
+    let submitted = handle.append_observation()["started"];
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     let released = budgets.data.available_permits();
