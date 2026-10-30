@@ -127,7 +127,14 @@ async fn indexed_load() -> Result<()> {
     // not merely that the final reader happens to find every ID.
     let state = annotation_publication::state(&c).await?;
     let mut merges = 0;
-    for version in state.manifests.as_ref().unwrap().versions.keys() {
+    let manifests = state.manifests.as_ref().unwrap();
+    // Bootstrap identity is retained in the catalog even after its data view
+    // is retired. Only subsequent retained versions are readable here.
+    for version in manifests
+        .versions
+        .keys()
+        .filter(|v| **v != manifests.initial_version)
+    {
         let selected = annotation_publication::read(&c, &narrow, Some(*version)).await?;
         if let Some(transaction) = selected.read_transaction().await? {
             if let Operation::CreateIndex {
