@@ -1,12 +1,23 @@
 use super::*;
 use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
+mod reclamation;
 
 async fn indexed_owner(
     c: &network::Cluster,
     narrow: &Storage,
     body: &Storage,
     compact: bool,
+) -> Result<(Service, service::runtime::Runtime)> {
+    indexed_owner_with_history(c, narrow, body, compact, 64).await
+}
+
+async fn indexed_owner_with_history(
+    c: &network::Cluster,
+    narrow: &Storage,
+    body: &Storage,
+    compact: bool,
+    history: usize,
 ) -> Result<(Service, service::runtime::Runtime)> {
     let state = annotation_publication::state(c).await?;
     service::runtime::Runtime::connect_mixed(
@@ -25,7 +36,7 @@ async fn indexed_owner(
                 min_source_bytes: 1 << 20,
                 max_records: 4,
                 max_batch_wait: Duration::from_millis(20),
-                retained_manifest_versions: 64,
+                retained_manifest_versions: history,
                 turn_id_index: Some(crate::materializer::TurnIdIndex { min_rows: 1 }),
                 compaction: compact.then_some(crate::materializer::SmallFileCompaction {
                     target_file_bytes: 64 << 10,

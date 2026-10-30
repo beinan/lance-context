@@ -347,8 +347,9 @@ async fn recover_inner(
             drop(before);
         }
         // The 8 MiB preparation fixture cannot also admit a complete retained
-        // manifest plus the collection page. Keep this refusal as a tested
-        // boundary. Independent publication may already have covered the suffix;
+        // manifest/index roots plus the collection page. Either root can hit
+        // the budget first, depending on listing/publication progress. Keep
+        // this refusal as a tested boundary. Publication may cover the suffix;
         // only an uncovered update still requires its original source record.
         let (small, runtime) = owner(&c, &storage, &limits).await?;
         let error = tokio::time::timeout(
@@ -358,8 +359,11 @@ async fn recover_inner(
         .await?
         .unwrap_err();
         assert!(
-            format!("{error:#}")
-                .contains("annotation retained manifest exceeds collection workspace"),
+            matches!(
+                error.to_string().as_str(),
+                "annotation retained manifest exceeds collection workspace"
+                    | "retained index metadata exceeds collection workspace"
+            ),
             "{error:#}"
         );
         assert_eq!(small.reclamation_observation().deleted, 0);

@@ -8,6 +8,7 @@ use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::{path::Path, ObjectMeta};
 
 mod deletion;
+mod indices;
 #[cfg(test)]
 mod listing_tests;
 mod manifest_cache;
@@ -284,7 +285,12 @@ impl Collector {
                         examined += 1;
                         (meta.location, meta.size)
                     };
-                    if !candidate(&path, &destination.base, service.ingress.scope.incarnation) {
+                    // This owner builds ID indexes only in the narrow table.
+                    // Body index objects keep their existing retention behavior.
+                    if !candidate(&path, &destination.base, service.ingress.scope.incarnation)
+                        && !(body_storage.is_none()
+                            && indices::candidate(&path, &storage.base).is_some())
+                    {
                         continue;
                     }
                     // Charge string storage and map nodes conservatively. A deferred
@@ -335,6 +341,17 @@ impl Collector {
                             &storage.base,
                             true,
                         )?;
+                        indices::protect(
+                            &mut candidates,
+                            base.manifest(),
+                            base.manifest_location(),
+                            &storage.base,
+                            &object_store,
+                            &self.metadata,
+                            budget,
+                            page_charge,
+                        )
+                        .await?;
                     }
                 }
                 for record in manifests.versions.values() {
@@ -399,6 +416,31 @@ impl Collector {
                         &storage.base,
                         retain_data,
                     )?;
+                    if retain_data {
+                        let location = lance_table::io::commit::ManifestLocation {
+                            version: record.version,
+                            path: path.clone(),
+                            size: Some(record.object.bytes),
+                            naming_scheme: if record.object.v2_names {
+                                lance_table::io::commit::ManifestNamingScheme::V2
+                            } else {
+                                lance_table::io::commit::ManifestNamingScheme::V1
+                            },
+                            e_tag: None,
+                            identity: Some(record.identity.to_string()),
+                        };
+                        indices::protect(
+                            &mut candidates,
+                            &manifest,
+                            &location,
+                            &storage.base,
+                            &object_store,
+                            &self.metadata,
+                            budget,
+                            page_charge + charge,
+                        )
+                        .await?;
+                    }
                 }
                 Ok::<_, anyhow::Error>(())
             })

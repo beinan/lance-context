@@ -32,8 +32,14 @@ turn after a long operation; the window does not preempt a native build.
 
 Qualification must include real owner create/patch traffic, native build and
 merge transactions, compaction, exact request-result recovery and lost Prepare
-replies. Automatic collection of obsolete index files is still required: the
-current annotation collector excludes `_indices`. Long-running storage bounds,
-cloud throughput, cold-read cost, capped-segment growth at large shard sizes,
-and multi-shard scaling remain unproven. Keep the option disabled by default;
-this candidate alone does not close those tasks.
+replies. This candidate also extends the existing closed-page collector to
+`_indices/<uuid>/page_lookup.lance` and `page_data.lance` in the narrow table.
+It protects raw index UUIDs from retained manifests and locally held read views,
+including native versions hidden from query planning. Index-root decoding has
+separate manifest-size admission and shares the existing weighted session cache.
+Unfamiliar index layouts and body-table indexes keep their previous retention.
+No index candidate is classified during pending preparation/publication.
+
+Long-running storage bounds, cloud throughput, cold-read cost, capped-segment
+growth at large shard sizes, and multi-shard scaling remain unproven. Keep the
+option disabled by default; this candidate alone does not close those tasks.
