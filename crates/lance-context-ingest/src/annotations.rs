@@ -85,6 +85,7 @@ struct Pending {
 pub struct Driver {
     service: Service,
     pending: Option<Pending>,
+    source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
 }
 
@@ -308,6 +309,7 @@ impl Service {
         let driver = Driver {
             service: service.clone(),
             pending: None,
+            source_page: None,
             staging_pressure: None,
         };
         Ok((service, driver))
@@ -517,6 +519,11 @@ impl Driver {
         result
     }
 
+    #[cfg(test)]
+    pub(crate) async fn step_for_test(&mut self) -> Result<()> {
+        self.step().await
+    }
+
     async fn step(&mut self) -> Result<()> {
         let service = &self.service;
         let ingress = &service.ingress;
@@ -526,33 +533,58 @@ impl Driver {
             return Ok(());
         }
         if self.pending.is_none() {
-            let (_, value) = service
-                .shared
-                .phases
-                .measure(Phase::AnnotationObserve, async {
-                    service.barrier().await?;
-                    reader::observe(
-                        ingress,
-                        ingress.group(0)?,
-                        query::Query::AcceptedBucket {
-                            table: ingress.scope.table,
-                            bucket: 0,
-                            after,
-                            limit: 1,
-                        },
-                    )
-                    .await
-                })
-                .await?;
-            let query::Value::Accepted(mut page) = value else {
-                bail!("annotation source page unavailable");
-            };
-            if let Some(cut) = replay_cut {
-                page.through = page.through.min(cut);
-                page.entries.retain(|(index, _)| *index <= cut);
+            if self
+                .source_page
+                .as_ref()
+                .is_some_and(|page| page.entries.is_empty() && page.through == after)
+            {
+                self.source_page = None;
             }
-            ensure!(page.through >= after, "annotation source cursor regressed");
-            if let Some((index, meta)) = page.entries.into_iter().next() {
+            if self.source_page.is_none() {
+                let (cut, value) = service
+                    .shared
+                    .phases
+                    .measure(Phase::AnnotationObserve, async {
+                        service.barrier().await?;
+                        reader::observe(
+                            ingress,
+                            ingress.group(0)?,
+                            query::Query::AcceptedBucket {
+                                table: ingress.scope.table,
+                                bucket: 0,
+                                after,
+                                limit: 32,
+                            },
+                        )
+                        .await
+                    })
+                    .await?;
+                let query::Value::Accepted(mut page) = value else {
+                    bail!("annotation source page unavailable");
+                };
+                if let Some(cut) = replay_cut {
+                    page.through = page.through.min(cut);
+                    page.entries.retain(|(index, _)| *index <= cut);
+                }
+                ensure!(
+                    page.through >= after && page.through <= cut.applied,
+                    "invalid annotation source cursor"
+                );
+                ensure!(page.entries.len() <= 32, "oversized annotation source page");
+                let mut previous = after;
+                for (index, _) in &page.entries {
+                    ensure!(
+                        *index > previous && *index <= page.through,
+                        "unordered annotation source page"
+                    );
+                    previous = *index;
+                }
+                // Retain bounded committed metadata only. Payload admission and
+                // apply remain sequential; a page is not application progress.
+                self.source_page = Some(page);
+            }
+            let page = self.source_page.as_ref().unwrap();
+            if let Some((index, meta)) = page.entries.first().cloned() {
                 ensure!(
                     index > after
                         && index <= page.through
@@ -637,6 +669,9 @@ impl Driver {
                         })
                         .await?,
                 );
+                // Keep the entry until fetch/decode succeeds. Cancellation or
+                // admission pressure must not skip the next committed record.
+                self.source_page.as_mut().unwrap().entries.remove(0);
             } else {
                 if page.through > after {
                     // Control progress participates in the same freeze gate;
@@ -652,6 +687,7 @@ impl Driver {
                         .progress
                         .send_modify(|p| p.through = page.through);
                 }
+                self.source_page = None;
                 return Ok(());
             }
         }
