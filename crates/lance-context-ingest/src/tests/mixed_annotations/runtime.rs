@@ -123,6 +123,32 @@ async fn resume(stage: u8) -> Result<()> {
     check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
     stop.send(()).unwrap();
     task.await??;
+    // Two creates (including re-import), two patches and point reads above.
+    // Observe can poll idle/control progress; only the four data records are
+    // fetched/decoded/applied, and point reads do not perform that work again.
+    let phases = a.phase_observation();
+    for (name, count) in [
+        ("annotation_fetch", 4),
+        ("annotation_decode", 4),
+        ("annotation_create", 2),
+        ("annotation_patch", 2),
+    ] {
+        let phase = phases
+            .iter()
+            .find(|p| p.phase == name)
+            .expect("missing apply phase");
+        assert_eq!(phase.started, count, "{name}");
+        assert_eq!(phase.completed, count, "{name}");
+        assert_eq!(phase.failed, 0, "{name}");
+        assert_eq!(phase.cancelled, 0, "{name}");
+    }
+    let observe = phases
+        .iter()
+        .find(|p| p.phase == "annotation_observe")
+        .unwrap();
+    assert!(observe.completed >= 4);
+    assert_eq!(observe.failed, 0);
+    assert_eq!(observe.started, observe.completed + observe.cancelled);
     drop((frozen, a));
     c.shutdown().await?;
     c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
