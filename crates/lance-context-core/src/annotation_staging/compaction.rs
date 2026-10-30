@@ -1,6 +1,13 @@
-//! Install a confirmed physical rewrite without retiring annotation updates.
+//! Install confirmed native maintenance without retiring annotation updates.
 use super::*;
 use lance_table::transaction::{Operation, Transaction};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Maintenance {
+    NarrowCompaction,
+    BodyCompaction,
+    Index,
+}
 
 impl AnnotationStaging {
     /// Switch the base after a confirmed, row-preserving native compaction.
@@ -17,7 +24,8 @@ impl AnnotationStaging {
         transaction: &Transaction,
         selected: Arc<Dataset>,
     ) -> Result<()> {
-        self.install_maintenance(transaction, selected, false).await
+        self.install_maintenance(transaction, selected, Maintenance::NarrowCompaction)
+            .await
     }
 
     /// Install a confirmed body-only rewrite selected by a native metadata
@@ -29,34 +37,60 @@ impl AnnotationStaging {
         transaction: &Transaction,
         selected: Arc<Dataset>,
     ) -> Result<()> {
-        self.install_maintenance(transaction, selected, true).await
+        self.install_maintenance(transaction, selected, Maintenance::BodyCompaction)
+            .await
+    }
+
+    /// Switch the base after a confirmed native index-only publication.
+    /// The caller validates index fields, coverage and replacement identities
+    /// against its pinned source and resolves the exact fenced publication.
+    /// This method does not build, schedule or authorize an index publication.
+    ///
+    /// Data fragments, annotation cut, request results and body reference must
+    /// stay unchanged. Active updates and captured readers retain their views;
+    /// a frozen annotation publication must finish before this installation.
+    pub async fn install_indexed(
+        &self,
+        transaction: &Transaction,
+        selected: Arc<Dataset>,
+    ) -> Result<()> {
+        self.install_maintenance(transaction, selected, Maintenance::Index)
+            .await
     }
 
     async fn install_maintenance(
         &self,
         transaction: &Transaction,
         selected: Arc<Dataset>,
-        body_only: bool,
+        maintenance: Maintenance,
     ) -> Result<()> {
         let (base, materialized) = {
             let state = self.state.read().await;
             if state.frozen.is_some() {
                 return Err(invalid(
-                    "compaction overlaps a frozen annotation generation",
+                    "maintenance overlaps a frozen annotation generation",
                 ));
             }
             (state.base.clone(), state.materialized)
         };
-        let operation = if body_only {
-            matches!(&transaction.operation, Operation::UpdateConfig {
+        let body_only = maintenance == Maintenance::BodyCompaction;
+        let operation = match maintenance {
+            Maintenance::BodyCompaction => {
+                matches!(&transaction.operation, Operation::UpdateConfig {
                 config_updates: None,
                 table_metadata_updates: None,
                 schema_metadata_updates: None,
                 field_metadata_updates,
             } if field_metadata_updates.is_empty())
-                && selected.manifest().fragments == base.manifest().fragments
-        } else {
-            matches!(&transaction.operation, Operation::Rewrite { groups, .. } if !groups.is_empty())
+                    && selected.manifest().fragments == base.manifest().fragments
+            }
+            Maintenance::NarrowCompaction => {
+                matches!(&transaction.operation, Operation::Rewrite { groups, .. } if !groups.is_empty())
+            }
+            Maintenance::Index => {
+                matches!(&transaction.operation, Operation::CreateIndex { new_indices, .. } if !new_indices.is_empty())
+                    && selected.manifest().fragments == base.manifest().fragments
+            }
         };
         if !operation
             || transaction.read_version != base.version_id()
@@ -65,20 +99,20 @@ impl AnnotationStaging {
             || selected.schema() != base.schema()
             || selected.read_transaction().await?.as_ref() != Some(transaction)
         {
-            return Err(invalid("selected snapshot is not this native compaction"));
+            return Err(invalid("selected snapshot is not this native maintenance"));
         }
         let original = base
             .read_transaction()
             .await?
-            .ok_or_else(|| invalid("compaction base has no annotation transaction"))?;
+            .ok_or_else(|| invalid("maintenance base has no annotation transaction"))?;
         let properties = original.transaction_properties.as_ref();
         let cut = properties
             .and_then(|p| p.get("lance-context.annotation-cut"))
-            .ok_or_else(|| invalid("compaction base has no annotation cut"))?;
+            .ok_or_else(|| invalid("maintenance base has no annotation cut"))?;
         let (scope, through): (Scope, u64) =
             serde_json::from_str(cut).map_err(|e| invalid(e.to_string()))?;
         if scope != self.scope || through != materialized {
-            return Err(invalid("compaction base annotation cut differs"));
+            return Err(invalid("maintenance base annotation cut differs"));
         }
         for key in [
             "lance-context.annotation-cut",
@@ -95,7 +129,7 @@ impl AnnotationStaging {
                     .and_then(|p| p.get(key))
             {
                 return Err(invalid(
-                    "compaction changed annotation cut, request results or body reference",
+                    "maintenance changed annotation cut, request results or body reference",
                 ));
             }
         }
@@ -121,7 +155,7 @@ impl AnnotationStaging {
         let mut state = self.state.write().await;
         if state.frozen.is_some() || !Arc::ptr_eq(&state.base, &base) {
             return Err(invalid(
-                "annotation base changed during compaction installation",
+                "annotation base changed during maintenance installation",
             ));
         }
         state.base = state.views.install(selected);

@@ -3,7 +3,7 @@ use super::*;
 use lance::dataset::optimize::{CompactionMode, CompactionOptions, CompactionTask, TaskData};
 use lance_table::transaction::{Operation, RewriteGroup, Transaction};
 
-async fn initialized(
+pub(super) async fn initialized(
     root: &std::path::Path,
 ) -> Result<(AnnotationStaging, Arc<Dataset>, Arc<Dataset>)> {
     let batch = body::imported(0, 2)?;
