@@ -257,6 +257,16 @@ resolution. The shared catalog also reports `state`, `prepare`, and `retire`
 work. This distinguishes a full source window waiting on maintenance from one
 waiting on native preparation or publication without logging individual turns.
 
+Annotation commit resolution reports four nested phases.
+`annotation_commit_base` loads the fixed predecessor;
+`annotation_commit_publish` validates and publishes the prepared target when it
+is not already selected; `annotation_commit_select` reads the catalog selection,
+loads that target and verifies its coverage; `annotation_commit_confirm` durably
+confirms that selection. These elapsed intervals include their storage or RPC
+waits. They separate a stalled publication from its recovery reads without
+changing publication decisions. A phase with no completion can still be in
+flight; inspect its starts and cancellations as well.
+
 Collection also reports three nested phases. `collect_list` measures each
 tag/branch probe and the bounded data-listing slice, including continuation waits;
 its counts are not cloud request counts. `collect_protect` measures retained

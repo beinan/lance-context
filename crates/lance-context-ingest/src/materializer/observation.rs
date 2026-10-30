@@ -46,8 +46,16 @@ pub enum Phase {
     AnnotationPointRead,
     /// Quorum publisher-binding lookup and validation, including HTTP health checks.
     AnnotationOwnerFence,
+    /// Loading the fixed predecessor during annotation commit resolution.
+    AnnotationCommitBase,
+    /// Publishing the prepared target, including native validation and catalog selection.
+    AnnotationCommitPublish,
+    /// Loading and validating the selected target before confirmation.
+    AnnotationCommitSelect,
+    /// Durably confirming the already selected target in the WAL catalog.
+    AnnotationCommitConfirm,
 }
-const NAMES: [&str; 27] = [
+const NAMES: [&str; 31] = [
     "claim",
     "acquire",
     "state",
@@ -75,6 +83,10 @@ const NAMES: [&str; 27] = [
     "annotation_upload_prepare",
     "annotation_point_read",
     "annotation_owner_fence",
+    "annotation_commit_base",
+    "annotation_commit_publish",
+    "annotation_commit_select",
+    "annotation_commit_confirm",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
