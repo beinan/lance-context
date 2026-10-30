@@ -1,4 +1,4 @@
-# Running one annotation shard
+# Running annotation shards
 
 The ingestion binary provides `annotation-owner CONFIG` and
 `annotation-ingress CONFIG`. They operate on an already provisioned managed
@@ -120,7 +120,8 @@ receipt keys, and storage configuration. Add an `annotations` block:
 ```
 
 This block is an addition to the existing process configuration, not a complete
-standalone config. Exactly one table and one virtual shard are supported.
+standalone config. The default configuration uses one table and one virtual shard.
+Fresh mixed bindings can opt into independent physical shards as described below.
 `ingress_memory_bytes`, `apply_memory_bytes`, and `materializer_memory_bytes` are
 independent budgets. Publication needs capacity for the full bounded frozen
 generation and its checkpoint metadata. `worker.publication` controls maximum
@@ -181,6 +182,44 @@ HTTP/2. There is no automatic HTTP/1 fallback or mutation replay after a transpo
 failure. Such failures still report an unknown outcome and retain the original
 request identity for explicit resolution. Forwarding shares Arrow body frames
 without decoding or coalescing the complete upload.
+
+### Independent physical shards
+
+For fresh mixed body/annotation bindings, each owner can use its own narrow
+table, body table and WAL bucket. Set `annotations.shard` to `{"bucket": 0}`
+for the first owner, `{"bucket": 1}` for the second, and so on. This number is
+the bucket position in `layout.buckets`, not the WAL group ID stored there.
+All roles use the same immutable layout and mutation contract. Adding a WAL
+group also requires its source verification key in the immutable policy on all
+clients and replicas, and the matching signing key on every voter hosting that
+group. Source keys must be distinct across groups and from the catalog key;
+reusing a key or changing only the layout is rejected by the WAL service. Each physical
+table needs distinct table/incarnation identities, destination and storage
+URIs, plus its own persisted bootstrap identity. Run `annotation-bootstrap`
+with each owner's configuration before serving requests.
+
+A shared ingress config sets `annotations.routes` to one entry per bucket.
+Each entry contains `binding` (the corresponding owner's complete
+`tables[0].binding`), `shard`, and the authorized `owner_url`. Its local
+table/shard/owner fields must match one of those entries. Missing or duplicate
+buckets, repeated physical destinations and mismatched local bindings fail
+configuration validation. Owner configs may omit `routes`; each owner serves
+only its assigned table. Ingresses share one admission budget across routes.
+
+Point reads route by turn ID using `annotations::Shard::for_turn`. Producers
+must partition batches by that same function, bind their Arrow schema with
+`Shard::bind_batch`, and open a producer for each physical table. The owner
+checks every row's placement before WAL submission. The ingress forwards the
+original Arrow IPC buffers; it does not repartition or decode uploads. The
+current client does not automatically partition arbitrary input batches.
+
+Each owner has an independent publication cut, recovery path and collector.
+There is no cross-shard transaction or global materialization position. A
+replacement owner must retain the original table identities, bucket and URIs.
+Changing the layout requires migration; this configuration does not move live
+data, convert legacy bindings or provide session-based routing. Annotation-only
+handoffs and projections retain their existing single-shard configuration.
+
 
 Graceful shutdown closes admission, lets admitted requests finish while the
 applier runs, then joins the listener and runtime before releasing the claim.
