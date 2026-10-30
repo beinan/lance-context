@@ -145,6 +145,27 @@ target does not bound an oversized row or total engine RSS; the existing shared
 workspace admission still applies. Session indexing and remote preparation remain
 unsupported.
 
+### Configure each running role
+
+Each process reads its own configuration file. Bootstrap and ingress settings
+are not inherited by an owner. In particular, native ID-index maintenance is
+opt-in: set `worker.publication.turn_id_index` on every owner that should maintain
+it, for example `{"min_rows": 65536}`. Setting it only on a bootstrap or ingress
+configuration does not schedule index maintenance. See the
+[ID-index prerequisites](annotation-id-index-experiment.md) for stable row IDs,
+fragment bounds and workspace requirements. The index covers immutable turn IDs;
+it does not maintain mutable status, label or score indexes.
+
+Keep the chosen publication, compaction and index policy explicit in each owner
+file. `http.options.data_requests`, `http.options.control_requests` and
+`ingress_memory_bytes` apply separately to each process. An ingress shares its
+admission budget across its routes; each owner has its own apply and publication
+budgets. A bootstrap file is not evidence of the settings used by either role.
+When comparing worker counts, compare the actual owner and ingress files,
+including their budgets and reader settings. Also check the selected Lance
+snapshot's index coverage and uncovered tail; enabling a policy does not mean
+that maintenance has already indexed every row.
+
 Compaction recovery tests retain or SIGKILL the three local WAL replicas and
 annotation applier after the maintenance plan, prepared files, an unknown
 manifest-selection reply, and confirmation before retirement. Reopening checks
