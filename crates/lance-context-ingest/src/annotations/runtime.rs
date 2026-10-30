@@ -495,12 +495,17 @@ impl Publisher {
         if !pending.plan.is_maintenance() {
             selection.scope()?;
         }
-        let base = checkpoint::load(
-            &self.service.ingress,
-            &self.storage,
-            pending.plan.read_version,
-        )
-        .await?;
+        let phases = self.service.shared.phases.clone();
+        let base = phases
+            .measure(
+                Phase::AnnotationCommitBase,
+                checkpoint::load(
+                    &self.service.ingress,
+                    &self.storage,
+                    pending.plan.read_version,
+                ),
+            )
+            .await?;
         let target = pending.plan.target_version()?;
         let manifests = view
             .manifests
@@ -511,104 +516,121 @@ impl Publisher {
                 .versions
                 .get(&pending.plan.read_version)
                 .context("annotation predecessor unavailable")?;
-            if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
-                materializer::stage::publish(
-                    &self.catalog,
-                    pending,
-                    prepared,
-                    predecessor,
-                    (*base).clone(),
-                )
+            phases
+                .measure(Phase::AnnotationCommitPublish, async {
+                    if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3)
+                    {
+                        materializer::stage::publish(
+                            &self.catalog,
+                            pending,
+                            prepared,
+                            predecessor,
+                            (*base).clone(),
+                        )
+                        .await?;
+                    } else {
+                        let commit = p::lance::ManifestCommit {
+                            authority: self.catalog.authority().clone(),
+                            incarnation: self.service.ingress.scope.incarnation,
+                            transaction: pending.plan.transaction,
+                            plan_index: pending.index,
+                            prepared_index: prepared.index,
+                            descriptor_digest: prepared.descriptors.digest,
+                            predecessor: predecessor.identity,
+                            target,
+                        };
+                        let catalog = Arc::new(self.service.ingress.client.manifest_catalog());
+                        if let Some(body) = &self.service.shared.body {
+                            publication::mixed::publish(
+                                catalog,
+                                &self.service.ingress.layout,
+                                &self.storage,
+                                body,
+                                commit,
+                                &selection,
+                                &prepared.descriptors,
+                                base.clone(),
+                            )
+                            .await?;
+                        } else {
+                            publication::publish(
+                                catalog,
+                                &self.service.ingress.layout,
+                                &self.storage,
+                                commit,
+                                &selection,
+                                &prepared.descriptors,
+                                base.clone(),
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
                 .await?;
-            } else {
-                let commit = p::lance::ManifestCommit {
-                    authority: self.catalog.authority().clone(),
-                    incarnation: self.service.ingress.scope.incarnation,
-                    transaction: pending.plan.transaction,
-                    plan_index: pending.index,
-                    prepared_index: prepared.index,
-                    descriptor_digest: prepared.descriptors.digest,
-                    predecessor: predecessor.identity,
-                    target,
-                };
-                let catalog = Arc::new(self.service.ingress.client.manifest_catalog());
-                if let Some(body) = &self.service.shared.body {
-                    publication::mixed::publish(
-                        catalog,
-                        &self.service.ingress.layout,
+        }
+        let (selected, manifest_identity) = phases
+            .measure(Phase::AnnotationCommitSelect, async {
+                let current = self.catalog.state().await?;
+                let record = current
+                    .manifests
+                    .as_ref()
+                    .context("annotation manifests unavailable")?
+                    .versions
+                    .get(&target)
+                    .context("annotation target not selected")?;
+                ensure!(
+                    record.prepared_index == prepared.index,
+                    "annotation preparation index differs"
+                );
+                let selected =
+                    checkpoint::load(&self.service.ingress, &self.storage, target).await?;
+                if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
+                    checkpoint::validate_compacted(&selected, &base, pending, prepared, record)
+                        .await?;
+                } else if let Some(body) = &self.service.shared.body {
+                    publication::mixed::selected_cut(
+                        &selected,
+                        &base,
+                        &prepared.descriptors,
+                        &selection,
+                        record,
                         &self.storage,
                         body,
-                        commit,
-                        &selection,
-                        &prepared.descriptors,
-                        base.clone(),
                     )
                     .await?;
                 } else {
-                    publication::publish(
-                        catalog,
-                        &self.service.ingress.layout,
-                        &self.storage,
-                        commit,
-                        &selection,
+                    publication::selected_cut(
+                        &selected,
+                        &base,
                         &prepared.descriptors,
-                        base.clone(),
+                        &selection,
+                        record,
+                        &self.storage,
                     )
                     .await?;
                 }
-            }
-        }
-        let current = self.catalog.state().await?;
-        let record = current
-            .manifests
-            .as_ref()
-            .context("annotation manifests unavailable")?
-            .versions
-            .get(&target)
-            .context("annotation target not selected")?;
-        ensure!(
-            record.prepared_index == prepared.index,
-            "annotation preparation index differs"
-        );
-        let selected = checkpoint::load(&self.service.ingress, &self.storage, target).await?;
-        if pending.plan.is_maintenance() && matches!(prepared.descriptors.format, 2 | 3) {
-            checkpoint::validate_compacted(&selected, &base, pending, prepared, record).await?;
-        } else if let Some(body) = &self.service.shared.body {
-            publication::mixed::selected_cut(
-                &selected,
-                &base,
-                &prepared.descriptors,
-                &selection,
-                record,
-                &self.storage,
-                body,
+                Ok::<_, anyhow::Error>((selected, record.identity))
+            })
+            .await?;
+        let reply = phases
+            .measure(
+                Phase::AnnotationCommitConfirm,
+                materializer::commit(
+                    &self.service.ingress.client,
+                    Command::Confirm(p::ConfirmPublication {
+                        authority: self.catalog.authority().clone(),
+                        incarnation: self.service.ingress.scope.incarnation,
+                        transaction: pending.plan.transaction,
+                        plan_index: pending.index,
+                        prepared_index: prepared.index,
+                        descriptor_digest: prepared.descriptors.digest,
+                        target,
+                        manifest_identity,
+                    }),
+                ),
             )
             .await?;
-        } else {
-            publication::selected_cut(
-                &selected,
-                &base,
-                &prepared.descriptors,
-                &selection,
-                record,
-                &self.storage,
-            )
-            .await?;
-        }
-        let reply = materializer::commit(
-            &self.service.ingress.client,
-            Command::Confirm(p::ConfirmPublication {
-                authority: self.catalog.authority().clone(),
-                incarnation: self.service.ingress.scope.incarnation,
-                transaction: pending.plan.transaction,
-                plan_index: pending.index,
-                prepared_index: prepared.index,
-                descriptor_digest: prepared.descriptors.digest,
-                target,
-                manifest_identity: record.identity,
-            }),
-        )
-        .await?;
         ensure!(
             matches!(reply, Applied::Publisher(p::Reply::Published(_))),
             "annotation confirmation rejected: {reply:?}"
