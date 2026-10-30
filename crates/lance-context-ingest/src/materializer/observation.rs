@@ -32,8 +32,12 @@ pub enum Phase {
     AnnotationDecode,
     AnnotationCreate,
     AnnotationPatch,
+    /// WAL append, including exact-identity observation after an unknown reply.
+    AnnotationAppend,
+    /// Waiting for the local ordered applier to reach an accepted WAL position.
+    AnnotationApplyWait,
 }
-const NAMES: [&str; 20] = [
+const NAMES: [&str; 22] = [
     "claim",
     "acquire",
     "state",
@@ -54,6 +58,8 @@ const NAMES: [&str; 20] = [
     "annotation_decode",
     "annotation_create",
     "annotation_patch",
+    "annotation_append",
+    "annotation_apply_wait",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

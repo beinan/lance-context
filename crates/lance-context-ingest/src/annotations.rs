@@ -453,8 +453,18 @@ impl Service {
     /// outcome is retained. Older identities are rejected, never re-executed.
     pub async fn submit(&self, prepared: &PreparedAppend, deadline: Duration) -> Result<Completed> {
         tokio::time::timeout(deadline, async {
-            let accepted = self.append_observed(prepared).await?;
-            self.wait_through(accepted.position.index).await?;
+            let accepted = self
+                .shared
+                .phases
+                .measure(Phase::AnnotationAppend, self.append_observed(prepared))
+                .await?;
+            self.shared
+                .phases
+                .measure(
+                    Phase::AnnotationApplyWait,
+                    self.wait_through(accepted.position.index),
+                )
+                .await?;
             let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;
             self.shared.results.lock().unwrap().resolve(&accepted, slot)
         })
