@@ -739,14 +739,11 @@ fn restart_follower(
         .map(|(&id, n)| (id, n.image_address))
         .collect();
     assert!(matches!(
-        c.nodes
-            .get_mut(&id)
-            .unwrap()
-            .call(Request::Start {
-                peers,
-                images,
-                pipeline_replication: c.pipeline_replication,
-            })?,
+        c.nodes.get_mut(&id).unwrap().call(Request::Start {
+            peers,
+            images,
+            pipeline_replication: c.pipeline_replication,
+        })?,
         Reply::Ready
     ));
     Ok(())
