@@ -48,7 +48,17 @@ pub struct Completed {
 struct Progress {
     through: u64,
     stopped: bool,
-    backpressured: bool,
+    backpressure: Option<ApplyBackpressure>,
+}
+
+/// The admission gate that most recently prevented ordered WAL application.
+/// This is a sampled state, not a refusal count or a measure of blocked time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyBackpressure {
+    ApplyMemory,
+    SourceWindow,
+    Staging,
 }
 
 struct Shared {
@@ -336,7 +346,7 @@ impl Service {
         let (progress, _) = watch::channel(Progress {
             through,
             stopped: false,
-            backpressured: false,
+            backpressure: None,
         });
         let outcomes = vec![None; ingress.client.producer_slots() as usize];
         let window = window::Window::new(through, ingress.client.max_plan_source_bytes());
@@ -619,7 +629,13 @@ impl Service {
 
     pub async fn observation(&self) -> (lance_context_core::annotation_staging::Observation, bool) {
         let state = self.shared.staging.observation().await;
-        (state, self.shared.progress.borrow().backpressured)
+        (state, self.apply_backpressure().is_some())
+    }
+
+    /// Returns the last gate that blocked apply, cleared by successful progress.
+    /// Capacity release alone does not clear it until the applier runs again.
+    pub fn apply_backpressure(&self) -> Option<ApplyBackpressure> {
+        self.shared.progress.borrow().backpressure
     }
 }
 
@@ -746,7 +762,7 @@ impl Driver {
                     service
                         .shared
                         .progress
-                        .send_modify(|p| p.backpressured = true);
+                        .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
                     return Ok(());
                 };
                 let body = match service.shared.local_payloads.body(producer_slot, &meta) {
@@ -837,7 +853,7 @@ impl Driver {
             service
                 .shared
                 .progress
-                .send_modify(|p| p.backpressured = true);
+                .send_modify(|p| p.backpressure = Some(ApplyBackpressure::SourceWindow));
             return Ok(());
         }
         let observed = service.shared.staging.observation().await;
@@ -912,7 +928,7 @@ impl Driver {
                 service
                     .shared
                     .progress
-                    .send_modify(|p| p.backpressured = true);
+                    .send_modify(|p| p.backpressure = Some(ApplyBackpressure::Staging));
                 return Ok(());
             }
         };
@@ -944,7 +960,7 @@ impl Driver {
         service.shared.progress.send_replace(Progress {
             through: pending.index,
             stopped: false,
-            backpressured: false,
+            backpressure: None,
         });
         Ok(())
     }

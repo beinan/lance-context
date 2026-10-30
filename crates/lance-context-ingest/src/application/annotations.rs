@@ -267,7 +267,8 @@ pub async fn serve_owner(
                 if !claim.valid().await? {
                     break Err(anyhow::anyhow!("annotation owner lease lost"));
                 }
-                let (view, pressured) = service.observation().await;
+                let (view, _) = service.observation().await;
+                let pressure = service.apply_backpressure();
                 let source = service.source_observation();
                 eprintln!("{}", serde_json::json!({"annotation": {
                     "observed_unix_ms": std::time::SystemTime::now()
@@ -276,7 +277,8 @@ pub async fn serve_owner(
                     "applied": view.applied, "materialized": view.materialized,
                     "active_entries": view.active_entries, "frozen_entries": view.frozen_entries,
                     "retained_bytes": view.retained_bytes, "source_records": source.records,
-                    "source_bytes": source.bytes, "backpressured": pressured,
+                    "source_bytes": source.bytes, "backpressured": pressure.is_some(),
+                    "backpressure_reason": pressure,
                     "reclamation": service.reclamation_observation(),
                     "phases": service.phase_observation(),
                 }}));

@@ -560,7 +560,7 @@ async fn next_listing(
         // while the serial publisher frees source/staging capacity.
         biased;
         next = tokio::time::timeout_at(until, listing.try_next()) => next.ok(),
-        _ = progress.wait_for(|p| p.backpressured) => None,
+        _ = progress.wait_for(|p| p.backpressure.is_some()) => None,
     }
 }
 
