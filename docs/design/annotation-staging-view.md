@@ -112,6 +112,15 @@ and application progress intact. Captured readers keep their old base registered
 for reclamation until released. This view check complements the publisher's
 row-preserving rewrite validation and durable publication protocol.
 
+`install_indexed` provides the corresponding view switch for a confirmed native
+`CreateIndex` transaction. It requires unchanged data fragments, schema, scoped
+annotation cut, request results and body reference. Active updates remain current,
+captured readers keep their original base, and an outstanding frozen publication
+prevents installation. The caller must validate index fields, fragment coverage
+and replacement identities, then resolve the exact fenced publication. This
+component does not enable automatic ID-index maintenance in the annotation owner;
+its bounded build/merge policy and durable publisher integration are separate.
+
 ## Binding a separate body snapshot
 
 `prepare_with_body` binds a `BodySnapshot` to the original native preparation.
