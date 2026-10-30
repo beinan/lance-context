@@ -203,6 +203,29 @@ mod tests {
             .session
             .file_metadata_cache()
             .with_key_prefix("raw-index-root-test");
+        // Refusing a root read must leave the entire candidate page intact;
+        // the caller cannot safely classify even abandoned pages yet.
+        let before = page.clone();
+        let budget = MergeMemoryBudget::new(1 << 20);
+        let page_reservation = budget.reserve(budget.limit()).await;
+        let error = protect(
+            &mut page,
+            selected.manifest(),
+            selected.manifest_location(),
+            &storage.base,
+            &store,
+            &cache,
+            &budget,
+            page_reservation.bytes(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "retained index metadata exceeds collection workspace"
+        );
+        assert_eq!(page, before);
+        drop(page_reservation);
         protect(
             &mut page,
             selected.manifest(),
