@@ -90,7 +90,12 @@ async fn indexed_load() -> Result<()> {
     let narrow = storage(root.path(), "annotations.lance").await?;
     let body = storage(root.path(), "body.lance").await?;
     seed_with_binding(&c, &narrow, &body, compaction::compact_binding()).await?;
-    let (a, runtime) = indexed_owner(&c, &narrow, &body, true).await?;
+    let initial = annotation_publication::state(&c).await?;
+    assert_eq!(initial.progress.minimum_read_version, 1);
+    assert!(initial.manifests.as_ref().unwrap().head > 1);
+    let (a, runtime) = indexed_owner(&c, &narrow, &body, true)
+        .await
+        .context("open indexed owner at selected bootstrap version")?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let creator = producer(&a, 1).await?;
     let patcher = producer(&a, 2).await?;
@@ -173,7 +178,9 @@ async fn indexed_load() -> Result<()> {
     c.shutdown().await?;
 
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
-    let (a, runtime) = indexed_owner(&c, &narrow, &body, true).await?;
+    let (a, runtime) = indexed_owner(&c, &narrow, &body, true)
+        .await
+        .context("reopen indexed owner after WAL restart")?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
     check(&a, "turn-0", "s", 0, "reviewed", Some(0.7)).await?;
     for row in 1..8 {

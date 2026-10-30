@@ -202,12 +202,14 @@ impl Runtime {
             view = publisher.catalog.state().await?;
         }
         if c.publication.turn_id_index.is_some() {
-            let base = checkpoint::load(
-                &service.ingress,
-                &storage,
-                view.progress.minimum_read_version,
-            )
-            .await?;
+            // Before the first advance, minimum_read_version is still the
+            // protocol floor (1). Bootstrap can select a later native version.
+            let version = view
+                .manifests
+                .as_ref()
+                .context("annotation manifests unavailable")?
+                .head;
+            let base = checkpoint::load(&service.ingress, &storage, version).await?;
             materializer::TurnIdIndex::validate_base(&base)?;
         }
         driver = driver.with_publication_limits(
