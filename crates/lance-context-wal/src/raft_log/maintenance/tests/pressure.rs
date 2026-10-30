@@ -2,6 +2,15 @@ use super::*;
 
 #[test]
 fn compacted_large_records_release_admission_despite_many_small_live_values() -> Result<()> {
+    release_admission(2 << 20, None)
+}
+
+#[test]
+fn pending_image_files_trigger_collection_without_releasing_their_reservation() -> Result<()> {
+    release_admission(8 << 20, Some(6 << 20))
+}
+
+fn release_admission(data_bytes: usize, file_bytes: Option<u64>) -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
     let log = PhysicalLog::open_with_file_size(root.path(), &layout, 1, 64 << 10)?;
@@ -44,12 +53,21 @@ fn compacted_large_records_release_admission_despite_many_small_live_values() ->
     let snapshot = checkpoint(&group, 16)?;
     group.configure_disk(DiskOptions {
         max_bytes: 32 << 20,
-        data_bytes: 2 << 20,
+        data_bytes,
         headroom_bytes: 16 << 20,
     })?;
-    let budget = group.disk_budget().unwrap();
+    let budget = group.disk_budget().unwrap().clone();
+    // Keep an image build/receive reservation alive throughout collection. The
+    // expired payloads alone fit this case's data ceiling; together with the
+    // pending file they block producers until physical collection releases them.
+    let file = file_bytes
+        .map(|bytes| budget.reserve_files(&[bytes]))
+        .transpose()?;
     let before = budget.snapshot().accounted_disk_bytes;
     assert!(before > 2 << 20, "fixture did not fill admission: {before}");
+    if file_bytes.is_some() {
+        assert!(before + 2 * group.node.target_file_bytes < data_bytes as u64);
+    }
     assert!(budget.reserve(256 << 10, true).is_err());
     for _ in 0..4 {
         maintenance.run()?;
@@ -61,8 +79,12 @@ fn compacted_large_records_release_admission_despite_many_small_live_values() ->
         "compacted payloads still occupy {after} bytes"
     );
     assert!(budget.reserve(256 << 10, true).is_ok());
+    assert_eq!(
+        budget.snapshot().reserved_file_bytes,
+        file_bytes.unwrap_or_default()
+    );
     verify(&sibling, 1, 4)?;
-    drop((maintenance, group, sibling, log));
+    drop((file, budget, maintenance, group, sibling, log));
     let reopened = PhysicalLog::open(root.path(), &layout, 1)?;
     let group = reopened.group(10)?;
     assert_eq!(group.snapshot(16, 2)?, snapshot);
