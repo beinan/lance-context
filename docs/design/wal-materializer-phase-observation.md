@@ -40,7 +40,11 @@ throughput improvement and provides no proof of a disk, CPU, or network ceiling.
 
 The annotation owner also reports five apply-path phases. `annotation_observe`
 includes its quorum barrier and accepted-source query, including idle/control
-polls. `annotation_fetch` times retrieval of one committed record. Unlike the
+polls. One query retains at most 32 committed record descriptors; payloads are
+still admitted, fetched, decoded and applied one at a time. A page's final cursor
+does not advance application progress until its records have been processed.
+Thus an observe count is a page/poll count, not a record count.
+`annotation_fetch` times retrieval of one committed record. Unlike the
 materializer's `decode_validate`, `annotation_decode` includes blocking-pool
 queueing as well as IPC decoding and validation. `annotation_create` and
 `annotation_patch` cover the respective staging operations after acquiring the

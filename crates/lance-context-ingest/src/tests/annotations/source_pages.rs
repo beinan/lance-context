@@ -1,0 +1,140 @@
+//! Buffered committed metadata must not become visible application progress.
+use super::*;
+
+fn completed(service: &Service, phase: &str) -> u64 {
+    service
+        .phase_observation()
+        .into_iter()
+        .find(|value| value.phase == phase)
+        .unwrap()
+        .completed
+}
+
+#[tokio::test]
+async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication() -> Result<()> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("annotation-source-pages-");
+    let root = match std::env::var("INGEST_TEST_ARTIFACTS") {
+        Ok(parent) => builder.tempdir_in(parent)?,
+        Err(_) => builder.tempdir()?,
+    }
+    .keep();
+    let c = network::Cluster::open_signed(&root, annotation_publication::one_shard()).await?;
+    let storage = Storage::resolve(
+        root.join("turns.lance").to_str().unwrap().into(),
+        Default::default(),
+        Arc::new(lance::session::Session::default()),
+    )
+    .await?;
+    let limits = Limits::default();
+    annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
+        .await?;
+    let budget = MergeMemoryBudget::new(8 << 20);
+    let (service, mut driver) = Service::connect(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding(),
+        &storage,
+        limits.clone(),
+        MergeMemoryBudget::new(8 << 20),
+        budget.clone(),
+    )
+    .await?;
+    let producer = producer(&service, 1).await?;
+    let mut indices = Vec::new();
+    for sequence in 1..=67 {
+        let status = format!("status-{sequence}");
+        let input = request(
+            &service,
+            &producer,
+            sequence,
+            wire(
+                &limits,
+                &[if sequence == 33 { "missing" } else { "T" }],
+                1,
+                Some(&status),
+                u8::from(sequence == 1),
+                (sequence == 1).then_some(0.9),
+            )?,
+        )
+        .await?;
+        // Build a committed backlog without returning application ACKs.
+        let response = c
+            .client
+            .request_routed(Request::Append {
+                group: 10,
+                batch: input.batch.clone(),
+            })
+            .await?;
+        let Reply::Commit(Outcome::Committed(Applied::Accepted { index })) = response.reply else {
+            bail!("test backlog append failed");
+        };
+        indices.push(index);
+    }
+    let initial = service.observation().await.0.applied;
+    let held = budget.reserve(budget.limit()).await;
+    for _ in 0..3 {
+        driver.step_for_test().await?;
+        assert_eq!(service.observation().await.0.applied, initial);
+        assert!(service.observation().await.1);
+        assert_eq!(completed(&service, "annotation_fetch"), 0);
+        assert_eq!(completed(&service, "annotation_observe"), 1);
+    }
+    drop(held);
+    driver.step_for_test().await?;
+    assert_eq!(service.observation().await.0.applied, indices[0]);
+    let frozen = service.freeze(Uuid::new_v4()).await?.unwrap();
+    driver.step_for_test().await?;
+    assert_eq!(service.observation().await.0.applied, indices[1]);
+    assert_eq!(completed(&service, "annotation_observe"), 1);
+
+    // Publish the first update while the second is active and the remainder
+    // is still only committed metadata. Retirement cannot discard either.
+    let (prepared, selection, descriptors, commit) =
+        crate::tests::annotation_checkpoint::prepare(&c, &frozen, 0).await?;
+    let published = crate::annotation_publication::publish(
+        Arc::new(c.client.manifest_catalog()),
+        &annotation_publication::one_shard(),
+        &storage,
+        commit,
+        &selection,
+        &descriptors,
+        prepared.annotations().base().clone(),
+    )
+    .await?;
+    service
+        .install_published(&prepared, Arc::new(published))
+        .await?;
+    annotation_publication::finish(&c).await?;
+    drop((prepared, frozen));
+
+    for (offset, index) in indices.iter().enumerate().skip(2) {
+        if offset == 32 {
+            let held = budget.reserve(budget.limit()).await;
+            driver.step_for_test().await?;
+            assert_eq!(service.observation().await.0.applied, indices[31]);
+            assert_eq!(completed(&service, "annotation_fetch"), 32);
+            assert_eq!(completed(&service, "annotation_observe"), 2);
+            drop(held);
+        }
+        driver.step_for_test().await?;
+        assert_eq!(service.observation().await.0.applied, *index);
+        assert_eq!(completed(&service, "annotation_fetch"), offset as u64 + 1);
+        assert_eq!(
+            completed(&service, "annotation_observe"),
+            offset as u64 / 32 + 1
+        );
+    }
+    // The final page also contains publication control entries. Apply their
+    // boundary only after all 67 data records, including the rejected patch.
+    driver.step_for_test().await?;
+    let value = service.get("T", Duration::from_secs(5)).await?.unwrap();
+    assert_eq!(value.status.as_deref(), Some("status-67"));
+    assert_eq!(value.score, Some(0.9));
+    assert_eq!(service.observation().await.0.materialized, indices[0]);
+    assert_eq!(completed(&service, "annotation_fetch"), 67);
+    assert_eq!(completed(&service, "annotation_observe"), 3);
+    assert_eq!(budget.reserved(), 0);
+    drop(driver);
+    c.shutdown().await
+}
