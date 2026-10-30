@@ -281,6 +281,15 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
     assert_eq!(apply.completed, 1);
     assert_eq!(apply.failed + apply.cancelled, 0);
     assert_eq!(
+        phases
+            .iter()
+            .find(|p| p.phase == "annotation_fetch")
+            .unwrap()
+            .started,
+        0,
+        "the submitting owner must reuse its admitted upload"
+    );
+    assert_eq!(
         b.get("T", Duration::from_secs(5))
             .await?
             .unwrap()
@@ -380,4 +389,5 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
 #[cfg(feature = "service")]
 mod uncertain_append;
 
+mod local_payload;
 mod source_pages;

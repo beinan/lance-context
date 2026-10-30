@@ -275,6 +275,17 @@ async fn mixed_held_body_read_outlives_publication_source_closure_and_frame_reti
     let p = producer(&a, 1).await?;
     let initial = request(&a, &p, 1, encoded(create(&["A"], &["s"], &[1])?)?).await?;
     a.submit(&initial, Duration::from_secs(10)).await?;
+    assert_eq!(
+        a.phase_observation()
+            .iter()
+            .find(|p| p.phase == "annotation_fetch")
+            .unwrap()
+            .started,
+        0
+    );
+    // The local upload can disappear: staged bodies and held readers retain
+    // their own apply reservation through publication and source retirement.
+    drop(initial);
     let held = a.get_turn("A", Duration::from_secs(10)).await?.unwrap();
     let frozen = a.freeze(Uuid::new_v4()).await?.unwrap();
     let selection = annotation_publication::select_range(
