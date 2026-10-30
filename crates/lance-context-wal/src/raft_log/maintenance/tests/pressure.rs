@@ -56,7 +56,7 @@ fn release_admission(data_bytes: usize, file_bytes: Option<u64>) -> Result<()> {
         data_bytes,
         headroom_bytes: 16 << 20,
     })?;
-    let budget = group.disk_budget().unwrap();
+    let budget = group.disk_budget().unwrap().clone();
     // Keep an image build/receive reservation alive throughout collection. The
     // expired payloads alone fit this case's data ceiling; together with the
     // pending file they block producers until physical collection releases them.
