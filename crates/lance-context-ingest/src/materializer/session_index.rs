@@ -7,8 +7,28 @@ use prost::Message;
 use std::collections::BTreeSet;
 
 const NAME: &str = "lance_context_rollout_id";
+
+#[derive(Clone, Copy)]
+pub(super) enum Key {
+    Session,
+    Turn,
+}
+impl Key {
+    pub(super) fn column(self) -> &'static str {
+        match self {
+            Self::Session => "rollout_id",
+            Self::Turn => "id",
+        }
+    }
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Session => NAME,
+            Self::Turn => "lance_context_turn_id",
+        }
+    }
+}
 const MAX_ROWS: usize = 1 << 20;
-const WORKSPACE: usize = 512 << 20;
+pub(super) const WORKSPACE: usize = 512 << 20;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -52,7 +72,7 @@ impl SessionIndex {
         let indices = dataset.load_indices().await?;
         let mut covered = BTreeSet::new();
         for index in indices.iter().filter(|i| i.name == NAME) {
-            validate_metadata(dataset, index)?;
+            validate_metadata(dataset, index, Key::Session)?;
             covered.extend(index.fragment_bitmap.as_ref().unwrap().iter());
         }
         let segments: Vec<_> = indices.iter().filter(|i| i.name == NAME).cloned().collect();
@@ -82,7 +102,7 @@ impl SessionIndex {
     }
 }
 
-enum Action {
+pub(super) enum Action {
     Build(Vec<u32>),
     Merge(Vec<IndexMetadata>),
 }
@@ -95,13 +115,13 @@ struct Change {
     removed: Vec<Uuid>,
 }
 
-fn validate_metadata(dataset: &Dataset, index: &IndexMetadata) -> Result<()> {
+pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: Key) -> Result<()> {
     let field = dataset
         .schema()
-        .field("rollout_id")
+        .field(key.column())
         .context("missing session column")?;
     ensure!(
-        index.name == NAME
+        index.name == key.name()
             && index.fields == vec![field.id]
             && index.covering_fields.is_empty()
             && !index.uuid.is_nil()
@@ -127,7 +147,7 @@ pub(crate) async fn scan_fragments(dataset: &Dataset) -> Result<Option<[Vec<Frag
     let indices = dataset.load_indices().await?;
     let mut coverage = BTreeSet::new();
     for index in indices.iter().filter(|index| index.name == NAME) {
-        if validate_metadata(dataset, index).is_err() {
+        if validate_metadata(dataset, index, Key::Session).is_err() {
             return Ok(None);
         }
         coverage.extend(
@@ -174,12 +194,23 @@ pub(super) async fn prepare(
     let Some(options) = &publisher.options.session_index else {
         return Ok(None);
     };
-    let mut dataset = publisher
+    let dataset = publisher
         .read_dataset(Some(pending.plan.read_version))
         .await?;
     let Some(action) = options.action(&dataset).await? else {
         return Ok(None);
     };
+    Ok(Some(
+        prepare_action(publisher, dataset, action, Key::Session).await?,
+    ))
+}
+
+pub(super) async fn prepare_action(
+    publisher: &Publisher,
+    mut dataset: Dataset,
+    action: Action,
+    key: Key,
+) -> Result<p::Descriptors> {
     let reservation = publisher.budget.reserve(WORKSPACE).await;
     let phases = publisher.phases.clone();
     // Cancellation cannot release admission while a native index build still runs.
@@ -201,11 +232,11 @@ pub(super) async fn prepare(
                     Action::Build(ids) => {
                         dataset
                             .create_index_builder(
-                                &["rollout_id"],
+                                &[key.column()],
                                 IndexType::BTree,
                                 &ScalarIndexParams::default(),
                             )
-                            .name(NAME.to_owned())
+                            .name(key.name().to_owned())
                             .replace(true)
                             .fragments(ids)
                             .execute_uncommitted()
@@ -217,7 +248,7 @@ pub(super) async fn prepare(
                 }
             })
             .await?;
-        validate_metadata(&dataset, &index)?;
+        validate_metadata(&dataset, &index, key)?;
         ensure!(
             !removed.is_empty() || index.dataset_version == dataset.version().version,
             "index snapshot changed"
@@ -240,12 +271,20 @@ pub(super) async fn prepare(
         p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))
     })
     .await??;
-    Ok(Some(descriptors))
+    Ok(descriptors)
 }
 
 pub(super) async fn operation(
     dataset: &Dataset,
     descriptors: &p::Descriptors,
+) -> Result<Operation> {
+    operation_for(dataset, descriptors, Key::Session).await
+}
+
+pub(super) async fn operation_for(
+    dataset: &Dataset,
+    descriptors: &p::Descriptors,
+    key: Key,
 ) -> Result<Operation> {
     ensure!(
         descriptors.format == 3 && dataset.manifest().uses_stable_row_ids(),
@@ -257,7 +296,7 @@ pub(super) async fn operation(
         "index snapshot changed"
     );
     let index = IndexMetadata::try_from(pb::IndexMetadata::decode(change.index.as_slice())?)?;
-    validate_metadata(dataset, &index)?;
+    validate_metadata(dataset, &index, key)?;
     ensure!(
         !change.removed.is_empty() || index.dataset_version == dataset.version().version,
         "index snapshot changed"
@@ -279,9 +318,9 @@ pub(super) async fn operation(
         .load_indices()
         .await?
         .iter()
-        .filter(|i| i.name == NAME)
+        .filter(|i| i.name == key.name())
     {
-        validate_metadata(dataset, old)?;
+        validate_metadata(dataset, old, key)?;
         ensure!(
             old.uuid != index.uuid,
             "index reused an existing segment identity"

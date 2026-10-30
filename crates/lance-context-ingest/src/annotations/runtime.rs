@@ -133,6 +133,11 @@ impl Runtime {
             c.publication.session_index.is_none() && !c.publication.pipeline_preparation,
             "annotation runtime does not support session indexing or remote preparation"
         );
+        ensure!(
+            c.publication.turn_id_index.is_none()
+                || c.limits.retained_entries <= materializer::turn_id_index::MAX_BUILD_ROWS,
+            "turn ID indexing requires at most 1048576 retained annotation entries"
+        );
         let workspace = c
             .limits
             .retained_bytes
@@ -195,6 +200,17 @@ impl Runtime {
             (service, driver) = connect().await?;
             publisher.service = service.clone();
             view = publisher.catalog.state().await?;
+        }
+        if c.publication.turn_id_index.is_some() {
+            // Before the first advance, minimum_read_version is still the
+            // protocol floor (1). Bootstrap can select a later native version.
+            let version = view
+                .manifests
+                .as_ref()
+                .context("annotation manifests unavailable")?
+                .head;
+            let base = checkpoint::load(&service.ingress, &storage, version).await?;
+            materializer::TurnIdIndex::validate_base(&base)?;
         }
         driver = driver.with_publication_limits(
             c.publication.max_records,

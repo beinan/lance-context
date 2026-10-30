@@ -16,11 +16,13 @@ mod plan;
 mod read_policy;
 mod session_index;
 pub(crate) mod stage;
+pub(crate) mod turn_id_index;
 pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
 pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
+pub use turn_id_index::TurnIdIndex;
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]
@@ -60,6 +62,9 @@ pub struct Options {
     /// All catalog voters and table publishers must support index maintenance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_index: Option<SessionIndex>,
+    /// Experimental bounded native ID indexing for annotation owners only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id_index: Option<TurnIdIndex>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -76,6 +81,7 @@ impl Default for Options {
             retained_manifest_versions: 64,
             compaction: None,
             session_index: None,
+            turn_id_index: None,
         }
     }
 }
@@ -97,6 +103,17 @@ impl Options {
             .context("materializer workspace overflow")
     }
     pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+        if let Some(index) = &self.turn_id_index {
+            ensure!(
+                self.session_index.is_none()
+                    && matches!(
+                        ingress.scope.contract.policy,
+                        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+                    ),
+                "turn ID indexing requires an annotation owner without session indexing"
+            );
+            index.validate(budget.limit())?;
+        }
         if let Some(index) = &self.session_index {
             index.validate(budget.limit())?;
         }
@@ -386,7 +403,7 @@ impl Publisher {
         );
         Ok(self.state().await?.progress.prepared)
     }
-    async fn maintenance_plan(&self, view: &p::Table) -> Result<Option<p::Plan>> {
+    pub(crate) async fn maintenance_plan(&self, view: &p::Table) -> Result<Option<p::Plan>> {
         if Self::compaction_first(view.progress.minimum_read_version) {
             if let Some(plan) = compaction::plan(self, view).await? {
                 return Ok(Some(plan));
@@ -395,10 +412,13 @@ impl Publisher {
         if let Some(plan) = session_index::plan(self, view).await? {
             return Ok(Some(plan));
         }
+        if let Some(plan) = turn_id_index::plan(self, view).await? {
+            return Ok(Some(plan));
+        }
         compaction::plan(self, view).await
     }
 
-    fn compaction_first(read_version: u64) -> bool {
+    pub(crate) fn compaction_first(read_version: u64) -> bool {
         // During backlog, each append/maintenance pair advances two versions.
         // Rotate from durable state so takeover cannot reset the preference.
         (read_version / 2) % 2 == 1
@@ -412,6 +432,9 @@ impl Publisher {
                 return compaction::prepare(self, pending).await;
             }
             if let Some(index) = session_index::prepare(self, pending).await? {
+                return Ok(index);
+            }
+            if let Some(index) = turn_id_index::prepare(self, pending).await? {
                 return Ok(index);
             }
             return compaction::prepare(self, pending).await;

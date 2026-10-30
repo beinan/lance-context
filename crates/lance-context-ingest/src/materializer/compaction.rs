@@ -50,9 +50,14 @@ impl SmallFileCompaction {
         );
         Ok(())
     }
-    fn fragments(&self, dataset: &Dataset, indices: &[IndexMetadata]) -> Option<Vec<Fragment>> {
+    fn fragments(
+        &self,
+        dataset: &Dataset,
+        indices: &[IndexMetadata],
+        row_limit: Option<usize>,
+    ) -> Option<Vec<Fragment>> {
         // A rewrite must have uniform coverage in every native index segment.
-        let mut groups: BTreeMap<Vec<bool>, (Vec<Fragment>, usize)> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<bool>, (Vec<Fragment>, usize, usize)> = BTreeMap::new();
         for fragment in dataset.manifest().fragments.iter() {
             // Managed ingest creates append-only, sized fragments. Unknown
             // sizes and deletion rewrites need separate planning policies.
@@ -75,19 +80,24 @@ impl SmallFileCompaction {
                         .contains(fragment.id as u32)
                 })
                 .collect();
-            let (selected, bytes) = groups.entry(coverage).or_default();
+            let (selected, bytes, rows) = groups.entry(coverage).or_default();
+            let count = fragment.physical_rows.unwrap();
             if size > self.target_file_bytes * 2 - *bytes {
+                continue;
+            }
+            if row_limit.is_some_and(|limit| count > limit.saturating_sub(*rows)) {
                 continue;
             }
             selected.push(fragment.clone());
             *bytes += size;
+            *rows = rows.checked_add(count)?;
             if selected.len() == 64 {
                 return Some(std::mem::take(selected));
             }
         }
         groups
             .into_values()
-            .map(|(fragments, _)| fragments)
+            .map(|(fragments, _, _)| fragments)
             .find(|fragments| fragments.len() >= self.min_fragments)
     }
 }
@@ -132,18 +142,28 @@ pub(crate) async fn read_compaction_base(publisher: &Publisher, version: u64) ->
     }
 }
 
-pub(super) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool> {
+pub(crate) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool> {
     let Some(options) = &publisher.options.compaction else {
         return Ok(false);
     };
     let dataset = read_compaction_base(publisher, version).await?;
     let indices = supported_indices(&dataset).await?;
-    Ok(options.fragments(&dataset, &indices).is_some())
+    Ok(options
+        .fragments(
+            &dataset,
+            &indices,
+            publisher
+                .options
+                .turn_id_index
+                .as_ref()
+                .map(|_| turn_id_index::MAX_BUILD_ROWS),
+        )
+        .is_some())
 }
 
 pub(crate) async fn has_work_on(dataset: &Dataset, options: &SmallFileCompaction) -> Result<bool> {
     let indices = supported_indices(dataset).await?;
-    Ok(options.fragments(dataset, &indices).is_some())
+    Ok(options.fragments(dataset, &indices, None).is_some())
 }
 
 pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Option<p::Plan>> {
@@ -171,7 +191,15 @@ pub(super) async fn prepare(
     let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
     let indices = supported_indices(&dataset).await?;
     let fragments = options
-        .fragments(&dataset, &indices)
+        .fragments(
+            &dataset,
+            &indices,
+            publisher
+                .options
+                .turn_id_index
+                .as_ref()
+                .map(|_| turn_id_index::MAX_BUILD_ROWS),
+        )
         .context("pending compaction has no eligible fragments under configured limits")?;
     let rows = fragments
         .iter()
@@ -271,7 +299,7 @@ pub(crate) async fn prepare_body_dataset(
     options.validate(record_bytes, budget.limit())?;
     let indices = supported_indices(&dataset).await?;
     let fragments = options
-        .fragments(&dataset, &indices)
+        .fragments(&dataset, &indices, None)
         .context("pending compaction has no eligible fragments under configured limits")?;
     let rows = fragments
         .iter()

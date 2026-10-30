@@ -2,6 +2,11 @@
 use super::*;
 
 impl Publisher {
+    async fn prefer_id_index(&mut self, version: u64) -> Result<bool> {
+        Ok(!materializer::Publisher::compaction_first(version)
+            && materializer::turn_id_index::has_work(&self.catalog, version).await?)
+    }
+
     pub(super) async fn compact_next(&mut self, view: &p::Table) -> Result<bool> {
         if let Some(pending) = &view.progress.pending {
             if !pending.plan.is_maintenance() {
@@ -13,7 +18,7 @@ impl Publisher {
             // further rewrites between publications. This reduces the fragment
             // fanout of subsequent narrow updates without an unbounded burst.
             // A retained plan always resolves above; idle maintenance may drain.
-            if self.options.compaction.is_none()
+            if (self.options.compaction.is_none() && self.options.turn_id_index.is_none())
                 || view
                     .progress
                     .checkpoint
@@ -39,10 +44,13 @@ impl Publisher {
             if self.compaction_checked_version == Some(view.progress.minimum_read_version) {
                 return Ok(false);
             }
-            let plan = if self
-                .body_compaction_candidate(view.progress.minimum_read_version)
+            let plan = if !self
+                .prefer_id_index(view.progress.minimum_read_version)
                 .await?
-                .is_some()
+                && self
+                    .body_compaction_candidate(view.progress.minimum_read_version)
+                    .await?
+                    .is_some()
             {
                 Some(p::Plan {
                     transaction: Uuid::new_v4(),
@@ -51,7 +59,7 @@ impl Publisher {
                     next_group: self.service.ingress.group(0)?,
                 })
             } else {
-                materializer::compaction::plan(&self.catalog, view).await?
+                self.catalog.maintenance_plan(view).await?
             };
             let Some(plan) = plan else {
                 // Remember only a completed no-candidate check, never a budget
@@ -74,7 +82,10 @@ impl Publisher {
             .pending
             .as_ref()
             .context("maintenance plan missing")?;
-        if current.progress.prepared.is_none() && !self.prepare_body_compaction(pending).await? {
+        if current.progress.prepared.is_none()
+            && (self.prefer_id_index(pending.plan.read_version).await?
+                || !self.prepare_body_compaction(pending).await?)
+        {
             self.catalog
                 .prepare_next()
                 .await?
@@ -96,6 +107,15 @@ impl Publisher {
                     .shared
                     .staging
                     .install_compacted(&transaction, selected)
+                    .await?;
+            } else if matches!(
+                transaction.operation,
+                lance_table::transaction::Operation::CreateIndex { .. }
+            ) {
+                self.service
+                    .shared
+                    .staging
+                    .install_indexed(&transaction, selected)
                     .await?;
             } else {
                 self.service

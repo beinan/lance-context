@@ -260,7 +260,11 @@ pub(crate) async fn annotation_compaction_transaction(
     );
     let mut transaction = Transaction::new(
         pending.plan.read_version,
-        super::compaction::operation(base, descriptors).await?,
+        match descriptors.format {
+            2 => super::compaction::operation(base, descriptors).await?,
+            3 => super::turn_id_index::operation(base, descriptors).await?,
+            _ => bail!("unexpected annotation maintenance descriptor format"),
+        },
         None,
     );
     transaction.uuid = pending.plan.transaction.to_string();
