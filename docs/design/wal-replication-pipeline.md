@@ -31,5 +31,8 @@ Qualification must demonstrate a follower receiving an append while the leader's
 real sync barrier is blocked, with no client ACK before release; injected leader
 and follower sync failures; bounded outgoing credits; snapshot catch-up; and
 complete payload/exact-retry recovery after reopening the original directories.
-Independent-process recovery and a same-binary performance comparison remain
-necessary before recommending this setting.
+The TLS process tests exercise both settings with leader SIGKILL, a full restart
+from the original directories, exact request identities and complete payload
+checks. They also interrupt snapshot installation and restart the recipient at
+its original endpoints. A same-binary performance comparison remains necessary
+before recommending this setting; these tests do not establish a speedup.
