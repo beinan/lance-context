@@ -600,18 +600,23 @@ impl Driver {
                     .shared
                     .phases
                     .measure(Phase::AnnotationObserve, async {
-                        service.barrier().await?;
-                        reader::observe(
-                            ingress,
-                            service.group()?,
-                            query::Query::AcceptedBucket {
-                                table: ingress.scope.table,
-                                bucket: service.bucket(),
-                                after,
-                                limit: 32,
-                            },
-                        )
-                        .await
+                        // Validate both observations before consuming a page.
+                        // Its cursor belongs to its own captured cut; closure
+                        // independently checks that our recovery base is usable.
+                        let (_, observed) = tokio::try_join!(
+                            service.barrier(),
+                            reader::observe(
+                                ingress,
+                                service.group()?,
+                                query::Query::AcceptedBucket {
+                                    table: ingress.scope.table,
+                                    bucket: service.bucket(),
+                                    after,
+                                    limit: 32,
+                                },
+                            )
+                        )?;
+                        Ok::<_, anyhow::Error>(observed)
                     })
                     .await?;
                 let query::Value::Accepted(mut page) = value else {
