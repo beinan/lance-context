@@ -415,20 +415,42 @@ impl Service {
     }
 
     async fn reserve_upload_observed(&self, bytes: usize) -> Result<Upload> {
+        let workspace = self.upload_workspace(bytes)?;
+        Ok(Upload {
+            scope: self.ingress.scope.clone(),
+            bytes,
+            reservation: self.ingress.budget.reserve(workspace).await,
+        })
+    }
+
+    /// HTTP/2 streams must not hold shared receive credit while waiting for
+    /// memory needed by another, already admitted upload on that connection.
+    #[cfg(feature = "http")]
+    pub(crate) async fn try_reserve_upload(&self, bytes: usize) -> Result<Option<Upload>> {
+        self.shared
+            .phases
+            .measure(Phase::AnnotationUploadAdmission, async {
+                let workspace = self.upload_workspace(bytes)?;
+                Ok(self
+                    .ingress
+                    .budget
+                    .try_reserve(workspace)
+                    .map(|reservation| Upload {
+                        scope: self.ingress.scope.clone(),
+                        bytes,
+                        reservation,
+                    }))
+            })
+            .await
+    }
+
+    fn upload_workspace(&self, bytes: usize) -> Result<usize> {
         let contract = &self.ingress.scope.contract;
         ensure!(
             bytes > 0 && bytes <= contract.max_record_bytes as usize,
             "annotation upload too large"
         );
-        Ok(Upload {
-            scope: self.ingress.scope.clone(),
-            bytes,
-            reservation: self
-                .ingress
-                .budget
-                .reserve(decode_workspace(contract, &self.limits, bytes)?)
-                .await,
-        })
+        decode_workspace(contract, &self.limits, bytes)
     }
 
     pub async fn prepare(
