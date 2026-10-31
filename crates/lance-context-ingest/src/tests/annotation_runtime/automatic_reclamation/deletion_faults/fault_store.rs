@@ -402,7 +402,12 @@ impl ObjectStore for FaultStore {
                     };
                     inner.delete(&path).await?;
                     if let Some(marker) = crash {
-                        std::fs::write(marker, path.as_ref()).map_err(|_| failure())?;
+                        // The parent sends SIGKILL as soon as the marker exists.
+                        // Publish its complete contents atomically so it cannot
+                        // kill us between creating the file and writing the path.
+                        let pending = marker.with_extension("pending");
+                        std::fs::write(&pending, path.as_ref()).map_err(|_| failure())?;
+                        std::fs::rename(pending, marker).map_err(|_| failure())?;
                         std::future::pending::<()>().await;
                     }
                     if lose {
