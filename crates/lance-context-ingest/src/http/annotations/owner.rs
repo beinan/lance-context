@@ -238,9 +238,11 @@ impl Owner {
                             options.body_total_timeout,
                         )
                         .await
-                        .map_err(|_| {
+                        .map_err(|error| {
+                            eprintln!("annotation status filter failed: {error:#}");
                             Failure::unavailable("status_filter_unavailable", "not_submitted")
-                        })?;
+                        })?
+                        .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?;
                     reservation = Some(held);
                     Json(result).into_response()
                 }

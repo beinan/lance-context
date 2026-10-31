@@ -20,6 +20,7 @@ impl Service {
     /// The HTTP owner fences the result after this query. The acquired epoch's
     /// recovery cut is required, but a later unacknowledged proposal cannot
     /// prevent a query of the already selected materialized snapshot.
+    /// None means shared memory refused admission before native work started.
     pub(crate) async fn filter_status_owned(
         &self,
         status: Option<String>,
@@ -27,7 +28,7 @@ impl Service {
         response_bytes: usize,
         recovery_cut: u64,
         deadline: Duration,
-    ) -> Result<(StatusMatches, MergeReservation)> {
+    ) -> Result<Option<(StatusMatches, MergeReservation)>> {
         tokio::time::timeout(deadline, async {
             self.wait_through(recovery_cut).await?;
             let read = self
@@ -42,16 +43,14 @@ impl Service {
             );
             // Optional filtering must not queue a large reservation ahead of
             // ingestion. Refuse promptly when shared capacity is occupied.
-            let reservation = self
-                .ingress
-                .budget
-                .try_reserve(workspace)
-                .context("status filter capacity exhausted")?;
+            let Some(reservation) = self.ingress.budget.try_reserve(workspace) else {
+                return Ok(None);
+            };
             // Native query tasks may outlive cancellation of an HTTP request.
             // Keep their base pin and reservation until the actual work ends.
             tokio::spawn(async move {
                 let result = read.resolve().await?;
-                Ok::<_, anyhow::Error>((result, reservation))
+                Ok::<_, anyhow::Error>(Some((result, reservation)))
             })
             .await?
         })
