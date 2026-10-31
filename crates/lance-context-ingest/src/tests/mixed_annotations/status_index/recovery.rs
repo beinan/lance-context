@@ -46,7 +46,7 @@ async fn leave_empty_definition(
         &patcher,
         1,
         encoded(mixed::wire::patches(
-            &patch(&["A"], Some("reviewed"), Some(0.1))?,
+            &patch(&["A", "B", "C"], Some("reviewed"), Some(0.1))?,
             &limits(),
         )?)?,
     )

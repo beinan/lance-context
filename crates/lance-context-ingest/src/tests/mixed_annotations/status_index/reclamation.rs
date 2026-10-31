@@ -127,22 +127,49 @@ async fn retained_reader() -> Result<()> {
         !old.is_subset(&live),
         "old status files were never replaced"
     );
-    let expected = live.union(&old).cloned().collect();
-    wait_files(&path, &expected).await?;
-    assert!(!annotation_publication::state(&c)
-        .await?
-        .manifests
-        .unwrap()
+    // Recent selected versions still protect their status files. Wait for the
+    // configured history bound, then include those exact roots in the expected
+    // set rather than incorrectly requiring immediate deletion at publication.
+    let manifests = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let state = annotation_publication::state(&c).await?;
+            let manifests = state.manifests.unwrap();
+            if manifests.versions.len() <= 4 && state.progress.pending.is_none() {
+                return Ok::<_, anyhow::Error>(manifests);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    assert!(!manifests.versions.contains_key(&held.base_version));
+    let mut retained = BTreeSet::new();
+    for version in manifests
         .versions
-        .contains_key(&held.base_version));
+        .keys()
+        .filter(|v| **v != manifests.initial_version)
+    {
+        let selected = annotation_publication::read(&c, &narrow, Some(*version)).await?;
+        retained.extend(referenced(&selected, &path).await?);
+    }
+    assert!(live.is_subset(&retained));
+    assert!(
+        old.difference(&retained).next().is_some(),
+        "old status is still rooted"
+    );
+    let expected = retained.union(&old).cloned().collect();
+    wait_files(&path, &expected)
+        .await
+        .context("collect all unrooted status files while reader is held")?;
     assert_eq!(
         held.resolve().await?.unwrap().status.as_deref(),
         Some("pending")
     );
     assert!(old.iter().all(|file| file.exists()));
     drop(held);
-    wait_files(&path, &live).await?;
-    assert!(old.difference(&live).all(|file| !file.exists()));
+    wait_files(&path, &retained)
+        .await
+        .context("collect retired status files after reader release")?;
+    assert!(old.difference(&retained).all(|file| !file.exists()));
     check(&a, "turn-0", "s", 0, "pending", None).await?;
     stop.send(()).unwrap();
     task.await??;
