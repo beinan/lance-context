@@ -51,6 +51,10 @@ pub struct Options {
     pub tick_interval: Duration,
     /// Maximum commands from each lane before polling durable Raft progress.
     pub batch_requests: usize,
+    /// End the drain batch after a round consumes this wall-time budget.
+    /// Cannot preempt a single operation or bound a poll's persistence latency.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
+    pub batch_time: Duration,
     /// Overlap ordinary peer messages with local persistence. Persistence-bound
     /// replies, snapshots and client completions retain their existing barriers.
     /// Experimental; disabled until a controlled comparison supports it.
@@ -67,6 +71,7 @@ impl Default for Options {
             peer_bytes: 64 << 20,
             tick_interval: Duration::from_millis(100),
             batch_requests: 32,
+            batch_time: Duration::from_millis(1),
             pipeline_replication: false,
         }
     }
@@ -85,6 +90,7 @@ impl Options {
         }
         ensure!(
             (1..=256).contains(&self.batch_requests)
+                && (Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.batch_time)
                 && self.tick_interval >= Duration::from_millis(10)
                 && self.tick_interval <= Duration::from_secs(1),
             "invalid runtime scheduling options"
@@ -799,6 +805,7 @@ impl Worker {
             let mut activity = false;
             let mut peer_credits = Vec::new();
             let mut after_poll = Vec::new();
+            let batch_started = Instant::now();
             for _ in 0..self.options.batch_requests {
                 let mut any = false;
                 if let Ok(result) = self.snapshot_results.try_recv() {
@@ -824,7 +831,7 @@ impl Worker {
                     any = true;
                 }
                 activity |= any;
-                if !any {
+                if !any || batch_started.elapsed() >= self.options.batch_time {
                     break;
                 }
             }
