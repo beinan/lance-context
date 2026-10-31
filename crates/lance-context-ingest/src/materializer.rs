@@ -16,12 +16,14 @@ mod plan;
 mod read_policy;
 mod session_index;
 pub(crate) mod stage;
+pub(crate) mod status_index;
 pub(crate) mod turn_id_index;
 pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
 pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
+pub use status_index::StatusIndex;
 pub use turn_id_index::TurnIdIndex;
 
 /// Resolve this from the authorized namespace, never from an append request.
@@ -65,6 +67,10 @@ pub struct Options {
     /// Experimental bounded native ID indexing for annotation owners only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id_index: Option<TurnIdIndex>,
+    /// Asynchronous native status indexing for annotation owners. Filters read
+    /// the selected materialized snapshot; point reads retain staging visibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_index: Option<StatusIndex>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -82,6 +88,7 @@ impl Default for Options {
             compaction: None,
             session_index: None,
             turn_id_index: None,
+            status_index: None,
         }
     }
 }
@@ -103,6 +110,17 @@ impl Options {
             .context("materializer workspace overflow")
     }
     pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+        if let Some(index) = &self.status_index {
+            ensure!(
+                self.session_index.is_none()
+                    && matches!(
+                        ingress.scope.contract.policy,
+                        WritePolicy::TurnAnnotations | WritePolicy::TurnIngestion
+                    ),
+                "status indexing requires an annotation owner without session indexing"
+            );
+            index.validate(budget.limit())?;
+        }
         if let Some(index) = &self.turn_id_index {
             ensure!(
                 self.session_index.is_none()
@@ -412,10 +430,29 @@ impl Publisher {
         if let Some(plan) = session_index::plan(self, view).await? {
             return Ok(Some(plan));
         }
+        if Self::status_index_first(view.progress.minimum_read_version) {
+            if let Some(plan) = status_index::plan(self, view).await? {
+                return Ok(Some(plan));
+            }
+        }
         if let Some(plan) = turn_id_index::plan(self, view).await? {
             return Ok(Some(plan));
         }
+        if let Some(plan) = status_index::plan(self, view).await? {
+            return Ok(Some(plan));
+        }
         compaction::plan(self, view).await
+    }
+
+    fn status_index_first(read_version: u64) -> bool {
+        // Alternate the preferred index across the existing compaction turns.
+        // The same selected version makes the same choice after takeover.
+        (read_version / 4) % 2 == 1
+    }
+
+    pub(crate) async fn has_annotation_index_work(&self, version: u64) -> Result<bool> {
+        Ok(turn_id_index::has_work(self, version).await?
+            || status_index::has_work(self, version).await?)
     }
 
     pub(crate) fn compaction_first(read_version: u64) -> bool {
@@ -434,7 +471,15 @@ impl Publisher {
             if let Some(index) = session_index::prepare(self, pending).await? {
                 return Ok(index);
             }
+            if Self::status_index_first(pending.plan.read_version) {
+                if let Some(index) = status_index::prepare(self, pending).await? {
+                    return Ok(index);
+                }
+            }
             if let Some(index) = turn_id_index::prepare(self, pending).await? {
+                return Ok(index);
+            }
+            if let Some(index) = status_index::prepare(self, pending).await? {
                 return Ok(index);
             }
             return compaction::prepare(self, pending).await;

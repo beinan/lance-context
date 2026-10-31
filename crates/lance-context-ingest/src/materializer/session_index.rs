@@ -12,18 +12,21 @@ const NAME: &str = "lance_context_rollout_id";
 pub(super) enum Key {
     Session,
     Turn,
+    Status,
 }
 impl Key {
     pub(super) fn column(self) -> &'static str {
         match self {
             Self::Session => "rollout_id",
             Self::Turn => "id",
+            Self::Status => "status",
         }
     }
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Session => NAME,
             Self::Turn => "lance_context_turn_id",
+            Self::Status => "lance_context_annotation_status",
         }
     }
 }
@@ -104,6 +107,10 @@ impl SessionIndex {
 
 pub(super) enum Action {
     Build(Vec<u32>),
+    BuildReplacingEmpty {
+        fragments: Vec<u32>,
+        empty_sources: Vec<Uuid>,
+    },
     Merge(Vec<IndexMetadata>),
 }
 
@@ -134,7 +141,7 @@ pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: K
             && index
                 .fragment_bitmap
                 .as_ref()
-                .is_some_and(|b| !b.is_empty()),
+                .is_some_and(|b| !b.is_empty() || matches!(key, Key::Status)),
         "incompatible managed session index metadata"
     );
     Ok(())
@@ -216,8 +223,13 @@ pub(super) async fn prepare_action(
     // Cancellation cannot release admission while a native index build still runs.
     let descriptors = tokio::spawn(async move {
         let _reservation = reservation;
+        let is_merge = matches!(&action, Action::Merge(_));
         let (coverage, removed): (BTreeSet<_>, Vec<_>) = match &action {
             Action::Build(ids) => (ids.iter().copied().collect(), Vec::new()),
+            Action::BuildReplacingEmpty {
+                fragments,
+                empty_sources,
+            } => (fragments.iter().copied().collect(), empty_sources.clone()),
             Action::Merge(segments) => (
                 segments
                     .iter()
@@ -229,7 +241,7 @@ pub(super) async fn prepare_action(
         let index = phases
             .measure(Phase::BlobWrite, async {
                 match action {
-                    Action::Build(ids) => {
+                    Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
                         dataset
                             .create_index_builder(
                                 &[key.column()],
@@ -250,7 +262,7 @@ pub(super) async fn prepare_action(
             .await?;
         validate_metadata(&dataset, &index, key)?;
         ensure!(
-            !removed.is_empty() || index.dataset_version == dataset.version().version,
+            is_merge || index.dataset_version == dataset.version().version,
             "index snapshot changed"
         );
         ensure!(
@@ -286,6 +298,23 @@ pub(super) async fn operation_for(
     descriptors: &p::Descriptors,
     key: Key,
 ) -> Result<Operation> {
+    decode_operation(dataset, descriptors, Some(key)).await
+}
+
+/// Recover a selected annotation index operation from its native metadata,
+/// including when the current owner's maintenance configuration has changed.
+pub(super) async fn annotation_operation(
+    dataset: &Dataset,
+    descriptors: &p::Descriptors,
+) -> Result<Operation> {
+    decode_operation(dataset, descriptors, None).await
+}
+
+async fn decode_operation(
+    dataset: &Dataset,
+    descriptors: &p::Descriptors,
+    expected: Option<Key>,
+) -> Result<Operation> {
     ensure!(
         descriptors.format == 3 && dataset.manifest().uses_stable_row_ids(),
         "unsupported index publication"
@@ -296,12 +325,19 @@ pub(super) async fn operation_for(
         "index snapshot changed"
     );
     let index = IndexMetadata::try_from(pb::IndexMetadata::decode(change.index.as_slice())?)?;
+    let key = match expected {
+        Some(key) => key,
+        None if index.name == Key::Turn.name() => Key::Turn,
+        None if index.name == Key::Status.name() => Key::Status,
+        None => anyhow::bail!("unsupported annotation index"),
+    };
     validate_metadata(dataset, &index, key)?;
     ensure!(
         !change.removed.is_empty() || index.dataset_version == dataset.version().version,
         "index snapshot changed"
     );
     let covered = index.fragment_bitmap.as_ref().unwrap();
+    ensure!(!covered.is_empty(), "index result has no coverage");
     let live: BTreeSet<_> = dataset.manifest().fragments.iter().map(|f| f.id).collect();
     ensure!(
         covered.iter().all(|id| live.contains(&u64::from(id))),
@@ -343,7 +379,15 @@ pub(super) async fn operation_for(
         removed_indices.len() == remove.len(),
         "index consolidation source changed"
     );
-    if !remove.is_empty() {
+    if !remove.is_empty() && removed_coverage.is_empty() {
+        // Updating the last indexed fragment retains an empty definition.
+        // CreateIndex does not retire it implicitly: a fresh catch-up build
+        // may remove only proven-empty status sources at this exact snapshot.
+        ensure!(
+            matches!(key, Key::Status) && index.dataset_version == dataset.version().version,
+            "invalid empty status index replacement"
+        );
+    } else if !remove.is_empty() {
         ensure!(
             remove.len() >= 2 && covered.iter().collect::<BTreeSet<_>>() == removed_coverage,
             "index consolidation changed coverage"

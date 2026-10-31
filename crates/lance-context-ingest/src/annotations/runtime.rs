@@ -164,9 +164,9 @@ impl Runtime {
             "annotation runtime does not support session indexing or remote preparation"
         );
         ensure!(
-            c.publication.turn_id_index.is_none()
+            (c.publication.turn_id_index.is_none() && c.publication.status_index.is_none())
                 || c.limits.retained_entries <= materializer::turn_id_index::MAX_BUILD_ROWS,
-            "turn ID indexing requires at most 1048576 retained annotation entries"
+            "annotation indexing requires at most 1048576 retained annotation entries"
         );
         let workspace = c
             .limits
@@ -232,7 +232,7 @@ impl Runtime {
             publisher.service = service.clone();
             view = publisher.catalog.state().await?;
         }
-        if c.publication.turn_id_index.is_some() {
+        if c.publication.turn_id_index.is_some() || c.publication.status_index.is_some() {
             // Before the first advance, minimum_read_version is still the
             // protocol floor (1). Bootstrap can select a later native version.
             let version = view

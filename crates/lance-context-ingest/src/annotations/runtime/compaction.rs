@@ -2,9 +2,9 @@
 use super::*;
 
 impl Publisher {
-    async fn prefer_id_index(&mut self, version: u64) -> Result<bool> {
+    async fn prefer_annotation_index(&mut self, version: u64) -> Result<bool> {
         Ok(!materializer::Publisher::compaction_first(version)
-            && materializer::turn_id_index::has_work(&self.catalog, version).await?)
+            && self.catalog.has_annotation_index_work(version).await?)
     }
 
     pub(super) async fn compact_next(&mut self, view: &p::Table) -> Result<bool> {
@@ -18,7 +18,9 @@ impl Publisher {
             // further rewrites between publications. This reduces the fragment
             // fanout of subsequent narrow updates without an unbounded burst.
             // A retained plan always resolves above; idle maintenance may drain.
-            if (self.options.compaction.is_none() && self.options.turn_id_index.is_none())
+            if (self.options.compaction.is_none()
+                && self.options.turn_id_index.is_none()
+                && self.options.status_index.is_none())
                 || view
                     .progress
                     .checkpoint
@@ -45,7 +47,7 @@ impl Publisher {
                 return Ok(false);
             }
             let plan = if !self
-                .prefer_id_index(view.progress.minimum_read_version)
+                .prefer_annotation_index(view.progress.minimum_read_version)
                 .await?
                 && self
                     .body_compaction_candidate(view.progress.minimum_read_version)
@@ -83,7 +85,9 @@ impl Publisher {
             .as_ref()
             .context("maintenance plan missing")?;
         if current.progress.prepared.is_none()
-            && (self.prefer_id_index(pending.plan.read_version).await?
+            && (self
+                .prefer_annotation_index(pending.plan.read_version)
+                .await?
                 || !self.prepare_body_compaction(pending).await?)
         {
             self.catalog
