@@ -24,3 +24,14 @@ HTTP/2 annotation uploads that cannot immediately reserve memory receive
 `memory_capacity` with `operation_outcome: not_submitted`. Waiting before reading
 one stream's body can block other admitted uploads on the same connection.
 The refusal occurs before decoding or appending to the WAL.
+
+The owner's `append_rpc` observation separates WAL append byte admission,
+connection acquisition (including pool waits and TLS), sending, and waiting for
+the response. WAL `/status` reports `append_execution`, from complete body receipt
+through worker execution and quorum completion; it excludes transport admission
+and reply delivery. Execution includes validation and scheduling, not just disk I/O.
+Each phase reports started/finished intervals, cumulative microseconds and the
+largest finished interval. Errors and cancellations finish intervals too; use
+the existing WAL outcome counters to distinguish outcomes. Observations are
+independent samples, phases can overlap across requests, and neither means nor
+maxima are p99 latency. An append redirected between nodes has multiple exchanges.

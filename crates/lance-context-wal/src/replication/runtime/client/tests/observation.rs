@@ -66,6 +66,10 @@ async fn append_diagnostics_distinguish_disk_refusals_from_unknown_outcomes() ->
     assert_eq!(observed["execution_other"], 0);
     assert_eq!(observed["cancelled"], 0);
     assert_eq!(observed.values().sum::<u64>(), 2 * observed["started"]);
+    let execution = handle.append_execution_timing();
+    assert_eq!(execution.started, 5);
+    assert_eq!(execution.finished, 5);
+    assert!(execution.elapsed_micros >= execution.max_elapsed_micros);
     c.shutdown().await
 }
 
@@ -156,6 +160,14 @@ async fn cancelled_append_execution_is_not_reported_as_rejected_or_accepted() ->
     assert!(expired.is_err());
     assert_eq!(handle.append_observation()["cancelled"], 1);
     assert_eq!(handle.append_observation()["accepted"], 0);
+    let execution = handle.append_execution_timing();
+    assert_eq!(execution.started, 1);
+    assert_eq!(execution.finished, 1);
+    assert!(execution.elapsed_micros >= 200_000);
+    let response = &c.client.append_timings()["response"];
+    assert_eq!(response.started, 1);
+    assert_eq!(response.finished, 1);
+    assert!(response.elapsed_micros >= 200_000);
     // The timed-out operation can still commit. Retry the original bytes and
     // verify one accepted record and the original durable position.
     let retried = c.client.request_routed(request).await?;
@@ -164,5 +176,79 @@ async fn cancelled_append_execution_is_not_reported_as_rejected_or_accepted() ->
     assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
     assert_eq!(handle.observation(10)?.status.accepted_records, 1);
     assert_eq!(handle.append_observation()["accepted"], 1);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_timings_separate_byte_and_connection_waits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let c = RpcCluster::open(
+        dir.path(),
+        Options {
+            connections: 1,
+            ..Options::default()
+        },
+    )
+    .await?;
+    let leader = c.leader().await?;
+    let handle = &c.net.nodes[&leader].handle;
+    let byte_permits = c.client.budgets.data.available_permits() as u32;
+    let bytes = c
+        .client
+        .budgets
+        .data
+        .clone()
+        .acquire_many_owned(byte_permits)
+        .await?;
+    let connection = c.client.nodes[&leader]
+        .data
+        .slots
+        .clone()
+        .acquire_owned()
+        .await?;
+    let client = c.client.clone();
+    let request = client.request(
+        leader,
+        Request::Append {
+            group: 10,
+            batch: batch(1),
+        },
+    );
+    tokio::pin!(request);
+    assert!(timeout(Duration::from_millis(30), &mut request)
+        .await
+        .is_err());
+    let blocked = c.client.append_timings();
+    assert_eq!(blocked["admission"].started, 1);
+    assert_eq!(blocked["admission"].finished, 0);
+    assert_eq!(blocked["connection"].started, 0);
+    assert_eq!(handle.append_execution_timing().started, 0);
+    drop(bytes);
+
+    assert!(timeout(Duration::from_millis(30), &mut request)
+        .await
+        .is_err());
+    let blocked = c.client.append_timings();
+    assert_eq!(blocked["admission"].finished, 1);
+    assert!(blocked["admission"].elapsed_micros >= 20_000);
+    assert_eq!(blocked["connection"].started, 1);
+    assert_eq!(blocked["connection"].finished, 0);
+    assert_eq!(blocked["send"].started, 0);
+    assert_eq!(handle.append_execution_timing().started, 0);
+    drop(connection);
+
+    let completed = request.await?;
+    let index = accepted(&completed);
+    drop(completed);
+    // Control traffic must not enter the append phase counters.
+    assert_eq!(producer(&c.client, leader, &batch(1)).await?, Some(index));
+    let observed = c.client.append_timings();
+    for phase in observed.values() {
+        assert_eq!(phase.started, 1);
+        assert_eq!(phase.finished, 1);
+        assert_eq!(phase.elapsed_micros, phase.max_elapsed_micros);
+    }
+    assert!(observed["connection"].elapsed_micros >= 20_000);
+    assert_eq!(handle.append_execution_timing().finished, 1);
     c.shutdown().await
 }
