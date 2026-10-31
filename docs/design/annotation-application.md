@@ -198,6 +198,12 @@ Annotation forwarding uses HTTP/2 to the owner, including cleartext HTTP/2 for
 an `http://` owner URL. An early admission refusal can cancel one upload stream
 without closing a connection while the ingress is still writing its body.
 Owners and forwarding ingress listeners continue accepting HTTP/1 clients.
+For streamed uploads, HTTP/2 is recommended on the client-to-ingress hop too:
+an HTTP/1 connection can close while an early refusal and an unfinished upload
+are still in flight. If the caller cannot read the complete refusal response,
+it must treat the outcome as unknown, even if it received a 503 status. Only a
+complete response explicitly declaring `not_submitted` permits the caller to
+resubmit that request as a known pre-submit refusal.
 Upgrade owners before forwarding ingresses; any proxy at `owner_url` must support
 HTTP/2. There is no automatic HTTP/1 fallback or mutation replay after a transport
 failure. Such failures still report an unknown outcome and retain the original

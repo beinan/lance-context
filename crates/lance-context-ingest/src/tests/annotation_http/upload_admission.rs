@@ -134,7 +134,11 @@ async fn exercise() -> Result<()> {
     )?;
     let front = Server::start(gateway.router(), None).await?;
     let client = reqwest::Client::builder()
-        .http1_only()
+        // Require stream cancellation on both hops. With HTTP/1, rejecting an
+        // unfinished upload can close the connection before its response body
+        // reaches the caller; that is an unknown transport outcome, not proof
+        // that this HTTP/2 admission check blocked.
+        .http2_prior_knowledge()
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -165,6 +169,7 @@ async fn exercise() -> Result<()> {
     // The refusal must arrive while A still holds its reservation and has no
     // remaining body available. A 30-second admission timer cannot satisfy this.
     let b_response = tokio::time::timeout(Duration::from_secs(5), &mut b_task).await???;
+    assert_eq!(b_response.version(), reqwest::Version::HTTP_2);
     assert_eq!(b_response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let refusal: serde_json::Value = b_response.json().await?;
     assert_eq!(refusal["error"], "memory_capacity");
