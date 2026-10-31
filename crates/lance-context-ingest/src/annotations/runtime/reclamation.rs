@@ -77,7 +77,8 @@ pub struct Observation {
     /// Failed read-only LIST attempts; no candidates from these attempts are deleted.
     #[serde(default)]
     pub list_failures: u64,
-    /// Publication is paused until a fresh listing attempt succeeds.
+    /// Collection is waiting for a fresh LIST after a failure. Publication can
+    /// continue: the failed attempt did not seal a page or issue any DELETE.
     #[serde(default)]
     pub listing_blocked: bool,
     /// Unresolved immutable paths in the one sealed page blocking publication.
@@ -145,7 +146,7 @@ impl Collector {
         budget: &Arc<MergeMemoryBudget>,
     ) -> Result<bool> {
         if tokio::time::Instant::now() < self.next_run {
-            return Ok(self.sealed.is_none() && !self.listing_blocked);
+            return Ok(self.sealed.is_none());
         }
         let result = if self.sealed.is_some() {
             // Reissue only unresolved immutable DELETE requests from the original,
@@ -172,7 +173,10 @@ impl Collector {
                 observed.list_failures += 1;
                 observed.listing_blocked = true;
                 eprintln!("{error:#}");
-                return Ok(false);
+                // There is no unresolved deletion page. Let the bounded source
+                // window drain while collection waits for its next fresh LIST.
+                // That attempt captures current protection roots before sealing.
+                return Ok(self.sealed.is_none());
             }
         }
         if result.is_ok()
@@ -184,7 +188,7 @@ impl Collector {
             std::mem::swap(&mut self.deferred, &mut self.other_deferred);
             self.body = !self.body;
         }
-        result.map(|()| self.sealed.is_none() && !self.listing_blocked)
+        result.map(|()| self.sealed.is_none())
     }
 
     async fn collect_page(
