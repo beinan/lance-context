@@ -1,4 +1,4 @@
-//! A pending listing response must retain its page while publication proceeds.
+//! Pending and failed read-only listings must not stop bounded publication.
 use super::*;
 
 #[tokio::test]
@@ -50,17 +50,29 @@ async fn failed_listing(suffix: Option<&str>, partial: bool) -> Result<()> {
         })
         .await??;
         let producer = producer(&service, 2).await?;
-        let update = request(
-            &service,
-            &producer,
-            1,
-            wire(&limits(), &["T"], 0, None, 1, Some(0.9))?,
-        )
-        .await?;
-        let result = service.submit(&update, Duration::from_secs(5)).await?;
-        let value = service.get("T", Duration::from_secs(5)).await?.unwrap();
-        ensure!(value.status.as_deref() == Some("acknowledged") && value.score == Some(0.9));
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut through = completed.index;
+        // Keep every fresh LIST failing while more than one source window of
+        // updates is acknowledged, read and materialized. No mutation is resent.
+        for sequence in 1..=4 {
+            let score = Some(sequence as f32);
+            let update = request(
+                &service,
+                &producer,
+                sequence,
+                wire(&limits(), &["T"], 0, None, 1, score)?,
+            )
+            .await?;
+            through = service.submit(&update, Duration::from_secs(5)).await?.index;
+            let value = service.get("T", Duration::from_secs(5)).await?.unwrap();
+            ensure!(value.status.as_deref() == Some("acknowledged") && value.score == score);
+            tokio::time::timeout(Duration::from_secs(5), drained(&c, &service, through))
+                .await
+                .context("publication paused behind failed read-only LIST")??;
+            let (staging, _) = service.observation().await;
+            ensure!(staging.retained_bytes <= limits().retained_bytes);
+            ensure!(service.source_observation().records == 0);
+            cold_check(&c, &storage, score).await?;
+        }
         ensure!(service.reclamation_observation().listing_blocked);
         ensure!(
             !task.is_finished(),
@@ -78,7 +90,7 @@ async fn failed_listing(suffix: Option<&str>, partial: bool) -> Result<()> {
         let (staging, _) = service.observation().await;
         ensure!(staging.retained_bytes <= limits().retained_bytes);
         ensure!(service.source_observation().records <= 2);
-        Ok::<_, anyhow::Error>(result.index)
+        Ok::<_, anyhow::Error>(through)
     }
     .await;
     // Release even for the old-code negative control, preserving the original
@@ -92,7 +104,7 @@ async fn failed_listing(suffix: Option<&str>, partial: bool) -> Result<()> {
             completed
         );
         ensure!(!service.reclamation_observation().listing_blocked);
-        cold_check(&c, &storage, Some(0.9)).await?;
+        cold_check(&c, &storage, Some(4.0)).await?;
         ensure!(abandoned.iter().all(|p| !p.exists()));
     }
     let _ = stop.send(());
