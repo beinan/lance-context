@@ -21,6 +21,7 @@ mod pressure;
 mod read_cut;
 mod shards;
 mod transport;
+mod upload_admission;
 
 struct Server {
     address: std::net::SocketAddr,
@@ -53,11 +54,14 @@ impl Server {
             },
         ));
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = stopped.await;
-                })
-                .await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
         });
         Ok(Self {
             address,

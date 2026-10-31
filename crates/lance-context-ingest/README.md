@@ -19,3 +19,8 @@ admission gate that prevented ordered apply; progress clears it. The existing
 `backpressured` flag is true whenever a reason is present. These are sampled
 states, not refusal counts or blocked durations. In particular, staging pressure
 can include values held by readers or an old frozen generation after publication.
+
+HTTP/2 annotation uploads that cannot immediately reserve memory receive
+`memory_capacity` with `operation_outcome: not_submitted`. Waiting before reading
+one stream's body can block other admitted uploads on the same connection.
+The refusal occurs before decoding or appending to the WAL.

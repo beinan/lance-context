@@ -94,13 +94,23 @@ impl Owner {
                 ingress.scope.contract.max_record_bytes as usize,
                 ARROW_FILE,
             )?;
-            let upload = tokio::time::timeout(
-                options.admission_timeout,
-                self.service.reserve_upload(length),
-            )
-            .await
-            .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
-            .map_err(|_| Failure::bad("invalid_upload_size"))?;
+            let upload = if request.version() == axum::http::Version::HTTP_2 {
+                // A waiting stream can consume the connection receive window
+                // and prevent admitted uploads from finishing and freeing memory.
+                self.service
+                    .try_reserve_upload(length)
+                    .await
+                    .map_err(|_| Failure::bad("invalid_upload_size"))?
+                    .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?
+            } else {
+                tokio::time::timeout(
+                    options.admission_timeout,
+                    self.service.reserve_upload(length),
+                )
+                .await
+                .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
+                .map_err(|_| Failure::bad("invalid_upload_size"))?
+            };
             let bytes = self
                 .service
                 .phase_counters()
