@@ -16,12 +16,13 @@ use lance_index::scalar::{
     AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
 };
 use lance_index::{Index, IndexType};
-use lance_select::NullableRowAddrSet;
+use lance_select::{NullableRowAddrSet, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use serde_json::json;
 
 use crate::dataset::Dataset;
+use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar::fetch_index_details;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
@@ -46,6 +47,8 @@ pub struct LogicalScalarIndex {
     column: String,
     index_type: IndexType,
     segments: Vec<Arc<dyn ScalarIndex>>,
+    masks: Vec<Option<Arc<RowAddrMask>>>,
+    fragments: Option<RoaringBitmap>,
 }
 
 impl LogicalScalarIndex {
@@ -55,6 +58,8 @@ impl LogicalScalarIndex {
     /// Used internally by `open_named_scalar_index`, and exposed so a
     /// distributed query engine can open an explicit subset of a scalar
     /// index's segments and present them as one index.
+    /// The supplied segments must already exclude invalidated fragment matches.
+    /// Use `open_named_scalar_index` to enforce committed per-segment coverage.
     pub fn try_new(
         name: String,
         column: String,
@@ -81,6 +86,8 @@ impl LogicalScalarIndex {
             name,
             column,
             index_type,
+            masks: vec![None; segments.len()],
+            fragments: None,
             segments,
         })
     }
@@ -91,6 +98,11 @@ impl DeepSizeOf for LogicalScalarIndex {
         self.name.deep_size_of_children(context)
             + self.column.deep_size_of_children(context)
             + self.segments.deep_size_of_children(context)
+            + self.masks.deep_size_of_children(context)
+            + self
+                .fragments
+                .as_ref()
+                .map_or(0, RoaringBitmap::serialized_size)
     }
 }
 
@@ -123,6 +135,9 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        if let Some(fragments) = &self.fragments {
+            return Ok(fragments.clone());
+        }
         let fragment_sets = try_join_all(
             self.segments
                 .iter()
@@ -154,11 +169,27 @@ impl ScalarIndex for LogicalScalarIndex {
         options: SearchOptions,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let results = try_join_all(
-            self.segments
-                .iter()
-                .map(|segment| segment.search_with_options(query, options, metrics)),
-        )
+        let results = try_join_all(self.segments.iter().zip(&self.masks).map(
+            |(segment, mask)| async move {
+                let result = segment.search_with_options(query, options, metrics).await?;
+                let Some(mask) = mask else {
+                    return Ok::<_, Error>(result);
+                };
+                // A newer delta may cover a fragment invalidated in this
+                // segment. The union's coverage cannot filter its stale
+                // matches (or stale NULLs); restrict each result first.
+                let mut selected = result.row_addrs().selected_rows().clone();
+                let mut nulls = result.row_addrs().null_rows().clone();
+                selected.mask(mask);
+                nulls.mask(mask);
+                let rows = NullableRowAddrSet::new(selected, nulls);
+                Ok(match result {
+                    SearchResult::Exact(_) => SearchResult::Exact(rows),
+                    SearchResult::AtMost(_) => SearchResult::AtMost(rows),
+                    SearchResult::AtLeast(_) => SearchResult::AtLeast(rows),
+                })
+            },
+        ))
         .await?;
         combine_search_results(results)
     }
@@ -331,8 +362,8 @@ pub async fn scalar_index_fragment_bitmap(
 /// Open a named scalar index, transparently bundling multiple segments when present.
 ///
 /// Loads every segment registered under `index_name` whose fragment bitmap intersects the
-/// dataset. If exactly one usable segment exists it is returned directly; if multiple exist
-/// they are wrapped in a [`LogicalScalarIndex`] so the caller sees a single [`ScalarIndex`].
+/// dataset. Results are restricted to each segment's committed coverage before
+/// combining them. A single segment requiring no mask is returned directly.
 /// Errors if no usable segment exists (the scanner planned a query against an index that is
 /// not present) or if the segments mix incompatible types.
 pub async fn open_named_scalar_index(
@@ -363,31 +394,56 @@ pub async fn open_scalar_index_segments(
                 .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
         });
     }
-    match indices.len() {
-        0 => Err(Error::internal(format!(
+    if indices.is_empty() {
+        return Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
             index_name, column
-        ))),
-        1 => {
-            dataset
-                .open_scalar_index(column, &indices[0].uuid, metrics)
-                .await
-        }
-        _ => {
-            let segments = try_join_all(indices.iter().map(|index| async move {
-                dataset
-                    .open_scalar_index(column, &index.uuid, metrics)
-                    .await
-            }))
-            .await?;
-
-            Ok(Arc::new(LogicalScalarIndex::try_new(
-                index_name.to_string(),
-                column.to_string(),
-                segments,
-            )?) as Arc<dyn ScalarIndex>)
-        }
+        )));
     }
+    let snapshot = Arc::new(dataset.clone());
+    let opened = try_join_all(indices.iter().map(|index| {
+        let snapshot = snapshot.clone();
+        async move {
+            let segment = dataset
+                .open_scalar_index(column, &index.uuid, metrics)
+                .await?;
+            let coverage = index
+                .fragment_bitmap
+                .as_ref()
+                .ok_or_else(|| Error::internal("scalar index segment has no fragment coverage"))?;
+            let mask = if segment.results_are_row_addresses() {
+                // Address-domain indices still return physical addresses when
+                // the dataset uses stable row IDs. Do not mix the two domains.
+                if coverage.is_superset(&dataset.fragment_bitmap) {
+                    None
+                } else {
+                    let mut allowed = RowAddrTreeMap::new();
+                    for fragment in coverage {
+                        allowed.insert_fragment(fragment);
+                    }
+                    Some(Arc::new(RowAddrMask::from_allowed(allowed)))
+                }
+            } else {
+                match DatasetPreFilter::create_restricted_deletion_mask(snapshot, coverage.clone())
+                {
+                    Some(load) => Some(load.await?),
+                    None => None,
+                }
+            };
+            Ok::<_, Error>((segment, mask))
+        }
+    }))
+    .await?;
+    let (mut segments, masks): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
+    if segments.len() == 1 && masks[0].is_none() {
+        return Ok(segments.pop().unwrap());
+    }
+    let mut logical =
+        LogicalScalarIndex::try_new(index_name.to_string(), column.to_string(), segments)?;
+    logical.masks = masks;
+    logical.fragments =
+        Some(union_fragment_bitmaps(&indices, index_name)? & dataset.fragment_bitmap.as_ref());
+    Ok(Arc::new(logical))
 }
 
 #[cfg(test)]

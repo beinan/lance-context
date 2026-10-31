@@ -17,6 +17,7 @@ mod index;
 mod published_values;
 mod reclamation;
 mod registration;
+mod status_segments;
 mod views;
 
 #[tokio::test]
