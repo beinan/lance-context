@@ -97,6 +97,10 @@ impl Forwarder {
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route(
+                "/api/v1/annotations/{table}/filter-status",
+                post(filter_status),
+            )
             .route("/api/v1/annotations/{table}/close", post(close))
             .with_state(self.clone())
     }
@@ -140,17 +144,26 @@ impl Forwarder {
             reply_limit(ingress).map_err(|_| Failure::bad("invalid_annotation_scope"))?;
         let (maximum, content_type) = match operation {
             Operation::Update => (ingress.scope.contract.max_record_bytes as usize, ARROW_FILE),
-            Operation::Read => (maximum_reply, "application/json"),
+            Operation::Read | Operation::FilterStatus => (maximum_reply, "application/json"),
             _ => (32 << 10, "application/json"),
         };
         let length = body::length(&request, maximum, content_type)?;
         let options = &self.gate.0.options;
-        let reservation = tokio::time::timeout(
-            options.admission_timeout,
-            ingress.budget.reserve(length + maximum_reply),
-        )
-        .await
-        .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?;
+        let reservation = if matches!(operation, Operation::FilterStatus) {
+            // Optional filtering must not queue a reservation in front of
+            // ingestion at either the forwarding ingress or the owner.
+            ingress
+                .budget
+                .try_reserve(length + maximum_reply)
+                .ok_or_else(|| Failure::unavailable("memory_capacity", "not_submitted"))?
+        } else {
+            tokio::time::timeout(
+                options.admission_timeout,
+                ingress.budget.reserve(length + maximum_reply),
+            )
+            .await
+            .map_err(|_| Failure::unavailable("memory_capacity", "not_submitted"))?
+        };
         let deadline = Instant::now() + options.body_total_timeout;
         let (request, mut url) = self.routes[table]
             .select(request, operation, length, &self.gate.0.keys, options)
@@ -273,4 +286,7 @@ async fn read(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> 
 }
 async fn close(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Close).await
+}
+async fn filter_status(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::FilterStatus).await
 }

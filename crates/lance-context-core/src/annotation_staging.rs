@@ -21,6 +21,7 @@ mod preserve_id;
 mod publication;
 mod published_values;
 mod registration;
+mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
 pub use publication::{
@@ -28,6 +29,7 @@ pub use publication::{
 };
 use registration::{Batch, Input, PendingTurn};
 pub use registration::{NewTurnSource, Registration};
+pub use status_filter::{StatusMatches, StatusRead, MAX_STATUS_MATCHES};
 pub use views::ProtectedBases;
 #[cfg(test)]
 mod tests;

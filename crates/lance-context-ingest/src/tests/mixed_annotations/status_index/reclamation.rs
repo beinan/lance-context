@@ -77,6 +77,7 @@ async fn retained_reader() -> Result<()> {
         .unwrap()
         .uuid;
     let held = a.capture_read_for_test("turn-0").await?;
+    let held_filter = a.capture_status_for_test(Some("pending".into())).await?;
     assert_eq!(held.base_version, base.version_id());
     drop(base);
     for sequence in 1..=8 {
@@ -166,6 +167,12 @@ async fn retained_reader() -> Result<()> {
     );
     assert!(old.iter().all(|file| file.exists()));
     drop(held);
+    // A materialized filter is also a real reader. Releasing the point read
+    // must not withdraw the filter's old native data/index roots.
+    let filtered = held_filter.resolve().await?;
+    assert_eq!(filtered.ids, vec!["turn-0"]);
+    assert!(old.iter().all(|file| file.exists()));
+    drop(held_filter);
     wait_files(&path, &retained)
         .await
         .context("collect retired status files after reader release")?;
