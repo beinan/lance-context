@@ -39,6 +39,9 @@ fn committed_fetch_finishes_before_a_later_failed_sync_without_acknowledging_new
                 pipeline_replication,
                 tick_interval: Duration::from_secs(1),
                 batch_requests: 16,
+                // Keep the queued fetches and append in the same drain batch:
+                // this test checks when serviced fetch replies are released.
+                batch_time: Duration::from_secs(1),
                 ..Options::default()
             },
         )?;

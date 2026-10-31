@@ -6,6 +6,7 @@ use crate::replication::{
 use std::path::Path;
 use tokio::time::{sleep, timeout};
 
+mod batching;
 mod early;
 #[cfg(feature = "peer-transport")]
 mod fetch;
@@ -23,6 +24,7 @@ struct Cluster {
     snapshot_transfers: Arc<AtomicU64>,
     hold_snapshots: Arc<AtomicBool>,
     held_snapshots: Arc<Mutex<Vec<Outbound>>>,
+    nonempty_entry_packets: Arc<AtomicU64>,
 }
 impl Cluster {
     fn open(root: &Path, options: Options) -> Result<Self> {
@@ -51,6 +53,7 @@ impl Cluster {
         let snapshot_transfers = Arc::new(AtomicU64::new(0));
         let hold_snapshots = Arc::new(AtomicBool::new(false));
         let held_snapshots = Arc::new(Mutex::new(Vec::new()));
+        let nonempty_entry_packets = Arc::new(AtomicU64::new(0));
         let relays = outboxes
             .into_iter()
             .map(|mut outbox| {
@@ -59,12 +62,16 @@ impl Cluster {
                 let snapshot_transfers = snapshot_transfers.clone();
                 let hold_snapshots = hold_snapshots.clone();
                 let held_snapshots = held_snapshots.clone();
+                let nonempty_entry_packets = nonempty_entry_packets.clone();
                 tokio::spawn(async move {
                     while let Some(outgoing) = outbox.recv().await {
                         let p = outgoing.packet();
                         let id = isolated.load(Ordering::Acquire);
                         if id == p.message.from || id == p.message.to {
                             continue;
+                        }
+                        if p.message.entries.iter().any(|entry| !entry.data.is_empty()) {
+                            nonempty_entry_packets.fetch_add(1, Ordering::Release);
                         }
                         if outgoing.snapshot_image().is_some() {
                             if hold_snapshots.load(Ordering::Acquire) {
@@ -95,6 +102,7 @@ impl Cluster {
             snapshot_transfers,
             hold_snapshots,
             held_snapshots,
+            nonempty_entry_packets,
         })
     }
     async fn elect(&self, id: u64, group: u64) -> Result<()> {
