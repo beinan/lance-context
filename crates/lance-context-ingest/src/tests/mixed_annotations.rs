@@ -7,6 +7,7 @@ mod lost_prepare;
 mod pressure;
 mod replay;
 mod runtime;
+mod status_index;
 use crate::{
     annotations::{self as service, mixed, Service},
     materializer::{Acquisition, Options, Storage},

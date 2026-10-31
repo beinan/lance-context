@@ -262,7 +262,7 @@ pub(crate) async fn annotation_compaction_transaction(
         pending.plan.read_version,
         match descriptors.format {
             2 => super::compaction::operation(base, descriptors).await?,
-            3 => super::turn_id_index::operation(base, descriptors).await?,
+            3 => super::session_index::annotation_operation(base, descriptors).await?,
             _ => bail!("unexpected annotation maintenance descriptor format"),
         },
         None,

@@ -148,13 +148,6 @@ pub(super) async fn prepare(
     ))
 }
 
-pub(super) async fn operation(
-    dataset: &Dataset,
-    descriptors: &p::Descriptors,
-) -> Result<lance::dataset::transaction::Operation> {
-    session_index::operation_for(dataset, descriptors, Key::Turn).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
