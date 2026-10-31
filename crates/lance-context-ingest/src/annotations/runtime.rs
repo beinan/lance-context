@@ -370,7 +370,7 @@ impl Publisher {
                 .get_or_insert_with(tokio::time::Instant::now);
             if source.bytes < self.options.min_source_bytes as u64
                 && source.records < self.options.max_records
-                && !self.service.shared.progress.borrow().backpressured
+                && self.service.shared.progress.borrow().backpressure.is_none()
                 && started.elapsed() < self.options.max_batch_wait
             {
                 return Ok(());

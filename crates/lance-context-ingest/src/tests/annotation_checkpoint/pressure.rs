@@ -79,6 +79,10 @@ async fn retained_generation(byte_pressure: bool) -> Result<()> {
         }
     })
     .await?;
+    assert_eq!(
+        service.apply_backpressure(),
+        Some(crate::annotations::ApplyBackpressure::Staging)
+    );
     let attempts = service.apply_attempts();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
@@ -113,6 +117,10 @@ async fn retained_generation(byte_pressure: bool) -> Result<()> {
     let attempts = service.apply_attempts();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(service.apply_attempts(), attempts);
+    assert_eq!(
+        service.apply_backpressure(),
+        Some(crate::annotations::ApplyBackpressure::Staging)
+    );
     assert!(!submitted.is_finished());
     let through = frozen.through();
     drop((prepared, frozen));
@@ -120,6 +128,7 @@ async fn retained_generation(byte_pressure: bool) -> Result<()> {
     // request. Its field patch retains the earlier successfully applied status.
     let completed = submitted.await??;
     assert_eq!(completed.result, MutationResult::Applied);
+    assert_eq!(service.apply_backpressure(), None);
     assert_eq!(
         service.submit(&req, Duration::from_secs(10)).await?,
         completed

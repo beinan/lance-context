@@ -79,12 +79,17 @@ async fn source_pages_preserve_apply_order_pressure_and_concurrent_publication()
         driver.step_for_test().await?;
         assert_eq!(service.observation().await.0.applied, initial);
         assert!(service.observation().await.1);
+        assert_eq!(
+            service.apply_backpressure(),
+            Some(annotations::ApplyBackpressure::ApplyMemory)
+        );
         assert_eq!(completed(&service, "annotation_fetch"), 0);
         assert_eq!(completed(&service, "annotation_observe"), 1);
     }
     drop(held);
     driver.step_for_test().await?;
     assert_eq!(service.observation().await.0.applied, indices[0]);
+    assert_eq!(service.apply_backpressure(), None);
     let frozen = service.freeze(Uuid::new_v4()).await?.unwrap();
     driver.step_for_test().await?;
     assert_eq!(service.observation().await.0.applied, indices[1]);

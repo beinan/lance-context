@@ -7,7 +7,7 @@ fn progress(backpressured: bool) -> (watch::Sender<Progress>, watch::Receiver<Pr
     watch::channel(Progress {
         through: 0,
         stopped: false,
-        backpressured,
+        backpressure: backpressured.then_some(ApplyBackpressure::Staging),
     })
 }
 
@@ -49,7 +49,7 @@ async fn backpressure_interrupts_pending_listing_and_retains_response() -> Resul
         assert!(futures::poll!(&mut next).is_pending());
         sender.send_modify(|p| p.through += 1);
         assert!(futures::poll!(&mut next).is_pending());
-        sender.send_modify(|p| p.backpressured = true);
+        sender.send_modify(|p| p.backpressure = Some(ApplyBackpressure::Staging));
         assert!(matches!(futures::poll!(&mut next), Poll::Ready(None)));
     }
     assert!(release.send(()).is_ok(), "original response was discarded");

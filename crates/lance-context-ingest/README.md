@@ -12,3 +12,10 @@ ingresses forward requests and do not run that maintenance. HTTP admission and
 memory budgets are also local to each process. See
 [role configuration](../../docs/design/annotation-application.md#configure-each-running-role)
 before copying a bootstrap configuration or comparing worker counts.
+
+The owner's periodic annotation observation reports `backpressure_reason` as
+`apply_memory`, `source_window`, `staging`, or `null`. It identifies the last
+admission gate that prevented ordered apply; progress clears it. The existing
+`backpressured` flag is true whenever a reason is present. These are sampled
+states, not refusal counts or blocked durations. In particular, staging pressure
+can include values held by readers or an old frozen generation after publication.

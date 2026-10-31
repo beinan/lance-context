@@ -138,6 +138,10 @@ async fn bounded_prefix(byte_limit: bool) -> Result<()> {
             }
         })
         .await?;
+        assert_eq!(
+            service.apply_backpressure(),
+            Some(crate::annotations::ApplyBackpressure::SourceWindow)
+        );
         assert!(
             !submitted.is_finished(),
             "source pressure must not acknowledge or reject the pending mutation"
@@ -164,6 +168,7 @@ async fn bounded_prefix(byte_limit: bool) -> Result<()> {
         assert_eq!(service.source_observation().bytes, 0);
         let (observed, pressured) = service.observation().await;
         assert!(!pressured);
+        assert_eq!(service.apply_backpressure(), None);
         assert_eq!(
             (
                 observed.retained_entries,
