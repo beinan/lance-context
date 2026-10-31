@@ -150,6 +150,11 @@ impl Routes {
                         .map_err(|_| Failure::bad("invalid_close"))?;
                     self.credential(keys, &close.producer)?
                 }
+                Operation::FilterStatus => {
+                    serde_json::from_slice::<StatusRequest>(&bytes)
+                        .map_err(|_| Failure::bad("invalid_status_filter"))?
+                        .bucket
+                }
                 Operation::Update => unreachable!(),
             };
             (

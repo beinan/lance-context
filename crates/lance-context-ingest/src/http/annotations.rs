@@ -24,11 +24,22 @@ pub struct PointRequest {
     pub turn: String,
 }
 
+/// One physical shard, selected from trusted deployment routes. Callers may
+/// query different buckets concurrently; positions are never combined globally.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusRequest {
+    pub bucket: u32,
+    pub status: Option<String>,
+    pub limit: usize,
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Open,
     Update,
     Read,
+    FilterStatus,
     Close,
 }
 impl Operation {
@@ -38,11 +49,12 @@ impl Operation {
             Self::Open => "producer",
             Self::Update => "update",
             Self::Read => "read",
+            Self::FilterStatus => "filter-status",
             Self::Close => "close",
         }
     }
     fn is_write(self) -> bool {
-        !matches!(self, Self::Read)
+        !matches!(self, Self::Read | Self::FilterStatus)
     }
 }
 

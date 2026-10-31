@@ -36,6 +36,10 @@ impl Owner {
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route(
+                "/api/v1/annotations/{table}/filter-status",
+                post(filter_status),
+            )
             .route("/api/v1/annotations/{table}/close", post(close))
             .with_state(self.clone())
     }
@@ -53,8 +57,8 @@ impl Owner {
             Err(error) => return early(error, request.version()),
         };
         match tokio::spawn(async move {
-            let response = self.process(&table, request, operation).await?;
-            Ok::<_, Failure>(hold_response(response, guard, None))
+            let (response, reservation) = self.process(&table, request, operation).await?;
+            Ok::<_, Failure>(hold_response(response, guard, reservation))
         })
         .await
         {
@@ -69,7 +73,7 @@ impl Owner {
         table: &str,
         request: Request,
         operation: Operation,
-    ) -> HttpResult<Response> {
+    ) -> HttpResult<(Response, Option<MergeReservation>)> {
         let ingress = self.service.ingress();
         if table != ingress.scope.contract.qualified_table {
             return Err(Failure {
@@ -87,6 +91,7 @@ impl Owner {
                 })?;
         }
         let options = &self.gate.0.options;
+        let mut reservation = None;
         let response = if matches!(operation, Operation::Update) {
             let (producer, sequence) = producer(ingress, &self.gate.0.keys, &request)?;
             let length = body::length(
@@ -180,7 +185,7 @@ impl Owner {
             )
                 .into_response()
         } else {
-            let maximum = if matches!(operation, Operation::Read) {
+            let maximum = if matches!(operation, Operation::Read | Operation::FilterStatus) {
                 self.reply_limit
             } else {
                 32 << 10
@@ -216,6 +221,28 @@ impl Owner {
                             Failure::unavailable("annotation_read_unavailable", "not_submitted")
                         })?;
                     Json(value).into_response()
+                }
+                Operation::FilterStatus => {
+                    let query: StatusRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_status_filter"))?;
+                    self.service
+                        .validate_status_filter(query.bucket, query.status.as_deref(), query.limit)
+                        .map_err(|_| Failure::bad("invalid_status_filter"))?;
+                    let (result, held) = self
+                        .service
+                        .filter_status_owned(
+                            query.status,
+                            query.limit,
+                            self.reply_limit,
+                            self.recovery_cut,
+                            options.body_total_timeout,
+                        )
+                        .await
+                        .map_err(|_| {
+                            Failure::unavailable("status_filter_unavailable", "not_submitted")
+                        })?;
+                    reservation = Some(held);
+                    Json(result).into_response()
                 }
                 Operation::Close => {
                     let close: CloseRequest = serde_json::from_slice(&bytes)
@@ -256,7 +283,7 @@ impl Owner {
                     },
                 )
             })?;
-        Ok(response)
+        Ok((response, reservation))
     }
 }
 
@@ -290,4 +317,14 @@ async fn close(
     request: Request,
 ) -> Response {
     owner.dispatch(table, request, Operation::Close).await
+}
+
+async fn filter_status(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner
+        .dispatch(table, request, Operation::FilterStatus)
+        .await
 }

@@ -23,6 +23,8 @@ mod local_payload;
 pub mod mixed;
 pub mod runtime;
 mod shard;
+#[cfg(feature = "http")]
+mod status_filter;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
@@ -154,6 +156,20 @@ impl Service {
         let through = self.barrier().await?;
         self.wait_through(through).await?;
         Ok(self.shared.staging.capture(turn).await?)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn capture_status_for_test(
+        &self,
+        status: Option<String>,
+    ) -> Result<lance_context_core::annotation_staging::StatusRead> {
+        let through = self.barrier().await?;
+        self.wait_through(through).await?;
+        Ok(self
+            .shared
+            .staging
+            .capture_status(status, 16, 64 << 10)
+            .await?)
     }
 
     #[cfg(test)]

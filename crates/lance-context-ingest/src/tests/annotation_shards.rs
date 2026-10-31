@@ -58,7 +58,7 @@ impl Physical {
         })
     }
 
-    async fn view(&self, c: &network::Cluster) -> Result<Box<p::Table>> {
+    pub(super) async fn view(&self, c: &network::Cluster) -> Result<Box<p::Table>> {
         let response = c
             .client
             .request_routed(Request::Query {

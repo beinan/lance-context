@@ -3,6 +3,15 @@ use super::*;
 
 #[tokio::test]
 async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner() -> Result<()> {
+    exercise(false).await
+}
+
+#[tokio::test]
+async fn status_filter_fences_after_storage_io_and_rejects_an_already_stale_owner() -> Result<()> {
+    exercise(true).await
+}
+
+async fn exercise(filter: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     let gates = Arc::new(store::Gates::default());
@@ -32,12 +41,17 @@ async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner()
     });
     tokio::pin!(old_work);
 
+    let (operation, query) = if filter {
+        (
+            "filter-status",
+            serde_json::json!({"bucket":0,"status":"pending","limit":16}),
+        )
+    } else {
+        ("read", serde_json::json!({"turn":"T"}))
+    };
+
     let mut cold = gates.pause_get();
-    let pending = tokio::spawn(
-        post(&client, &old_ingress, "read")
-            .json(&PointRequest { turn: "T".into() })
-            .send(),
-    );
+    let pending = tokio::spawn(post(&client, &old_ingress, operation).json(&query).send());
     tokio::select! {
         result = &mut old_work => anyhow::bail!("old runtime stopped: {result:?}"),
         entered = cold.entered() => entered?,
@@ -85,8 +99,8 @@ async fn point_read_fences_after_storage_io_and_rejects_an_already_stale_owner()
     // Another request begins only after the successor's write ACK. The old
     // listener is still running, and its own apply position has not advanced.
     assert!(old_service.observation().await.0.applied < reply.completion.index);
-    let stale = post(&client, &old_ingress, "read")
-        .json(&PointRequest { turn: "T".into() })
+    let stale = post(&client, &old_ingress, operation)
+        .json(&query)
         .send()
         .await?;
     let stale_status = stale.status();

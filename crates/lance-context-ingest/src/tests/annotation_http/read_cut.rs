@@ -1,4 +1,19 @@
 use super::*;
+use lance_context_core::annotation_staging::StatusMatches;
+
+async fn filter(client: &reqwest::Client, server: &Server) -> Result<StatusMatches> {
+    Ok(post(client, server, "filter-status")
+        .json(&http::annotations::StatusRequest {
+            bucket: 0,
+            status: Some("pending".into()),
+            limit: 16,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
 
 /// The replacement must replay its predecessor's ACKs before reading, while a
 /// later unacknowledged WAL proposal must not block the already visible value.
@@ -34,7 +49,7 @@ async fn owned_reads_replay_predecessor_acks_without_waiting_for_later_proposals
         super::super::annotations::wire(&limits, &["T"], 1, Some("acknowledged"), 0, None)?,
     )
     .await?;
-    predecessor.submit(&first, Duration::from_secs(30)).await?;
+    let first_ack = predecessor.submit(&first, Duration::from_secs(30)).await?;
     stop.send(()).unwrap();
     task.await??;
     drop(predecessor);
@@ -54,8 +69,8 @@ async fn owned_reads_replay_predecessor_acks_without_waiting_for_later_proposals
         let _ = stopped.await;
     });
     tokio::pin!(work);
-    let first_value = {
-        let initial = point(&client, &b);
+    let (first_value, first_filter) = {
+        let initial = async { tokio::try_join!(point(&client, &b), filter(&client, &a)) };
         tokio::pin!(initial);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut initial)
@@ -65,10 +80,12 @@ async fn owned_reads_replay_predecessor_acks_without_waiting_for_later_proposals
         );
         tokio::select! {
             result = &mut work => anyhow::bail!("runtime stopped: {result:?}"),
-            result = &mut initial => result?.unwrap(),
+            result = &mut initial => result?,
         }
     };
+    let first_value = first_value.unwrap();
     assert_eq!(first_value.status.as_deref(), Some("acknowledged"));
+    assert!(first_filter.applied_through_at_capture >= first_ack.index);
 
     // Stop polling the runtime, but leave RF3 and both ingresses running.
     // Commit the next proposal without issuing a successful annotation ACK.
@@ -81,7 +98,10 @@ async fn owned_reads_replay_predecessor_acks_without_waiting_for_later_proposals
     .await?;
     let accepted = service.ingress().append(&later).await?;
     assert!(service.observation().await.0.applied < accepted.position.index);
-    let visible = tokio::time::timeout(Duration::from_secs(1), point(&client, &a)).await;
+    let visible = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::try_join!(point(&client, &a), filter(&client, &b))
+    })
+    .await;
 
     // Resume application and reconcile that exact proposal; its original WAL
     // position must be returned and the new value becomes immediately visible.
@@ -106,6 +126,13 @@ async fn owned_reads_replay_predecessor_acks_without_waiting_for_later_proposals
     c.shutdown().await?;
     // Assert after clean shutdown so the expected old-behavior failure leaves
     // no running owner, HTTP request, or WAL fixture behind.
-    assert_eq!(visible??, Some(first_value));
+    let (point, filtered) = visible??;
+    assert_eq!(point, Some(first_value));
+    assert!(filtered.applied_through_at_capture >= first_ack.index);
+    assert!(filtered.applied_through_at_capture < accepted.position.index);
+    assert_eq!(
+        filtered.ids.iter().any(|id| id == "T"),
+        filtered.materialized_through < first_ack.index
+    );
     Ok(())
 }
