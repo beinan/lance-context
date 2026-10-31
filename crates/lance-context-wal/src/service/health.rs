@@ -34,6 +34,7 @@ struct View {
     groups: BTreeMap<u64, Group>,
     admission: runtime::Admission,
     appends: BTreeMap<&'static str, u64>,
+    append_execution: runtime::client::timing::Observation,
     disk: Option<crate::admission::Snapshot>,
     maintenance: maintenance::Progress,
     snapshots_sent: u64,
@@ -73,6 +74,7 @@ impl State {
             groups,
             admission: self.handle.admission(),
             appends: self.handle.append_observation(),
+            append_execution: self.handle.append_execution_timing(),
             disk: self.handle.disk_budget(),
             maintenance: self
                 .maintenance

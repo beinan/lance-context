@@ -281,6 +281,7 @@ pub async fn serve_owner(
                     "backpressure_reason": pressure,
                     "reclamation": service.reclamation_observation(),
                     "phases": service.phase_observation(),
+                    "append_rpc": ingress.client.append_timings(),
                 }}));
             }
         };

@@ -41,6 +41,7 @@ const MAX_META: usize = 2 << 20;
 const PREFIX: usize = 24;
 
 pub(super) mod observation;
+pub mod timing;
 
 #[derive(Clone, Debug)]
 pub struct Endpoint {
@@ -295,6 +296,12 @@ impl Handle {
     pub fn append_observation(&self) -> BTreeMap<&'static str, u64> {
         self.shared.appends.snapshot()
     }
+    /// From receipt of the complete body to execution ending, including worker
+    /// queue, proposal validation and quorum completion. Not pure disk time;
+    /// excludes request transport/admission and sending the reply.
+    pub fn append_execution_timing(&self) -> timing::Observation {
+        self.shared.appends.execution.snapshot()
+    }
     /// Read on the owner thread with data-lane credit, separate from small
     /// control replies. Returned bytes describe local committed state only.
     /// Complete after validating that already durable payload, without waiting
@@ -466,7 +473,9 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
     let body = receive(io, body_len).await?;
     let append = matches!(request, WireRequest::Append { .. });
     let observation = append.then(|| handle.shared.appends.start());
+    let execution = append.then(|| handle.shared.appends.execution.start());
     let executed = execute(handle, request, body).await;
+    drop(execution);
     if let Some(observation) = observation {
         observation.finish(&executed);
     }
@@ -608,8 +617,20 @@ pub struct Client {
     voters: BTreeMap<u64, Vec<u64>>,
     catalog: u64,
     leaders: Mutex<BTreeMap<u64, u64>>,
+    append_timings: [timing::Counter; 4],
 }
 impl Client {
+    /// Per-exchange append phases, including redirected, failed and cancelled
+    /// exchanges. Admission waits for byte credit; connection includes pool
+    /// waiting and any TLS handshake; send includes flush; response includes
+    /// peer execution and reply validation. These are not per-request outcomes.
+    pub fn append_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        ["admission", "connection", "send", "response"]
+            .into_iter()
+            .zip(&self.append_timings)
+            .map(|(name, counter)| (name, counter.snapshot()))
+            .collect()
+    }
     pub fn identity(&self) -> (uuid::Uuid, [u8; 32]) {
         (self.cluster, self.layout)
     }
@@ -686,6 +707,7 @@ impl Client {
             voters: layout.groups.clone(),
             catalog: super::p::control_group(layout),
             leaders: Mutex::new(BTreeMap::new()),
+            append_timings: Default::default(),
         })
     }
     /// A failure/cancellation is an unknown outcome. Retain and reconcile the
@@ -841,6 +863,7 @@ impl Client {
         };
         let size = usize::try_from(codec().serialized_size(&(&expected, &wire))?)?;
         ensure!(size <= MAX_META, "client metadata too large");
+        let admission = append.then(|| self.append_timings[0].start());
         let credit = self
             .budgets
             .reserve(
@@ -848,8 +871,10 @@ impl Client {
                 2 * size + body.len() + 2 * MAX_META + if fetch { self.max_record } else { 0 },
             )
             .await?;
+        drop(admission);
         let metadata = codec().serialize(&(&expected, wire))?;
         let pool = if data { &pools.data } else { &pools.control };
+        let mut connection = append.then(|| self.append_timings[1].start());
         let _slot = pool.slots.clone().acquire_owned().await?;
         let mut idle = pool.take_idle().await?;
         let mut reconnect_read = read_only && idle.is_some();
@@ -881,13 +906,17 @@ impl Client {
                     stream
                 }
             };
+            drop(connection.take());
             let mut stage = "send";
             let response: Result<(Reply, Bytes)> = async {
+                let sending = append.then(|| self.append_timings[2].start());
                 let id = self
                     .next
                     .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                     .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
                 send(&mut stream, id, &metadata, &body).await?;
+                drop(sending);
+                let _receiving = append.then(|| self.append_timings[3].start());
                 stage = "response_prefix";
                 let (received_id, meta_len, body_len) =
                     prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;

@@ -54,15 +54,18 @@ const LABELS: [&str; 17] = [
 ];
 
 #[derive(Default)]
-pub(in crate::replication::runtime) struct Counters([AtomicU64; LABELS.len()]);
+pub(in crate::replication::runtime) struct Counters {
+    outcomes: [AtomicU64; LABELS.len()],
+    pub(super) execution: super::timing::Counter,
+}
 impl Counters {
     fn increment(&self, kind: Kind) {
-        super::super::increment_rejection(&self.0[kind as usize]);
+        super::super::increment_rejection(&self.outcomes[kind as usize]);
     }
     pub(in crate::replication::runtime) fn snapshot(&self) -> BTreeMap<&'static str, u64> {
         LABELS
             .iter()
-            .zip(&self.0)
+            .zip(&self.outcomes)
             .map(|(&label, counter)| (label, counter.load(Ordering::Relaxed)))
             .collect()
     }
