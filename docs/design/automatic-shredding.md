@@ -213,3 +213,7 @@ capacity guarantees.
 Both baseline arms store serialized JSON in a `LargeUtf8` column. This isolates
 extraction and duplication costs using the same string encoding as the document
 residual; it is not a benchmark of Lance's JSONB extension or Arrow Variant.
+
+The [November 2026 measurements](../benchmarks/automatic-shredding-2026-11/README.md)
+include raw samples, before/after regressions, live and retained storage, and
+the remaining synchronous preparation and memory costs.
