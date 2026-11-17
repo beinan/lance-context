@@ -77,3 +77,19 @@ maintenance is logged without reporting the committed append as failed;
 use upstream unshred/JSON conversion. Path reads project ancestor residuals and
 the requested typed subtree, then invoke Arrow's `variant_get` with literal path
 components. Unrelated extracted text is not part of that projection.
+
+## Text search and Python
+
+Text indexes target standard `document.typed_value...typed_value` children.
+Preparation builds missing indexes without a data backfill. Native matches rank
+first; remaining result slots use the same OR tokenizer over standard residual
+values, with score zero and unspecified order. This fallback reads root and
+nested residual fields, excluding extracted typed text. It can scan all residuals
+on rare/no-hit queries and does not provide global BM25 ranking across both sets.
+Equality uses Arrow's path kernel over projected columns; scalar predicate
+pushdown remains a performance limitation.
+
+Python exports `VariantDocumentStore` alongside the baseline `DocumentStore`.
+Their ordinary add/get/get_path/filter_eq/search and snapshot interfaces align.
+The Variant wrapper delegates to the separate native Variant implementation;
+it does not adapt the baseline's JSON-residual codec.

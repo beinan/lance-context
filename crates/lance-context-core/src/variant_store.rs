@@ -1,7 +1,7 @@
 //! Versioned documents backed by the standard Arrow Variant extension.
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
@@ -394,6 +394,8 @@ fn quote(key: &str) -> String {
 fn invalid(error: impl std::fmt::Display) -> Error {
     Error::invalid_input(error.to_string())
 }
+
+mod query;
 
 #[cfg(test)]
 mod tests;
