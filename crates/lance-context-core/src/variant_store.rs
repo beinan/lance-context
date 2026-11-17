@@ -16,7 +16,9 @@ use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Dataset, Error, Result};
 use lance_index::{optimize::OptimizeOptions, scalar::ScalarIndexParams, IndexType};
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{variant_get, GetOptions, VariantArray, VariantType};
+use parquet_variant_compute::{
+    unshred_variant, variant_get, GetOptions, VariantArray, VariantType,
+};
 use serde_json::Value;
 
 use crate::{
@@ -243,7 +245,7 @@ impl VariantDocumentStore {
     pub async fn get_path(&self, id: &str, path: &[String]) -> Result<Option<Value>> {
         let mut scanner = self.dataset.scan();
         scanner
-            .project(&self.projection(path))?
+            .project_with_schema(&self.project_schema(&self.projection(path))?)?
             .filter_expr(col(ID).eq(lit(id)));
         scanner.limit(Some(1), None)?;
         let mut stream = scanner.try_into_stream().await?;
@@ -257,12 +259,7 @@ impl VariantDocumentStore {
             let value = if path.is_empty() {
                 input.clone()
             } else {
-                variant_get(
-                    input,
-                    GetOptions::new_with_path(VariantPath::from_iter(
-                        path.iter().map(|p| VariantPathElement::field(p.as_str())),
-                    )),
-                )?
+                select_path(input, path)?
             };
             let array = VariantArray::try_new(value.as_ref())?;
             return Ok(variant_to_json_values(&array)?.into_iter().next().flatten());
@@ -270,14 +267,17 @@ impl VariantDocumentStore {
         Ok(None)
     }
 
-    fn projection(&self, path: &[String]) -> Vec<String> {
+    fn projection(&self, path: &[String]) -> Vec<Vec<String>> {
         if path.is_empty() {
-            return vec![DOCUMENT.to_owned()];
+            return vec![vec![DOCUMENT.to_owned()]];
         }
         let schema = Schema::from(self.dataset.schema());
         let mut wrapper = schema.field(1).data_type();
-        let mut prefix = DOCUMENT.to_string();
-        let mut columns = vec![format!("{prefix}.metadata"), format!("{prefix}.value")];
+        let mut prefix = vec![DOCUMENT.to_string()];
+        let mut columns = vec![
+            vec![DOCUMENT.into(), "metadata".into()],
+            vec![DOCUMENT.into(), "value".into()],
+        ];
         for (i, key) in path.iter().enumerate() {
             let DataType::Struct(fields) = wrapper else {
                 break;
@@ -291,15 +291,37 @@ impl VariantDocumentStore {
             let Some(child) = children.iter().find(|f| f.name() == key) else {
                 break;
             };
-            prefix = format!("{prefix}.typed_value.{}", quote(key));
+            prefix.extend(["typed_value".into(), key.clone()]);
             if i + 1 == path.len() {
                 columns.push(prefix);
                 break;
             }
-            columns.push(format!("{prefix}.value"));
+            let mut residual = prefix.clone();
+            residual.push("value".into());
+            columns.push(residual);
             wrapper = child.data_type();
         }
         columns
+    }
+
+    // Resolve literal JSON keys directly, including empty keys and dots. Lance's
+    // string path grammar is not SQL quoting and cannot represent empty keys.
+    fn project_schema(&self, paths: &[Vec<String>]) -> Result<lance_core::datatypes::Schema> {
+        let mut ids = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut fields = &self.dataset.schema().fields;
+            for (position, key) in path.iter().enumerate() {
+                let field = fields
+                    .iter()
+                    .find(|field| field.name == *key)
+                    .ok_or_else(|| invalid(format!("missing physical Variant path {path:?}")))?;
+                if position + 1 == path.len() {
+                    ids.push(field.id);
+                }
+                fields = &field.children;
+            }
+        }
+        Ok(self.dataset.schema().project_by_ids(&ids, true))
     }
 
     pub async fn checkout(&mut self, version: u64) -> Result<()> {
@@ -388,9 +410,21 @@ fn estimate(value: &Value) -> usize {
         _ => 32,
     }
 }
-fn quote(key: &str) -> String {
-    format!("\"{}\"", key.replace('"', "\"\""))
+// Arrow 58's direct shredded path traversal can discard an ancestor residual
+// when the requested child exists in the typed schema but is null for that row.
+// Unshred only the projected subtree/residuals before the official path kernel.
+fn select_path(input: &arrow_array::ArrayRef, path: &[String]) -> Result<arrow_array::ArrayRef> {
+    let input = unshred_variant(&VariantArray::try_new(input.as_ref())?)?;
+    let input: arrow_array::ArrayRef = Arc::new(input.into_inner());
+    Ok(variant_get(
+        &input,
+        GetOptions::new_with_path(VariantPath::from_iter(
+            path.iter()
+                .map(|key| VariantPathElement::field(key.as_str())),
+        )),
+    )?)
 }
+
 fn invalid(error: impl std::fmt::Display) -> Error {
     Error::invalid_input(error.to_string())
 }

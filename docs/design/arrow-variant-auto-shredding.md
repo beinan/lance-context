@@ -75,8 +75,13 @@ A BTree index on ID is maintained after a durable data commit. Failure of that
 maintenance is logged without reporting the committed append as failed;
 `prepare_point_reads` explicitly retries and reports indexing errors. Whole reads
 use upstream unshred/JSON conversion. Path reads project ancestor residuals and
-the requested typed subtree, then invoke Arrow's `variant_get` with literal path
-components. Unrelated extracted text is not part of that projection.
+the requested typed subtree. Physical projection resolves literal keys to field
+IDs, including dots, quotes and empty keys. Arrow 58's direct shredded path
+traversal can miss an ancestor residual when a typed child exists but is null
+for that row. The adapter therefore unshreds the projected representation with
+Arrow before invoking its `variant_get` kernel. Unrelated extracted text is not
+part of that projection. This adds reconstruction work for the selected fields;
+it does not require a Lance patch or a custom Variant decoder.
 
 ## Text search and Python
 
@@ -84,7 +89,10 @@ Text indexes target standard `document.typed_value...typed_value` children.
 Preparation builds missing indexes without a data backfill. Native matches rank
 first; remaining result slots use the same OR tokenizer over standard residual
 values, with score zero and unspecified order. This fallback reads root and
-nested residual fields, excluding extracted typed text. It can scan all residuals
+nested residual fields, excluding text covered by native indexes. The current
+Lance nested-index traversal supports plain ASCII identifier components here;
+typed strings under other keys use the fallback scan too, preserving coverage
+without copying their text into a separate column. It can scan all residuals
 on rare/no-hit queries and does not provide global BM25 ranking across both sets.
 Equality uses Arrow's path kernel over projected columns; scalar predicate
 pushdown remains a performance limitation.

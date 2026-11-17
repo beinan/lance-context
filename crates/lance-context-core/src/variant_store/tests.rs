@@ -79,6 +79,12 @@ async fn projected_paths_match_whole_value_for_mixed_shapes_and_literal_keys() {
         json!([1, null]),
         json!({"quote\"":"literal","integer":u64::MAX,"negative":i64::MIN}),
     ];
+    store.add(vec![documents[0].clone()]).await.unwrap();
+    assert!(store
+        .layout()
+        .fields()
+        .iter()
+        .any(|field| field.path == ["a.b", ""]));
     let ids = store.add(documents.clone()).await.unwrap();
     let paths = vec![
         vec!["body"],
@@ -220,4 +226,30 @@ async fn variant_equality_preserves_missing_null_and_residual_containers() {
             .unwrap(),
         vec![ids[3].clone()]
     );
+}
+
+#[tokio::test]
+async fn nested_and_literal_text_paths_are_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("nested_search.lance");
+    let mut store =
+        VariantDocumentStore::create(uri.to_str().unwrap(), ShredPolicy::default(), None)
+            .await
+            .unwrap();
+    let record = json!({"nested":{"body":"indexedotter"}, "a.b":{"":"literalotter"}, "back`tick":"tickotter", "quote\"":"quoteotter"});
+    let id = store.add(vec![record.clone()]).await.unwrap()[0].clone();
+    assert_eq!(store.layout().fields().len(), 4);
+    for query in ["indexedotter", "literalotter", "tickotter", "quoteotter"] {
+        let hits = store.search(query, 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, id);
+    }
+    assert_eq!(
+        store
+            .get_path(&id, &["a.b".into(), "".into()])
+            .await
+            .unwrap(),
+        Some(json!("literalotter"))
+    );
+    assert_eq!(store.get(&id).await.unwrap(), Some(record));
 }

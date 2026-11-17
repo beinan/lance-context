@@ -19,11 +19,11 @@ impl VariantDocumentStore {
         self.layout
             .fields()
             .iter()
-            .filter(|field| field.data_type == ShredType::String)
+            .filter(|field| field.data_type == ShredType::String && indexable_path(&field.path))
             .map(|field| {
                 let mut name = DOCUMENT.to_string();
                 for key in &field.path {
-                    name = format!("{name}.typed_value.{}", quote(key));
+                    name = format!("{name}.typed_value.{key}");
                 }
                 format!("{name}.typed_value")
             })
@@ -111,7 +111,7 @@ impl VariantDocumentStore {
         }
         let mut seen: HashSet<_> = hits.iter().map(|hit| hit.id.clone()).collect();
         let mut scanner = self.dataset.scan();
-        scanner.project(&self.residual_projection())?;
+        scanner.project_with_schema(&self.project_schema(&self.residual_projection())?)?;
         scanner
             .batch_size(1024)
             .batch_size_bytes(4 * 1024 * 1024)
@@ -151,20 +151,27 @@ impl VariantDocumentStore {
         Ok(hits)
     }
 
-    fn residual_projection(&self) -> Vec<String> {
+    fn residual_projection(&self) -> Vec<Vec<String>> {
         let mut columns = vec![
-            ID.into(),
-            format!("{DOCUMENT}.metadata"),
-            format!("{DOCUMENT}.value"),
+            vec![ID.into()],
+            vec![DOCUMENT.into(), "metadata".into()],
+            vec![DOCUMENT.into(), "value".into()],
         ];
         for field in self.layout.fields() {
-            let mut prefix = DOCUMENT.to_string();
+            let mut prefix = vec![DOCUMENT.to_string()];
             for key in &field.path {
-                prefix = format!("{prefix}.typed_value.{}", quote(key));
-                let column = format!("{prefix}.value");
+                prefix.extend(["typed_value".into(), key.clone()]);
+                let mut column = prefix.clone();
+                column.push("value".into());
                 if !columns.contains(&column) {
                     columns.push(column);
                 }
+            }
+            // Lance's current nested FTS traversal only accepts plain path
+            // components. Keep other typed strings searchable via this scan.
+            if field.data_type == ShredType::String && !indexable_path(&field.path) {
+                prefix.push("typed_value".into());
+                columns.push(prefix);
             }
         }
         columns
@@ -182,11 +189,11 @@ impl VariantDocumentStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut columns = vec![ID.to_owned()];
+        let mut columns = vec![vec![ID.to_owned()]];
         columns.extend(self.projection(path));
         let mut scanner = self.dataset.scan();
         scanner
-            .project(&columns)?
+            .project_with_schema(&self.project_schema(&columns)?)?
             .batch_size(1024)
             .batch_size_bytes(4 * 1024 * 1024)
             .batch_readahead(1);
@@ -200,13 +207,7 @@ impl VariantDocumentStore {
             let input = batch
                 .column_by_name(DOCUMENT)
                 .ok_or_else(|| invalid("missing Variant"))?;
-            let selected = variant_get(
-                input,
-                GetOptions::new_with_path(VariantPath::from_iter(
-                    path.iter()
-                        .map(|key| VariantPathElement::field(key.as_str())),
-                )),
-            )?;
+            let selected = select_path(input, path)?;
             let selected = VariantArray::try_new(selected.as_ref())?;
             for (row, actual) in variant_to_json_values(&selected)?.iter().enumerate() {
                 if actual.as_ref() == Some(value) {
@@ -238,4 +239,15 @@ fn matches(value: &Value, tokenizer: &mut dyn LanceTokenizer, terms: &HashSet<St
             .any(|value| matches(value, tokenizer, terms)),
         _ => false,
     }
+}
+
+fn indexable_path(path: &[String]) -> bool {
+    path.iter().all(|key| {
+        !key.is_empty()
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    })
 }
