@@ -107,3 +107,14 @@ def test_residual_search_only_matches_string_values(tmp_path):
     assert store.search("roototter")[0]["id"] == ids[2]
     for query in ["keyonly", "987654", "nquoted", "!!!"]:
         assert store.search(query) == []
+
+
+def test_prepare_point_reads_is_repeatable_and_snapshot_safe(tmp_path):
+    store = DocumentStore.create(tmp_path / "point-index.lance")
+    ids = store.add([{"body": "otter", "metadata": {"counter": 1}}])
+    version = store.version()
+    store.prepare_point_reads()
+    assert store.version() == version
+    store.checkout(version)
+    store.prepare_point_reads()
+    assert store.get_path(ids[0], ["metadata"]) == {"counter": 1}
