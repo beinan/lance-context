@@ -23,10 +23,10 @@ from .api import (  # pyright: ignore[reportMissingImports]
     generate_id,
 )
 from .documents import DocumentStore
-from .variant_documents import VariantDocumentStore
 from .embeddings import (  # pyright: ignore[reportMissingImports]
     MultiModalEmbeddingProvider,
 )
+from .variant_documents import VariantDocumentStore
 
 __all__ = [
     "AlreadyExistsError",

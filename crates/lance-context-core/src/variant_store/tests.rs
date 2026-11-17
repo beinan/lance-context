@@ -253,3 +253,39 @@ async fn nested_and_literal_text_paths_are_searchable() {
     );
     assert_eq!(store.get(&id).await.unwrap(), Some(record));
 }
+
+#[tokio::test]
+async fn text_search_survives_layout_replacement_and_pinned_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("replace_index.lance");
+    let mut store = VariantDocumentStore::create(
+        uri.to_str().unwrap(),
+        ShredPolicy {
+            max_columns: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let old = store
+        .add(vec![json!({"body":"originalotter"})])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    let version = store.version();
+    let new = store
+        .add(vec![json!({"later":"recentotter"})])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(store.layout().fields()[0].path, ["later"]);
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    assert_eq!(store.search("recentotter", 10).await.unwrap()[0].id, new);
+    store.checkout(version).await.unwrap();
+    assert_eq!(store.search("originalotter", 10).await.unwrap()[0].id, old);
+    assert!(store.search("recentotter", 10).await.unwrap().is_empty());
+    store.refresh().await.unwrap();
+    assert_eq!(store.search("recentotter", 10).await.unwrap()[0].id, new);
+}

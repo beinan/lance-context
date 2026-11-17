@@ -39,3 +39,21 @@ def test_variant_preserves_json_boundaries_and_literal_keys(tmp_path):
     with pytest.raises(KeyError):
         store.get_path(ids[2], ["a.b"])
     assert store.filter_eq(["a.b"], None) == [ids[1]]
+
+
+def test_variant_streaming_uses_variant_backend_and_preserves_partial_commits(tmp_path):
+    store = VariantDocumentStore.create(tmp_path / "stream.lance")
+
+    def documents():
+        yield {"body": "otter zero"}
+        yield {"body": "otter one"}
+        raise RuntimeError("source stopped")
+
+    batches = store.add_iter(documents(), max_batch_rows=1)
+    first = next(batches)
+    assert store.get(first[0]) == {"body": "otter zero"}
+    # The next source failure must not undo the batch already committed.
+    with pytest.raises(RuntimeError, match="source stopped"):
+        list(batches)
+    reopened = VariantDocumentStore.open(tmp_path / "stream.lance")
+    assert reopened.get(first[0]) == {"body": "otter zero"}
