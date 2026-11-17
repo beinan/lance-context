@@ -181,14 +181,17 @@ impl DocumentStore {
             self.layout = next;
         }
         let ids: Vec<_> = documents.iter().map(|_| crate::generate_id()).collect();
-        let encoded = documents
-            .into_iter()
-            .map(|document| self.layout.shred(document).map_err(Error::invalid_input))
-            .collect::<Result<Vec<_>>>()?;
         let schema = Arc::new(Schema::from(self.dataset.schema()));
-        let batch = encode(&ids, &encoded, &self.layout, schema.clone())?;
+        let batches = ingestion::DocumentBatches::new(
+            ids.clone(),
+            documents,
+            self.layout.clone(),
+            schema.clone(),
+        );
+        // Encode one bounded batch at a time; Lance publishes the complete
+        // iterator in a single append commit, preserving add's atomicity.
         self.dataset
-            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .append(RecordBatchIterator::new(batches, schema), None)
             .await?;
         self.maintain_point_reads().await;
         Ok(ids)
@@ -435,6 +438,7 @@ fn validate_depth(value: &Value, depth: usize) -> Result<()> {
     Ok(())
 }
 
+mod ingestion;
 mod point_reads;
 mod query;
 mod residual_search;
