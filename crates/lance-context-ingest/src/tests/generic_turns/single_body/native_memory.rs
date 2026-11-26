@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct Admission {
     refuse: AtomicBool,
     typed: AtomicBool,
+    shared_error: AtomicBool,
     refused: AtomicUsize,
     held: Arc<AtomicUsize>,
 }
@@ -54,10 +55,26 @@ impl NativeMemoryPool for Admission {
                 NativeMemoryKind::Index => "index decode",
             };
             let message = format!("executor {owner} memory exhausted: requested {bytes}");
-            return Err(if typed {
+            let error = if typed {
                 lance_core::Error::backpressure(message)
             } else {
                 lance_core::Error::execution(message)
+            };
+            return Err(if self.shared_error.load(Ordering::SeqCst) {
+                // Replay streams can retain a second Arc owner. Conversion
+                // then keeps DF Shared inside Lance External instead of
+                // unwrapping it to the typed native error at the top level.
+                let shared = Arc::new(datafusion_common::DataFusionError::External(Box::new(
+                    error,
+                )));
+                let wrapped = lance_core::Error::from(datafusion_common::DataFusionError::Shared(
+                    shared.clone(),
+                ));
+                assert!(matches!(wrapped, lance_core::Error::External { .. }));
+                assert!(!wrapped.is_backpressure());
+                wrapped
+            } else {
+                error
             });
         }
         self.held.fetch_add(bytes, Ordering::SeqCst);
@@ -181,6 +198,15 @@ async fn native_lookup_refusal_preserves_wal_suffix_and_first_create_on_recovery
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typed_native_lookup_pressure_drains_prefix_and_resumes_same_owner() -> Result<()> {
+    typed_lookup_pressure(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_native_lookup_pressure_drains_prefix_and_resumes_same_owner() -> Result<()> {
+    typed_lookup_pressure(true).await
+}
+
+async fn typed_lookup_pressure(shared_error: bool) -> Result<()> {
     let input = bodies()?;
     let spec = TurnIngestionSpec::new(
         input[0].schema(),
@@ -191,6 +217,7 @@ async fn typed_native_lookup_pressure_drains_prefix_and_resumes_same_owner() -> 
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     let admission = Arc::new(Admission::default());
     admission.typed.store(true, Ordering::SeqCst);
+    admission.shared_error.store(shared_error, Ordering::SeqCst);
     let storage = Storage::resolve(
         root.path().join("full-body.lance").to_str().unwrap().into(),
         Default::default(),
