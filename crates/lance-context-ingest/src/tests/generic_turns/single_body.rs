@@ -12,6 +12,7 @@ mod native_memory;
 mod payload_memory;
 #[cfg(unix)]
 mod process;
+mod reader_pressure;
 mod upload_failure;
 
 pub(super) async fn owner(
