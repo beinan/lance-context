@@ -40,7 +40,7 @@ async fn write(uri: &str, rows: &[(&str, &str)], mode: WriteMode) -> Result<Data
 }
 
 async fn prepare(source: &Dataset, options: &SessionTurnIndex) -> Result<p::Descriptors> {
-    let budget = MergeMemoryBudget::new(session_index::WORKSPACE);
+    let budget = MergeMemoryBudget::new(WORKSPACE);
     session_index::spawn_action(
         source.clone(),
         options.action(source).await?.context("no index work")?,
@@ -49,6 +49,18 @@ async fn prepare(source: &Dataset, options: &SessionTurnIndex) -> Result<p::Desc
         Arc::default(),
     )
     .await?
+}
+
+#[test]
+fn composite_zonemap_256mib_admission_keeps_other_index_budgets() -> Result<()> {
+    let options = SessionTurnIndex::hex_utf8_v1();
+    options.validate(256 << 20)?;
+    assert!(options.validate((256 << 20) - 1).is_err());
+    assert_eq!(Key::SessionTurn.workspace(), 256 << 20);
+    assert_eq!(Key::Turn.workspace(), 512 << 20);
+    assert_eq!(Key::Status.workspace(), 512 << 20);
+    assert!(TurnIdIndex::default().validate(256 << 20).is_err());
+    Ok(())
 }
 
 async fn install(source: &Dataset, descriptors: &p::Descriptors) -> Result<Dataset> {
@@ -216,5 +228,57 @@ async fn composite_zonemap_invalid_old_key_cannot_hide_original_identity() -> Re
         .unwrap_err();
     assert!(format!("{error:#}").contains("differs from its original business key"));
     assert!(source.load_indices().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn composite_zonemap_256mib_build_limit_preserves_raw_tail() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let uri = root.path().join("bounded.lance");
+    let ids = (0..=MAX_BUILD_ROWS)
+        .map(|row| format!("turn-{row:08}"))
+        .collect::<Vec<_>>();
+    let input = batch(
+        &ids.iter()
+            .map(|id| ("session", id.as_str()))
+            .collect::<Vec<_>>(),
+    )?;
+    let source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(input.clone())], input.schema()),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: MAX_BUILD_ROWS / 32,
+            max_rows_per_group: MAX_BUILD_ROWS / 32,
+            enable_stable_row_ids: true,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    drop(input);
+    assert_eq!(source.fragments().len(), 33);
+    let options = SessionTurnIndex::hex_utf8_v1();
+    options.validate(WORKSPACE)?;
+    let indexed = install(&source, &prepare(&source, &options).await?).await?;
+    let indices = indexed.load_indices().await?;
+    assert_eq!(indices[0].fragment_bitmap.as_ref().unwrap().len(), 32);
+    let result = lookup(
+        &indexed,
+        &[
+            ("session", &ids[MAX_BUILD_ROWS]),
+            ("session", "turn-99999999"),
+        ],
+        true,
+    )
+    .await?;
+    assert!(result
+        .get(&format!("[\"session\",\"{}\"]", ids[MAX_BUILD_ROWS]))
+        .unwrap());
+    assert_eq!(result.get("[\"session\",\"turn-99999999\"]"), Some(false));
+    // The full first build cannot hide the one-row append beyond its cut.
+    assert_eq!(result.observation().rows_scanned, Some(1));
+    let caught_up = install(&indexed, &prepare(&indexed, &options).await?).await?;
+    assert!(options.action(&caught_up).await?.is_none());
+    assert_eq!(caught_up.count_rows(None).await?, MAX_BUILD_ROWS + 1);
     Ok(())
 }

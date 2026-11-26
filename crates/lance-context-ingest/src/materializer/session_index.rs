@@ -16,6 +16,14 @@ pub(super) enum Key {
     SessionTurn,
 }
 impl Key {
+    pub(super) fn workspace(self) -> usize {
+        if matches!(self, Self::SessionTurn) {
+            session_turn_index::WORKSPACE
+        } else {
+            WORKSPACE
+        }
+    }
+
     pub(super) fn column(self) -> &'static str {
         match self {
             Self::Session => "rollout_id",
@@ -236,7 +244,7 @@ pub(super) async fn prepare_action(
     action: Action,
     key: Key,
 ) -> Result<p::Descriptors> {
-    let reservation = publisher.budget.reserve(WORKSPACE).await;
+    let reservation = publisher.budget.reserve(key.workspace()).await;
     spawn_action(dataset, action, key, reservation, publisher.phases.clone()).await?
 }
 
@@ -275,20 +283,7 @@ pub(super) fn spawn_action(
             match action {
                 Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
                     if matches!(key, Key::SessionTurn) {
-                        session_turn_index::validate_inputs(&dataset, &ids).await?;
-                        let params = ScalarIndexParams::for_builtin(
-                            lance_index::scalar::BuiltinIndexType::ZoneMap,
-                        )
-                        .with_params(
-                            &lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(1024),
-                        );
-                        return Ok(dataset
-                            .create_index_builder(&[key.column()], IndexType::ZoneMap, &params)
-                            .name(key.name().to_owned())
-                            .replace(true)
-                            .fragments(ids)
-                            .execute_uncommitted()
-                            .await?);
+                        return session_turn_index::build(&dataset, ids).await;
                     }
                     let indices = dataset.load_indices().await?;
                     if let Some(template) = indices.iter().find(|i| i.name == key.name()) {

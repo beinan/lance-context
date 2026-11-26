@@ -121,8 +121,13 @@ impl Default for Options {
 }
 impl Options {
     fn index_row_limit(&self) -> Option<usize> {
-        (self.turn_id_index.is_some() || self.session_turn_index.is_some())
-            .then_some(turn_id_index::MAX_BUILD_ROWS)
+        if self.session_turn_index.is_some() {
+            Some(session_turn_index::MAX_BUILD_ROWS)
+        } else {
+            self.turn_id_index
+                .is_some()
+                .then_some(turn_id_index::MAX_BUILD_ROWS)
+        }
     }
     pub(crate) fn workspace(
         &self,

@@ -44,7 +44,12 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         publisher.options.max_source_bytes,
         publisher.options.max_records,
     )?;
-    if publisher.budget.limit() < session_index::WORKSPACE + publication_workspace {
+    let minimum_workspace = if publisher.options.session_turn_index.is_some() {
+        Key::SessionTurn.workspace()
+    } else {
+        session_index::WORKSPACE
+    };
+    if publisher.budget.limit() < minimum_workspace + publication_workspace {
         return Ok(None);
     }
     if Publisher::compaction_first(version) && compaction::has_work(publisher, version).await? {
@@ -77,7 +82,10 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     let Some((action, key)) = selected else {
         return Ok(None);
     };
-    let Some(reservation) = publisher.budget.try_reserve(session_index::WORKSPACE) else {
+    if publisher.budget.limit() < key.workspace() + publication_workspace {
+        return Ok(None);
+    }
+    let Some(reservation) = publisher.budget.try_reserve(key.workspace()) else {
         return Ok(None);
     };
     let job = session_index::spawn_action(

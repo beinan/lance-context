@@ -5,6 +5,14 @@ use lance::index::DatasetIndexExt;
 use session_index::{Action, Key};
 use std::collections::BTreeSet;
 
+mod build;
+pub(super) use build::build;
+
+pub(super) const WORKSPACE: usize = 256 << 20;
+pub(super) const MAX_BUILD_ROWS: usize = 256 << 10;
+const MAX_MERGE_ROWS: usize = 4 << 20;
+const MAX_MERGE_FRAGMENTS: u64 = 1024;
+
 #[cfg(test)]
 mod tests;
 
@@ -20,13 +28,13 @@ mod tests;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionTurnIndex {
-    /// Maximum physical fragments per build (also capped at 1048576 rows).
+    /// Maximum physical fragments per build (also capped at 262144 rows).
     pub max_fragments: usize,
 }
 
 impl Default for SessionTurnIndex {
     fn default() -> Self {
-        Self { max_fragments: 128 }
+        Self { max_fragments: 32 }
     }
 }
 
@@ -38,7 +46,7 @@ impl SessionTurnIndex {
 
     pub(super) fn validate(&self, budget: usize) -> Result<()> {
         ensure!(
-            (1..=128).contains(&self.max_fragments) && budget >= session_index::WORKSPACE,
+            (1..=32).contains(&self.max_fragments) && budget >= WORKSPACE,
             "invalid session/turn ZoneMap fragment bound or insufficient workspace"
         );
         Ok(())
@@ -79,7 +87,11 @@ impl SessionTurnIndex {
                     empty_sources.push(index.uuid);
                 }
             } else {
-                segments.push((index.clone(), rows));
+                // Native merging holds its source summaries and its output in
+                // memory. Bound both represented rows and fragment/zone tails.
+                if rows <= MAX_MERGE_ROWS / 4 && coverage.len() <= MAX_MERGE_FRAGMENTS / 4 {
+                    segments.push((index.clone(), rows));
+                }
             }
         }
         // Same bounded four-way row tiers as ID maintenance, with native
@@ -90,7 +102,7 @@ impl SessionTurnIndex {
         let mut selected = Vec::new();
         let mut rows = 0;
         for (id, count) in fragments {
-            if covered.contains(&id) || count == 0 || count > turn_id_index::MAX_BUILD_ROWS - rows {
+            if covered.contains(&id) || count == 0 || count > MAX_BUILD_ROWS - rows {
                 continue;
             }
             selected.push(id);
@@ -143,31 +155,6 @@ pub(super) async fn prepare(
     Ok(Some(
         session_index::prepare_action(publisher, dataset, action, Key::SessionTurn).await?,
     ))
-}
-
-/// Audit only the three narrow identity columns of this bounded source window.
-/// Do not publish an index for malformed pre-existing derived values.
-pub(super) async fn validate_inputs(dataset: &Dataset, ids: &[u32]) -> Result<()> {
-    let fragments = ids
-        .iter()
-        .map(|&id| {
-            dataset
-                .get_fragment(id as usize)
-                .map(|f| f.metadata().clone())
-                .context("ZoneMap source fragment missing")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut scan = dataset.scan();
-    scan.project(&["session_id", "id", session_turn_key::COLUMN])?
-        .with_fragments(fragments)
-        .batch_size(2048)
-        .batch_readahead(1)
-        .fragment_readahead(1);
-    let mut stream = scan.try_into_stream().await?;
-    while let Some(batch) = stream.try_next().await? {
-        session_turn_key::validate_batch(&batch)?;
-    }
-    Ok(())
 }
 
 /// Only validated, selected-main coverage may prune on the derived column.

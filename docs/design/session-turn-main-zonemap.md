@@ -20,13 +20,28 @@ are added or rewritten. Other full-body schemas keep the original lookup path.
 The owner builds `session_turn_zonemap_v1` on its authoritative selected main.
 An independent search or detached version does not supply coverage for this
 lookup. Each build validates the three narrow identity columns, processes at
-most 128 fragments and 1048576 physical rows, and uses 1024 rows per zone. The
+most 32 fragments and 262144 physical rows, and uses 1024 rows per zone. The
 fragment limit can be lowered through `SessionTurnIndex.max_fragments`.
-Four similarly sized segments can merge, capped at 16777216 represented rows.
-The existing 512 MiB index reservation is an admission estimate, not a cap on
-native allocations. The publication budget must accommodate it; background
-preparation additionally leaves an ordinary publication's workspace available.
-Current fragments and retained generations must satisfy the 1048576-row bound.
+Four similarly sized segments can merge, capped at 4194304 represented rows and
+1024 physical fragments. Larger existing segments remain readable and are not
+selected for these merges.
+
+The ZoneMap uses a full 256 MiB reservation from the existing shared publication
+budget; the other index types keep their 512 MiB reservations. Validation and
+training share one ordered narrow scan: 2048-row/1 MiB batch targets, an 8 MiB I/O
+buffer, one fragment and one decode batch in flight, and a 32 MiB DataFusion
+pool. The native trainer receives shared Arrow key/address arrays; there is no
+second scan, sort, body read, or value-buffer copy. These controls and the
+reservation are admission estimates, not an allocator/RSS cap on native pages,
+variable-width values, caches, or index summaries. Oversized native pages may
+exceed scanner byte targets.
+
+A 256 MiB owner performs this work serially. Background preparation additionally
+requires an ordinary publication's workspace to remain available. New compaction
+groups obey the smaller build row bound. Existing fragments larger than 262144
+rows remain on the correct raw lookup path; enabling this option does not split
+them. Current fragments and retained generations still must satisfy the original
+1048576-row validation bound.
 
 Lookup prunes validated main coverage using the derived-key IN predicate. It
 probes uncovered fragments using original session/id predicates, checks exact
