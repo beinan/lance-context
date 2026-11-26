@@ -99,8 +99,10 @@ pub enum Phase {
     AnnotationCompactionRemap,
     /// Validating and persisting narrow rewrite metadata after index remapping.
     AnnotationCompactionMetadata,
+    /// Full-body derived session/turn ZoneMap build or merge, within BlobWrite.
+    NativeSessionTurnIndex,
 }
-const NAMES: [&str; 53] = [
+const NAMES: [&str; 54] = [
     "claim",
     "acquire",
     "state",
@@ -154,6 +156,7 @@ const NAMES: [&str; 53] = [
     "annotation_maintenance_publish",
     "annotation_compaction_remap",
     "annotation_compaction_metadata",
+    "native_session_turn_index",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 

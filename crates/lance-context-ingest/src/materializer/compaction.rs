@@ -150,15 +150,7 @@ pub(crate) async fn has_work(publisher: &Publisher, version: u64) -> Result<bool
     let dataset = read_compaction_base(publisher, version).await?;
     let indices = supported_indices(&dataset).await?;
     Ok(options
-        .fragments(
-            &dataset,
-            &indices,
-            publisher
-                .options
-                .turn_id_index
-                .as_ref()
-                .map(|_| turn_id_index::MAX_BUILD_ROWS),
-        )
+        .fragments(&dataset, &indices, publisher.options.index_row_limit())
         .is_some())
 }
 
@@ -190,15 +182,7 @@ pub(crate) async fn prepare_task(
         .as_ref()
         .context("compaction options missing")?;
     let indices = supported_indices(dataset).await?;
-    let fragments = options.fragments(
-        dataset,
-        &indices,
-        publisher
-            .options
-            .turn_id_index
-            .as_ref()
-            .map(|_| turn_id_index::MAX_BUILD_ROWS),
-    );
+    let fragments = options.fragments(dataset, &indices, publisher.options.index_row_limit());
     let Some(fragments) = fragments else {
         return Ok(None);
     };

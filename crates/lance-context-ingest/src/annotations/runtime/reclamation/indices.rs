@@ -1,4 +1,4 @@
-//! Collect only native BTree page objects after protecting every raw index UUID.
+//! Collect known native index objects after protecting every raw index UUID.
 use super::*;
 use lance::cache::{CacheKey, LanceCache};
 use lance_io::object_store::ObjectStore;
@@ -21,7 +21,10 @@ pub(super) fn candidate(path: &Path, base: &Path) -> Option<Uuid> {
         .strip_prefix(prefix.as_ref())?
         .strip_prefix('/')?;
     let (directory, file) = relative.split_once('/')?;
-    if !matches!(file, "page_lookup.lance" | "page_data.lance") {
+    if !matches!(
+        file,
+        "page_lookup.lance" | "page_data.lance" | "zonemap.lance"
+    ) {
         return None;
     }
     let uuid = Uuid::parse_str(directory).ok()?;
@@ -107,7 +110,7 @@ mod tests {
     fn index_candidates_are_only_exact_native_page_paths() {
         let base = Path::from("owned/narrow");
         let uuid = Uuid::new_v4();
-        for file in ["page_lookup.lance", "page_data.lance"] {
+        for file in ["page_lookup.lance", "page_data.lance", "zonemap.lance"] {
             assert_eq!(
                 candidate(
                     &Path::from(format!("owned/narrow/_indices/{uuid}/{file}")),

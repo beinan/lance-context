@@ -22,6 +22,7 @@ mod prepare;
 mod read_policy;
 pub(crate) mod retirement;
 mod session_index;
+pub(crate) mod session_turn_index;
 pub(crate) mod stage;
 pub(crate) mod status_index;
 mod transport;
@@ -31,6 +32,7 @@ use observation::{Counters as PhaseCounters, Phase};
 pub use read_policy::SourceReadPolicy;
 pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
+pub use session_turn_index::SessionTurnIndex;
 pub use status_index::StatusIndex;
 pub use turn_id_index::TurnIdIndex;
 
@@ -91,6 +93,10 @@ pub struct Options {
     /// the selected materialized snapshot; point reads retain staging visibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_index: Option<StatusIndex>,
+    /// Explicit derived-key lookup and bounded ZoneMap maintenance for a
+    /// full-body owner. Runtime only; does not change its durable identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_turn_index: Option<SessionTurnIndex>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -109,10 +115,15 @@ impl Default for Options {
             session_index: None,
             turn_id_index: None,
             status_index: None,
+            session_turn_index: None,
         }
     }
 }
 impl Options {
+    fn index_row_limit(&self) -> Option<usize> {
+        (self.turn_id_index.is_some() || self.session_turn_index.is_some())
+            .then_some(turn_id_index::MAX_BUILD_ROWS)
+    }
     pub(crate) fn workspace(
         &self,
         contract: &IngestContract,
@@ -130,6 +141,19 @@ impl Options {
             .context("materializer workspace overflow")
     }
     pub(super) fn validate(&self, ingress: &Ingress, budget: &MergeMemoryBudget) -> Result<()> {
+        if let Some(index) = &self.session_turn_index {
+            ensure!(
+                crate::annotations::single_body::is_schema(&ingress.schema)
+                    && self.session_index.is_none()
+                    && self.turn_id_index.is_none()
+                    && self.status_index.is_none(),
+                "session/turn ZoneMap requires a full-body owner"
+            );
+            crate::turn_ingestion::session_turn_key::validate(
+                ingress.turn_spec.as_ref().context("body spec missing")?,
+            )?;
+            index.validate(budget.limit())?;
+        }
         if let Some(index) = &self.status_index {
             ensure!(
                 self.session_index.is_none()
@@ -462,6 +486,9 @@ impl Publisher {
         if let Some(plan) = session_index::plan(self, view).await? {
             return Ok(Some(plan));
         }
+        if let Some(plan) = session_turn_index::plan(self, view).await? {
+            return Ok(Some(plan));
+        }
         if Self::status_index_first(view.progress.minimum_read_version) {
             if let Some(plan) = status_index::plan(self, view).await? {
                 return Ok(Some(plan));
@@ -484,13 +511,17 @@ impl Publisher {
 
     pub(crate) async fn has_annotation_index_work(&self, version: u64) -> Result<bool> {
         Ok(turn_id_index::has_work(self, version).await?
-            || status_index::has_work(self, version).await?)
+            || status_index::has_work(self, version).await?
+            || session_turn_index::has_work(self, version).await?)
     }
 
     pub(crate) async fn has_ready_annotation_maintenance_work(&self, version: u64) -> Result<bool> {
         // Match maintenance_plan's selected work. A ready ID build or rewrite
         // cannot admit a smaller status build that would run ahead of it.
         if Self::compaction_first(version) && compaction::has_work(self, version).await? {
+            return Ok(true);
+        }
+        if session_turn_index::has_work(self, version).await? {
             return Ok(true);
         }
         if Self::status_index_first(version) && status_index::has_work(self, version).await? {
@@ -519,6 +550,9 @@ impl Publisher {
                 return compaction::prepare(self, pending).await;
             }
             if let Some(index) = session_index::prepare(self, pending).await? {
+                return Ok(index);
+            }
+            if let Some(index) = session_turn_index::prepare(self, pending).await? {
                 return Ok(index);
             }
             if Self::status_index_first(pending.plan.read_version) {

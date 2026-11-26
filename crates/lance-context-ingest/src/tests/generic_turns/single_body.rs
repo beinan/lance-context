@@ -13,6 +13,7 @@ mod native_memory;
 mod payload_memory;
 #[cfg(unix)]
 mod process;
+mod session_turn_index;
 mod staged_lookup;
 mod upload_failure;
 

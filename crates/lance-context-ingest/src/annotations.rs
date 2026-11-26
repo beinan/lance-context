@@ -110,6 +110,7 @@ pub struct Service {
     shared: Arc<Shared>,
     apply_budget: Arc<MergeMemoryBudget>,
     lookup_budget: Option<Arc<MergeMemoryBudget>>,
+    session_turn_key: bool,
 }
 
 struct Pending {
@@ -476,6 +477,7 @@ impl Service {
             limits,
             apply_budget,
             lookup_budget,
+            session_turn_key: false,
             shared: Arc::new(Shared {
                 narrow: storage.clone(),
                 body,
@@ -686,6 +688,7 @@ impl Service {
         let layout = self.ingress.layout.clone();
         let bucket = self.bucket();
         let spec = self.ingress.turn_spec.clone();
+        let session_turn_key = self.session_turn_key;
         tokio::task::spawn_blocking(move || {
             let decoded = if single_body::is_schema(&schema) {
                 single_body::decode(
@@ -693,6 +696,7 @@ impl Service {
                     schema,
                     upload.scope.contract.max_rows,
                     value_bytes,
+                    session_turn_key,
                 )?
             } else if mixed {
                 mixed::wire::decode(

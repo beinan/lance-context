@@ -147,6 +147,15 @@ impl TurnIngestionSpec {
         base: Arc<Dataset>,
         prepared: PreparedTurnLookup,
     ) -> Result<TurnLookup> {
+        self.lookup_prepared_with_key(base, prepared, false).await
+    }
+
+    pub(crate) async fn lookup_prepared_with_key(
+        &self,
+        base: Arc<Dataset>,
+        prepared: PreparedTurnLookup,
+        session_turn_key: bool,
+    ) -> Result<TurnLookup> {
         ensure!(
             arrow_schema::Schema::from(base.schema()) == *self.body_schema
                 || arrow_schema::Schema::from(base.schema())
@@ -155,7 +164,7 @@ impl TurnIngestionSpec {
         );
         let PreparedTurnLookup {
             keys: mut requested,
-            workspace: reservation,
+            workspace: mut reservation,
             started,
         } = prepared;
         let staged_keys = requested.values().filter(|present| **present).count();
@@ -174,95 +183,158 @@ impl TurnIngestionSpec {
                 _workspace: reservation,
             });
         }
-        let mut column_values = vec![BTreeSet::new(); self.primary_key.len()];
-        for (key, present) in &requested {
-            if *present {
-                continue;
-            }
-            for (values, value) in column_values.iter_mut().zip(self.key_values(key)?) {
-                values.insert(value.into_owned());
-            }
+        if session_turn_key {
+            session_turn_key::validate(self)?;
         }
-        let predicate = self
-            .primary_key
-            .iter()
-            .zip(column_values)
-            .map(|(name, values)| {
-                let values = values
-                    .into_iter()
-                    .map(|value| format!("'{}'", value.replace('\'', "''")))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("`{}` IN ({values})", name.replace('`', "``"))
-            })
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let mut scan = base.scan();
-        scan.project(
-            &self
-                .primary_key
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-        )?;
-        scan.filter(&predicate)?;
-        scan.batch_size(SCAN_BATCH_ROWS)
-            .batch_readahead(1)
-            .fragment_readahead(1);
-        let summary = Arc::new(Mutex::new(None));
-        let observed = summary.clone();
-        scan.scan_stats_callback(Arc::new(move |stats| {
-            *observed.lock().unwrap() = Some(stats.clone());
-        }));
-        observation.scans_started = 1;
-        let mut stream = scan.try_into_stream().await?;
-        while let Some(batch) = stream.try_next().await? {
-            observation.projected_rows = observation
-                .projected_rows
-                .saturating_add(batch.num_rows() as u64);
-            observation.projected_array_bytes = observation
-                .projected_array_bytes
-                .saturating_add(batch.get_array_memory_size() as u64);
-            let columns = batch
-                .columns()
-                .iter()
-                .map(|column| {
-                    column
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .context("invalid body key projection")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for row in 0..batch.num_rows() {
-                ensure!(
-                    columns.iter().all(|column| !column.is_null(row)),
-                    "null materialized body key"
-                );
-                let values = columns
-                    .iter()
-                    .map(|column| column.value(row))
-                    .collect::<Vec<_>>();
-                let key = self.business_key(&values, MAX_KEY_BYTES)?;
-                if let Some(found) = requested.get_mut(&key) {
-                    if !*found {
-                        *found = true;
-                        remaining -= 1;
-                    }
-                }
-            }
+        let windows = if session_turn_key {
+            crate::materializer::session_turn_index::lookup_fragments(&base, &mut reservation)
+                .await?
+        } else {
+            vec![(false, None)]
+        };
+        for (session_turn_key, fragments) in windows {
             if remaining == 0 {
                 break;
             }
-        }
-        drop(stream);
-        if let Some(stats) = summary.lock().unwrap().take() {
-            observation.lance_bytes_read = Some(stats.bytes_read);
-            observation.lance_requests = Some(stats.requests);
-            observation.lance_indices_loaded = Some(stats.indices_loaded);
-            observation.fragments_scanned = stats.all_counts.get("fragments_scanned").copied();
-            observation.ranges_scanned = stats.all_counts.get("ranges_scanned").copied();
-            observation.rows_scanned = stats.all_counts.get("rows_scanned").copied();
-            observation.task_wait_time_ns = stats.all_times.get("task_wait_time").copied();
+            let columns = if session_turn_key {
+                vec![session_turn_key::COLUMN.to_owned()]
+            } else {
+                self.primary_key.clone()
+            };
+            let mut column_values = vec![BTreeSet::new(); columns.len()];
+            for (key, present) in &requested {
+                if *present {
+                    continue;
+                }
+                let values = self.key_values(key)?;
+                if session_turn_key {
+                    column_values[0].insert(session_turn_key::encode(&values[0], &values[1]));
+                } else {
+                    for (column, value) in column_values.iter_mut().zip(values) {
+                        column.insert(value.into_owned());
+                    }
+                }
+            }
+            let predicate = columns
+                .iter()
+                .zip(column_values)
+                .map(|(name, values)| {
+                    let values = values
+                        .into_iter()
+                        .map(|value| format!("'{}'", value.replace('\'', "''")))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("`{}` IN ({values})", name.replace('`', "``"))
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let mut scan = base.scan();
+            if let Some(fragments) = fragments {
+                scan.with_fragments(fragments);
+            }
+            scan.project(
+                &self
+                    .primary_key
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )?;
+            scan.filter(&predicate)?;
+            scan.batch_size(SCAN_BATCH_ROWS)
+                .batch_readahead(1)
+                .fragment_readahead(1);
+            let summary = Arc::new(Mutex::new(None));
+            let observed = summary.clone();
+            scan.scan_stats_callback(Arc::new(move |stats| {
+                *observed.lock().unwrap() = Some(stats.clone());
+            }));
+            observation.scans_started += 1;
+            let mut stream = scan.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                observation.projected_rows = observation
+                    .projected_rows
+                    .saturating_add(batch.num_rows() as u64);
+                observation.projected_array_bytes = observation
+                    .projected_array_bytes
+                    .saturating_add(batch.get_array_memory_size() as u64);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        column
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .context("invalid body key projection")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    ensure!(
+                        columns.iter().all(|column| !column.is_null(row)),
+                        "null materialized body key"
+                    );
+                    let values = columns
+                        .iter()
+                        .map(|column| column.value(row))
+                        .collect::<Vec<_>>();
+                    let key = self.business_key(&values, MAX_KEY_BYTES)?;
+                    if let Some(found) = requested.get_mut(&key) {
+                        if !*found {
+                            *found = true;
+                            remaining -= 1;
+                        }
+                    }
+                }
+                if remaining == 0 {
+                    break;
+                }
+            }
+            drop(stream);
+            let stats = summary.lock().unwrap().take();
+            // A two-part lookup reports a native total only when every executed
+            // part supplied that metric. Missing observations are never zero.
+            let add = |old: Option<usize>, value: Option<usize>| {
+                if observation.scans_started == 1 {
+                    value
+                } else {
+                    old.zip(value).map(|(a, b)| a.saturating_add(b))
+                }
+            };
+            observation.lance_bytes_read = add(
+                observation.lance_bytes_read,
+                stats.as_ref().map(|s| s.bytes_read),
+            );
+            observation.lance_requests = add(
+                observation.lance_requests,
+                stats.as_ref().map(|s| s.requests),
+            );
+            observation.lance_indices_loaded = add(
+                observation.lance_indices_loaded,
+                stats.as_ref().map(|s| s.indices_loaded),
+            );
+            observation.fragments_scanned = add(
+                observation.fragments_scanned,
+                stats
+                    .as_ref()
+                    .and_then(|s| s.all_counts.get("fragments_scanned").copied()),
+            );
+            observation.ranges_scanned = add(
+                observation.ranges_scanned,
+                stats
+                    .as_ref()
+                    .and_then(|s| s.all_counts.get("ranges_scanned").copied()),
+            );
+            observation.rows_scanned = add(
+                observation.rows_scanned,
+                stats
+                    .as_ref()
+                    .and_then(|s| s.all_counts.get("rows_scanned").copied()),
+            );
+            observation.task_wait_time_ns = add(
+                observation.task_wait_time_ns,
+                stats
+                    .as_ref()
+                    .and_then(|s| s.all_times.get("task_wait_time").copied()),
+            );
         }
         observation.elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         Ok(TurnLookup {

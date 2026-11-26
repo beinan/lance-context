@@ -114,6 +114,7 @@ pub(super) fn decode(
     schema: SchemaRef,
     maximum: u32,
     key_bytes: usize,
+    session_turn_key: bool,
 ) -> Result<mixed::Decoded> {
     ensure!(is_schema(&schema), "not an immutable body transport");
     let spec =
@@ -139,6 +140,10 @@ pub(super) fn decode(
             );
         }
         let original = RecordBatch::try_new(spec.body_schema().clone(), batch.columns().to_vec())?;
+        if session_turn_key {
+            crate::turn_ingestion::session_turn_key::validate(&spec)?;
+            crate::turn_ingestion::session_turn_key::validate_batch(&original)?;
+        }
         for row in 0..batch.num_rows() {
             let turn = spec.row_key(&original, row, key_bytes)?;
             let rollout_id = spec.routing_key(&turn)?;
@@ -211,7 +216,14 @@ impl Service {
                 else {
                     return Ok(None);
                 };
-                let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
+                let keys = match spec
+                    .lookup_prepared_with_key(
+                        base.dataset().clone(),
+                        prepared,
+                        self.session_turn_key,
+                    )
+                    .await
+                {
                     Ok(keys) => keys,
                     Err(error)
                         if error.chain().any(|cause| {

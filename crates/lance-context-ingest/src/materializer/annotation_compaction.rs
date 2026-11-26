@@ -58,6 +58,7 @@ impl Preparation {
                 || lance_index::is_system_index(index)
                 || (first
                     && index.results_are_row_addrs()
+                    && !lance_context_core::native_compaction::withdraws_zone_map_coverage(index)
                     && (!index.supports_eager_remap() || result.row_addrs.is_none()))
             {
                 return Ok(None);

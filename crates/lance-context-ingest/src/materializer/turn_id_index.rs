@@ -44,7 +44,7 @@ impl TurnIdIndex {
     // Merge four similarly sized segments, never a large historical segment
     // with every new tail. A merge covers at most sixteen million rows. Large
     // shards can still accumulate capped segments; this is not a scale-out policy.
-    fn merge(segments: Vec<(IndexMetadata, usize)>) -> Option<Action> {
+    pub(super) fn merge(segments: Vec<(IndexMetadata, usize)>) -> Option<Action> {
         let mut tiers: BTreeMap<usize, Vec<IndexMetadata>> = BTreeMap::new();
         for (index, rows) in segments {
             let mut ceiling = 1;

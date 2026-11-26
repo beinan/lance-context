@@ -3,7 +3,7 @@ use crate::materializer::SmallFileCompaction;
 use futures::TryStreamExt;
 use std::collections::BTreeMap;
 
-fn compact_binding() -> TableBinding {
+pub(super) fn compact_binding() -> TableBinding {
     TableBinding {
         max_record_bytes: 256 << 10,
         ..binding()
@@ -50,7 +50,7 @@ async fn compact_owner(
     .await
 }
 
-async fn row_ids(base: &lance::Dataset) -> Result<BTreeMap<(String, String), u64>> {
+pub(super) async fn row_ids(base: &lance::Dataset) -> Result<BTreeMap<(String, String), u64>> {
     let mut scan = base.scan();
     scan.project(&["session_id", "id"])?.with_row_id();
     let mut stream = scan.try_into_stream().await?;

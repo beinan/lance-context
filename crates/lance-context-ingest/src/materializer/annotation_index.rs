@@ -22,13 +22,19 @@ impl Preparation {
                 session_index::rebase_turn(&self.source, current, &descriptors).await?,
             )),
             Key::Status => session_index::rebase_status(&self.source, current, &descriptors).await,
+            Key::SessionTurn => {
+                session_index::rebase_unchanged(&self.source, current, &descriptors, self.key).await
+            }
             Key::Session => unreachable!("annotation preparation selects only turn or status"),
         }
     }
 }
 
 pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<Preparation>> {
-    if publisher.options.turn_id_index.is_none() && publisher.options.status_index.is_none() {
+    if publisher.options.turn_id_index.is_none()
+        && publisher.options.status_index.is_none()
+        && publisher.options.session_turn_index.is_none()
+    {
         return Ok(None);
     }
     // Keep an ordinary publication's workspace available while the one native
@@ -47,6 +53,12 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     let source = compaction::read_compaction_base(publisher, version).await?;
     let status_first = Publisher::status_index_first(version);
     let mut selected: Option<(Action, Key)> = None;
+    if let Some(options) = &publisher.options.session_turn_index {
+        selected = options
+            .action(&source)
+            .await?
+            .map(|a| (a, Key::SessionTurn));
+    }
     if status_first {
         if let Some(options) = &publisher.options.status_index {
             selected = options.action(&source, 1).await?.map(|a| (a, Key::Status));

@@ -284,7 +284,7 @@ impl Runtime {
         ensure!(
             configuration.publication.turn_id_index.is_none()
                 && configuration.publication.status_index.is_none(),
-            "single body indexing is supplied by its consumer"
+            "single body owners support only the explicit session/turn ZoneMap index"
         );
         Self::connect_mode(
             client,
@@ -318,7 +318,9 @@ impl Runtime {
             "annotation runtime does not support session indexing or remote preparation"
         );
         ensure!(
-            (c.publication.turn_id_index.is_none() && c.publication.status_index.is_none())
+            (c.publication.turn_id_index.is_none()
+                && c.publication.status_index.is_none()
+                && c.publication.session_turn_index.is_none())
                 || c.limits.retained_entries <= materializer::turn_id_index::MAX_BUILD_ROWS,
             "annotation indexing requires at most 1048576 retained annotation entries"
         );
@@ -346,14 +348,18 @@ impl Runtime {
             spec,
         )
         .await?;
-        let connect = || {
-            Service::open_mode(
+        let connect = || async {
+            let (mut service, mut driver) = Service::open_mode(
                 ingress.clone(),
                 &storage,
                 body.clone(),
                 c.limits.clone(),
                 c.apply_budget.clone(),
             )
+            .await?;
+            service.session_turn_key = c.publication.session_turn_index.is_some();
+            driver.service = service.clone();
+            Ok::<_, anyhow::Error>((service, driver))
         };
         let catalog = materializer::Publisher::acquire(
             ingress.clone(),
@@ -391,7 +397,10 @@ impl Runtime {
             publisher.service = service.clone();
             view = publisher.catalog.state().await?;
         }
-        if c.publication.turn_id_index.is_some() || c.publication.status_index.is_some() {
+        if c.publication.turn_id_index.is_some()
+            || c.publication.status_index.is_some()
+            || c.publication.session_turn_index.is_some()
+        {
             // Before the first advance, minimum_read_version is still the
             // protocol floor (1). Bootstrap can select a later native version.
             let version = view

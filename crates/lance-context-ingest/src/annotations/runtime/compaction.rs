@@ -164,7 +164,8 @@ impl Publisher {
             // remains eligible, subject to one pressure deferral below.
             if (self.options.compaction.is_none()
                 && self.options.turn_id_index.is_none()
-                && self.options.status_index.is_none())
+                && self.options.status_index.is_none()
+                && self.options.session_turn_index.is_none())
                 || view
                     .progress
                     .checkpoint

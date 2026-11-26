@@ -94,6 +94,7 @@ pub(super) async fn fetch(
     let layout = ingress.layout.clone();
     let scope = ingress.scope.clone();
     let spec = ingress.turn_spec.clone();
+    let session_turn_key = service.session_turn_key;
     Ok(Some(
         service
             .shared
@@ -101,7 +102,7 @@ pub(super) async fn fetch(
             .measure(Phase::AnnotationDecode, async {
                 tokio::task::spawn_blocking(move || -> Result<Pending> {
                     let decoded = if single_body::is_schema(&schema) {
-                        single_body::decode(body, schema, max_rows, value_bytes)?
+                        single_body::decode(body, schema, max_rows, value_bytes, session_turn_key)?
                     } else if mixed {
                         mixed::wire::decode(body, schema, max_rows, value_bytes)?
                     } else {

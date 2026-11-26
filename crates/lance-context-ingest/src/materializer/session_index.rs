@@ -13,6 +13,7 @@ pub(super) enum Key {
     Session,
     Turn,
     Status,
+    SessionTurn,
 }
 impl Key {
     pub(super) fn column(self) -> &'static str {
@@ -20,6 +21,7 @@ impl Key {
             Self::Session => "rollout_id",
             Self::Turn => "id",
             Self::Status => "status",
+            Self::SessionTurn => crate::turn_ingestion::session_turn_key::COLUMN,
         }
     }
     pub(super) fn name(self) -> &'static str {
@@ -27,6 +29,7 @@ impl Key {
             Self::Session => NAME,
             Self::Turn => "lance_context_turn_id",
             Self::Status => "lance_context_annotation_status",
+            Self::SessionTurn => crate::turn_ingestion::session_turn_key::INDEX,
         }
     }
 }
@@ -145,11 +148,17 @@ pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: K
             && index
                 .index_details
                 .as_ref()
-                .is_some_and(|d| d.type_url.ends_with("BTreeIndexDetails"))
+                .is_some_and(
+                    |d| d.type_url.ends_with(if matches!(key, Key::SessionTurn) {
+                        "ZoneMapIndexDetails"
+                    } else {
+                        "BTreeIndexDetails"
+                    })
+                )
             && index
                 .fragment_bitmap
                 .as_ref()
-                .is_some_and(|b| !b.is_empty() || matches!(key, Key::Status)),
+                .is_some_and(|b| !b.is_empty() || matches!(key, Key::Status | Key::SessionTurn)),
         "incompatible managed session index metadata"
     );
     Ok(())
@@ -260,10 +269,27 @@ pub(super) fn spawn_action(
             Key::Session => Phase::NativeSessionIndex,
             Key::Turn => Phase::NativeTurnIdIndex,
             Key::Status => Phase::NativeStatusIndex,
+            Key::SessionTurn => Phase::NativeSessionTurnIndex,
         };
         let native = async {
             match action {
                 Action::Build(ids) | Action::BuildReplacingEmpty { fragments: ids, .. } => {
+                    if matches!(key, Key::SessionTurn) {
+                        session_turn_index::validate_inputs(&dataset, &ids).await?;
+                        let params = ScalarIndexParams::for_builtin(
+                            lance_index::scalar::BuiltinIndexType::ZoneMap,
+                        )
+                        .with_params(
+                            &lance_index::scalar::zonemap::ZoneMapIndexBuilderParams::new(1024),
+                        );
+                        return Ok(dataset
+                            .create_index_builder(&[key.column()], IndexType::ZoneMap, &params)
+                            .name(key.name().to_owned())
+                            .replace(true)
+                            .fragments(ids)
+                            .execute_uncommitted()
+                            .await?);
+                    }
                     let indices = dataset.load_indices().await?;
                     if let Some(template) = indices.iter().find(|i| i.name == key.name()) {
                         for index in indices.iter().filter(|i| i.name == key.name()) {
@@ -295,9 +321,10 @@ pub(super) fn spawn_action(
                         .await?)
                 }
                 Action::Merge(segments) => {
-                    if segments
-                        .first()
-                        .is_some_and(|index| index.index_version == 0)
+                    if !matches!(key, Key::SessionTurn)
+                        && segments
+                            .first()
+                            .is_some_and(|index| index.index_version == 0)
                     {
                         legacy::merge(&dataset, key, segments).await
                     } else {
@@ -414,6 +441,15 @@ pub(super) async fn rebase_status(
     target: &Dataset,
     descriptors: &p::Descriptors,
 ) -> Result<Option<p::Descriptors>> {
+    rebase_unchanged(source, target, descriptors, Key::Status).await
+}
+
+pub(super) async fn rebase_unchanged(
+    source: &Dataset,
+    target: &Dataset,
+    descriptors: &p::Descriptors,
+    key: Key,
+) -> Result<Option<p::Descriptors>> {
     ensure!(
         source.uri() == target.uri()
             && source.schema() == target.schema()
@@ -421,7 +457,7 @@ pub(super) async fn rebase_status(
         "status index snapshot binding changed"
     );
     let Operation::CreateIndex { new_indices, .. } =
-        operation_for(source, descriptors, Key::Status).await?
+        operation_for(source, descriptors, key).await?
     else {
         unreachable!("index descriptor decoder returns CreateIndex")
     };
@@ -470,7 +506,7 @@ pub(super) async fn rebase_status(
     let rebased = p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))?;
     // Consolidation may replace only the same source UUIDs and their current
     // surviving coverage. Also reject newly installed overlapping segments.
-    operation_for(target, &rebased, Key::Status).await?;
+    operation_for(target, &rebased, key).await?;
     Ok(Some(rebased))
 }
 
@@ -517,6 +553,7 @@ async fn decode_operation(
         Some(key) => key,
         None if index.name == Key::Turn.name() => Key::Turn,
         None if index.name == Key::Status.name() => Key::Status,
+        None if index.name == Key::SessionTurn.name() => Key::SessionTurn,
         None => anyhow::bail!("unsupported annotation index"),
     };
     validate_metadata(dataset, &index, key)?;
@@ -576,7 +613,8 @@ async fn decode_operation(
         // CreateIndex does not retire it implicitly: a fresh catch-up build
         // may remove only proven-empty status sources at this exact snapshot.
         ensure!(
-            matches!(key, Key::Status) && index.dataset_version == dataset.version().version,
+            matches!(key, Key::Status | Key::SessionTurn)
+                && index.dataset_version == dataset.version().version,
             "invalid empty status index replacement"
         );
     } else if !remove.is_empty() {
