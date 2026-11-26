@@ -1,0 +1,183 @@
+use super::*;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{body::Incoming, service::service_fn, Request, Response, StatusCode};
+use serde::Serialize;
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+pub(super) struct State {
+    pub node: u64,
+    pub handle: runtime::Handle,
+    pub groups: Vec<u64>,
+    pub draining: AtomicBool,
+    pub maintenance: maintenance::Shared,
+    pub peers: Arc<peer::Statistics>,
+    pub snapshots: Arc<snapshot::Statistics>,
+}
+#[derive(Serialize)]
+struct Group {
+    status: crate::replication::Status,
+    checkpoint_index: u64,
+    first_retained_index: u64,
+    observed_age_ms: u64,
+    polling: bool,
+    stopped: bool,
+    fetch: runtime::FetchObservation,
+    durable_poll: runtime::PollObservation,
+    persistence: Option<runtime::PersistenceObservation>,
+    append: runtime::AppendObservation,
+}
+#[derive(Serialize)]
+struct View {
+    node: u64,
+    ready: bool,
+    groups: BTreeMap<u64, Group>,
+    admission: runtime::Admission,
+    appends: BTreeMap<&'static str, u64>,
+    last_append_disk_refusal: Option<crate::admission::DiskBudgetExhausted>,
+    append_execution: runtime::client::timing::Observation,
+    append_receive: BTreeMap<&'static str, runtime::client::timing::Observation>,
+    disk: Option<crate::admission::Snapshot>,
+    maintenance: maintenance::Progress,
+    native_io_process: native_io::Observation,
+    snapshots_sent: u64,
+    snapshots_installed: u64,
+    snapshots_failed: u64,
+    outbound_snapshots: Vec<snapshot::TransferObservation>,
+    peer_drops: (u64, u64),
+    peer_rejections: runtime::PeerRejections,
+    peer_sent_frames: u64,
+    peer_received_frames: u64,
+    peer_dropped_outbound: u64,
+    peer_enqueue_not_ready: u64,
+    peer_enqueue_byte_capacity: u64,
+    peer_enqueue_queue_full: u64,
+    peer_enqueue_queue_closed: u64,
+    peer_failed_exchanges: u64,
+    peer_rejected_connections: u64,
+    peer_rejected_packets: u64,
+    peer_destinations: BTreeMap<u64, peer::DestinationObservation>,
+}
+impl State {
+    fn view(&self) -> Result<View> {
+        let mut ready = !self.draining.load(Ordering::Acquire);
+        let mut groups = BTreeMap::new();
+        for &group in &self.groups {
+            let o = self.handle.observation(group)?;
+            let age = o.observed_at.elapsed();
+            ready &= !o.stopped && o.failure.is_none() && age <= Duration::from_secs(15);
+            groups.insert(
+                group,
+                Group {
+                    status: o.status,
+                    checkpoint_index: o.checkpoint_index,
+                    first_retained_index: o.first_retained_index,
+                    observed_age_ms: age.as_millis().min(u64::MAX as u128) as u64,
+                    polling: o.polling,
+                    stopped: o.stopped,
+                    fetch: o.fetch,
+                    durable_poll: o.durable_poll,
+                    persistence: o.persistence,
+                    append: o.append,
+                },
+            );
+        }
+        Ok(View {
+            node: self.node,
+            ready,
+            groups,
+            admission: self.handle.admission(),
+            appends: self.handle.append_observation(),
+            last_append_disk_refusal: self.handle.last_append_disk_refusal(),
+            append_execution: self.handle.append_execution_timing(),
+            append_receive: self.handle.append_receive_timings(),
+            disk: self.handle.disk_budget(),
+            maintenance: self
+                .maintenance
+                .lock()
+                .map_err(|_| anyhow::anyhow!("maintenance observation unavailable"))?
+                .clone(),
+            native_io_process: native_io::observe(),
+            snapshots_sent: self.snapshots.sent.load(Ordering::Relaxed),
+            snapshots_installed: self.snapshots.installed.load(Ordering::Relaxed),
+            snapshots_failed: self.snapshots.failed.load(Ordering::Relaxed),
+            outbound_snapshots: self.snapshots.outbound_observations(),
+            peer_drops: self.handle.peer_drops(),
+            peer_rejections: self.handle.peer_rejections(),
+            peer_sent_frames: self.peers.sent_frames.load(Ordering::Relaxed),
+            peer_received_frames: self.peers.received_frames.load(Ordering::Relaxed),
+            peer_dropped_outbound: self.peers.dropped_outbound.load(Ordering::Relaxed),
+            peer_enqueue_not_ready: self.peers.enqueue_not_ready.load(Ordering::Relaxed),
+            peer_enqueue_byte_capacity: self.peers.enqueue_byte_capacity.load(Ordering::Relaxed),
+            peer_enqueue_queue_full: self.peers.enqueue_queue_full.load(Ordering::Relaxed),
+            peer_enqueue_queue_closed: self.peers.enqueue_queue_closed.load(Ordering::Relaxed),
+            peer_failed_exchanges: self.peers.failed_exchanges.load(Ordering::Relaxed),
+            peer_rejected_connections: self.peers.rejected_connections.load(Ordering::Relaxed),
+            peer_rejected_packets: self.peers.rejected_packets.load(Ordering::Relaxed),
+            peer_destinations: self.peers.destination_observations(),
+        })
+    }
+}
+async fn respond(
+    state: Arc<State>,
+    request: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (code, body) = if request.method() != hyper::Method::GET {
+        (StatusCode::METHOD_NOT_ALLOWED, Bytes::new())
+    } else {
+        match request.uri().path() {
+            "/health/live" => (StatusCode::OK, Bytes::from_static(b"{\"live\":true}\n")),
+            "/health/ready" | "/status" => match state.view() {
+                Ok(view) => (
+                    if view.ready {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    Bytes::from(serde_json::to_vec(&view).unwrap_or_default()),
+                ),
+                Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Bytes::new()),
+            },
+            _ => (StatusCode::NOT_FOUND, Bytes::new()),
+        }
+    };
+    Ok(Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(Full::new(body))
+        .expect("fixed HTTP response"))
+}
+/// Bound even slow header readers independently of the WAL's data/control pools.
+pub(super) async fn serve(
+    listener: TcpListener,
+    state: Arc<State>,
+    mut stop: watch::Receiver<bool>,
+) -> Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(16));
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {},
+            incoming = listener.accept() => {
+                let (tcp,_)=incoming?;
+                let Ok(permit)=slots.clone().try_acquire_owned() else { drop(tcp); continue; };
+                let state=state.clone();
+                tasks.spawn(async move {
+                    let _permit=permit;
+                    let service=service_fn(move |request| respond(state.clone(),request));
+                    let mut http=hyper::server::conn::http1::Builder::new();
+                    http.keep_alive(false).max_buf_size(8192);
+                    let _=tokio::time::timeout(Duration::from_secs(2),http.serve_connection(hyper_util::rt::TokioIo::new(tcp),service)).await;
+                });
+            }
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+}

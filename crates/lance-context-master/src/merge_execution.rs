@@ -1,0 +1,3445 @@
+//! Serial worker merges with durable execution ownership and targeted retries.
+use crate::{state::MasterState, task_store::TaskClaim};
+use lance_context_merge::{ClaimProof, Coordinator, Execution, Phase};
+use std::{sync::Arc, time::Duration};
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_DELAY: Duration = Duration::from_millis(250);
+const WATCH_REFRESH: Duration = Duration::from_secs(10);
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+const ATTEMPTS: usize = 3;
+const OWNER_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const OWNER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNER_PROBE_FAILURES: u8 = 3;
+
+#[derive(serde::Deserialize)]
+struct ExecutorIdentity {
+    instance: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Capabilities {
+    protocol: u32,
+    instance: String,
+    timeout_secs: u64,
+    queue_timeout_secs: u64,
+    idle_timeout_secs: u64,
+    progress_protocol: u32,
+    owned_targets: Vec<String>,
+    #[serde(default)]
+    fenced_legacy_merges: bool,
+    #[serde(default = "admission_ready_by_default")]
+    merge_admission_ready: bool,
+}
+
+const WORKER_ADMISSION_PENDING: &str = "worker admission discovery is still pending; no merge sent";
+const WORKER_PROTOCOL_UNSUPPORTED: &str = "worker lacks bounded owned-merge protocol";
+
+enum WorkerRetry {
+    Deferred(String),
+    Eligible {
+        capabilities: Option<Capabilities>,
+        // Reuse only an observation made without an intervening capability
+        // request. A reprobe may overlap an administrative failure reset.
+        failures_before: Option<u32>,
+    },
+}
+
+fn validate_capabilities(capabilities: &Capabilities, target: &str) -> Result<(), String> {
+    if !capabilities.merge_admission_ready {
+        return Err(WORKER_ADMISSION_PENDING.into());
+    }
+    if capabilities.protocol != 2
+        || capabilities.progress_protocol != 1
+        || (!capabilities.owned_targets.iter().any(|t| t == target)
+            && !capabilities.fenced_legacy_merges)
+        || capabilities.timeout_secs == 0
+        || capabilities.queue_timeout_secs == 0
+        || capabilities.idle_timeout_secs == 0
+    {
+        return Err(WORKER_PROTOCOL_UNSUPPORTED.into());
+    }
+    Ok(())
+}
+
+async fn worker_retry(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    target: &str,
+    endpoint: &str,
+) -> Result<WorkerRetry, String> {
+    use lance_context_merge::failure::FailureClass;
+    let Some(failure) = coordinator.failure(target, endpoint).await? else {
+        return Ok(WorkerRetry::Eligible {
+            capabilities: None,
+            failures_before: Some(0),
+        });
+    };
+    if failure.next_retry_ms <= lance_context_merge::failure::now_ms() {
+        return Ok(WorkerRetry::Eligible {
+            capabilities: None,
+            failures_before: Some(failure.consecutive_attempts),
+        });
+    }
+    let admission_failure = (failure.class == FailureClass::DataOrConfiguration
+        && failure.last_error == WORKER_PROTOCOL_UNSUPPORTED)
+        || (failure.class == FailureClass::Retryable
+            && failure.last_error == WORKER_ADMISSION_PENDING);
+    // Old masters also wrote the protocol error for temporary closed admission.
+    // Only these exact pre-admission errors may be reconsidered on a fresh GET.
+    // No timer/poll loop, failure reset, or extra etcd write is introduced.
+    // Reuse the verified capabilities for the normal fenced reservation/start.
+    if admission_failure {
+        if let Ok(Ok(caps)) =
+            tokio::time::timeout(OWNER_PROBE_TIMEOUT, capabilities(http, endpoint)).await
+        {
+            if validate_capabilities(&caps, target).is_ok() {
+                return Ok(WorkerRetry::Eligible {
+                    capabilities: Some(caps),
+                    failures_before: None,
+                });
+            }
+        }
+    }
+    Ok(WorkerRetry::Deferred(format!(
+        "{endpoint}: retry at {}; {:?}: {}",
+        failure.next_retry_ms, failure.class, failure.last_error
+    )))
+}
+
+fn admission_ready_by_default() -> bool {
+    true
+}
+
+pub(crate) async fn run_merge_wal(
+    state: &Arc<MasterState>,
+    claim: &TaskClaim,
+) -> Result<String, String> {
+    let coordinator = state.task_store.merge_coordinator();
+    let proof = state.task_store.merge_claim(claim);
+    let target = &claim.task.target;
+    if state.config.merge_rollout.draining(target) {
+        // A drain stops new work, but must still resolve an already-owned
+        // execution. Otherwise rollback would strand its persistent lock.
+        if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            ensure_recovery_due(&coordinator, &old).await?;
+            if reconcile(&state.http, &coordinator, &proof, old, false)
+                .await
+                .is_err()
+            {
+                if let Some(current) = coordinator.get(target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                }
+            }
+        }
+        return Err("merge target draining for protocol transition".into());
+    }
+    if !state.config.merge_rollout.owned(target) && !state.config.merge_rollout.fence_legacy {
+        if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            // Turning off new admission must never disable recovery of durable
+            // worker records. Observe useful progress before considering cancel.
+            if old.protocol == 0 && old.phase == Phase::Finished {
+                recover_execution(state, &coordinator, &proof, old).await?;
+                return Ok("released acknowledged legacy merge; new pass may be scheduled".into());
+            }
+            if old.maintenance.is_some() || old.protocol != 2 {
+                return Err("owned execution still present; refusing legacy downgrade".into());
+            }
+            ensure_recovery_due(&coordinator, &old).await?;
+            if reconcile(&state.http, &coordinator, &proof, old, false)
+                .await
+                .is_err()
+            {
+                if let Some(current) = coordinator.get(target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                }
+            }
+            return Ok("reconciled recorded worker merge; new fenced admission disabled".into());
+        }
+        return run_legacy(state, claim).await;
+    }
+    if state.config.worker_endpoints.is_empty()
+        && !crate::local_merge::selected(&state.config, target)
+        && coordinator.get(target).await?.is_none()
+    {
+        return Err("no worker endpoints configured".into());
+    }
+    if (state.config.merge_rollout.owned(target) && state.config.append.enabled(target))
+        || crate::local_merge::selected(&state.config, target)
+    {
+        if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            ensure_recovery_due(&coordinator, &old).await?;
+            if old.maintenance.is_none() {
+                // A newly selected resident target may still have useful
+                // background work. Wait for its real progress and terminal
+                // acknowledgement before considering storage recovery.
+                if reconcile(&state.http, &coordinator, &proof, old, false)
+                    .await
+                    .is_err()
+                {
+                    if let Some(current) = coordinator.get(target).await? {
+                        recover_execution(state, &coordinator, &proof, current).await?;
+                    }
+                }
+            } else {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            }
+        }
+        return crate::maintenance_execution::run_as(
+            state,
+            claim,
+            lance_context_merge::MaintenanceKind::Catchup,
+            async {
+                if state.config.merge_rollout.owned(target) && state.config.append.enabled(target) {
+                    crate::rollout_append::run(state, target).await
+                } else {
+                    crate::local_merge::run(state, target).await
+                }
+            },
+        )
+        .await;
+    }
+    // Reconcile/fence before any other table mutation. One retry of the fan-out
+    // after a completed barrier lets healthy shards progress in this task.
+    for recovery_round in 0..2 {
+        if let Some(old) = coordinator.get(&claim.task.target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            ensure_recovery_due(&coordinator, &old).await?;
+            if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            } else if let Err(error) =
+                reconcile(&state.http, &coordinator, &proof, old, false).await
+            {
+                if let Some(current) = coordinator.get(&claim.task.target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                } else {
+                    tracing::info!(target = %claim.task.target, %error, "previous merge ended; resuming shards");
+                }
+            }
+        }
+        let outcome = run_workers_admitted(
+            &state.http,
+            &coordinator,
+            &proof,
+            &claim.task.target,
+            &state.config.worker_endpoints,
+            Some(&state.admission),
+        )
+        .await;
+        if outcome.is_ok()
+            || recovery_round == 1
+            || coordinator.get(&claim.task.target).await?.is_none()
+        {
+            return outcome;
+        }
+    }
+    unreachable!("bounded merge recovery loop returns on last iteration")
+}
+
+// Compatibility path is chosen only by explicit configuration, never after a
+// failed owned RPC. It retains legacy limitations until that table is drained.
+async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<String, String> {
+    let endpoints = if state.registered_target(&claim.task.target).is_some() {
+        state.managed_worker_endpoints().await?
+    } else {
+        state.config.worker_endpoints.clone()
+    };
+    if endpoints.is_empty() {
+        return Err("no worker endpoints configured".into());
+    }
+    let coordinator = state.task_store.merge_coordinator();
+    let proof = state.task_store.merge_claim(claim);
+    run_legacy_workers_admitted(
+        &state.http,
+        &endpoints,
+        &claim.task.target,
+        LegacyOwnership::Durable {
+            coordinator: &coordinator,
+            proof: &proof,
+        },
+        // A manually submitted legacy task has no automatic demand consumer.
+        // Keep its original full pass rather than silently abandoning its tail.
+        (state.config.merge_wal_interval_secs > 0).then_some(&state.admission),
+        state.registered_target(&claim.task.target),
+    )
+    .await
+}
+
+// The untracked variant exists only for HTTP classification unit tests. Every
+// production call must carry the canonical claim and durable coordinator.
+enum LegacyOwnership<'a> {
+    Durable {
+        coordinator: &'a Coordinator,
+        proof: &'a ClaimProof,
+    },
+    #[cfg(test)]
+    HttpTest,
+}
+
+impl LegacyOwnership<'_> {
+    async fn unresolved(&self, target: &str) -> Result<bool, String> {
+        match self {
+            Self::Durable { coordinator, .. } => Ok(coordinator.get(target).await?.is_some()),
+            #[cfg(test)]
+            Self::HttpTest => Ok(false),
+        }
+    }
+    /// Mixed-version fleets upgrade one worker at a time. A worker which has
+    /// closed legacy admission must receive a protocol-2 reservation, never a
+    /// protocol-0 record followed by a conflicting background reservation.
+    async fn upgraded_worker(
+        &self,
+        http: &reqwest::Client,
+        target: &str,
+        endpoint: &str,
+        reprobed: Option<Capabilities>,
+    ) -> Result<Option<usize>, String> {
+        match self {
+            Self::Durable { coordinator, proof } => {
+                let owned_probe = reprobed.is_some();
+                let caps = match match reprobed {
+                    Some(caps) => Ok(caps),
+                    None => capabilities(http, endpoint).await,
+                } {
+                    Ok(caps) => caps,
+                    Err(error) => {
+                        coordinator
+                            .record_failure(proof, target, endpoint, &error)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                if !caps.merge_admission_ready {
+                    let error = WORKER_ADMISSION_PENDING;
+                    coordinator
+                        .record_failure(proof, target, endpoint, error)
+                        .await?;
+                    return Err(error.into());
+                }
+                if caps.fenced_legacy_merges || owned_probe {
+                    let before = coordinator
+                        .failure(target, endpoint)
+                        .await?
+                        .map_or(0, |f| f.consecutive_attempts);
+                    let result =
+                        one_with_capabilities(http, coordinator, proof, target, endpoint, caps)
+                            .await;
+                    if let Err(error) = &result {
+                        if coordinator.get(target).await?.is_none()
+                            && coordinator
+                                .failure(target, endpoint)
+                                .await?
+                                .is_none_or(|f| f.consecutive_attempts <= before)
+                        {
+                            coordinator
+                                .record_failure(proof, target, endpoint, error)
+                                .await?;
+                        }
+                    }
+                    result.map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            #[cfg(test)]
+            Self::HttpTest => Ok(None),
+        }
+    }
+    async fn admit(&self, target: &str, endpoint: &str) -> Result<Option<Execution>, String> {
+        match self {
+            Self::Durable { coordinator, proof } => coordinator
+                .admit_legacy(proof, target, endpoint)
+                .await
+                .map(Some),
+            #[cfg(test)]
+            Self::HttpTest => Ok(None),
+        }
+    }
+
+    async fn retry(
+        &self,
+        http: &reqwest::Client,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<WorkerRetry, String> {
+        match self {
+            Self::Durable { coordinator, .. } => {
+                worker_retry(http, coordinator, target, endpoint).await
+            }
+            #[cfg(test)]
+            Self::HttpTest => Ok(WorkerRetry::Eligible {
+                capabilities: None,
+                failures_before: None,
+            }),
+        }
+    }
+
+    async fn known_outcome(
+        &self,
+        execution: Option<Execution>,
+        outcome: Result<usize, String>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Durable { coordinator, proof } => {
+                let running = execution.ok_or("missing legacy ownership record")?;
+                if !coordinator.finish(&running, outcome.clone()).await? {
+                    return Err(
+                        "legacy completion ownership changed; refusing further admission".into(),
+                    );
+                }
+                if !coordinator
+                    .release(proof, &running.finished(outcome))
+                    .await?
+                {
+                    return Err("claim lost before releasing acknowledged legacy execution".into());
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::HttpTest => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+async fn run_legacy_workers(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+) -> Result<String, String> {
+    run_legacy_workers_inner(http, endpoints, target, LegacyOwnership::HttpTest).await
+}
+
+#[cfg(test)]
+async fn run_legacy_workers_inner(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+    ownership: LegacyOwnership<'_>,
+) -> Result<String, String> {
+    run_legacy_workers_admitted(http, endpoints, target, ownership, None, None).await
+}
+
+// A task may span many workers. Admission is reserved separately at each turn
+// so executor drain joins only the in-flight turn, not the rest of the fleet.
+async fn run_legacy_workers_admitted(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+    ownership: LegacyOwnership<'_>,
+    admission: Option<&Arc<crate::admission::Admission>>,
+    registered: Option<(&str, &str)>,
+) -> Result<String, String> {
+    let mut reclaimed = 0u64;
+    let mut completed = 0usize;
+    let mut unavailable = Vec::new();
+    let mut yielded = false;
+    for endpoint in endpoints {
+        let _turn = match admit_worker_turn(admission, target) {
+            Ok(turn) => turn,
+            Err(()) => {
+                match &ownership {
+                    LegacyOwnership::Durable { coordinator, .. } => {
+                        coordinator.request_merge(target).await?;
+                    }
+                    #[cfg(test)]
+                    LegacyOwnership::HttpTest => unreachable!("test ownership has no drain"),
+                }
+                yielded = true;
+                break;
+            }
+        };
+        let endpoint = endpoint.trim_end_matches('/');
+        let reprobed = match ownership.retry(http, target, endpoint).await? {
+            WorkerRetry::Deferred(deferred) => {
+                metrics::counter!("master_merge_wal_legacy_deferred_total").increment(1);
+                unavailable.push(deferred);
+                continue;
+            }
+            WorkerRetry::Eligible { capabilities, .. } => capabilities,
+        };
+        let started = std::time::Instant::now();
+        let upgraded = if registered.is_some() {
+            // Registered schemas are maintained through their application worker route.
+            Ok(None)
+        } else {
+            ownership
+                .upgraded_worker(http, target, endpoint, reprobed)
+                .await
+        };
+        match upgraded {
+            Ok(Some(n)) => {
+                metrics::histogram!("master_merge_wal_worker_duration_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                metrics::counter!("master_merge_wal_workers_total", "result" => "ok").increment(1);
+                metrics::counter!("master_merge_wal_generations_reclaimed_total")
+                    .increment(n as u64);
+                reclaimed += n as u64;
+                completed += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A failed capability probe must never cause an old-style POST.
+                // A failed owned request may still have a durable execution;
+                // the next canonical pass reconciles it before admitting work.
+                metrics::counter!("master_merge_wal_workers_total", "result" => "failed")
+                    .increment(1);
+                if !ownership.unresolved(target).await? {
+                    unavailable.push(format!("{endpoint}: {error}"));
+                    continue;
+                }
+                return Err(format!("merged {reclaimed} generations across {completed}/{} workers; {endpoint}: {error}", endpoints.len()));
+            }
+        }
+        let url = if let Some((kind, name)) = registered {
+            let mut url = reqwest::Url::parse(endpoint).map_err(|e| e.to_string())?;
+            url.path_segments_mut()
+                .map_err(|_| "worker endpoint cannot be a base URL")?
+                .pop_if_empty()
+                .extend(["api", "v1", kind, name, "merge-wal"]);
+            url.to_string()
+        } else {
+            match target.strip_prefix("generic:") {
+                Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
+                None => format!("{endpoint}/api/v1/internal/merge-wal/{target}"),
+            }
+        };
+        let execution = ownership.admit(target, endpoint).await?;
+        let started = std::time::Instant::now();
+        let result = crate::merge_capacity::observe(async {
+            let request = http.post(url);
+            let request = if registered.is_some() { request.timeout(Duration::from_secs(600)) } else { request };
+            let mut response = request.send().await.map_err(|error| {
+                // The shared worker client must disable redirects: a failed
+                // connection AFTER a redirected POST could hide an execution.
+                // Keep a table name such as "schema" or "invalid" out of
+                // failure classification; target/endpoint are separate fields.
+                (error.is_connect(), error.without_url().to_string())
+            })?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND && registered.is_none() {
+                return Ok(0);
+            }
+            if response.status().is_redirection() {
+                return Err((
+                    false,
+                    format!("legacy merge redirect refused: HTTP {}", response.status()),
+                ));
+            }
+            if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                // This exact response is emitted by the worker's outer drain
+                // gate before the merge handler is admitted. Other 503s may
+                // follow storage work and must retain their durable ownership.
+                let refused = tokio::time::timeout(RPC_TIMEOUT, async {
+                    let mut body = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                        if body.len().saturating_add(chunk.len()) > 64 {
+                            return Ok::<_, String>(false);
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(body == b"worker is draining")
+                })
+                .await;
+                return Err((
+                    matches!(refused, Ok(Ok(true))),
+                    "legacy merge returned HTTP 503; only an exact worker drain refusal proves no admission".into(),
+                ));
+            }
+            let reply: serde_json::Value = response
+                .error_for_status()
+                .map_err(|e| (false, e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| (false, e.to_string()))?;
+            reply["reclaimed"]
+                .as_u64()
+                .ok_or_else(|| (false, "invalid legacy merge response".to_string()))
+        })
+        .await;
+        metrics::histogram!("master_merge_wal_worker_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+        metrics::counter!("master_merge_wal_workers_total", "result" => if result.is_ok() { "ok" } else { "failed" }).increment(1);
+        match result {
+            Ok(n) => {
+                ownership.known_outcome(execution, Ok(n as usize)).await?;
+                completed += 1;
+                reclaimed += n;
+                // Preserve real progress even when a later worker is unavailable.
+                metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(n);
+            }
+            Err((true, error)) => {
+                // Redirects are disabled; this connection never admitted work.
+                // Persist failure accounting in the same transaction that
+                // releases this proven-unadmitted execution. A new task or
+                // master must not reset the endpoint's attempt count.
+                ownership
+                    .known_outcome(execution, Err(error.clone()))
+                    .await?;
+                tracing::warn!(%endpoint, %target, %error, "worker merge was not admitted; continuing healthy workers");
+                unavailable.push(format!("{endpoint}: {error}"));
+            }
+            Err((false, error)) => {
+                // A response error, reset, or timeout after sending may leave
+                // an unfenced legacy writer alive. Do not advance the fan-out.
+                // Fetch evidence from the same worker without opening stores or
+                // querying etcd. This never permits retry, takeover or restart.
+                let progress = legacy_progress(http, endpoint, target).await;
+                return Err(format!(
+                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}; legacy progress: {progress}",
+                    endpoints.len()
+                ));
+            }
+        }
+    }
+    let detail = format!(
+        "merged {reclaimed} generations across {completed}/{} workers (legacy){}",
+        endpoints.len(),
+        if yielded {
+            "; executor draining; durable continuation requested"
+        } else {
+            ""
+        }
+    );
+    if unavailable.is_empty() {
+        Ok(detail)
+    } else {
+        // Keep the canonical task failed/retryable: skipped shards are not done.
+        Err(format!(
+            "{detail}; unavailable workers: {}",
+            unavailable.join("; ")
+        ))
+    }
+}
+
+async fn legacy_progress(http: &reqwest::Client, endpoint: &str, target: &str) -> String {
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = http
+                .get(format!("{endpoint}/api/v1/internal/legacy-merges"))
+                .query(&[("target", target)])
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return Err("snapshot exceeds 64 KiB".to_string());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["instance"].as_str().is_none()
+                || value["snapshot"]["protocol"] != 1
+                || value["snapshot"]["takeover_authorized"] != false
+            {
+                return Err("unsupported progress response".to_string());
+            }
+            let snapshot = &value["snapshot"];
+            let executions = snapshot["executions"]
+                .as_array()
+                .ok_or_else(|| "missing execution observations".to_string())?;
+            // Task errors are stored in etcd. Keep the durable summary small even
+            // if the endpoint returns a large history or an unexpected field.
+            let summaries: Vec<_> = executions.iter().take(8).map(|row| serde_json::json!({
+            "id": row["id"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+            "phase": row["phase"].as_str().map(|s| s.chars().take(32).collect::<String>()),
+            "elapsed_ms": row["elapsed_ms"].as_u64(),
+            "completed_steps": row["completed_steps"].as_u64(),
+            "base_commits": row["work"]["base_commits"].as_u64(),
+            "generations_reclaimed": row["work"]["generations_reclaimed"].as_u64(),
+            "wal_decoded_bytes": row["work"]["wal_decoded_bytes"].as_u64(),
+            "encoded_bytes": row["work"]["encoded_bytes"].as_u64(),
+            "active_commits": row["writes"]["active_commits"].as_u64(),
+            "uncertain_commit": row["writes"]["uncertain_commit"].as_bool(),
+        })).collect();
+            Ok(serde_json::json!({
+            "instance": value["instance"].as_str().unwrap().chars().take(128).collect::<String>(),
+            "takeover_authorized": false,
+            "untracked_admissions": snapshot["untracked_admissions"].as_u64(),
+            "evicted_history": snapshot["evicted_history"].as_u64(),
+            "truncated": executions.len() > 8 || snapshot["truncated"].as_bool() != Some(false),
+            "executions": summaries,
+        }).to_string())
+        })
+        .await;
+    match result {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => format!("unavailable ({error}); ownership unresolved"),
+        Err(_) => "unavailable (observation timed out); ownership unresolved".into(),
+    }
+}
+
+struct Deadlines {
+    queue: tokio::time::Instant,
+    idle_timeout: Duration,
+    running: Option<tokio::time::Instant>,
+    last_progress: tokio::time::Instant,
+    sequence: Option<u64>,
+}
+
+impl Deadlines {
+    fn new(execution: &Execution, now: tokio::time::Instant) -> Self {
+        Self {
+            queue: now + Duration::from_secs(execution.queue_timeout_secs) + RPC_TIMEOUT,
+            idle_timeout: Duration::from_secs(execution.idle_timeout_secs) + RPC_TIMEOUT,
+            running: None,
+            last_progress: now,
+            sequence: None,
+        }
+    }
+    fn observe(&mut self, sequence: u64, now: tokio::time::Instant) {
+        self.running.get_or_insert(now);
+        if self.sequence.is_none_or(|previous| sequence > previous) {
+            self.sequence = Some(sequence);
+            self.last_progress = now;
+        }
+    }
+    fn expired(&self, now: tokio::time::Instant) -> bool {
+        match self.running {
+            None => now >= self.queue,
+            Some(_) => now.duration_since(self.last_progress) >= self.idle_timeout,
+        }
+    }
+
+    fn next_check(&self) -> tokio::time::Instant {
+        match self.running {
+            None => self.queue,
+            Some(_) => self.last_progress + self.idle_timeout,
+        }
+    }
+}
+
+pub(crate) async fn ensure_recovery_due(
+    coordinator: &Coordinator,
+    old: &Execution,
+) -> Result<(), String> {
+    if old.phase == Phase::Recovering {
+        if let Some(failure) = coordinator.failure(&old.target, &old.endpoint).await? {
+            if failure.last_error.contains("recovery barrier failed")
+                && failure.next_retry_ms > lance_context_merge::failure::now_ms()
+            {
+                return Err(format!(
+                    "{}; recovery probe at {}",
+                    failure.last_error, failure.next_retry_ms
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn recover_execution(
+    state: &Arc<MasterState>,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    old: Execution,
+) -> Result<(), String> {
+    let result = async {
+        // Completion can race a failed identity probe or the end of cancel
+        // grace. A terminal executor needs release, not a new storage barrier.
+        if matches!(old.phase, Phase::Finished | Phase::Recovered) {
+            return coordinator.release(proof, &old).await?.then_some(())
+                .ok_or_else(|| "claim lost before releasing terminal merge execution".to_string());
+        }
+        // Protocol 2 admits no storage writes before Reserved -> Running.
+        // Cancel that exact reservation under the current recovery claim. If
+        // start raced and won, leave its ownership intact for normal fencing.
+        if old.phase == Phase::Reserved {
+            let terminal = coordinator.cancel_reserved_for_recovery(proof, &old).await?
+                .ok_or_else(|| "merge reservation or recovery claim changed before cancellation".to_string())?;
+            return coordinator.release(proof, &terminal).await?.then_some(())
+                .ok_or_else(|| "claim lost before releasing cancelled merge reservation".to_string());
+        }
+        if state.registered_target(&old.target).is_some() {
+            return Err("unresolved registered-store execution requires owner reconciliation; rollout storage recovery does not apply".into());
+        }
+        let frozen = coordinator.freeze(proof, &old).await?
+            .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
+        let watermarks = coordinator.watermarks(&frozen).await?;
+        let uri = match frozen.target.strip_prefix("generic:") {
+            Some(name) => state.generic_uri(name), None => state.rollout_uri(&frozen.target),
+        };
+        if watermarks.dataset_uri.as_deref().is_some_and(|worker_uri| worker_uri != uri) {
+            return Err("dataset URI mismatch between worker and recovery master".into());
+        }
+        tokio::time::timeout(Duration::from_secs(120),
+            lance_context_core::merge_write_scope::fence_manifest_versions(&uri, None, &watermarks.versions, &frozen.id)
+        ).await.map_err(|_| "storage recovery barrier deadline exceeded".to_string())?
+            .map_err(|e| e.to_string())?;
+        if !coordinator.finish_recovery(proof, &frozen).await? {
+            return Err("claim lost before publishing storage recovery barrier".into());
+        }
+        let recovered = coordinator.get(&frozen.target).await?.ok_or_else(|| "recovered execution disappeared".to_string())?;
+        if recovered.id != frozen.id || !coordinator.release(proof, &recovered).await? {
+            return Err("claim lost before releasing recovered execution".into());
+        }
+        metrics::counter!("master_merge_storage_recoveries_total", "result" => "ok").increment(1);
+        tracing::warn!(target = %frozen.target, endpoint = %frozen.endpoint, id = %frozen.id, "old merge storage commits fenced; resuming healthy shards");
+        Ok(())
+    }.await;
+    if let Err(error) = &result {
+        let message = format!("merge ownership unresolved: recovery barrier failed: {error}");
+        coordinator
+            .record_failure(proof, &old.target, &old.endpoint, &message)
+            .await?;
+        metrics::counter!("master_merge_storage_recoveries_total", "result" => "failed")
+            .increment(1);
+        return Err(message);
+    }
+    result
+}
+
+// Use the same admission lock as begin_drain, rather than a check followed by
+// an untracked start. A turn admitted before drain retains ownership through
+// terminal acknowledgement; drain never cancels a progressing worker.
+fn admit_worker_turn(
+    admission: Option<&Arc<crate::admission::Admission>>,
+    target: &str,
+) -> Result<Option<crate::admission::Operation>, ()> {
+    match admission {
+        Some(admission) => {
+            let operation = admission.try_admit_named("merge_worker_turn").ok_or(())?;
+            operation.target(target);
+            Ok(Some(operation))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+async fn run_workers(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoints: &[String],
+) -> Result<String, String> {
+    run_workers_admitted(http, coordinator, proof, target, endpoints, None).await
+}
+
+async fn run_workers_admitted(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoints: &[String],
+    admission: Option<&Arc<crate::admission::Admission>>,
+) -> Result<String, String> {
+    if endpoints.is_empty() {
+        return Err("no worker endpoints configured after reconciling recorded execution".into());
+    }
+    let mut pending = endpoints.to_vec();
+    let mut deferred = Vec::new();
+
+    let mut reclaimed = 0;
+    let mut completed = 0;
+    let mut yielded = false;
+    let mut errors = Vec::new();
+    'attempts: for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        let mut retry = Vec::new();
+        for endpoint in pending {
+            let _turn = match admit_worker_turn(admission, target) {
+                Ok(turn) => turn,
+                Err(()) => {
+                    // Persist the tail before declaring this bounded pass done.
+                    // A failed put remains a failed canonical task. Do not clear
+                    // endpoint failure history or bypass an unresolved owner.
+                    coordinator.request_merge(target).await?;
+                    yielded = true;
+                    break 'attempts;
+                }
+            };
+            // Keep earlier retry errors for endpoints not revisited before
+            // drain. Only this endpoint's next result replaces its failure.
+            errors.retain(|(failed, _): &(String, String)| failed != &endpoint);
+            // Probe at this worker's turn, not before earlier workers run:
+            // their merges may take long enough for its identity to change.
+            let (reprobed, observed_failures) = if attempt == 0 {
+                match worker_retry(http, coordinator, target, &endpoint).await? {
+                    WorkerRetry::Deferred(message) => {
+                        deferred.push(message);
+                        continue;
+                    }
+                    WorkerRetry::Eligible {
+                        capabilities,
+                        failures_before,
+                    } => (capabilities, failures_before),
+                }
+            } else {
+                (None, None)
+            };
+            let failures_before = match observed_failures {
+                Some(count) => count,
+                // Later attempts and capability reprobes need a fresh baseline.
+                None => coordinator
+                    .failure(target, &endpoint)
+                    .await?
+                    .map_or(0, |failure| failure.consecutive_attempts),
+            };
+            let started = std::time::Instant::now();
+            let outcome = match reprobed {
+                Some(caps) => {
+                    one_with_capabilities(http, coordinator, proof, target, &endpoint, caps).await
+                }
+                None => one(http, coordinator, proof, target, &endpoint).await,
+            };
+            metrics::histogram!("master_merge_wal_worker_duration_seconds")
+                .record(started.elapsed().as_secs_f64());
+            metrics::counter!("master_merge_wal_workers_total", "result" => if outcome.is_ok() { "ok" } else { "failed" }).increment(1);
+            match outcome {
+                Ok(n) => {
+                    reclaimed += n;
+                    completed += 1;
+                    metrics::counter!("master_merge_wal_generations_reclaimed_total")
+                        .increment(n as u64);
+                }
+                Err(error) => {
+                    // An execution still in storage is not a failed endpoint we
+                    // may skip. Ownership must first be reconciled to terminal.
+                    if coordinator.get(target).await?.is_some() {
+                        return Err(error);
+                    }
+                    // Executed failures are recorded atomically with release.
+                    // Capability/admission failures have no execution result.
+                    let failure = match coordinator.failure(target, &endpoint).await? {
+                        Some(failure) if failure.consecutive_attempts > failures_before => failure,
+                        _ => {
+                            coordinator
+                                .record_failure(proof, target, &endpoint, &error)
+                                .await?
+                        }
+                    };
+                    let message = format!(
+                        "{endpoint}: {error} (attempt {}; retry at {}; attention={})",
+                        failure.consecutive_attempts,
+                        failure.next_retry_ms,
+                        failure.needs_attention
+                    );
+                    if failure.consecutive_attempts < ATTEMPTS as u32 && !failure.needs_attention {
+                        errors.push((endpoint.clone(), message));
+                        retry.push(endpoint);
+                    } else {
+                        deferred.push(message);
+                    }
+                }
+            }
+        }
+        pending = retry;
+        if pending.is_empty() {
+            break;
+        }
+    }
+    let mut errors: Vec<_> = errors.into_iter().map(|(_, error)| error).collect();
+    errors.extend(deferred);
+    if !errors.is_empty() {
+        return Err(format!("merged {reclaimed} generations; {} worker(s) failed or cooling down (up to {ATTEMPTS} targeted attempts): {}", errors.len(), errors.join("; ")));
+    }
+    Ok(format!(
+        "merged {reclaimed} generations across {completed}/{} workers{}",
+        endpoints.len(),
+        if yielded {
+            "; executor draining; durable continuation requested"
+        } else {
+            ""
+        }
+    ))
+}
+
+async fn one(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoint: &str,
+) -> Result<usize, String> {
+    let capabilities = capabilities(http, endpoint).await?;
+    one_with_capabilities(http, coordinator, proof, target, endpoint, capabilities).await
+}
+
+async fn capabilities(http: &reqwest::Client, endpoint: &str) -> Result<Capabilities, String> {
+    let base = format!(
+        "{}/api/v1/internal/merge-executor",
+        endpoint.trim_end_matches('/')
+    );
+    http.get(&base)
+        .timeout(RPC_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn one_with_capabilities(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoint: &str,
+    capabilities: Capabilities,
+) -> Result<usize, String> {
+    let base = format!(
+        "{}/api/v1/internal/merge-executor",
+        endpoint.trim_end_matches('/')
+    );
+    validate_capabilities(&capabilities, target)?;
+    let mut execution = Execution::new(
+        target,
+        endpoint,
+        &capabilities.instance,
+        capabilities.timeout_secs,
+    );
+    execution.queue_timeout_secs = capabilities.queue_timeout_secs;
+    execution.idle_timeout_secs = capabilities.idle_timeout_secs;
+    // Even a lost reserve response is ambiguous. Recover the fence before
+    // issuing any other storage operation; never infer absence from an error.
+    let admission = coordinator.reserve(proof, &execution).await;
+    match admission {
+        Ok(true) => {}
+        _ => {
+            if let Some(current) = coordinator.get(target).await? {
+                if current.id == execution.id {
+                    return reconcile(http, coordinator, proof, current, true).await;
+                }
+            }
+            return Err("merge admission failed or task claim lost".into());
+        }
+    }
+    let started = http
+        .post(format!("{base}/start"))
+        .timeout(RPC_TIMEOUT)
+        .json(&execution)
+        .send()
+        .await;
+    let cancel = !matches!(started, Ok(ref response) if response.status().is_success());
+    // A transport error can mean the worker is already writing. It is NOT an
+    // outcome, and cannot let this task advance to another endpoint.
+    reconcile(http, coordinator, proof, execution, cancel).await
+}
+
+async fn reconcile(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    initial: Execution,
+    cancel_immediately: bool,
+) -> Result<usize, String> {
+    reconcile_with_grace(
+        http,
+        coordinator,
+        proof,
+        initial,
+        cancel_immediately,
+        Duration::from_secs(60),
+    )
+    .await
+}
+
+async fn reconcile_with_grace(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    initial: Execution,
+    cancel_immediately: bool,
+    grace: Duration,
+) -> Result<usize, String> {
+    if initial.protocol != 2 {
+        return Err("legacy merge ownership unresolved; terminal acknowledgement or verified retirement required".into());
+    }
+    let mut deadlines = Deadlines::new(&initial, tokio::time::Instant::now());
+    let mut cancel_started = cancel_immediately.then(tokio::time::Instant::now);
+    let mut next_cancel = tokio::time::Instant::now();
+    let mut next_probe = tokio::time::Instant::now() + OWNER_PROBE_INTERVAL;
+    let mut failed_probes = 0;
+    let mut changes = None;
+    loop {
+        // Losing etcd responses must not turn this into an unbounded scheduler
+        // wait. Ownership remains durable when the reconciliation slot exits.
+        if cancel_started.is_some_and(|at| at.elapsed() >= grace) {
+            let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained pending storage version recovery";
+            coordinator
+                .record_failure(proof, &initial.target, &initial.endpoint, error)
+                .await?;
+            return Err(error.into());
+        }
+        let (current, revision) = match coordinator.get_with_revision(&initial.target).await {
+            Ok((Some(current), revision)) if current.id == initial.id => (current, revision),
+            Ok(_) => return Err("merge execution ownership changed during reconciliation".into()),
+            Err(error) => {
+                // Bound an unavailable coordinator independently. On successful
+                // reads, sample progress before evaluating the idle deadline.
+                if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
+                    cancel_started = Some(tokio::time::Instant::now());
+                }
+                tracing::warn!(target = %initial.target, %error, "cannot confirm merge completion; retaining execution fence");
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+        };
+        metrics::counter!("master_merge_execution_observations_total").increment(1);
+        if matches!(current.phase, Phase::Uncertain | Phase::Recovering) {
+            let error = current
+                .error
+                .unwrap_or_else(|| "merge ownership unresolved: ambiguous storage commit".into());
+            coordinator
+                .record_failure(proof, &current.target, &current.endpoint, &error)
+                .await?;
+            return Err(error);
+        }
+        if matches!(current.phase, Phase::Finished | Phase::Recovered) {
+            if !coordinator.release(proof, &current).await? {
+                return Err("task claim lost while releasing terminal merge execution".into());
+            }
+            return current.error.map_or(Ok(current.reclaimed), Err);
+        }
+        if cancel_started.is_none() {
+            if let Ok(Some(progress)) = coordinator.progress(&current).await {
+                if deadlines
+                    .sequence
+                    .is_none_or(|previous| progress.sequence > previous)
+                {
+                    // Completed work outweighs an unavailable HTTP endpoint.
+                    failed_probes = 0;
+                }
+                deadlines.observe(progress.sequence, tokio::time::Instant::now());
+            }
+            if deadlines.expired(tokio::time::Instant::now()) {
+                cancel_started = Some(tokio::time::Instant::now());
+            }
+        }
+        if tokio::time::Instant::now() >= next_probe {
+            let probe = async {
+                http.get(format!(
+                    "{}/api/v1/internal/merge-executor",
+                    current.endpoint.trim_end_matches('/')
+                ))
+                .timeout(OWNER_PROBE_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ExecutorIdentity>()
+                .await
+            }
+            .await;
+            next_probe = tokio::time::Instant::now() + OWNER_PROBE_INTERVAL;
+            let reason = match probe {
+                Ok(identity) if identity.instance == current.instance => {
+                    failed_probes = 0;
+                    None
+                }
+                Ok(_) => Some("merge executor incarnation changed"),
+                Err(_) => {
+                    failed_probes += 1;
+                    (failed_probes >= OWNER_PROBE_FAILURES)
+                        .then_some("merge executor unreachable without progress")
+                }
+            };
+            if let Some(reason) = reason {
+                if current.phase == Phase::Reserved {
+                    // No execution has started. CAS cancellation either wins
+                    // admission or the next observation sees the running owner.
+                    let _ = coordinator.cancel_reserved(&current).await;
+                    continue;
+                }
+                // This is a reason to revoke admission and run the storage
+                // barrier, never permission to release ownership directly.
+                let error = format!("merge ownership unresolved: {reason}; recovery required");
+                coordinator
+                    .record_failure(proof, &current.target, &current.endpoint, &error)
+                    .await?;
+                tracing::warn!(target = %current.target, endpoint = %current.endpoint,
+                    id = %current.id, %reason, "recovering lost merge executor before execution deadline");
+                return Err(error);
+            }
+        }
+        if cancel_started.is_some() && tokio::time::Instant::now() >= next_cancel {
+            next_cancel = tokio::time::Instant::now() + RETRY_DELAY;
+            // CAS reserved work to terminal, or ask its owner to cancel the
+            // actual storage future. HTTP success alone is not acknowledgement.
+            if current.phase == Phase::Reserved {
+                let _ = coordinator.cancel_reserved(&current).await;
+            }
+            let _ = http
+                .post(format!(
+                    "{}/api/v1/internal/merge-executor/cancel",
+                    current.endpoint.trim_end_matches('/')
+                ))
+                .timeout(RPC_TIMEOUT)
+                .json(&current)
+                .send()
+                .await;
+        }
+        // Only long-lived executions need a stream. A fast/empty merge above
+        // releases immediately without paying for a watch. Starting at the
+        // read revision covers completion/progress during subscription setup.
+        if changes.is_none() {
+            match tokio::time::timeout(
+                OWNER_PROBE_TIMEOUT,
+                coordinator.watch_execution(&current, revision),
+            )
+            .await
+            {
+                Ok(Ok(watch)) => changes = Some(watch),
+                _ => {
+                    metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    continue;
+                }
+            }
+        }
+        // Progress already contains the sequence. Consume it locally instead
+        // of rereading two etcd keys for each notification. Fix the freshness
+        // boundary before entering the loop: continuous work must not postpone
+        // an owner probe, cancellation, or the next authoritative snapshot.
+        let refresh = tokio::time::Instant::now() + WATCH_REFRESH;
+        loop {
+            let mut wake = refresh.min(next_probe);
+            if let Some(started) = cancel_started {
+                wake = wake.min(started + grace).min(next_cancel);
+            } else {
+                wake = wake.min(deadlines.next_check());
+            }
+            // An always-ready stream must not win over an expired timer.
+            if tokio::time::Instant::now() >= wake {
+                break;
+            }
+            match tokio::time::timeout_at(wake, changes.as_mut().unwrap().next_update()).await {
+                Ok(Ok(update)) => {
+                    metrics::counter!("master_merge_execution_watch_notifications_total")
+                        .increment(1);
+                    match update {
+                        lance_context_merge::progress::ExecutionUpdate::Progress(sequence)
+                            if cancel_started.is_none() && current.phase == Phase::Running =>
+                        {
+                            if deadlines
+                                .sequence
+                                .is_none_or(|previous| sequence > previous)
+                            {
+                                failed_probes = 0;
+                            }
+                            deadlines.observe(sequence, tokio::time::Instant::now());
+                            metrics::counter!("master_merge_execution_watch_progress_total")
+                                .increment(1);
+                        }
+                        _ => {
+                            // Ownership changes, reserved work, and cancellation
+                            // still take the authoritative reconciliation path.
+                            tokio::time::sleep(POLL_DELAY).await;
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    metrics::counter!("master_merge_execution_watch_errors_total").increment(1);
+                    changes = None;
+                    tokio::time::sleep(RETRY_DELAY).await;
+                    break;
+                }
+                Err(_) => break, // freshness/owner/deadline check, not progress
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn registered_workers_require_success_and_have_a_request_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/events/table/merge-wal",
+                post(|| async { Json(serde_json::json!({"reclaimed": 3})) }),
+            )
+            .route(
+                "/api/v1/events/stalled/merge-wal",
+                post(move || {
+                    let signal = signal.clone();
+                    async move {
+                        signal.notify_one();
+                        std::future::pending::<()>().await;
+                        Json(serde_json::json!({"reclaimed": 0}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = crate::state::worker_http_client().unwrap();
+        let endpoints = vec![endpoint.clone(), endpoint.clone()];
+        let result = run_legacy_workers_admitted(
+            &http,
+            &endpoints,
+            "events:table",
+            LegacyOwnership::HttpTest,
+            None,
+            Some(("events", "table")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "merged 6 generations across 2/2 workers (legacy)");
+        let endpoints = vec![endpoint.clone(), format!("{endpoint}/missing")];
+        assert!(run_legacy_workers_admitted(
+            &http,
+            &endpoints,
+            "events:table",
+            LegacyOwnership::HttpTest,
+            None,
+            Some(("events", "table"))
+        )
+        .await
+        .is_err());
+        assert!(run_legacy_workers(&http, &endpoints, "unregistered")
+            .await
+            .is_ok());
+        let pending = tokio::spawn(async move {
+            run_legacy_workers_admitted(
+                &http,
+                &[endpoint],
+                "events:stalled",
+                LegacyOwnership::HttpTest,
+                None,
+                Some(("events", "stalled")),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(601)).await;
+        tokio::time::resume();
+        let result = tokio::time::timeout(Duration::from_secs(10), pending).await;
+        server.abort();
+        assert!(result
+            .expect("stalled worker must hit its deadline")
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn queue_execution_and_real_progress_have_independent_deadlines() {
+        use super::*;
+        let mut execution = Execution::new("hot", "worker", "boot", 1800);
+        execution.queue_timeout_secs = 600;
+        execution.idle_timeout_secs = 120;
+        let now = tokio::time::Instant::now();
+        let mut deadlines = Deadlines::new(&execution, now);
+        assert!(!deadlines.expired(now + Duration::from_secs(599)));
+        // A long queue wait consumes none of the running budget.
+        let started = now + Duration::from_secs(599);
+        deadlines.observe(0, started);
+        for step in 1..=10 {
+            let current = started + Duration::from_secs(step * 100);
+            deadlines.observe(step, current);
+            assert!(!deadlines.expired(current));
+        }
+        // Receiving the same progress repeatedly is only a heartbeat.
+        let stalled = started + Duration::from_secs(1131);
+        deadlines.observe(10, stalled);
+        assert!(deadlines.expired(stalled));
+        deadlines.observe(9, stalled); // A replayed older Watch event is not work.
+        assert!(deadlines.expired(stalled));
+        // Real progress continues beyond the legacy total runtime ceiling.
+        deadlines.observe(11, started + Duration::from_secs(1811));
+        assert!(!deadlines.expired(started + Duration::from_secs(1811)));
+    }
+
+    #[test]
+    fn a_worker_that_never_acquires_a_slot_has_a_bounded_queue_wait() {
+        use super::*;
+        let mut execution = Execution::new("hot", "worker", "boot", 3600);
+        execution.queue_timeout_secs = 10;
+        let now = tokio::time::Instant::now();
+        let deadlines = Deadlines::new(&execution, now);
+        assert!(deadlines.expired(now + Duration::from_secs(21)));
+    }
+    use super::*;
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    use tokio::sync::watch;
+
+    #[derive(Clone)]
+    struct Worker {
+        coordinator: Coordinator,
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+        stall_first: bool,
+        name: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct CapabilityGate {
+        entered: tokio::sync::Notify,
+        proceed: tokio::sync::Notify,
+        calls: AtomicUsize,
+    }
+
+    async fn worker(worker: Worker) -> (String, tokio::task::JoinHandle<()>) {
+        worker_with_capability_gate(worker, None).await
+    }
+
+    async fn worker_with_capability_gate(
+        worker: Worker,
+        gate: Option<Arc<CapabilityGate>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/api/v1/internal/merge-executor",
+                get(move || {
+                    let gate = gate.clone();
+                    async move {
+                    if let Some(gate) = gate {
+                        if gate.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            gate.entered.notify_one();
+                            gate.proceed.notified().await;
+                        }
+                    }
+                    Json(serde_json::json!({"protocol":2,"instance":"test","timeout_secs":1,"queue_timeout_secs":1,"idle_timeout_secs":1,"progress_protocol":1,"owned_targets":["table"]}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/internal/merge-executor/start",
+                post(
+                    |State(w): State<Worker>, Json(e): Json<Execution>| async move {
+                        let running = w.coordinator.start(&e).await.unwrap().unwrap();
+                        tokio::spawn(async move {
+                            let call = w.calls.fetch_add(1, Ordering::SeqCst);
+                            let (_cancel, rx) = watch::channel(false);
+                            let result = lance_context_merge::execute_scoped(
+                                async {
+                                    if w.stall_first && call == 0 {
+                                        return std::future::pending().await;
+                                    }
+                                    if w.fail {
+                                        Err("injected shard failure".into())
+                                    } else {
+                                        Ok(7)
+                                    }
+                                },
+                                Duration::from_secs(1),
+                                rx,
+                            )
+                            .await;
+                            w.events.lock().unwrap().push(format!(
+                                "{}:{}",
+                                w.name,
+                                if result.is_ok() { "ok" } else { "failed" }
+                            ));
+                            assert!(w.coordinator.finish(&running, result).await.unwrap());
+                        });
+                        axum::http::StatusCode::ACCEPTED
+                    },
+                ),
+            )
+            .with_state(worker);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        (
+            address,
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn first_worker_turn_reuses_failure_read() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        async fn ranges(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let body = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let samples: Vec<f64> = body
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Range\"")
+                })
+                .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!samples.is_empty(), "etcd Range counter required");
+            samples.iter().sum()
+        }
+        for (previous_attempts, fail) in [(0, false), (2, false), (2, true)] {
+            let (coordinator, proof) = fixture().await;
+            let executor = Worker {
+                coordinator: coordinator.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail,
+                stall_first: false,
+                name: "first-turn",
+                events: Arc::new(Mutex::new(Vec::new())),
+            };
+            let gate = Arc::new(CapabilityGate::default());
+            let (endpoint, server) =
+                worker_with_capability_gate(executor.clone(), Some(gate.clone())).await;
+            for _ in 0..previous_attempts {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, "storage timeout")
+                    .await
+                    .unwrap();
+            }
+            if let Some(mut failure) = coordinator.failure("table", &endpoint).await.unwrap() {
+                // Make the persisted retry eligible without a wall-clock wait.
+                failure.next_retry_ms = 0;
+                let mut client = etcd_client::Client::connect(
+                    [std::env::var("ETCD_TEST_ENDPOINTS").unwrap()],
+                    None,
+                )
+                .await
+                .unwrap();
+                let key = lance_context_merge::failure::failure_key(
+                    proof.key.strip_suffix("/claim").unwrap(),
+                    "table",
+                    &endpoint,
+                );
+                client
+                    .put(key, serde_json::to_vec(&failure).unwrap(), None)
+                    .await
+                    .unwrap();
+            }
+            let http = reqwest::Client::new();
+            let before = ranges(&http).await;
+            let task = tokio::spawn({
+                let coordinator = coordinator.clone();
+                let proof = proof.clone();
+                let endpoint = endpoint.clone();
+                async move { run_workers(&http, &coordinator, &proof, "table", &[endpoint]).await }
+            });
+            tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+                .await
+                .unwrap();
+            // The capability GET is blocked: reservation, execution and finish
+            // RPCs cannot contaminate the first-turn failure lookup count.
+            let reads = ranges(&reqwest::Client::new()).await - before;
+            gate.proceed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                reads, 1.0,
+                "previous_attempts={previous_attempts}, fail={fail}"
+            );
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.is_err(), fail, "{result:?}");
+            let after = coordinator.failure("table", &endpoint).await.unwrap();
+            if fail {
+                assert_eq!(
+                    after.unwrap().consecutive_attempts,
+                    3,
+                    "count the executed failure once"
+                );
+            } else {
+                assert!(after.is_none());
+            }
+            assert!(coordinator.get("table").await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn capability_reprobe_refreshes_failure_baseline_after_reset() {
+        for replacement_attempts in [0, 2] {
+            let (coordinator, proof) = fixture().await;
+            let executor = Worker {
+                coordinator: coordinator.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+                stall_first: false,
+                name: "reprobe-reset",
+                events: Arc::new(Mutex::new(Vec::new())),
+            };
+            let gate = Arc::new(CapabilityGate::default());
+            let (endpoint, server) =
+                worker_with_capability_gate(executor.clone(), Some(gate.clone())).await;
+            for _ in 0..15 {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                    .await
+                    .unwrap();
+            }
+            let task = tokio::spawn({
+                let coordinator = coordinator.clone();
+                let proof = proof.clone();
+                let endpoint = endpoint.clone();
+                async move {
+                    run_workers(
+                        &reqwest::Client::new(),
+                        &coordinator,
+                        &proof,
+                        "table",
+                        &[endpoint],
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+                .await
+                .unwrap();
+            // The old admission error triggered a capability reprobe. Reset or
+            // replace its history while that HTTP request is still in flight.
+            coordinator
+                .clear_failure(&proof, "table", &endpoint)
+                .await
+                .unwrap();
+            for _ in 0..replacement_attempts {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                    .await
+                    .unwrap();
+            }
+            gate.proceed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert!(result.is_err());
+            assert_eq!(
+                executor.calls.load(Ordering::SeqCst),
+                3 - replacement_attempts
+            );
+            assert_eq!(
+                coordinator
+                    .failure("table", &endpoint)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consecutive_attempts,
+                3
+            );
+            assert!(coordinator.get("table").await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fanout_drain_before_first_turn_preserves_demand_and_failure_history() {
+        let (coordinator, proof) = fixture().await;
+        let admission = Arc::new(crate::admission::Admission::default());
+        admission.begin_drain();
+        let endpoints = vec!["http://127.0.0.1:1".to_owned()];
+        let failure = coordinator
+            .record_failure(&proof, "table", &endpoints[0], "invalid payload fixture")
+            .await
+            .unwrap();
+        for legacy in [false, true] {
+            let outcome = if legacy {
+                run_legacy_workers_admitted(
+                    &reqwest::Client::new(),
+                    &endpoints,
+                    "table",
+                    LegacyOwnership::Durable {
+                        coordinator: &coordinator,
+                        proof: &proof,
+                    },
+                    Some(&admission),
+                    None,
+                )
+                .await
+            } else {
+                run_workers_admitted(
+                    &reqwest::Client::new(),
+                    &coordinator,
+                    &proof,
+                    "table",
+                    &endpoints,
+                    Some(&admission),
+                )
+                .await
+            }
+            .unwrap();
+            assert!(outcome.contains("merged 0 generations across 0/1 workers"));
+            assert!(outcome.contains("durable continuation requested"));
+            assert!(coordinator
+                .get_merge_request("table")
+                .await
+                .unwrap()
+                .is_some());
+            assert!(coordinator.get("table").await.unwrap().is_none());
+            let after = coordinator
+                .failure("table", &endpoints[0])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.consecutive_attempts, failure.consecutive_attempts);
+            assert_eq!(after.next_retry_ms, failure.next_retry_ms);
+            assert_eq!(after.last_error, failure.last_error);
+        }
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fanout_drain_before_retry_retains_real_failure() {
+        let (coordinator, proof) = fixture().await;
+        let admission = Arc::new(crate::admission::Admission::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v1/internal/merge-executor",
+                get(|| async {
+                    Json(
+                        serde_json::json!({"protocol":2,"instance":"test","timeout_secs":60,
+                    "queue_timeout_secs":60,"idle_timeout_secs":60,"progress_protocol":1,
+                    "owned_targets":["table"]}),
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/internal/merge-executor/start",
+                post({
+                    let coordinator = coordinator.clone();
+                    let admission = admission.clone();
+                    let calls = calls.clone();
+                    move |Json(execution): Json<Execution>| {
+                        let coordinator = coordinator.clone();
+                        let admission = admission.clone();
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let running = coordinator.start(&execution).await.unwrap().unwrap();
+                            assert!(coordinator
+                                .finish(&running, Err("injected shard failure".into()))
+                                .await
+                                .unwrap());
+                            admission.begin_drain();
+                            axum::http::StatusCode::ACCEPTED
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = run_workers_admitted(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint),
+            Some(&admission),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(result.unwrap_err().contains("injected shard failure"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator
+            .get_merge_request("table")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert_eq!(
+            coordinator
+                .failure("table", &endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            1
+        );
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn quiet_execution_bounds_etcd_reads_without_delaying_completion() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        async fn range_count(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let body = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let samples: Vec<f64> = body
+                .lines()
+                .filter(|l| {
+                    l.starts_with("grpc_server_started_total{")
+                        && l.contains("grpc_method=\"Range\"")
+                })
+                .map(|l| l.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!samples.is_empty(), "etcd Range counter required");
+            samples.iter().sum()
+        }
+        let http = reqwest::Client::new();
+        let before = range_count(&http).await;
+        let c = coordinator.clone();
+        let e = execution.clone();
+        let h = http.clone();
+        let waiter = tokio::spawn(async move { reconcile(&h, &c, &proof, e, false).await });
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!waiter.is_finished());
+        let reads = range_count(&http).await - before;
+        eprintln!("quiet merge 6s Range RPCs: {reads}");
+        // The previous two reads/250ms loop uses about 48 reads here. This
+        // exclusive real-etcd bound includes setup and allows scheduling jitter.
+        assert!(reads <= 8.0, "quiet merge issued {reads} Range RPCs");
+        // Cross the periodic owner/freshness check: canceling a pending watch
+        // receive for that check must not break subsequent notifications.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let reads = range_count(&http).await - before;
+        eprintln!("quiet merge 11s Range RPCs: {reads}");
+        assert!(reads <= 8.0, "quiet merge issued {reads} Range RPCs");
+        assert!(coordinator.finish(&running, Ok(11)).await.unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1500), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires exclusive isolated ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn progressing_execution_consumes_watch_without_repeated_reads() {
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").as_deref(), Ok("1"));
+        let (coordinator, proof) = fixture().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = probes.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/api/v1/internal/merge-executor",
+                    get(move || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        async { Json(serde_json::json!({"instance":"test"})) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let execution = Execution::new("table", &endpoint, "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let http = reqwest::Client::new();
+        async fn ranges(http: &reqwest::Client) -> f64 {
+            let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+            let metrics = http
+                .get(format!("{endpoint}/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let values: Vec<f64> = metrics
+                .lines()
+                .filter(|line| {
+                    line.starts_with("grpc_server_started_total{")
+                        && line.contains("grpc_method=\"Range\"")
+                })
+                .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+                .collect();
+            assert!(!values.is_empty());
+            values.iter().sum()
+        }
+        let before = ranges(&http).await;
+        let observer = coordinator.clone();
+        let client = http.clone();
+        let waiter =
+            tokio::spawn(
+                async move { reconcile(&client, &observer, &proof, execution, false).await },
+            );
+        // Cross the fixed 10s owner check while delivering sustained progress.
+        // Publications use Txn, so this measures the observer's actual GETs.
+        for sequence in 1..=120 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let reads = ranges(&http).await - before;
+        let owner_checks = probes.load(Ordering::SeqCst);
+        assert!(coordinator.finish(&running, Ok(17)).await.unwrap());
+        let terminal = tokio::time::timeout(Duration::from_secs(2), waiter).await;
+        server.abort();
+        let _ = server.await;
+        eprintln!("120 progress publications: {reads} Range RPCs; {owner_checks} owner checks");
+        assert_eq!(terminal.unwrap().unwrap().unwrap(), 17);
+        assert!(owner_checks > 0, "progress starved the owner probe");
+        assert!(reads <= 8.0, "progress notifications caused {reads} GETs");
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn repeated_watch_sequence_does_not_hide_stalled_execution() {
+        let (coordinator, proof) = fixture().await;
+        let mut execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        execution.idle_timeout_secs = 1;
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 7).await.unwrap());
+        let writer = coordinator.clone();
+        let active = running.clone();
+        let publisher = tokio::spawn(async move {
+            loop {
+                assert!(writer.publish_progress(&active, 7).await.unwrap());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(18),
+            reconcile_with_grace(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                execution,
+                false,
+                Duration::from_secs(2),
+            ),
+        )
+        .await;
+        publisher.abort();
+        let _ = publisher.await;
+        assert!(outcome
+            .unwrap()
+            .unwrap_err()
+            .contains("did not acknowledge termination"));
+        // Failed observation is never permission to remove a surviving writer.
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_watch_reconnect_observes_completion_after_transport_loss() {
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "test", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        // Break only this test's TCP connections. Other fixtures and the
+        // durable etcd state remain untouched; the writer uses a direct client.
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let upstream = endpoint.strip_prefix("http://").unwrap().to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let (cut, signal) = watch::channel(0_u64);
+        let connected = Arc::new(AtomicUsize::new(0));
+        let counter = connected.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut incoming, _) = listener.accept().await.unwrap();
+                let mut outgoing = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let mut signal = signal.clone();
+                signal.borrow_and_update();
+                counter.fetch_add(1, Ordering::SeqCst);
+                connections.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing) => {},
+                        _ = signal.changed() => {},
+                    }
+                });
+                while connections.try_join_next().is_some() {}
+            }
+        });
+        let client = etcd_client::Client::connect([proxy], None).await.unwrap();
+        let observer = Coordinator::new(client, proof.key.strip_suffix("/claim").unwrap());
+        let waiter = tokio::spawn(async move {
+            reconcile(&reqwest::Client::new(), &observer, &proof, execution, false).await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiter.is_finished());
+        let before = connected.load(Ordering::SeqCst);
+        assert!(before > 0);
+        cut.send_modify(|n| *n += 1);
+        assert!(coordinator.finish(&running, Ok(13)).await.unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(8), waiter).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(result.unwrap().unwrap().unwrap(), 13);
+        assert!(connected.load(Ordering::SeqCst) > before, "must reconnect");
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    async fn fixture() -> (Coordinator, ClaimProof) {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").expect("isolated local etcd required");
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/merge-fanout-tests/{}", Execution::new("", "", "", 1).id);
+        let lease = client.lease_grant(120, None).await.unwrap().id();
+        let proof = ClaimProof {
+            key: format!("{prefix}/claim"),
+            token: "owner".into(),
+            lease_id: lease,
+        };
+        client
+            .put(
+                lance_context_merge::target_lock_key(&prefix, "table"),
+                proof.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        client
+            .put(
+                proof.key.clone(),
+                proof.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        (Coordinator::new(client, prefix), proof)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_mixed_fleet_uses_owned_protocol_without_legacy_reservation() {
+        let (coordinator, proof) = fixture().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let c = coordinator.clone();
+        let fenced = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[],"fenced_legacy_merges":true,"merge_admission_ready":true}))
+        })).route("/api/v1/internal/merge-executor/start", post(move |Json(e): Json<Execution>| {
+            let c = c.clone(); let calls = counted.clone();
+            async move {
+                assert_eq!(e.protocol, 2);
+                let running = c.start(&e).await.unwrap().unwrap();
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(c.finish(&running, Ok(7)).await.unwrap());
+                axum::http::StatusCode::ACCEPTED
+            }
+        })).fallback(post(|| async { panic!("fenced worker must never receive a legacy POST"); #[allow(unreachable_code)] axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let legacy = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"old","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        })).fallback(post(|| async { Json(serde_json::json!({"reclaimed":3})) }));
+        let mut endpoints = Vec::new();
+        let mut servers = Vec::new();
+        for app in [fenced, legacy] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.push(format!("http://{}", listener.local_addr().unwrap()));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+        let result = super::run_legacy_workers_inner(
+            &reqwest::Client::new(),
+            &endpoints,
+            "table",
+            super::LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("merged 10 generations across 2/2"),
+            "{result}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_unresolved_worker_mode_never_admits_legacy() {
+        let (coordinator, proof) = fixture().await;
+        let app = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[],"fenced_legacy_merges":false,"merge_admission_ready":false}))
+        })).fallback(post(|| async { panic!("unknown mode must not admit any POST"); #[allow(unreachable_code)] axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = super::run_legacy_workers_inner(
+            &reqwest::Client::new(),
+            &[endpoint],
+            "table",
+            super::LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("discovery is still pending"));
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn append_wildcard_does_not_adopt_new_tables_before_native_routing() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()];
+        cfg.etcd.etcd_prefix = format!(
+            "/merge-fenced-routing/{}",
+            lance_context_core::generate_id()
+        );
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        assert!(cfg.merge_rollout.owned_targets.is_empty());
+        assert!(!crate::local_merge::selected(&cfg, "table"));
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "fenced-worker",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![endpoint];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = run_merge_wal(&state, &claim).await;
+        server.abort();
+        assert!(outcome.as_ref().unwrap().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, outcome).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn orphaned_merge_is_storage_fenced_and_healthy_shard_progresses() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let prefix = format!("/merge-orphan-tests/{}", Execution::new("", "", "", 1).id);
+        let cfg = crate::config::MasterConfig::parse_from([
+            "test",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "--etcd-endpoints",
+            &endpoints,
+            "--etcd-prefix",
+            &prefix,
+            "--merge-owned-targets",
+            "table",
+        ]);
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("table");
+        lance_context_core::RolloutStore::open(&uri)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let initial_version = lance::Dataset::open(&uri).await.unwrap().version().version;
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "healthy",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (healthy, server) = worker(good.clone()).await;
+        let lost = "http://127.0.0.1:1".to_string();
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![lost.clone(), healthy];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = state.task_store.merge_claim(&claim);
+        let execution = Execution::new("table", &lost, "dead-worker", 1);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&running, &uri, "base", initial_version + 1)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .report_uncertain(&running, "lost storage response".into())
+            .await
+            .unwrap());
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run_merge_wal(&state, &claim))
+            .await
+            .unwrap();
+        assert!(outcome.unwrap_err().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert!(lance::Dataset::open(&uri).await.unwrap().version().version > initial_version + 1);
+        assert!(coordinator
+            .authorize_commit(&running, &uri, "base", initial_version + 4)
+            .await
+            .is_err());
+
+        // A probe may decide to recover just as the executor publishes its
+        // terminal result. Release that result without trying to freeze it.
+        let completed = Execution::new("table", &lost, "late-completion", 1);
+        assert!(coordinator.reserve(&proof, &completed).await.unwrap());
+        let completed = coordinator.start(&completed).await.unwrap().unwrap();
+        assert!(coordinator.finish(&completed, Ok(0)).await.unwrap());
+        let completed = coordinator.get("table").await.unwrap().unwrap();
+        recover_execution(&state, &coordinator, &proof, completed)
+            .await
+            .unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
+
+        // A mismatched worker namespace must remain fenced, never recover by
+        // committing a barrier to an unrelated same-named table.
+        let wrong = Execution::new("table", &lost, "misconfigured-worker", 1);
+        assert!(coordinator.reserve(&proof, &wrong).await.unwrap());
+        let wrong = coordinator.start(&wrong).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&wrong, "file:///different-table", "base", 7)
+            .await
+            .unwrap();
+        let error = recover_execution(&state, &coordinator, &proof, wrong)
+            .await
+            .unwrap_err();
+        assert!(error.contains("dataset URI mismatch"));
+        assert_eq!(
+            coordinator.get("table").await.unwrap().unwrap().phase,
+            Phase::Recovering
+        );
+        state.task_store.finish(claim, Err(error)).await.unwrap();
+        server.abort();
+        let mut client =
+            etcd_client::Client::connect(endpoints.split(',').collect::<Vec<_>>(), None)
+                .await
+                .unwrap();
+        client
+            .delete(
+                prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn verify_lost_executor(restarted: bool) {
+        let (coordinator, proof) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = if restarted {
+            Router::new().route(
+                "/api/v1/internal/merge-executor",
+                get(|| async { Json(serde_json::json!({"instance": "new-process"})) }),
+            )
+        } else {
+            Router::new()
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let execution = Execution::new("table", &endpoint, "old-process", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let error = tokio::time::timeout(
+            Duration::from_secs(if restarted { 15 } else { 40 }),
+            reconcile(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                running.clone(),
+                false,
+            ),
+        )
+        .await
+        .expect("lost executor must be detected before the 600-second idle timeout")
+        .unwrap_err();
+        assert!(
+            error.contains(if restarted {
+                "incarnation changed"
+            } else {
+                "unreachable"
+            }),
+            "{error}"
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
+        assert!(!coordinator
+            .reserve(&proof, &Execution::new("table", "other", "new", 3600))
+            .await
+            .unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn restarted_executor_is_detected_before_idle_deadline() {
+        verify_lost_executor(true).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn unreachable_executor_is_detected_before_idle_deadline() {
+        verify_lost_executor(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn real_progress_prevents_takeover_when_http_probes_fail() {
+        let (coordinator, proof) = fixture().await;
+        let execution = Execution::new("table", "http://127.0.0.1:1", "worker", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 0).await.unwrap());
+        let publisher = coordinator.clone();
+        let working = running.clone();
+        let work = tokio::spawn(async move {
+            for step in 1..=35 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(publisher.publish_progress(&working, step).await.unwrap());
+            }
+            assert!(publisher.finish(&working, Ok(7)).await.unwrap());
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                reconcile(
+                    &reqwest::Client::new(),
+                    &coordinator,
+                    &proof,
+                    running,
+                    false
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            7
+        );
+        work.await.unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert!(coordinator
+            .failure("table", &execution.endpoint)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn missing_executor_returns_attention_without_unlocking_surviving_write() {
+        let (coordinator, proof) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, Router::new()).await.unwrap() });
+        let execution = Execution::new("table", &endpoint, "lost-process", 1);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            reconcile_with_grace(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                running.clone(),
+                true,
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("ownership unresolved"));
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(running.clone())
+        );
+        assert!(!coordinator
+            .reserve(&proof, &Execution::new("table", "replacement", "new", 1))
+            .await
+            .unwrap());
+        assert!(
+            coordinator
+                .failure("table", &endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .needs_attention
+        );
+        // A late positive acknowledgement still permits normal recovery.
+        assert!(coordinator
+            .finish(&running, Err("cancelled".into()))
+            .await
+            .unwrap());
+        let terminal = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_reprobes_a_ready_executor() {
+        let (coordinator, proof) = fixture().await;
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "ready-after-restart",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        for _ in 0..15 {
+            coordinator
+                .record_failure(
+                    &proof,
+                    "table",
+                    &endpoint,
+                    "worker lacks bounded owned-merge protocol",
+                )
+                .await
+                .unwrap();
+        }
+        let before = coordinator
+            .failure("table", &endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.next_retry_ms > lance_context_merge::failure::now_ms());
+        let outcome = run_workers(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint),
+        )
+        .await;
+        server.abort();
+        assert!(outcome.as_ref().is_ok_and(|s| s.contains("merged 7 generations")),
+            "a fresh supported worker must not stay blocked by its pre-admission failure: {outcome:?}");
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator
+            .failure("table", &endpoint)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn worker_admission_pending_is_transient_but_never_authorizes_merge() {
+        let mut value = serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,
+            "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,
+            "owned_targets":["table"],"merge_admission_ready":false});
+        let caps: Capabilities = serde_json::from_value(value.clone()).unwrap();
+        let error = validate_capabilities(&caps, "table").unwrap_err();
+        assert_eq!(error, WORKER_ADMISSION_PENDING);
+        assert_eq!(
+            lance_context_merge::failure::classify(&error),
+            lance_context_merge::failure::FailureClass::Retryable
+        );
+        value["merge_admission_ready"] = true.into();
+        let caps: Capabilities = serde_json::from_value(value.clone()).unwrap();
+        assert!(validate_capabilities(&caps, "table").is_ok());
+        for (key, invalid) in [
+            ("protocol", 1),
+            ("progress_protocol", 0),
+            ("timeout_secs", 0),
+            ("queue_timeout_secs", 0),
+            ("idle_timeout_secs", 0),
+        ] {
+            let mut bad = value.clone();
+            bad[key] = invalid.into();
+            let caps: Capabilities = serde_json::from_value(bad).unwrap();
+            assert_eq!(
+                validate_capabilities(&caps, "table").unwrap_err(),
+                WORKER_PROTOCOL_UNSUPPORTED
+            );
+        }
+        assert!(validate_capabilities(&caps, "different-table").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_preserves_unresolved_and_unrelated_failures() {
+        use axum::response::IntoResponse;
+        let valid = serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,
+            "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,
+            "owned_targets":["table"],"merge_admission_ready":true});
+        let mut cases = Vec::new();
+        for (key, value) in [
+            ("merge_admission_ready", serde_json::json!(false)),
+            ("protocol", serde_json::json!(1)),
+            ("progress_protocol", serde_json::json!(0)),
+            ("timeout_secs", serde_json::json!(0)),
+            ("queue_timeout_secs", serde_json::json!(0)),
+            ("idle_timeout_secs", serde_json::json!(0)),
+            ("owned_targets", serde_json::json!([])),
+        ] {
+            let mut caps = valid.clone();
+            caps[key] = value;
+            cases.push((WORKER_PROTOCOL_UNSUPPORTED, caps, false, 1));
+        }
+        cases.push((WORKER_PROTOCOL_UNSUPPORTED, valid.clone(), true, 1));
+        let mut unready = valid.clone();
+        unready["merge_admission_ready"] = false.into();
+        cases.push((WORKER_ADMISSION_PENDING, unready, false, 1));
+        for error in [
+            "status=403 forbidden",
+            "invalid schema",
+            "storage timeout",
+            "merge ownership unresolved: worker lacks bounded owned-merge protocol",
+        ] {
+            cases.push((error, valid.clone(), false, 0));
+        }
+        for (error, caps, forbidden, expected_gets) in cases {
+            let (coordinator, proof) = fixture().await;
+            let gets = Arc::new(AtomicUsize::new(0));
+            let counted = gets.clone();
+            let app = Router::new()
+                .route(
+                    "/api/v1/internal/merge-executor",
+                    get(move || {
+                        let counted = counted.clone();
+                        let caps = caps.clone();
+                        async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            if forbidden {
+                                axum::http::StatusCode::FORBIDDEN.into_response()
+                            } else {
+                                Json(caps).into_response()
+                            }
+                        }
+                    }),
+                )
+                .fallback(post(|| async {
+                    panic!("failed capability probe must never write");
+                    #[allow(unreachable_code)]
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            for _ in 0..15 {
+                coordinator
+                    .record_failure(&proof, "table", &endpoint, error)
+                    .await
+                    .unwrap();
+            }
+            let before =
+                serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap())
+                    .unwrap();
+            assert!(matches!(
+                worker_retry(&reqwest::Client::new(), &coordinator, "table", &endpoint)
+                    .await
+                    .unwrap(),
+                WorkerRetry::Deferred(_)
+            ));
+            assert_eq!(gets.load(Ordering::SeqCst), expected_gets);
+            assert_eq!(
+                serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap())
+                    .unwrap(),
+                before
+            );
+            assert!(coordinator.get("table").await.unwrap().is_none());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_capability_backoff_recovery_keeps_real_attempt_budget_and_ownership() {
+        for legacy in [false, true] {
+            for payload_fails in [false, true] {
+                let (coordinator, proof) = fixture().await;
+                let executor = Worker {
+                    coordinator: coordinator.clone(),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail: payload_fails,
+                    stall_first: false,
+                    name: "recovered",
+                    events: Arc::new(Mutex::new(Vec::new())),
+                };
+                let (endpoint, server) = worker(executor.clone()).await;
+                for _ in 0..15 {
+                    coordinator
+                        .record_failure(&proof, "table", &endpoint, WORKER_ADMISSION_PENDING)
+                        .await
+                        .unwrap();
+                }
+                let before = coordinator
+                    .failure("table", &endpoint)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(before.next_retry_ms > lance_context_merge::failure::now_ms());
+                let result = if legacy {
+                    run_legacy_workers_inner(
+                        &reqwest::Client::new(),
+                        std::slice::from_ref(&endpoint),
+                        "table",
+                        LegacyOwnership::Durable {
+                            coordinator: &coordinator,
+                            proof: &proof,
+                        },
+                    )
+                    .await
+                } else {
+                    run_workers(
+                        &reqwest::Client::new(),
+                        &coordinator,
+                        &proof,
+                        "table",
+                        std::slice::from_ref(&endpoint),
+                    )
+                    .await
+                };
+                assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(result.is_err(), payload_fails, "{result:?}");
+                if payload_fails {
+                    let after = coordinator
+                        .failure("table", &endpoint)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(after.consecutive_attempts, 16);
+                    assert_eq!(after.last_error, "injected shard failure");
+                    assert!(after.needs_attention);
+                } else {
+                    assert!(coordinator
+                        .failure("table", &endpoint)
+                        .await
+                        .unwrap()
+                        .is_none());
+                }
+                assert!(coordinator.get("table").await.unwrap().is_none());
+                server.abort();
+            }
+        }
+        // A positive GET grants no ownership: losing the claim still prohibits start.
+        let (coordinator, proof) = fixture().await;
+        let executor = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "unclaimed",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(executor.clone()).await;
+        coordinator
+            .record_failure(&proof, "table", &endpoint, WORKER_PROTOCOL_UNSUPPORTED)
+            .await
+            .unwrap();
+        let before =
+            serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap()).unwrap();
+        let mut client =
+            etcd_client::Client::connect([std::env::var("ETCD_TEST_ENDPOINTS").unwrap()], None)
+                .await
+                .unwrap();
+        client.lease_revoke(proof.lease_id).await.unwrap();
+        assert!(run_workers(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            std::slice::from_ref(&endpoint)
+        )
+        .await
+        .is_err());
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(coordinator.failure("table", &endpoint).await.unwrap()).unwrap(),
+            before
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn missing_owned_capability_never_falls_back_to_legacy_post() {
+        let (coordinator, proof) = fixture().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/table",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({"reclaimed": 9}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(one(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            &endpoint
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn stalled_shard_is_terminated_healthy_shards_advance_then_only_failure_retries() {
+        let (coordinator, proof) = fixture().await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let bad = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: true,
+            name: "stalled",
+            events: events.clone(),
+        };
+        let good = Worker {
+            stall_first: false,
+            name: "healthy",
+            calls: Arc::new(AtomicUsize::new(0)),
+            ..bad.clone()
+        };
+        let (first, first_server) = worker(bad.clone()).await;
+        let (second, second_server) = worker(good.clone()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_workers(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                "table",
+                &[first, second],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("merged 14"));
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["stalled:failed", "healthy:ok", "stalled:ok"]
+        );
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        first_server.abort();
+        second_server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn partial_success_does_not_hide_exhausted_shard_failure() {
+        let (coordinator, proof) = fixture().await;
+        let bad = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: true,
+            stall_first: false,
+            name: "bad",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let good = Worker {
+            fail: false,
+            name: "good",
+            calls: Arc::new(AtomicUsize::new(0)),
+            ..bad.clone()
+        };
+        let (first, first_server) = worker(bad.clone()).await;
+        let (second, second_server) = worker(good.clone()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(25),
+            run_workers(
+                &reqwest::Client::new(),
+                &coordinator,
+                &proof,
+                "table",
+                &[first.clone(), second.clone()],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(result.contains("merged 7 generations"));
+        assert!(result.contains("1 worker(s) failed or cooling down"));
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        // A fresh task must retain the failed shard's backoff, while still
+        // admitting the healthy shard for newly arrived generations.
+        let next = run_workers(
+            &reqwest::Client::new(),
+            &coordinator,
+            &proof,
+            "table",
+            &[first.clone(), second],
+        )
+        .await
+        .unwrap_err();
+        assert!(next.contains("retry at"));
+        assert_eq!(bad.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(good.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            coordinator
+                .failure("table", &first)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            3
+        );
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        first_server.abort();
+        second_server.abort();
+    }
+}
+
+#[cfg(test)]
+mod legacy_connection_tests {
+    use super::run_legacy_workers;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    async fn durable_store() -> (tempfile::TempDir, crate::task_store::TaskStore, String) {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(
+            endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:")
+        );
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![endpoint];
+        cfg.etcd.etcd_prefix = format!(
+            "/legacy-ownership-tests/{}",
+            lance_context_core::generate_id()
+        );
+        let store = crate::task_store::TaskStore::open(&cfg).await.unwrap();
+        (dir, store, cfg.etcd.etcd_prefix)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_timeout_retains_ownership_after_task_finish_and_blocks_replay() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let barrier = release.clone();
+        let (endpoint, server) = serve(Router::new().fallback(post(move || {
+            let observed = observed.clone();
+            let barrier = barrier.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                barrier.notified().await;
+                Json(serde_json::json!({"reclaimed": 3}))
+            }
+        })))
+        .await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let proof = store.merge_claim(&claim);
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let outcome = run_legacy_workers_inner(
+            &http,
+            std::slice::from_ref(&endpoint),
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await;
+        assert!(outcome.as_ref().unwrap_err().contains("stopped at"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let running = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(running.protocol, 0);
+        assert_eq!(running.phase, lance_context_merge::Phase::Running);
+        store.finish(claim, outcome).await.unwrap();
+        let lock = store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].lease(),
+            0,
+            "ambiguous writer protection must outlive task lease"
+        );
+        assert_eq!(
+            lock.kvs()[0].value(),
+            lance_context_merge::execution_owner(&running).as_bytes()
+        );
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let retry = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_proof = store.merge_claim(&retry);
+        let retry_result = run_legacy_workers_inner(
+            &http,
+            &[endpoint],
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &retry_proof,
+            },
+        )
+        .await;
+        assert!(retry_result
+            .unwrap_err()
+            .contains("execution already present"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "reconciler claim cannot POST another writer"
+        );
+        assert!(
+            coordinator.freeze(&retry_proof, &running).await.is_err(),
+            "protocol 2 barriers cannot retire legacy work"
+        );
+        store
+            .finish(retry, Err("legacy ownership unresolved".into()))
+            .await
+            .unwrap();
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_connection_budget_survives_new_tasks_without_blocking_healthy_workers() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::{TaskKinds, TaskStore};
+        use lance_context_api::TaskKind;
+
+        const TARGET: &str = "schema_invalid_protocol_probe";
+
+        async fn pass(store: &TaskStore, endpoints: &[String]) -> String {
+            store
+                .enqueue(TaskKind::MergeWal, TARGET, vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let coordinator = store.merge_coordinator();
+            let proof = store.merge_claim(&claim);
+            let outcome = run_legacy_workers_inner(
+                &crate::state::worker_http_client().unwrap(),
+                endpoints,
+                TARGET,
+                LegacyOwnership::Durable {
+                    coordinator: &coordinator,
+                    proof: &proof,
+                },
+            )
+            .await;
+            let error = outcome.as_ref().unwrap_err().clone();
+            assert!(
+                coordinator.get(TARGET).await.unwrap().is_none(),
+                "only proven-unadmitted failures may release ownership"
+            );
+            store.finish(claim, outcome).await.unwrap();
+            error
+        }
+        let (_dir, store, _) = durable_store().await;
+        // The port stays reserved and never listens: every real attempt is a
+        // definite pre-admission failure, not a lost response from a writer.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let bad = format!("http://{}", socket.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let endpoints = [bad.clone(), good.clone()];
+        let coordinator = store.merge_coordinator();
+        assert!(pass(&store, &endpoints)
+            .await
+            .contains("merged 7 generations"));
+        let first = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert_eq!(first.consecutive_attempts, 1);
+        assert_eq!(
+            first.class,
+            lance_context_merge::failure::FailureClass::Retryable,
+            "target names must not turn connection failures into permanent configuration errors"
+        );
+        let second = pass(&store, &endpoints).await;
+        assert!(second.contains("retry at"));
+        assert!(second.contains("merged 7 generations"));
+        let skipped = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert_eq!(skipped.consecutive_attempts, 1);
+        assert_eq!(
+            skipped.last_failure_ms, first.last_failure_ms,
+            "a skipped endpoint cannot be charged another actual failure"
+        );
+        for expected in 2..=3 {
+            let failure = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+            let delay = failure
+                .next_retry_ms
+                .saturating_sub(lance_context_merge::failure::now_ms());
+            assert!(
+                delay <= 2500,
+                "only the first two short retry windows are awaited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay + 10)).await;
+            assert!(pass(&store, &endpoints)
+                .await
+                .contains("merged 7 generations"));
+            let current = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+            assert_eq!(
+                current.consecutive_attempts, expected,
+                "fresh task completion must not reset the unavailable endpoint's budget"
+            );
+        }
+        let exhausted = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert!(
+            !exhausted.needs_attention,
+            "reuse the existing transient-failure policy"
+        );
+        assert!(exhausted.next_retry_ms - exhausted.last_failure_ms >= 30000);
+        assert!(pass(&store, &endpoints).await.contains("retry at"));
+        assert_eq!(
+            coordinator
+                .failure(TARGET, &bad)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            3
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "every pass must still advance the healthy worker"
+        );
+        assert!(coordinator.failure(TARGET, &good).await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_success_releases_each_endpoint_and_task_lock() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = healthy(calls.clone()).await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let proof = store.merge_claim(&claim);
+        let result = run_legacy_workers_inner(
+            &crate::state::worker_http_client().unwrap(),
+            &[endpoint.clone(), endpoint],
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await;
+        assert!(result.as_ref().unwrap().contains("merged 14 generations"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        store.finish(claim, result).await.unwrap();
+        assert!(store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_admission_survives_claim_lease_loss_before_http() {
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = store.merge_claim(&claim);
+        let coordinator = store.merge_coordinator();
+        let running = coordinator
+            .admit_legacy(&proof, "table", "http://uncontacted-worker")
+            .await
+            .unwrap();
+        store
+            .etcd_client()
+            .clone()
+            .lease_revoke(proof.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(running.clone())
+        );
+        assert!(!coordinator.cancel_reserved(&running).await.unwrap());
+        assert!(coordinator.freeze(&proof, &running).await.is_err());
+        let lock = store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(lock.kvs()[0].lease(), 0);
+        assert_eq!(
+            lock.kvs()[0].value(),
+            lance_context_merge::execution_owner(&running).as_bytes()
+        );
+        assert!(coordinator
+            .admit_legacy(&proof, "other", "http://uncontacted-worker")
+            .await
+            .is_err());
+    }
+
+    async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let app = app.route("/api/v1/internal/merge-executor", axum::routing::get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"legacy-test","timeout_secs":600,
+                "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, handle)
+    }
+
+    async fn healthy(calls: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+        serve(Router::new().fallback(post(move || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({"reclaimed": 7}))
+            }
+        })))
+        .await
+    }
+
+    #[tokio::test]
+    async fn progress_evidence_is_reported_but_never_allows_unsafe_fanout() {
+        let (bad, failed_server) = serve(Router::new()
+            .route("/api/v1/internal/legacy-merges", axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(query.get("target").unwrap(), "table");
+                    Json(serde_json::json!({"instance":"boot-1", "snapshot":{
+                        "protocol":1, "takeover_authorized":false,
+                        "executions":[{"id":"exec-1","completed_steps":42,"writes":{"active_commits":1}}]
+                    }}))
+                }))
+            .fallback(post(|| async { StatusCode::INTERNAL_SERVER_ERROR }))).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[bad, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("exec-1"), "{error}");
+        assert!(error.contains("active_commits"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        failed_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_progress_is_bounded_and_not_accepted_as_handoff_evidence() {
+        let (endpoint, server) =
+            serve(Router::new().fallback(axum::routing::get(|| async { "x".repeat(65537) }))).await;
+        let evidence = super::legacy_progress(
+            &crate::state::worker_http_client().unwrap(),
+            &endpoint,
+            "table",
+        )
+        .await;
+        assert!(evidence.contains("exceeds 64 KiB"), "{evidence}");
+        assert!(evidence.contains("ownership unresolved"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_refusal_preserves_progress_on_both_sides() {
+        // Reserve a non-listening port so another test cannot take it.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let lost = format!("http://{}", socket.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[good.clone(), lost, good], "table")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("merged 14 generations across 2/3 workers"),
+            "{error}"
+        );
+        assert!(error.contains("unavailable workers"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn only_exact_drain_refusal_releases_legacy_record_and_continues_fanout() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        for (body, unadmitted) in [
+            ("worker is draining".to_string(), true),
+            ("storage failed after publication".to_string(), false),
+            ("worker is draining\n".to_string(), false),
+            ("worker is draining".repeat(8), false),
+        ] {
+            let (_dir, store, _) = durable_store().await;
+            let (bad, rejected) = serve(Router::new().fallback(post(move || {
+                let body = body.clone();
+                async move { (StatusCode::SERVICE_UNAVAILABLE, body) }
+            })))
+            .await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (good, healthy_server) = healthy(calls.clone()).await;
+            store
+                .enqueue(TaskKind::MergeWal, "table", vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let coordinator = store.merge_coordinator();
+            let proof = store.merge_claim(&claim);
+            let result = run_legacy_workers_inner(
+                &crate::state::worker_http_client().unwrap(),
+                &[bad, good],
+                "table",
+                LegacyOwnership::Durable {
+                    coordinator: &coordinator,
+                    proof: &proof,
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(unadmitted));
+            assert_eq!(
+                coordinator.get("table").await.unwrap().is_none(),
+                unadmitted
+            );
+            store.finish(claim, result).await.unwrap();
+            assert_eq!(
+                coordinator.get("table").await.unwrap().is_none(),
+                unadmitted
+            );
+            rejected.abort();
+            healthy_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn server_failure_stops_before_next_legacy_writer() {
+        let (bad, failed_server) =
+            serve(Router::new().fallback(post(|| async { StatusCode::INTERNAL_SERVER_ERROR })))
+                .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[good.clone(), bad, good], "table")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("merged 7 generations across 1/3 workers"),
+            "{error}"
+        );
+        assert!(error.contains("stopped at"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        failed_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn redirected_connect_failure_cannot_be_treated_as_unadmitted() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let lost = format!("http://{}/elsewhere", socket.local_addr().unwrap());
+        let (redirect, redirect_server) = serve(Router::new().fallback(post(move || {
+            let location = lost.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", location)],
+                    Json(serde_json::json!({"reclaimed": 99})),
+                )
+                    .into_response()
+            }
+        })))
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[redirect, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("stopped at"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        redirect_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_after_admission_does_not_advance_to_another_writer() {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let seen = admitted.clone();
+        let (slow, slow_server) = serve(Router::new().fallback(post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Json(serde_json::json!({"reclaimed": 3}))
+            }
+        })))
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        // Test-only execution deadline reproduces an ambiguous lost response.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let error = run_legacy_workers(&http, &[slow, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("stopped at"), "{error}");
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        slow_server.abort();
+        server.abort();
+    }
+}

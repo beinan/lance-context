@@ -1,0 +1,461 @@
+//! Regression tests: collect mode must reclaim merged generation directories.
+//!
+//! One store, one shard, fully serial — no concurrency, no fence. This isolates
+//! a single property: `merge_own_shard` appends merged generations into the base
+//! table and drains them from the shard manifest, and must ALSO delete the
+//! `_mem_wal/{shard}/{gen}/` blob directory. Historically it did not, leaking one
+//! zombie directory per merged generation (a pure storage leak: data was correct
+//! but `_mem_wal/` grew without bound). After the fix, the count of on-disk
+//! `_gen_` directories tracks the manifest's pending generations exactly.
+//! Physical cleanup runs in an isolated process with collection explicitly
+//! enabled; default retain mode intentionally preserves retired generations.
+
+use std::path::Path;
+
+use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+
+/// Re-execute only this test with collection configured before any store opens.
+/// Each test owns a temporary local directory and has no legacy readers or
+/// deleters, so its collection barrier is satisfied. A child process avoids
+/// mutating the shared environment of concurrently running tests.
+fn run_collect_child(test_name: &str) -> bool {
+    if std::env::var("ROCKETKEEP_WAL_LIFECYCLE").as_deref() == Ok("collect") {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("ROCKETKEEP_WAL_LIFECYCLE", "collect")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "collect-mode test {test_name} did not pass: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
+
+fn rec(id: &str) -> RolloutRecord {
+    RolloutRecord {
+        id: id.to_string(),
+        rollout_id: "r".to_string(),
+        problem_id: "p".to_string(),
+        dataset: Some("d".to_string()),
+        sequence_order: 0,
+        role: ROLE_ASSISTANT.to_string(),
+        created_at: chrono::Utc::now(),
+        content: Some("x".to_string()),
+        content_type: "text/plain".to_string(),
+        model_input_string: None,
+        model_output_string: None,
+        rationale: None,
+        problem_text: None,
+        user_metadata: None,
+        input_tokens: None,
+        output_tokens: None,
+        num_input_tokens: None,
+        num_output_tokens: None,
+        output_logprobs: None,
+        input_logprobs: None,
+        ref_logprobs: None,
+        loss_mask: None,
+        advantage: None,
+        reward: None,
+        raw_reward: None,
+        grader_id: None,
+        score: None,
+        include_in_training: None,
+        exclude_reason: None,
+        policy_version: None,
+        relationships: vec![],
+        binary_payload: None,
+        payload_size: None,
+        payload_checksum: None,
+        artifact_type: None,
+        metadata: None,
+    }
+}
+
+/// Merged generation directories are removed on a spawned task after the
+/// manifest drain commits (lance-context #287), so a test that asserts on
+/// the filesystem waits for the cleanup to land instead of racing it.
+async fn wait_gen_dirs_on_disk(dataset_dir: &Path, expected: usize) -> usize {
+    for _ in 0..200 {
+        let n = count_gen_dirs_on_disk(dataset_dir);
+        if n == expected {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    count_gen_dirs_on_disk(dataset_dir)
+}
+
+fn count_gen_dirs_on_disk(dataset_dir: &Path) -> usize {
+    let mem_wal = dataset_dir.join("_mem_wal");
+    let mut count = 0;
+    if let Ok(shards) = std::fs::read_dir(&mem_wal) {
+        for shard in shards.flatten() {
+            if let Ok(entries) = std::fs::read_dir(shard.path()) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.contains("_gen_") && e.path().is_dir() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serial_merge_deletes_merged_generation_dirs() {
+    if run_collect_child("serial_merge_deletes_merged_generation_dirs") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+
+    // Merge every 10 accumulated generations into the base table.
+    let opts = RolloutStoreOptions {
+        shard_id: Some("solo".to_string()),
+        merge_after_generations: Some(10),
+        ..Default::default()
+    };
+
+    let mut store = RolloutStore::open_with_options(&uri, opts.clone())
+        .await
+        .unwrap();
+
+    // 30 serial single-row appends. `add` is durable-only now, so we `flush`
+    // each one into its own generation (as an inline seal used to), then run the
+    // count-triggered merge explicitly (it moved off the append path onto the
+    // periodic sweeper). Every 10th accumulated generation is folded into the
+    // base table and drained from the manifest.
+    let n = 30;
+    for i in 0..n {
+        store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+        store.maybe_merge_own_shard().await.unwrap();
+    }
+
+    let obs = store.observe().await.unwrap();
+    let manifest_pending = obs.pending_wal_generations as usize;
+
+    // Data correctness must be measured through the LSM read path, which
+    // de-duplicates by `id`. `observe().row_count` is a raw `count_rows()` over
+    // the base table and does NOT de-duplicate, so it over-counts the physical
+    // duplicate rows that a WAL merge can leave in the base table (see the
+    // dedup-consistency issue). Assert on the read path instead.
+    let listed = store.list(None, None).await.unwrap();
+    let mut ids: Vec<String> = listed.iter().map(|record| record.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+
+    let on_disk = wait_gen_dirs_on_disk(Path::new(&uri), manifest_pending).await;
+
+    eprintln!(
+        "appends={n} listed={} unique_ids={} raw_row_count={} \
+         manifest_pending_generations={manifest_pending} \
+         gen_dirs_on_disk={on_disk} leaked={}",
+        listed.len(),
+        ids.len(),
+        obs.row_count,
+        on_disk.saturating_sub(manifest_pending)
+    );
+
+    // Data correctness: every appended row is readable exactly once through the
+    // deduplicating read path.
+    assert_eq!(
+        listed.len(),
+        n,
+        "read path must return each appended row exactly once"
+    );
+    assert_eq!(ids.len(), n, "no duplicate ids on the read path");
+
+    // The fix: merged generations are drained from the manifest AND their blob
+    // dirs are deleted, so on-disk gen dirs never exceed the manifest's pending
+    // count. (Before the fix this was 30 dirs on disk vs 0 pending = 30 leaks.)
+    assert_eq!(
+        on_disk, manifest_pending,
+        "on-disk generation dirs ({on_disk}) must match manifest pending \
+         generations ({manifest_pending}); a surplus means merged generations \
+         leaked their blob directories"
+    );
+}
+
+/// One merge pass must fold at most `merge_max_generations`, and the leftovers
+/// must survive to be merged by later passes.
+///
+/// A merge buffers every row of every generation it takes before appending, and
+/// rollout rows carry `binary_payload` inline, so an unbounded pass over a
+/// backlog materialises the whole artifact volume at once. That is what drove
+/// worker RSS up a step per merge (glibc retains the freed bulk allocation in
+/// its arenas) until pods were OOMKilled.
+///
+/// Capping the pass is only safe because merging a *subset* is already a
+/// first-class case: the drain removes just the generation ids it merged and
+/// deletes just those directories. This test pins both halves of that -- the
+/// cap binds, and nothing is lost to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn merge_pass_is_bounded_and_leftovers_survive() {
+    if run_collect_child("merge_pass_is_bounded_and_leftovers_survive") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+
+    // Count trigger off: drive merges explicitly so the assertions are about
+    // one pass, not about when a pass fires.
+    let opts = RolloutStoreOptions {
+        shard_id: Some("bounded".to_string()),
+        merge_after_generations: None,
+        merge_max_generations: Some(3),
+        ..Default::default()
+    };
+
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+
+    // Ten generations pending, well over the cap of 3.
+    let n = 10;
+    for i in 0..n {
+        store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+    }
+    let pending_before = store.observe().await.unwrap().pending_wal_generations;
+    assert_eq!(
+        pending_before, n as i64,
+        "each append should seal one generation"
+    );
+
+    // `cleanup_own_shard` is the time-triggered path: threshold 1, so without a
+    // per-pass cap it would take all ten at once. It must take exactly 3.
+    let reclaimed = store.cleanup_own_shard().await.unwrap();
+    assert_eq!(
+        reclaimed, 3,
+        "one pass must fold at most merge_max_generations (3), not the whole backlog"
+    );
+
+    // `cleanup_own_shard` seals first, which can add a generation; what matters
+    // is that the cap removed exactly 3 and the rest are still pending.
+    let pending_after = store.observe().await.unwrap().pending_wal_generations;
+    assert_eq!(
+        pending_after,
+        pending_before - 3,
+        "leftover generations must stay pending, not be dropped"
+    );
+
+    // Draining takes several passes, and every row survives all of them.
+    let mut passes = 1;
+    loop {
+        let reclaimed = store.cleanup_own_shard().await.unwrap();
+        if reclaimed == 0 {
+            break;
+        }
+        assert!(
+            reclaimed <= 3,
+            "every pass must respect the cap; got {reclaimed}"
+        );
+        passes += 1;
+        assert!(passes < 20, "merge failed to converge");
+    }
+    assert!(
+        passes >= 4,
+        "10 generations at 3 per pass must take at least 4 passes; took {passes}"
+    );
+
+    assert_eq!(
+        store.observe().await.unwrap().pending_wal_generations,
+        0,
+        "repeated passes must fully drain the backlog"
+    );
+
+    // No row was lost or duplicated across the multi-pass drain.
+    let listed = store.list(None, None).await.unwrap();
+    let mut ids: Vec<String> = listed.iter().map(|r| r.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        n,
+        "every appended row must survive a bounded merge"
+    );
+
+    // The subset drain must still delete what it merged.
+    let on_disk = wait_gen_dirs_on_disk(Path::new(&uri), 0).await;
+    assert_eq!(
+        on_disk, 0,
+        "a bounded merge must still delete merged generation dirs"
+    );
+}
+
+/// Disabling both caps restores the unbounded behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_merge_caps_merge_everything_in_one_pass() {
+    if run_collect_child("zero_merge_caps_merge_everything_in_one_pass") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+
+    let opts = RolloutStoreOptions {
+        shard_id: Some("unbounded".to_string()),
+        merge_after_generations: None,
+        merge_max_generations: Some(0),
+        merge_max_bytes: Some(0),
+        key_index_type: Default::default(),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+
+    for i in 0..6 {
+        store.add(&[rec(&format!("row-{i}"))]).await.unwrap();
+        store.flush().await.unwrap();
+    }
+
+    let reclaimed = store.cleanup_own_shard().await.unwrap();
+    assert_eq!(
+        reclaimed, 6,
+        "0 must mean unbounded: one pass takes all six"
+    );
+    assert_eq!(store.observe().await.unwrap().pending_wal_generations, 0);
+}
+
+/// The same five generations must drain differently as either cap binds.
+/// Small budgets exercise the large-blob behavior without allocating GiBs.
+async fn assert_blob_merge_passes(max_generations: usize, max_bytes: usize, passes: &[usize]) {
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let opts = RolloutStoreOptions {
+        shard_id: Some("byte-budget".to_string()),
+        merge_max_generations: Some(max_generations),
+        merge_max_bytes: Some(max_bytes),
+        key_index_type: Default::default(),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        let mut record = rec(&format!("blob-{i}"));
+        record.binary_payload = Some(vec![i as u8; 1024 * 1024]);
+        store.add(std::slice::from_ref(&record)).await.unwrap();
+        store.flush().await.unwrap();
+        expected.push(record);
+    }
+
+    let mut pending = expected.len();
+    for &reclaimed in passes {
+        assert_eq!(store.cleanup_own_shard().await.unwrap(), reclaimed);
+        pending -= reclaimed;
+        assert_eq!(
+            store.observe().await.unwrap().pending_wal_generations,
+            pending as i64,
+            "only merged generations may be drained"
+        );
+        assert_eq!(wait_gen_dirs_on_disk(tmp.path(), pending).await, pending);
+        // Check the union of base and pending generations after every pass,
+        // including the actual inline bytes, not just ids or row counts.
+        let mut listed = store.list(None, None).await.unwrap();
+        listed.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(listed.len(), expected.len());
+        for (actual, expected) in listed.iter().zip(&expected) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(
+                store.get_blob(&actual.id).await.unwrap(),
+                expected.binary_payload
+            );
+        }
+    }
+    assert_eq!(pending, 0);
+    assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_budget_binds_before_generation_cap() {
+    if run_collect_child("byte_budget_binds_before_generation_cap") {
+        return;
+    }
+    // Each generation is below 1.5 MiB, but two together exceed it.
+    assert_blob_merge_passes(8, 1536 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_budget_applies_with_generation_cap_disabled() {
+    if run_collect_child("byte_budget_applies_with_generation_cap_disabled") {
+        return;
+    }
+    assert_blob_merge_passes(0, 1536 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_cap_binds_before_byte_budget() {
+    if run_collect_child("generation_cap_binds_before_byte_budget") {
+        return;
+    }
+    assert_blob_merge_passes(2, 16 * 1024 * 1024, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_byte_budget_keeps_generation_cap() {
+    if run_collect_child("zero_byte_budget_keeps_generation_cap") {
+        return;
+    }
+    assert_blob_merge_passes(2, 0, &[2, 2, 1]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_generation_is_merged_in_full_and_makes_progress() {
+    if run_collect_child("oversized_generation_is_merged_in_full_and_makes_progress") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_string_lossy().to_string();
+    let opts = RolloutStoreOptions {
+        shard_id: Some("oversized".to_string()),
+        merge_after_generations: Some(1),
+        merge_max_generations: Some(8),
+        merge_max_bytes: Some(1),
+        key_index_type: Default::default(),
+        ..Default::default()
+    };
+    let mut store = RolloutStore::open_with_options(&uri, opts).await.unwrap();
+    for generation in 0..2 {
+        let records: Vec<_> = (0..3)
+            .map(|row| {
+                let mut record = rec(&format!("{generation}-{row}"));
+                record.binary_payload = Some(vec![row; 4096]);
+                record
+            })
+            .collect();
+        store.add(&records).await.unwrap();
+        store.flush().await.unwrap();
+    }
+    // Exercise the count-triggered prepare/commit path as well as cleanup.
+    for pending in [1, 0] {
+        assert_eq!(store.maybe_merge_own_shard().await.unwrap(), 1);
+        assert_eq!(
+            store.observe().await.unwrap().pending_wal_generations,
+            pending
+        );
+        assert_eq!(
+            wait_gen_dirs_on_disk(tmp.path(), pending as usize).await,
+            pending as usize
+        );
+        let listed = store.list(None, None).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            6,
+            "a generation must never be partially drained"
+        );
+        for record in listed {
+            let row = record.id.as_bytes()[2] - b'0';
+            assert_eq!(
+                store.get_blob(&record.id).await.unwrap(),
+                Some(vec![row; 4096])
+            );
+        }
+    }
+    assert_eq!(store.maybe_merge_own_shard().await.unwrap(), 0);
+}

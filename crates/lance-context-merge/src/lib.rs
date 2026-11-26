@@ -1,0 +1,2112 @@
+//! Execution fences outlive scheduler leases and HTTP connections.
+//!
+//! A claim authorizes admission, not cancellation of an existing storage write.
+//! Only the executor can publish its terminal outcome. Recovery first cancels
+//! and reconciles the old execution; it never clears a running fence on timeout.
+
+use lance_context_metrics::etcd::{ObserveEtcd, Operation};
+pub mod background;
+pub mod demand;
+pub mod failure;
+pub mod fencing;
+pub mod legacy_retirement;
+mod mode;
+pub mod progress;
+pub mod rollout;
+
+use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
+use serde::{Deserialize, Serialize};
+
+pub type Result<T> = std::result::Result<T, String>;
+
+// Existing protocol-2 Recovered records can carry this durable reason across
+// a crash between cancellation and release; no new wire fields or phases.
+pub(crate) const RESERVED_RECOVERY_REASON: &str = "merge reservation recovered before admission";
+
+#[derive(Clone, Debug)]
+pub struct ClaimProof {
+    pub key: String,
+    pub token: String,
+    pub lease_id: i64,
+}
+
+/// The durable execution version observed by a recovery scan. This is not a
+/// wire-format field or write authority; consumers use it only to reject stale
+/// scheduling observations in their enqueue transaction.
+#[derive(Clone, Debug)]
+pub struct ExecutionObservation {
+    pub execution: Execution,
+    pub revision: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Reserved,
+    Running,
+    Uncertain,
+    Recovering,
+    Recovered,
+    Finished,
+}
+
+/// Local master mutations use the same storage fence as WAL merging. Older
+/// readers cannot CAS these records because they do not preserve this field.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceKind {
+    Compact,
+    IndexId,
+    Repair,
+    Catchup,
+}
+
+impl MaintenanceKind {
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::Compact => "master:compact",
+            Self::IndexId => "master:index_id",
+            Self::Repair => "master:repair",
+            Self::Catchup => "master:catchup",
+        }
+    }
+    pub fn from_endpoint(endpoint: &str) -> Option<Self> {
+        match endpoint {
+            "master:compact" => Some(Self::Compact),
+            "master:index_id" => Some(Self::IndexId),
+            "master:repair" => Some(Self::Repair),
+            "master:catchup" => Some(Self::Catchup),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Execution {
+    /// Count/timer-triggered worker execution, admitted without a scheduler
+    /// claim. Its persistent owner and commit permits are otherwise identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<MaintenanceKind>,
+    pub id: String,
+    pub target: String,
+    pub endpoint: String,
+    pub instance: String,
+    pub timeout_secs: u64,
+    #[serde(default = "default_queue_timeout")]
+    pub queue_timeout_secs: u64,
+    #[serde(default = "default_queue_timeout")]
+    pub idle_timeout_secs: u64,
+    pub phase: Phase,
+    pub reclaimed: usize,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "protocol_absent")]
+    pub protocol: u32,
+}
+
+fn protocol_absent(protocol: &u32) -> bool {
+    *protocol == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+fn default_queue_timeout() -> u64 {
+    600
+}
+
+impl Execution {
+    pub fn new(target: &str, endpoint: &str, instance: &str, timeout_secs: u64) -> Self {
+        Self {
+            background: false,
+            maintenance: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            target: target.into(),
+            endpoint: endpoint.into(),
+            instance: instance.into(),
+            timeout_secs,
+            queue_timeout_secs: default_queue_timeout(),
+            idle_timeout_secs: default_queue_timeout(),
+            phase: Phase::Reserved,
+            reclaimed: 0,
+            error: None,
+            protocol: 2,
+        }
+    }
+
+    /// Catch-up work with no admitted storage writer, including cancellation
+    /// persisted before a recovery process lost its claim.
+    pub fn unstarted_catchup(&self) -> bool {
+        self.protocol == 2
+            && !self.background
+            && self.maintenance == Some(MaintenanceKind::Catchup)
+            && self.endpoint == MaintenanceKind::Catchup.endpoint()
+            && self.reclaimed == 0
+            && (self.phase == Phase::Reserved
+                || (self.phase == Phase::Recovered
+                    && self.error.as_deref() == Some(RESERVED_RECOVERY_REASON)))
+    }
+
+    pub fn finished(&self, outcome: Result<usize>) -> Self {
+        let mut next = self.clone();
+        next.phase = Phase::Finished;
+        match outcome {
+            Ok(n) => next.reclaimed = n,
+            Err(e) => next.error = Some(e),
+        }
+        next
+    }
+}
+
+/// Deliberately no lease on these keys. An expired task claim must not let a
+/// second endpoint commit while the first endpoint's HTTP handler is still alive.
+#[derive(Clone)]
+pub struct Coordinator {
+    client: Client,
+    prefix: String,
+}
+
+pub fn execution_key(prefix: &str, target: &str) -> String {
+    let encoded: String = target
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(
+        "{}/merge-executions/{encoded}",
+        prefix.trim_end_matches('/')
+    )
+}
+
+pub fn target_lock_key(prefix: &str, target: &str) -> String {
+    execution_key(prefix, target).replace("/merge-executions/", "/target-locks/")
+}
+
+pub fn execution_owner(execution: &Execution) -> String {
+    format!("merge-execution:{}", execution.id)
+}
+
+fn encode(execution: &Execution) -> Vec<u8> {
+    serde_json::to_vec(execution).expect("execution is JSON serializable")
+}
+
+impl Coordinator {
+    pub fn new(client: Client, prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            prefix: prefix.into(),
+        }
+    }
+
+    pub async fn get(&self, target: &str) -> Result<Option<Execution>> {
+        self.get_with_revision(target).await.map(|(value, _)| value)
+    }
+
+    /// The read revision closes the gap between this snapshot and an execution
+    /// watch. Watch notifications never replace authoritative ownership reads.
+    pub async fn get_with_revision(&self, target: &str) -> Result<(Option<Execution>, i64)> {
+        let response = self
+            .client
+            .clone()
+            .get(execution_key(&self.prefix, target), None)
+            .observed(Operation::MergeRead)
+            .await
+            .map_err(|e| e.to_string())?;
+        let revision = response
+            .header()
+            .ok_or("execution read missing revision")?
+            .revision();
+        let value = response
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        Ok((value, revision))
+    }
+
+    /// Bounded recovery inventory; execution records themselves are durable
+    /// demand even if a process died before writing its failure ledger.
+    pub async fn execution_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<Execution>, Option<String>)> {
+        let (rows, next) = self.execution_observation_page(after).await?;
+        Ok((rows.into_iter().map(|row| row.execution).collect(), next))
+    }
+
+    /// Preserve the version already returned by this bounded read, so delayed
+    /// scans cannot enqueue work after an execution has been released/replaced.
+    pub async fn execution_observation_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<ExecutionObservation>, Option<String>)> {
+        let prefix = format!("{}/merge-executions/", self.prefix.trim_end_matches('/'));
+        let (start, options) = match after {
+            None => (prefix.clone(), etcd_client::GetOptions::new().with_prefix()),
+            Some(key) if key.starts_with(&prefix) => {
+                let mut end = prefix.as_bytes().to_vec();
+                *end.last_mut().unwrap() += 1;
+                (
+                    format!("{key}\0"),
+                    etcd_client::GetOptions::new().with_range(end),
+                )
+            }
+            Some(_) => return Err("invalid execution cursor".into()),
+        };
+        let response = self
+            .client
+            .clone()
+            .get(start, Some(options.with_limit(256)))
+            .observed(Operation::MergeScan)
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows = response
+            .kvs()
+            .iter()
+            .map(|kv| {
+                let execution: Execution =
+                    serde_json::from_slice(kv.value()).map_err(|e| e.to_string())?;
+                if kv.key() != execution_key(&self.prefix, &execution.target).as_bytes() {
+                    return Err("execution target does not match inventory key".into());
+                }
+                Ok(ExecutionObservation {
+                    execution,
+                    revision: kv.mod_revision(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next = response
+            .more()
+            .then(|| {
+                response
+                    .kvs()
+                    .last()
+                    .map(|kv| String::from_utf8_lossy(kv.key()).into_owned())
+            })
+            .flatten();
+        Ok((rows, next))
+    }
+
+    /// Atomic claim check and admission close the delayed-request/lease-loss race.
+    pub async fn reserve(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
+        if execution.phase != Phase::Reserved
+            || execution.background
+            || execution.timeout_secs == 0
+            || execution.protocol != 2
+        {
+            return Err("invalid merge execution reservation".into());
+        }
+        self.reserve_record(claim, execution).await
+    }
+
+    /// Record an unfenced HTTP execution BEFORE sending its request. Protocol 0
+    /// cannot be recovered using protocol 2 storage barriers. Running is
+    /// deliberate: a legacy worker cannot CAS Reserved -> Running, so even a
+    /// crash before send must conservatively retain ownership.
+    pub async fn admit_legacy(
+        &self,
+        claim: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<Execution> {
+        let mut execution = Execution::new(target, endpoint, "legacy-http", 1);
+        execution.protocol = 0;
+        execution.phase = Phase::Running;
+        if !self.reserve_record(claim, &execution).await? {
+            return Err(
+                "claim lost or execution already present before legacy merge admission".into(),
+            );
+        }
+        Ok(execution)
+    }
+
+    async fn reserve_record(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
+        let key = execution_key(&self.prefix, &execution.target);
+        self.transact_observed(
+            Operation::MergeReserve,
+            vec![
+                Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
+                Compare::version(key.as_str(), CompareOp::Equal, 0),
+                Compare::value(
+                    target_lock_key(&self.prefix, &execution.target),
+                    CompareOp::Equal,
+                    claim.token.as_bytes(),
+                ),
+            ],
+            vec![
+                TxnOp::put(key, encode(execution), None),
+                TxnOp::put(
+                    target_lock_key(&self.prefix, &execution.target),
+                    execution_owner(execution),
+                    None,
+                ),
+            ],
+        )
+        .await
+    }
+
+    pub async fn start(&self, execution: &Execution) -> Result<Option<Execution>> {
+        if execution.phase != Phase::Reserved {
+            return Err("execution is not reserved".into());
+        }
+        let mut running = execution.clone();
+        running.phase = Phase::Running;
+        Ok(self.replace(execution, &running).await?.then_some(running))
+    }
+
+    pub async fn finish(&self, running: &Execution, outcome: Result<usize>) -> Result<bool> {
+        if running.phase != Phase::Running {
+            return Err("execution is not running".into());
+        }
+        self.replace(running, &running.finished(outcome)).await
+    }
+
+    /// The Rust write future ended with an ambiguous storage result. This is
+    /// durable diagnostic evidence, not permission to hand off storage writes.
+    pub async fn report_uncertain(&self, running: &Execution, error: String) -> Result<bool> {
+        if running.phase != Phase::Running {
+            return Err("execution is not running".into());
+        }
+        let mut next = running.finished(Err(error));
+        next.phase = Phase::Uncertain;
+        self.replace(running, &next).await
+    }
+
+    /// Cancelling an unstarted request is a CAS. A late POST cannot start it.
+    pub async fn cancel_reserved(&self, execution: &Execution) -> Result<bool> {
+        if execution.phase != Phase::Reserved {
+            return Ok(false);
+        }
+        self.replace(
+            execution,
+            &execution.finished(Err("cancelled before admission".into())),
+        )
+        .await
+    }
+
+    /// Cancel only a protocol-2 reservation that still has no admitted writer.
+    /// The claim, exact execution, and persistent target owner are compared in
+    /// one transaction. A racing start wins or loses this same execution CAS;
+    /// neither a stale recovery claim nor a late start can reclaim ownership.
+    pub async fn cancel_reserved_for_recovery(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+    ) -> Result<Option<Execution>> {
+        if execution.protocol != 2 || execution.phase != Phase::Reserved {
+            return Err("recovery cancellation requires a protocol-2 reservation".into());
+        }
+        let mut terminal = execution.finished(Err(RESERVED_RECOVERY_REASON.into()));
+        terminal.phase = Phase::Recovered;
+        Ok(self
+            .transact(
+                vec![
+                    Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
+                    Compare::value(
+                        execution_key(&self.prefix, &execution.target),
+                        CompareOp::Equal,
+                        encode(execution),
+                    ),
+                    Compare::value(
+                        target_lock_key(&self.prefix, &execution.target),
+                        CompareOp::Equal,
+                        execution_owner(execution),
+                    ),
+                ],
+                vec![TxnOp::put(
+                    execution_key(&self.prefix, &execution.target),
+                    encode(&terminal),
+                    None,
+                )],
+            )
+            .await?
+            .then_some(terminal))
+    }
+
+    /// Never delete on elapsed time, an HTTP error, or claim expiry. Both the
+    /// terminal result and the current task claim must still match atomically.
+    pub async fn release(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
+        self.release_inner(claim, execution, false).await
+    }
+
+    /// Retire an orphan catch-up reservation only in the same transaction as
+    /// its cancelled execution. Never clear a marker on time or Pod absence.
+    pub async fn release_orphaned_catchup(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+    ) -> Result<bool> {
+        if !execution.unstarted_catchup() || execution.phase != Phase::Recovered {
+            return Err(
+                "orphan catch-up release requires a cancelled protocol-2 reservation".into(),
+            );
+        }
+        self.release_inner(claim, execution, true).await
+    }
+
+    async fn release_inner(
+        &self,
+        claim: &ClaimProof,
+        execution: &Execution,
+        orphaned_catchup: bool,
+    ) -> Result<bool> {
+        if !matches!(execution.phase, Phase::Finished | Phase::Recovered) {
+            return Err("cannot release a live execution".into());
+        }
+        let key = execution_key(&self.prefix, &execution.target);
+        let (mut compares, mut operations) = self.completion_changes(execution).await?;
+        if orphaned_catchup {
+            let active = key.replace("/merge-executions/", "/catchup-active/");
+            compares.extend([
+                Compare::value(
+                    active.as_str(),
+                    CompareOp::Equal,
+                    execution.instance.as_bytes(),
+                ),
+                Compare::version(
+                    key.replace("/merge-executions/", "/catchup-records/"),
+                    CompareOp::Equal,
+                    0,
+                ),
+            ]);
+            operations.push(TxnOp::delete(active, None));
+        }
+        compares.extend([
+            Compare::value(claim.key.as_str(), CompareOp::Equal, claim.token.as_bytes()),
+            Compare::value(key.as_str(), CompareOp::Equal, encode(execution)),
+            Compare::value(
+                target_lock_key(&self.prefix, &execution.target),
+                CompareOp::Equal,
+                execution_owner(execution),
+            ),
+        ]);
+        operations.extend([
+            self.remove_permits(execution),
+            self.remove_progress(execution),
+            self.remove_work_progress(execution),
+            TxnOp::delete(key, None),
+            TxnOp::put(
+                target_lock_key(&self.prefix, &execution.target),
+                claim.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(claim.lease_id)),
+            ),
+        ]);
+        self.transact_observed(Operation::MergeRelease, compares, operations)
+            .await
+    }
+
+    async fn replace(&self, old: &Execution, new: &Execution) -> Result<bool> {
+        let key = execution_key(&self.prefix, &old.target);
+        self.transact_observed(
+            if new.phase == Phase::Running {
+                Operation::MergeStart
+            } else {
+                Operation::MergeTerminal
+            },
+            vec![Compare::value(key.as_str(), CompareOp::Equal, encode(old))],
+            vec![TxnOp::put(key, encode(new), None)],
+        )
+        .await
+    }
+
+    pub(crate) async fn transact(
+        &self,
+        compares: Vec<Compare>,
+        operations: Vec<TxnOp>,
+    ) -> Result<bool> {
+        self.transact_observed(Operation::MergeOther, compares, operations)
+            .await
+    }
+
+    pub(crate) async fn transact_observed(
+        &self,
+        operation: Operation,
+        compares: Vec<Compare>,
+        operations: Vec<TxnOp>,
+    ) -> Result<bool> {
+        self.client
+            .clone()
+            .txn(Txn::new().when(compares).and_then(operations))
+            .observed(operation)
+            .await
+            .map(|r| r.succeeded())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The executor owns this future independently of the request handler. On
+/// cancellation, drop its scoped storage future *before* publishing Finished.
+/// Callers must not pass a detached JoinHandle: dropping one does not stop it.
+pub async fn execute_scoped<F, T>(
+    work: F,
+    timeout: std::time::Duration,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    execute_until_cancelled(
+        async {
+            tokio::time::timeout(timeout, work)
+                .await
+                .unwrap_or_else(|_| Err("merge execution deadline exceeded".into()))
+        },
+        cancel,
+    )
+    .await
+}
+
+/// The caller supplies a real-progress watchdog. Cancellation drops the storage
+/// future before returning, without a total runtime ceiling on useful work.
+pub async fn execute_until_cancelled<F, T>(
+    work: F,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if *cancel.borrow_and_update() { return; }
+                if cancel.changed().await.is_err() { std::future::pending::<()>().await; }
+            }
+        } => Err("merge execution cancelled".into()),
+        result = work => result,
+    }
+}
+
+#[derive(Clone, Debug, clap::Args)]
+pub struct EtcdConfig {
+    /// Comma-separated etcd v3 endpoints. Scheduler state (task queue,
+    /// lease-based claims, per-experiment write locks) lives in etcd so several
+    /// stateless master replicas can share one queue. Required.
+    #[arg(long, env = "ETCD_ENDPOINTS", value_delimiter = ',')]
+    pub etcd_endpoints: Vec<String>,
+
+    /// Namespace for all lance-context master keys in etcd.
+    #[arg(long, env = "ETCD_PREFIX", default_value = "/lance-context/master")]
+    pub etcd_prefix: String,
+
+    /// Optional etcd username. `ETCD_PASSWORD` must also be set.
+    #[arg(long, env = "ETCD_USERNAME")]
+    pub etcd_username: Option<String>,
+
+    /// Optional etcd password. `ETCD_USERNAME` must also be set.
+    #[arg(long, env = "ETCD_PASSWORD")]
+    pub etcd_password: Option<String>,
+
+    /// Optional PEM CA certificate path for etcd TLS.
+    #[arg(long, env = "ETCD_CA_CERT")]
+    pub etcd_ca_cert: Option<String>,
+
+    /// Optional PEM client certificate path for etcd mutual TLS.
+    #[arg(long, env = "ETCD_CLIENT_CERT")]
+    pub etcd_client_cert: Option<String>,
+
+    /// Optional PEM client private-key path for etcd mutual TLS.
+    #[arg(long, env = "ETCD_CLIENT_KEY")]
+    pub etcd_client_key: Option<String>,
+}
+
+impl EtcdConfig {
+    pub async fn connect(&self) -> Result<Coordinator> {
+        use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
+        use std::time::Duration;
+        let config = self;
+        let mut options = ConnectOptions::new()
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_timeout(Duration::from_secs(10))
+            .with_keep_alive(Duration::from_secs(10), Duration::from_secs(3))
+            .with_require_leader(true);
+        match (&config.etcd_username, &config.etcd_password) {
+            (Some(username), Some(password)) => {
+                options = options.with_user(username, password);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(String::from(
+                    "ETCD_USERNAME and ETCD_PASSWORD must be configured together",
+                ))
+            }
+        }
+        if let Some(path) = &config.etcd_ca_cert {
+            let pem = std::fs::read(path)
+                .map_err(|err| format!("failed to read ETCD_CA_CERT '{path}': {err}"))?;
+            let mut tls = TlsOptions::new().ca_certificate(Certificate::from_pem(pem));
+            match (&config.etcd_client_cert, &config.etcd_client_key) {
+                (Some(cert), Some(key)) => {
+                    let cert_pem = std::fs::read(cert).map_err(|err| {
+                        format!("failed to read ETCD_CLIENT_CERT '{cert}': {err}")
+                    })?;
+                    let key_pem = std::fs::read(key)
+                        .map_err(|err| format!("failed to read ETCD_CLIENT_KEY '{key}': {err}"))?;
+                    tls = tls.identity(Identity::from_pem(cert_pem, key_pem));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(String::from(
+                        "ETCD_CLIENT_CERT and ETCD_CLIENT_KEY must be configured together",
+                    ))
+                }
+            }
+            options = options.with_tls(tls);
+        } else if config.etcd_client_cert.is_some() || config.etcd_client_key.is_some() {
+            return Err(String::from(
+                "ETCD_CA_CERT is required when configuring an etcd client certificate",
+            ));
+        }
+        let client = Client::connect(config.etcd_endpoints.clone(), Some(options))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(Coordinator::new(client, self.etcd_prefix.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::sync::{oneshot, watch};
+
+    struct InFlight(Arc<AtomicBool>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_drops_the_writer_before_terminal_acknowledgement() {
+        let writing = Arc::new(AtomicBool::new(false));
+        let flag = writing.clone();
+        let (_cancel, rx) = watch::channel(false);
+        let result = execute_scoped(
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                let _guard = InFlight(flag);
+                std::future::pending::<Result<usize>>().await
+            },
+            Duration::from_secs(600),
+            rx,
+        )
+        .await;
+        assert!(result.unwrap_err().contains("deadline"));
+        assert!(!writing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn disconnected_caller_does_not_detach_uncontrolled_work() {
+        let writing = Arc::new(AtomicBool::new(false));
+        let flag = writing.clone();
+        let (cancel, rx) = watch::channel(false);
+        let (entered, began) = oneshot::channel();
+        // The HTTP handler owns only admission, never this executor's lifetime.
+        let executor = tokio::spawn(execute_scoped(
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                let _guard = InFlight(flag);
+                entered.send(()).unwrap();
+                std::future::pending::<Result<usize>>().await
+            },
+            Duration::from_secs(600),
+            rx,
+        ));
+        began.await.unwrap();
+        assert!(writing.load(Ordering::SeqCst));
+        cancel.send(true).unwrap();
+        assert!(executor.await.unwrap().unwrap_err().contains("cancelled"));
+        assert!(!writing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_request_never_polls_storage() {
+        let (cancel, rx) = watch::channel(false);
+        cancel.send(true).unwrap();
+        let result: Result<usize> = execute_scoped(
+            async { panic!("must not execute storage") },
+            Duration::from_secs(1),
+            rx,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn maintenance_records_preserve_legacy_worker_encoding_and_require_new_readers() {
+        let legacy = Execution::new("table", "http://worker", "instance", 600);
+        let encoded = encode(&legacy);
+        assert!(!String::from_utf8_lossy(&encoded).contains("maintenance"));
+        assert_eq!(
+            serde_json::from_slice::<Execution>(&encoded).unwrap(),
+            legacy
+        );
+        for kind in [
+            MaintenanceKind::Compact,
+            MaintenanceKind::IndexId,
+            MaintenanceKind::Repair,
+            MaintenanceKind::Catchup,
+        ] {
+            let mut local = legacy.clone();
+            local.maintenance = Some(kind);
+            local.endpoint = kind.endpoint().into();
+            let encoded = encode(&local);
+            assert_eq!(
+                serde_json::from_slice::<Execution>(&encoded).unwrap(),
+                local
+            );
+            assert_eq!(MaintenanceKind::from_endpoint(&local.endpoint), Some(kind));
+            // An old reader omits the new field on re-encoding: its value CAS
+            // cannot start, finish, freeze or release this local execution.
+            let mut old_reader = local.clone();
+            old_reader.maintenance = None;
+            assert_ne!(encode(&old_reader), encoded);
+        }
+        assert_eq!(MaintenanceKind::from_endpoint("http://worker"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_inventory_pages_without_crossing_namespace() {
+        let (coordinator, mut client, _, _) = fixture().await;
+        for n in 0..257 {
+            let execution = Execution::new(&format!("table-{n:03}"), "master:repair", "lost", 60);
+            client
+                .put(
+                    execution_key(&coordinator.prefix, &execution.target),
+                    encode(&execution),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let (first, cursor) = coordinator.execution_page(None).await.unwrap();
+        assert_eq!(first.len(), 256);
+        let (last, done) = coordinator.execution_page(cursor.as_deref()).await.unwrap();
+        assert_eq!(last.len(), 1);
+        assert!(done.is_none());
+        assert!(!first.iter().any(|e| e.id == last[0].id));
+        assert!(coordinator
+            .execution_page(Some("/another-prefix/key"))
+            .await
+            .is_err());
+    }
+
+    // Isolated prefix on a LOCAL test etcd. These tests never use production.
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn owner_watch_ignores_own_progress_and_replays_revocation_and_delete() {
+        let (coordinator, _client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        for sequence in 1..=8 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watch.changed())
+                .await
+                .is_err()
+        );
+        drop(watch);
+
+        // Revoke after the read but before subscribing: revision + 1 must replay it.
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(frozen.clone())
+        );
+        drop(watch);
+
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS; compacts test instance"]
+    async fn owner_watch_compaction_requires_refresh_not_fencing() {
+        assert_eq!(
+            std::env::var("ETCD_TEST_ALLOW_COMPACTION").as_deref(),
+            Ok("1")
+        );
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        for sequence in 1..=3 {
+            assert!(coordinator
+                .publish_progress(&running, sequence)
+                .await
+                .unwrap());
+        }
+        let (_, compact_revision) = coordinator.get_with_revision("table").await.unwrap();
+        client.compact(compact_revision, None).await.unwrap();
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(watch);
+        let (current, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert_eq!(current, Some(running.clone()));
+        let mut watch = coordinator
+            .watch_execution_owner("table", revision)
+            .await
+            .unwrap();
+        assert!(coordinator.finish(&running, Ok(3)).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_watch_replays_progress_and_terminal_changes_during_setup() {
+        let (coordinator, _client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.publish_progress(&running, 7).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            7
+        );
+        drop(watch);
+
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.finish(&running, Ok(9)).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let terminal = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(terminal.phase, Phase::Finished);
+        assert_eq!(terminal.reclaimed, 9);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn execution_watch_isolates_other_executions_and_ignores_watch_heartbeats() {
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution(&execution, revision)
+            .await
+            .unwrap();
+        let other = format!("{}/merge-progress/other", coordinator.prefix);
+        let publisher = tokio::spawn(async move {
+            for step in 0..40 {
+                client
+                    .put(other.clone(), step.to_string(), None)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), watch.changed())
+                .await
+                .is_err()
+        );
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(coordinator.get("table").await.unwrap().unwrap(), running);
+        publisher.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn typed_progress_watch_replays_payload_and_refreshes_on_owner_or_delete() {
+        use crate::progress::ExecutionUpdate;
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        assert!(coordinator.publish_progress(&running, 7).await.unwrap());
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Progress(7)
+        );
+        // A target reuse cannot feed another execution's sequence into this watch.
+        client
+            .put(
+                format!("{}/merge-progress/other", coordinator.prefix),
+                r#"{"sequence":999}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), watch.next_update())
+                .await
+                .is_err()
+        );
+        client
+            .delete(
+                format!("{}/merge-progress/{}", coordinator.prefix, running.id),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Refresh
+        );
+        assert!(coordinator.finish(&running, Ok(4)).await.unwrap());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecutionUpdate::Refresh
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn typed_progress_watch_rejects_malformed_payload() {
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution(&execution, revision)
+            .await
+            .unwrap();
+        client
+            .put(
+                format!("{}/merge-progress/{}", coordinator.prefix, execution.id),
+                "malformed",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.next_update())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(execution));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS; compacts test instance"]
+    async fn execution_watch_compaction_requires_fresh_snapshot_then_resumes() {
+        assert_eq!(
+            std::env::var("ETCD_TEST_ALLOW_COMPACTION").as_deref(),
+            Ok("1")
+        );
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        for step in 1..=3 {
+            assert!(coordinator.publish_progress(&running, step).await.unwrap());
+        }
+        let (_, compact_revision) = coordinator.get_with_revision("table").await.unwrap();
+        client.compact(compact_revision, None).await.unwrap();
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), watch.changed())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        drop(watch);
+        let (_, revision) = coordinator.get_with_revision("table").await.unwrap();
+        let mut watch = coordinator
+            .watch_execution(&running, revision)
+            .await
+            .unwrap();
+        assert!(coordinator.finish(&running, Ok(3)).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn fixture() -> (Coordinator, Client, ClaimProof, i64) {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("ETCD_TEST_ENDPOINTS is required for ignored etcd tests");
+        let mut client = Client::connect([endpoint], None).await.unwrap();
+        let prefix = format!("/merge-execution-tests/{}", uuid::Uuid::new_v4());
+        let lease = client.lease_grant(30, None).await.unwrap().id();
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/test"),
+            token: "original".into(),
+            lease_id: lease,
+        };
+        client
+            .put(
+                target_lock_key(&prefix, "table"),
+                proof.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        client
+            .put(
+                proof.key.clone(),
+                proof.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(lease)),
+            )
+            .await
+            .unwrap();
+        (
+            Coordinator::new(client.clone(), prefix),
+            client,
+            proof,
+            lease,
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn native_failure_retirement_preserves_new_debt_and_lost_ownership() {
+        let (c, mut client, proof, _) = fixture().await;
+        let endpoint = "http://worker:3000";
+        let error =
+            format!("error sending request for url ({endpoint}/api/v1/internal/merge-executor)");
+        c.record_failure(&proof, "table", endpoint, &error)
+            .await
+            .unwrap();
+        let observed = c
+            .target_failure_observations("table")
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(c
+            .target_failure_observations("other-table")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut reserved =
+            Execution::new("table", MaintenanceKind::Catchup.endpoint(), "native", 60);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(c.reserve(&proof, &reserved).await.unwrap());
+        let running = c.start(&reserved).await.unwrap().unwrap();
+        c.record_failure(&proof, "table", endpoint, &error)
+            .await
+            .unwrap();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &observed)
+            .await
+            .unwrap());
+        let fresh = c
+            .target_failure_observations("table")
+            .await
+            .unwrap()
+            .remove(0);
+        let mut wrong_execution = running.clone();
+        wrong_execution.id = uuid::Uuid::new_v4().to_string();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &wrong_execution, &fresh)
+            .await
+            .unwrap());
+        let mut wrong_claim = proof.clone();
+        wrong_claim.token = "not-the-owner".into();
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&wrong_claim, &running, &fresh)
+            .await
+            .unwrap());
+        assert_eq!(
+            c.failure("table", endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            2
+        );
+        assert!(c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
+            .await
+            .unwrap());
+        assert!(c.failure("table", endpoint).await.unwrap().is_none());
+        assert_eq!(c.get("table").await.unwrap().unwrap(), running);
+        assert!(!c
+            .clear_observed_failure_after_native_recovery(&proof, &running, &fresh)
+            .await
+            .unwrap());
+        client
+            .delete(
+                format!("{}/", c.prefix),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_preserves_unrelated_failure_budgets() {
+        for error in [
+            None,
+            Some("storage status=403 forbidden"),
+            Some("invalid schema"),
+            Some("storage timeout"),
+            Some("merge ownership unresolved: storage status=403"),
+        ] {
+            let (coordinator, _, proof, _) = fixture().await;
+            let reserved = Execution::new("table", "master:catchup", "old", 600);
+            assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+            if let Some(error) = error {
+                for _ in 0..15 {
+                    coordinator
+                        .record_failure(&proof, "table", "master:catchup", error)
+                        .await
+                        .unwrap();
+                }
+            }
+            let before = coordinator
+                .failure("table", "master:catchup")
+                .await
+                .unwrap();
+            let terminal = coordinator
+                .cancel_reserved_for_recovery(&proof, &reserved)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            let after = coordinator
+                .failure("table", "master:catchup")
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_retry_probe_rejects_stale_claim_and_failure_revision() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let reserved = Execution::new("table", "master:catchup", "old", 600);
+        assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+        let protocol_error = "merge ownership unresolved: recovery barrier failed: execution lacks recoverable storage fencing protocol";
+        coordinator
+            .record_failure(&proof, "table", "master:catchup", protocol_error)
+            .await
+            .unwrap();
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = coordinator
+            .failure("table", "master:catchup")
+            .await
+            .unwrap();
+        client.lease_revoke(lease).await.unwrap();
+        assert!(!coordinator.release(&proof, &terminal).await.unwrap());
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(
+                coordinator
+                    .failure("table", "master:catchup")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(terminal.clone())
+        );
+        let replacement = ClaimProof {
+            key: proof.key.clone(),
+            token: "replacement".into(),
+            lease_id: client.lease_grant(30, None).await.unwrap().id(),
+        };
+        client
+            .put(
+                replacement.key.clone(),
+                replacement.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(replacement.lease_id)),
+            )
+            .await
+            .unwrap();
+        // A concurrent newer failure must not be overwritten by a stale decision
+        // to make the recovered protocol failure eligible for one probe.
+        let (compares, operations) = coordinator.completion_changes(&terminal).await.unwrap();
+        assert!(!operations.is_empty());
+        coordinator
+            .record_failure(
+                &replacement,
+                "table",
+                "master:catchup",
+                "status=403 forbidden",
+            )
+            .await
+            .unwrap();
+        assert!(!coordinator.transact(compares, operations).await.unwrap());
+        let newer = coordinator
+            .failure("table", "master:catchup")
+            .await
+            .unwrap();
+        assert!(coordinator.release(&replacement, &terminal).await.unwrap());
+        assert_eq!(
+            serde_json::to_value(newer).unwrap(),
+            serde_json::to_value(
+                coordinator
+                    .failure("table", "master:catchup")
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert!(coordinator.get("table").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_excludes_a_racing_start_and_preserves_running_permits() {
+        let (coordinator, _, proof, _) = fixture().await;
+        for mode in 0..24 {
+            let mut reserved = Execution::new("table", "master:catchup", "old", 600);
+            reserved.maintenance = Some(MaintenanceKind::Catchup);
+            assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+            let (started, cancelled) = match mode {
+                0 => {
+                    let cancelled = coordinator
+                        .cancel_reserved_for_recovery(&proof, &reserved)
+                        .await;
+                    (coordinator.start(&reserved).await, cancelled)
+                }
+                1 => {
+                    let started = coordinator.start(&reserved).await;
+                    (
+                        started,
+                        coordinator
+                            .cancel_reserved_for_recovery(&proof, &reserved)
+                            .await,
+                    )
+                }
+                _ => tokio::join!(
+                    coordinator.start(&reserved),
+                    coordinator.cancel_reserved_for_recovery(&proof, &reserved)
+                ),
+            };
+            let started = started.unwrap();
+            let cancelled = cancelled.unwrap();
+            assert_ne!(started.is_some(), cancelled.is_some());
+            if let Some(terminal) = cancelled {
+                assert_eq!(terminal.phase, Phase::Recovered);
+                assert!(coordinator.start(&reserved).await.unwrap().is_none());
+                let mut late = reserved.clone();
+                late.phase = Phase::Running;
+                assert!(coordinator
+                    .authorize_commit(&late, "file:///table", "base", 7)
+                    .await
+                    .is_err());
+                assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            } else {
+                let running = started.unwrap();
+                coordinator
+                    .authorize_commit(&running, "file:///table", "base", 7)
+                    .await
+                    .unwrap();
+                assert!(coordinator
+                    .cancel_reserved_for_recovery(&proof, &reserved)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(coordinator.release(&proof, &running).await.is_err());
+                assert_eq!(
+                    coordinator.get("table").await.unwrap(),
+                    Some(running.clone())
+                );
+                let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+                assert_eq!(
+                    coordinator.watermarks(&frozen).await.unwrap().versions["base"],
+                    7
+                );
+                assert!(coordinator
+                    .authorize_commit(&running, "file:///table", "base", 8)
+                    .await
+                    .is_err());
+                // Coordinator-only fixture: no actual storage write was issued.
+                assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+                let terminal = coordinator.get("table").await.unwrap().unwrap();
+                assert!(coordinator.release(&proof, &terminal).await.unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn reserved_recovery_rejects_expired_claim_and_unknown_protocol() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let mut reserved = Execution::new("table", "master:catchup", "old", 600);
+        reserved.maintenance = Some(MaintenanceKind::Catchup);
+        assert!(coordinator.reserve(&proof, &reserved).await.unwrap());
+        client.lease_revoke(lease).await.unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(reserved.clone())
+        );
+        let next_lease = client.lease_grant(30, None).await.unwrap().id();
+        let next = ClaimProof {
+            token: "replacement".into(),
+            lease_id: next_lease,
+            ..proof.clone()
+        };
+        client
+            .put(
+                next.key.clone(),
+                next.token.clone(),
+                Some(etcd_client::PutOptions::new().with_lease(next_lease)),
+            )
+            .await
+            .unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&proof, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        // Existing records with an unknown protocol must remain protected.
+        let mut unknown = reserved.clone();
+        unknown.protocol = 0;
+        client
+            .put(
+                execution_key(&coordinator.prefix, "table"),
+                encode(&unknown),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&next, &unknown)
+            .await
+            .is_err());
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(unknown));
+        client
+            .put(
+                execution_key(&coordinator.prefix, "table"),
+                encode(&reserved),
+                None,
+            )
+            .await
+            .unwrap();
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&next, &reserved)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!coordinator.release(&proof, &terminal).await.unwrap());
+        assert!(coordinator.release(&next, &terminal).await.unwrap());
+        let successor = Execution::new("table", "master:catchup", "new", 600);
+        assert!(coordinator.reserve(&next, &successor).await.unwrap());
+        assert!(coordinator
+            .cancel_reserved_for_recovery(&next, &reserved)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(successor.clone())
+        );
+        let terminal = coordinator
+            .cancel_reserved_for_recovery(&next, &successor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.release(&next, &terminal).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_demand_coalesces_without_resetting_failure_backoff() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let mut last = None;
+        for _ in 0..4 {
+            last = Some(
+                coordinator
+                    .record_failure(&proof, "table", "worker", "storage timeout")
+                    .await
+                    .unwrap(),
+            );
+        }
+        for _ in 0..10 {
+            coordinator.request_merge("table").await.unwrap();
+        }
+        let (rows, next) = coordinator.request_page(None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, "table");
+        assert!(next.is_none());
+        let after = coordinator
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .unwrap();
+        let before = last.unwrap();
+        assert_eq!(after.consecutive_attempts, 4);
+        assert_eq!(after.next_retry_ms, before.next_retry_ms);
+        // A later flush must survive the old demand acknowledgement.
+        coordinator.request_merge("table").await.unwrap();
+        assert!(!coordinator.acknowledge_request(&rows[0]).await.unwrap());
+        let newer = coordinator.request_page(None).await.unwrap().0;
+        assert!(coordinator.acknowledge_request(&newer[0]).await.unwrap());
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        coordinator.request_merge("table").await.unwrap();
+        assert_eq!(
+            coordinator.request_page(None).await.unwrap().0[0].target,
+            "table"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn progress_cannot_resurrect_a_frozen_or_released_execution() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let execution = Execution::new("table", "worker", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        assert!(coordinator.publish_progress(&running, 4).await.unwrap());
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            4
+        );
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        assert!(!coordinator.publish_progress(&running, 5).await.unwrap());
+        // Empty watermarks: this test did not authorize any storage writes.
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(coordinator.progress(&running).await.unwrap().is_none());
+        assert!(!coordinator.publish_progress(&running, 6).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn detailed_work_keeps_legacy_progress_cas_and_cannot_resurrect_execution() {
+        let (coordinator, _, proof, _) = fixture().await;
+        let execution = Execution::new("table", "master:catchup", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let report = serde_json::json!({"sequence": 4, "work": {"wal_rows_read": 100}});
+        assert!(coordinator
+            .publish_work_progress(&running, 4, report.clone())
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator.work_progress(&running).await.unwrap(),
+            Some(report.clone())
+        );
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            4
+        );
+        // One-revision snapshot: execution, sequence and report agree.
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.execution, running);
+        assert_eq!(snapshot.progress.as_ref().map(|p| p.sequence), Some(4));
+        assert_eq!(snapshot.work_report, Some(report.clone()));
+        assert!(snapshot.revision > 0);
+        // A heartbeat that advances the sequence without a new report must
+        // not render the old report as current.
+        assert!(coordinator.publish_progress(&running, 5).await.unwrap());
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.progress.as_ref().map(|p| p.sequence), Some(5));
+        assert!(snapshot.work_report.is_none(), "stale report dropped");
+        assert!(coordinator
+            .publish_work_progress(&running, 4, report.clone())
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator
+                .progress(&running)
+                .await
+                .unwrap()
+                .unwrap()
+                .sequence,
+            5,
+            "a stale detailed report must not overwrite a newer sequence"
+        );
+        assert!(coordinator
+            .progress_snapshot("absent")
+            .await
+            .unwrap()
+            .is_none());
+        // A stale observation cannot revoke completed new work. Details have
+        // their own key, so the established exact-byte sequence CAS still works.
+        assert!(!coordinator.revoke_stalled(&running, Some(3)).await.unwrap());
+        assert!(!coordinator.revoke_stalled(&running, Some(4)).await.unwrap());
+        assert!(coordinator.revoke_stalled(&running, Some(5)).await.unwrap());
+        assert!(!coordinator
+            .publish_work_progress(&running, 5, report.clone())
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        let frozen = coordinator
+            .freeze(&proof, &uncertain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(coordinator.work_progress(&running).await.unwrap().is_none());
+        assert!(!coordinator
+            .publish_work_progress(&running, 6, report)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retried_work_progress_cannot_regress_after_ambiguous_or_delayed_publication() {
+        let (coordinator, mut client, proof, _) = fixture().await;
+        let execution = Execution::new("table", "master:catchup", "boot", 3600);
+        assert!(coordinator.reserve(&proof, &execution).await.unwrap());
+        let running = coordinator.start(&execution).await.unwrap().unwrap();
+        let progress_key = format!("{}/merge-progress/{}", coordinator.prefix, running.id);
+        let work_key = format!("{}/merge-work/{}", coordinator.prefix, running.id);
+        // Hold an old request with its original compare revision, then allow
+        // a retry to publish first. This models an RPC whose outcome is unknown.
+        let delayed = Txn::new()
+            .when(vec![
+                Compare::value(
+                    execution_key(&coordinator.prefix, "table"),
+                    CompareOp::Equal,
+                    encode(&running),
+                ),
+                Compare::mod_revision(progress_key.clone(), CompareOp::Equal, 0),
+            ])
+            .and_then(vec![
+                TxnOp::put(progress_key.clone(), br#"{"sequence":1}"#.to_vec(), None),
+                TxnOp::put(work_key, br#"{"sequence":1}"#.to_vec(), None),
+            ]);
+        let mut publisher = coordinator.work_progress_publisher(&running);
+        assert!(publisher
+            .publish(2, serde_json::json!({"sequence":2}))
+            .await
+            .unwrap());
+        assert!(!client.txn(delayed).await.unwrap().succeeded());
+        // A client that lost the acknowledgement still has revision zero.
+        // It must resolve the conflict and preserve normal future publications.
+        let mut lost_ack = coordinator.work_progress_publisher(&running);
+        assert!(lost_ack
+            .publish(2, serde_json::json!({"sequence":2}))
+            .await
+            .unwrap());
+        assert!(lost_ack
+            .publish(3, serde_json::json!({"sequence":3}))
+            .await
+            .unwrap());
+        assert!(publisher
+            .publish(1, serde_json::json!({"sequence":1}))
+            .await
+            .unwrap());
+        let snapshot = coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.progress.unwrap().sequence, 3);
+        assert_eq!(snapshot.work_report.unwrap()["sequence"], 3);
+        let frozen = coordinator.freeze(&proof, &running).await.unwrap().unwrap();
+        assert!(!lost_ack
+            .publish(4, serde_json::json!({"sequence":4}))
+            .await
+            .unwrap());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 7)
+            .await
+            .is_err());
+        assert!(coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &recovered).await.unwrap());
+        assert!(!publisher
+            .publish(5, serde_json::json!({"sequence":5}))
+            .await
+            .unwrap());
+        assert!(coordinator
+            .progress_snapshot("table")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn recovery_closes_commit_admission_and_retains_every_allowed_version() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&proof, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        coordinator
+            .authorize_commit(&running, "file:///table", "base", 7)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .authorize_commit(&running, "file:///wrong-table", "base", 8)
+            .await
+            .is_err());
+        client.lease_revoke(lease).await.unwrap();
+        // The old executor remains protected independently of its scheduler.
+        coordinator
+            .authorize_commit(&running, "file:///table", "base", 8)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .freeze(&proof, &running)
+            .await
+            .unwrap()
+            .is_none());
+        let next = ClaimProof {
+            token: "recovery-owner".into(),
+            lease_id: 0,
+            ..proof.clone()
+        };
+        client
+            .put(next.key.clone(), next.token.clone(), None)
+            .await
+            .unwrap();
+        let shard = format!("shard:{}", uuid::Uuid::new_v4());
+        coordinator
+            .authorize_commit(&running, "file:///table", &shard, 91)
+            .await
+            .unwrap();
+        let (admitted, frozen) = tokio::join!(
+            coordinator.authorize_commit(&running, "file:///table", "base", 9),
+            coordinator.freeze(&next, &running),
+        );
+        let frozen = frozen.unwrap().unwrap();
+        let plan = coordinator.watermarks(&frozen).await.unwrap();
+        assert_eq!(plan.dataset_uri.as_deref(), Some("file:///table"));
+        assert_eq!(plan.versions["base"], if admitted.is_ok() { 9 } else { 8 });
+        assert_eq!(plan.versions[&shard], 91);
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 10)
+            .await
+            .is_err());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", &shard, 92)
+            .await
+            .is_err());
+        assert!(coordinator.release(&next, &frozen).await.is_err());
+        assert!(!coordinator.finish_recovery(&proof, &frozen).await.unwrap());
+        // Storage fencing itself is tested against real manifests in core.
+        assert!(coordinator.finish_recovery(&next, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(recovered.phase, Phase::Recovered);
+        assert!(coordinator.release(&next, &recovered).await.unwrap());
+        assert!(coordinator
+            .authorize_commit(&running, "file:///table", "base", 11)
+            .await
+            .is_err());
+        // A successful barrier must not disguise a permanent data failure as
+        // another ownership failure with a short metadata-probe backoff.
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&next, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        assert!(coordinator
+            .report_uncertain(
+                &running,
+                "merge ownership unresolved: manifest commit result unknown; schema mismatch"
+                    .into(),
+            )
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        let frozen = coordinator
+            .freeze(&next, &uncertain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(coordinator.finish_recovery(&next, &frozen).await.unwrap());
+        let recovered = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&next, &recovered).await.unwrap());
+        let failure = coordinator
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.class, failure::FailureClass::DataOrConfiguration);
+        assert!(failure.needs_attention);
+        assert!(failure.last_error.contains("schema mismatch"));
+        assert_eq!(failure.next_retry_ms - failure.last_failure_ms, 3_600_000);
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn ambiguous_storage_response_cannot_release_the_execution() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let operation = Execution::new("table", "worker", "boot", 1);
+        assert!(coordinator.reserve(&proof, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        assert!(coordinator
+            .report_uncertain(&running, "storage response lost".into())
+            .await
+            .unwrap());
+        let uncertain = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(uncertain.phase, Phase::Uncertain);
+        assert!(coordinator.release(&proof, &uncertain).await.is_err());
+        assert!(!coordinator.finish(&running, Ok(1)).await.unwrap());
+        client.lease_revoke(lease).await.unwrap();
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(uncertain));
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn persisted_preparation_conflict_is_corrected_without_clearing_budget() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let error = "Invalid user input: index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:1529:24";
+        let endpoint = "master:index_id";
+        // Reproduce the previous binary's durable one-hour permanent-error record.
+        let mut old = coordinator
+            .record_failure(&proof, "table", endpoint, "schema mismatch")
+            .await
+            .unwrap();
+        old.last_error = error.into();
+        old.consecutive_attempts = 4;
+        let records = client
+            .get(
+                format!("{}/merge-failures/", coordinator.prefix),
+                Some(etcd_client::GetOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(records.kvs().len(), 1);
+        let key = records.kvs()[0].key().to_vec();
+        let encoded = serde_json::to_vec(&old).unwrap();
+        client
+            .put(key.clone(), encoded.clone(), None)
+            .await
+            .unwrap();
+
+        let reconnected = Coordinator::new(client.clone(), coordinator.prefix.clone());
+        let corrected = reconnected
+            .failure("table", endpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(corrected.class, failure::FailureClass::Retryable);
+        assert_eq!(corrected.consecutive_attempts, 4);
+        assert_eq!(corrected.next_retry_ms, old.last_failure_ms + 60_000);
+        assert!(!corrected.needs_attention);
+        let (page, next) = reconnected.failure_page(None, 1).await.unwrap();
+        assert!(next.is_none());
+        assert_eq!(
+            serde_json::to_value(&page[0]).unwrap(),
+            serde_json::to_value(&corrected).unwrap()
+        );
+        // Reads neither change persisted data nor release ownership.
+        assert_eq!(
+            client.get(key.clone(), None).await.unwrap().kvs()[0].value(),
+            encoded
+        );
+        assert_eq!(
+            client.get(proof.key.clone(), None).await.unwrap().kvs()[0].value(),
+            proof.token.as_bytes()
+        );
+
+        let next = reconnected
+            .record_failure(&proof, "table", endpoint, error)
+            .await
+            .unwrap();
+        assert_eq!(next.consecutive_attempts, 5);
+        assert_eq!(next.class, failure::FailureClass::Retryable);
+        assert_eq!(next.next_retry_ms, next.last_failure_ms + 120_000);
+        client.lease_revoke(lease).await.unwrap();
+        assert!(reconnected
+            .record_failure(&proof, "table", endpoint, error)
+            .await
+            .is_err());
+        assert!(reconnected
+            .clear_failure(&proof, "table", endpoint)
+            .await
+            .is_err());
+        assert_eq!(
+            reconnected
+                .failure("table", endpoint)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            5
+        );
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn failure_budget_survives_reconnect_and_lost_claim_cannot_clear_it() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        for count in 1..=3 {
+            let failure = coordinator
+                .record_failure(&proof, "table", "worker", "temporary failure")
+                .await
+                .unwrap();
+            assert_eq!(failure.consecutive_attempts, count);
+        }
+        let reconnected = Coordinator::new(client.clone(), coordinator.prefix.clone());
+        let failure = reconnected
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failure.consecutive_attempts, 3);
+        assert!(failure.next_retry_ms > failure.last_failure_ms + 20_000);
+        reconnected
+            .record_failure(&proof, "table2", "worker", "schema mismatch")
+            .await
+            .unwrap();
+        let (page, next) = reconnected.failure_page(None, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        let (second, end) = reconnected.failure_page(next.as_deref(), 1).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_ne!(page[0].target, second[0].target);
+        assert!(end.is_none());
+        client.lease_revoke(lease).await.unwrap();
+        assert!(reconnected
+            .clear_failure(&proof, "table", "worker")
+            .await
+            .is_err());
+        assert!(reconnected
+            .record_failure(&proof, "table", "worker", "stale writer")
+            .await
+            .is_err());
+        assert_eq!(
+            reconnected
+                .failure("table", "worker")
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            3
+        );
+        client
+            .put(proof.key.clone(), proof.token.clone(), None)
+            .await
+            .unwrap();
+        reconnected
+            .clear_failure(&proof, "table", "worker")
+            .await
+            .unwrap();
+        assert!(reconnected
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .is_none());
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn revoked_claim_cannot_release_surviving_server_work() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let operation = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &operation).await.unwrap());
+        let running = coordinator.start(&operation).await.unwrap().unwrap();
+        client.lease_revoke(lease).await.unwrap();
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(running.clone())
+        );
+        let next = ClaimProof {
+            key: proof.key.clone(),
+            token: "replacement".into(),
+            lease_id: 0,
+        };
+        client
+            .put(next.key.clone(), next.token.clone(), None)
+            .await
+            .unwrap();
+        assert!(!coordinator
+            .reserve(&next, &Execution::new("table", "worker2", "boot2", 600))
+            .await
+            .unwrap());
+        assert!(coordinator.release(&next, &running).await.is_err());
+        assert!(coordinator
+            .finish(&running, Err("cancelled".into()))
+            .await
+            .unwrap());
+        let done = coordinator.get("table").await.unwrap().unwrap();
+        assert!(!coordinator.release(&proof, &done).await.unwrap());
+        assert!(coordinator
+            .failure("table", "worker")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(coordinator.release(&next, &done).await.unwrap());
+        assert_eq!(
+            coordinator
+                .failure("table", "worker")
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            1,
+            "releasing a failed execution must atomically persist the retry budget"
+        );
+        assert!(coordinator
+            .reserve(&next, &Execution::new("table", "worker2", "boot2", 600))
+            .await
+            .unwrap());
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn delayed_http_start_cannot_resurrect_cancelled_operation() {
+        let (coordinator, mut client, proof, lease) = fixture().await;
+        let old = Execution::new("table", "worker", "boot", 600);
+        assert!(coordinator.reserve(&proof, &old).await.unwrap());
+        assert!(coordinator.cancel_reserved(&old).await.unwrap());
+        let done = coordinator.get("table").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &done).await.unwrap());
+        let new = Execution::new("table", "worker2", "boot2", 600);
+        assert!(coordinator.reserve(&proof, &new).await.unwrap());
+        assert!(coordinator.start(&old).await.unwrap().is_none());
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(new));
+        client.lease_revoke(lease).await.unwrap();
+        client
+            .delete(
+                coordinator.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+}

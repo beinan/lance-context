@@ -1,0 +1,2773 @@
+//! Background stats scanner.
+//!
+//! Every `stats_scan_interval_secs` the scanner enumerates all experiments from
+//! the registry, opens each one read-only with bounded concurrency, records its
+//! [`RolloutObservation`] into the stats table, and reconciles away rows for
+//! experiments that have since been deleted from the registry. Failures on a
+//! single experiment are logged and skipped; the next round retries.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::Utc;
+use futures::stream::{self, StreamExt};
+use lance_context_core::{
+    CompactionConfig, GenericStore, GenericStoreOptions, RolloutStore, RolloutStoreOptions,
+    StoreRegistry,
+};
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
+use crate::scheduler::generic_target;
+use crate::state::MasterState;
+use crate::stats_store::{unique_stats_rows, StatRow};
+use lance_context_api::{ExperimentSummary, TaskKind};
+
+/// Per-experiment open+observe timeout so one wedged dataset cannot stall a
+/// scan round.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+type ScanObservation = (String, Option<(StatRow, bool)>);
+
+/// Stop scheduling reads at the next table boundary. The caller still joins
+/// the bounded set of observations already admitted into `buffer_unordered`.
+fn observations_until_drain<'a, S: futures::Stream + 'a>(
+    admission: &'a crate::admission::Admission,
+    entries: S,
+) -> impl futures::Stream<Item = S::Item> + 'a {
+    entries.take_while(move |_| futures::future::ready(admission.is_accepting()))
+}
+
+fn require_scan_admission(state: &MasterState) -> lance::Result<()> {
+    if state.admission.is_accepting() {
+        Ok(())
+    } else {
+        Err(lance::Error::io(
+            "stats scan yielded during executor drain; previous snapshot retained",
+        ))
+    }
+}
+
+/// Early admission uses the ordinary durable queue, never a separate executor.
+/// Bound both new tasks and total control-plane time per scan. A degraded queue
+/// must not turn table observation into thousands of serial request timeouts.
+struct ScanMergeAdmission {
+    remaining: usize,
+    time_left: Duration,
+}
+
+impl ScanMergeAdmission {
+    fn new(state: &MasterState) -> Self {
+        Self {
+            remaining: if state.config.merge_wal_interval_secs == 0 {
+                0
+            } else {
+                crate::scheduler::MAX_SWEEP_ENQUEUE
+            },
+            time_left: Duration::from_secs(10),
+        }
+    }
+
+    async fn observe(&mut self, state: &Arc<MasterState>, row: &StatRow) {
+        if self.remaining == 0
+            || !state.admission.is_accepting()
+            || self.time_left.is_zero()
+            || row.pending_wal_generations <= 0
+            || row.pending_wal_generations < state.config.merge_wal_min_generations
+            || !state.config.admits_automatic_wal(&row.name)
+        {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let admit = async {
+            if state
+                .task_store
+                .is_cooling_down(TaskKind::MergeWal, &row.name)
+                .await?
+            {
+                return Ok(false);
+            }
+            let before = state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, &row.name)
+                .await?;
+            // Use the ordinary enqueue even when an active pointer exists:
+            // it validates the record and repairs a stale terminal pointer.
+            let task = state
+                .task_store
+                .enqueue_with_context(
+                    TaskKind::MergeWal,
+                    &row.name,
+                    vec![],
+                    crate::admission_telemetry::Context::stats(
+                        crate::admission_telemetry::Origin::Scan,
+                        row,
+                    ),
+                )
+                .await?;
+            // Another producer may have won the race. Count conservatively:
+            // admission must never exceed its bound because of concurrency.
+            Ok::<_, lance::Error>(before.as_deref() != Some(task.id.as_str()))
+        };
+        let result = tokio::time::timeout(self.time_left.min(Duration::from_secs(2)), admit).await;
+        self.time_left = self.time_left.saturating_sub(start.elapsed());
+        let outcome = match result {
+            Ok(Ok(true)) => {
+                self.remaining -= 1;
+                "enqueued"
+            }
+            Ok(Ok(false)) => "already_active_or_cooling_down",
+            result => {
+                // A timeout/error can follow a committed enqueue. Do not
+                // replay it or modify ownership; leave reconciliation to the
+                // durable queue and stop early admission for this round.
+                self.remaining = 0;
+                tracing::warn!(target = %row.name, ?result, "scan early merge admission stopped; observation continues");
+                "unavailable"
+            }
+        };
+        metrics::counter!("master_scan_merge_admission_total", "outcome" => outcome).increment(1);
+    }
+}
+
+/// Consume each completed observation before waiting for the rest of the scan.
+/// Incremental (base-version-unchanged) observations also recount pending WAL,
+/// so their counts are fresh and eligible. Failed observations are not.
+async fn collect_observations(
+    state: &Arc<MasterState>,
+    observations: impl futures::Stream<Item = ScanObservation>,
+) -> Vec<ScanObservation> {
+    futures::pin_mut!(observations);
+    let mut admission = ScanMergeAdmission::new(state);
+    let mut observed = Vec::new();
+    while let Some(result) = observations.next().await {
+        if let (_, Some((row, _))) = &result {
+            admission.observe(state, row).await;
+        }
+        observed.push(result);
+    }
+    observed
+}
+
+/// Bound on the compaction half of one `_stats` maintenance pass, which runs
+/// under the store lock, so a slow object store cannot wedge the scanner loop.
+///
+/// The cleanup half is not bounded: see [`maintain_stats`].
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bound on the merge and compaction steps of retiring one experiment. Larger
+/// than `OBSERVE_TIMEOUT` because both genuinely rewrite data; a retirement that
+/// exceeds it is abandoned and retried next round, which is harmless.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Compact `_stats` and prune its old manifest versions.
+///
+/// Scans now write the table as one `Overwrite` snapshot per round rather than
+/// two commits per experiment, so in steady state the version chain grows by
+/// one per round and this pass is cheap. It remains necessary to reclaim those
+/// versions, and to recover deployments that ran the old per-row path.
+///
+/// # The store lock is held only for the compaction
+///
+/// Compaction rewrites the table and must exclude other writers, so it runs
+/// under `state.stats`. The cleanup that follows deletes objects no live
+/// version references; it needs no exclusive access, only time -- a backlog of
+/// tens of thousands of versions is tens of thousands of deletes against a
+/// remote object store. It used to run under the same lock, and every sweep
+/// and every post-compaction stats refresh on every master waited behind it
+/// (36 minutes observed after a routine restart). It now runs on a detached
+/// handle with the lock released; the store is re-opened afterwards so its
+/// in-memory handle never points at a pruned manifest.
+///
+/// The cleanup is deliberately unbounded. Lance deletes as it goes, so a
+/// timeout would only abandon the pass mid-way, not undo it, and with the lock
+/// released nothing waits on it any more. Only the compaction is bounded by
+/// [`MAINTENANCE_TIMEOUT`].
+///
+/// Callers must hold the `stats-writer` coordination lock so only one replica
+/// ever rewrites the dataset.
+pub async fn maintain_stats(state: &Arc<MasterState>) -> lance::Result<()> {
+    let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
+    let start = std::time::Instant::now();
+
+    let compacted = {
+        let mut stats = state.stats.lock().await;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, stats.compact())
+            .await
+            .unwrap_or_else(|_| Err(lance::Error::io("stats compaction timed out")))
+    };
+    let outcome = match compacted {
+        Ok((compaction, cleaner)) => {
+            let removal = cleaner.cleanup(ttl).await;
+            // Re-open regardless of the cleanup's outcome: a failed cleanup
+            // may still have deleted manifests the current handle references.
+            let reload = state.stats.lock().await.reload().await;
+            match (removal, reload) {
+                (Ok(removal), Ok(())) => Ok((compaction, removal)),
+                (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let version = state.stats.lock().await.version();
+
+    match outcome {
+        Ok((compaction, removal)) => {
+            state.stats_maintenance_failures.store(0, Ordering::Relaxed);
+            state
+                .stats_last_reclaimed_version
+                .store(version, Ordering::Relaxed);
+            metrics::histogram!("master_stats_maintenance_duration_seconds")
+                .record(start.elapsed().as_secs_f64());
+            metrics::counter!("master_stats_versions_removed_total")
+                .increment(removal.old_versions);
+            metrics::gauge!("master_stats_version").set(version as f64);
+            metrics::gauge!("master_stats_maintenance_consecutive_failures").set(0.0);
+            metrics::gauge!("master_stats_unreclaimed_versions").set(0.0);
+            tracing::info!(
+                fragments_removed = compaction.fragments_removed,
+                fragments_added = compaction.fragments_added,
+                old_versions_removed = removal.old_versions,
+                bytes_removed = removal.bytes_removed,
+                version,
+                elapsed_secs = start.elapsed().as_secs(),
+                "stats maintenance complete"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Failure was previously silent: `master_stats_versions_removed_total`
+            // only moves on success, so a maintenance pass that kept failing
+            // (object-store outage, permissions, a genuinely stuck compaction)
+            // showed up as a counter that stopped incrementing -- indistinguishable
+            // from "nothing to reclaim". Meanwhile versions accumulate again and
+            // the table walks back toward the state this whole path exists to
+            // prevent.
+            //
+            // Export the two things worth alerting on. Note the raw version
+            // *number* is not one of them: it climbs by design and says nothing
+            // about disk. What matters is how many versions have gone unreclaimed
+            // since the last successful pass.
+            let failures = state
+                .stats_maintenance_failures
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            let last_reclaimed = state.stats_last_reclaimed_version.load(Ordering::Relaxed);
+            let unreclaimed = version.saturating_sub(last_reclaimed);
+
+            metrics::counter!("master_stats_maintenance_failures_total").increment(1);
+            metrics::gauge!("master_stats_maintenance_consecutive_failures").set(failures as f64);
+            metrics::gauge!("master_stats_unreclaimed_versions").set(unreclaimed as f64);
+
+            tracing::warn!(
+                error = %e,
+                consecutive_failures = failures,
+                unreclaimed_versions = unreclaimed,
+                version,
+                "stats maintenance failed; old manifests are not being reclaimed"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Compact a store registry and prune its old manifest versions.
+///
+/// Workers write the registry on every store create/delete as a delete plus an
+/// append, so it gains two versions and one fragment per store and, without
+/// this, every manifest lists every fragment: 34k versions of ~840 KB each
+/// were observed for a 10k-row table, and every `create`/`get` re-read one.
+///
+/// Same shape as [`maintain_stats`]: the compaction (a `Rewrite` that must not
+/// race another master's) runs under `state.stats`-style exclusion via the
+/// registry lock, bounded by [`MAINTENANCE_TIMEOUT`]; the cleanup runs on a
+/// detached handle with the lock released. Workers keep appending in between:
+/// Lance retries their commits past the rewrite, and the grace window keeps
+/// any version a worker may still be reading.
+async fn maintain_registry(
+    state: &Arc<MasterState>,
+    label: &str,
+    registry: &Arc<dyn StoreRegistry>,
+) -> lance::Result<()> {
+    // etcd-backed registries need no maintenance.
+    let Some(table) = registry.lance_table() else {
+        return Ok(());
+    };
+    let ttl = Duration::from_secs(state.config.stats_history_ttl_secs);
+    let start = std::time::Instant::now();
+    let (compaction, cleaner) = {
+        let mut table = table.lock().await;
+        tokio::time::timeout(MAINTENANCE_TIMEOUT, table.compact())
+            .await
+            .unwrap_or_else(|_| Err(lance::Error::io("registry compaction timed out")))?
+    };
+    let removal = cleaner.cleanup(ttl).await;
+    let reload = table.lock().await.reload().await;
+    let removal = match (removal, reload) {
+        (Ok(removal), Ok(())) => removal,
+        (Err(e), _) | (Ok(_), Err(e)) => return Err(e),
+    };
+    let version = table.lock().await.version();
+    metrics::counter!("master_registry_versions_removed_total", "registry" => label.to_string())
+        .increment(removal.old_versions);
+    metrics::gauge!("master_registry_version", "registry" => label.to_string()).set(version as f64);
+    tracing::info!(
+        registry = label,
+        fragments_removed = compaction.fragments_removed,
+        fragments_added = compaction.fragments_added,
+        old_versions_removed = removal.old_versions,
+        bytes_removed = removal.bytes_removed,
+        version,
+        elapsed_secs = start.elapsed().as_secs(),
+        "registry maintenance complete"
+    );
+    Ok(())
+}
+
+/// Run a single scan pass: refresh every experiment's stats row and drop rows
+/// for experiments no longer in the registry. Returns the number of
+/// experiments successfully observed.
+pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
+    let operation = state
+        .admission
+        .try_admit_named("stats_scan")
+        .ok_or_else(|| lance::Error::io("master executor is draining; stats scan not admitted"))?;
+    operation.phase("coordination_lock");
+    let guard = state.task_store.coordination_lock("stats-writer").await?;
+    let result = scan_once_inner(state, &operation, &guard).await;
+    operation.phase("release_coordination_lock");
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(count),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
+    let Some(operation) = state.admission.try_admit_named("stats_scan") else {
+        return Ok(None);
+    };
+    operation.phase("coordination_lock");
+    let Some(guard) = state
+        .task_store
+        .try_coordination_lock("stats-writer")
+        .await?
+    else {
+        return Ok(None);
+    };
+    let result = scan_once_inner(state, &operation, &guard).await;
+    // Maintenance runs under the same writer lock as the scan that just
+    // created the versions, and its failure never fails the scan round.
+    if maintain && result.is_ok() && state.admission.is_accepting() {
+        operation.phase("stats_maintenance");
+        if let Err(e) = maintain_stats(state).await {
+            tracing::warn!(error = %e, "stats maintenance failed");
+        }
+        let mut maintained = HashSet::new();
+        for (label, registry) in [
+            ("rollout", &state.registry),
+            ("generic", &state.generic_registry),
+            ("datagen", &state.datagen_registry),
+        ]
+        .into_iter()
+        .chain(
+            state
+                .config
+                .managed_store_kind
+                .as_deref()
+                .zip(state.managed_registry.as_ref()),
+        ) {
+            if !maintained.insert(label) {
+                continue;
+            }
+            if !state.admission.is_accepting() {
+                break;
+            }
+            if let Err(e) = maintain_registry(state, label, registry).await {
+                tracing::warn!(registry = label, error = %e, "registry maintenance failed");
+            }
+            if !state.admission.is_accepting() {
+                break;
+            }
+            if let Some(m) = registry
+                .as_any()
+                .downcast_ref::<lance_context_core::MirroredRegistry>()
+            {
+                match lance_context_core::backfill_registry(&*m.primary, &*m.mirror).await {
+                    Ok(copied) if copied > 0 => {
+                        tracing::info!(registry = label, copied, "healed registry mirror")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(registry = label, error = %e, "registry mirror heal failed")
+                    }
+                }
+            }
+        }
+    }
+    operation.phase("release_coordination_lock");
+    let release = state.task_store.release_coordination_lock(guard).await;
+    match (result, release) {
+        (Ok(count), Ok(())) => Ok(Some(count)),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn scan_once_inner(
+    state: &Arc<MasterState>,
+    operation: &crate::admission::Operation,
+    guard: &crate::task_store::CoordinationGuard,
+) -> lance::Result<usize> {
+    require_scan_admission(state)?;
+    operation.phase("registry_read");
+    let scan_start = std::time::Instant::now();
+    let scan_started_ms = Utc::now().timestamp_millis();
+    // Rollout experiments under their bare name; generic stores under the
+    // `generic:` task-target prefix, so they occupy distinct rows and the
+    // WAL-merge sweep enqueues them as generic tasks. Their MemWAL merges
+    // depend on this: the sweep reads nothing but this table.
+    let mut entries: Vec<ScanEntry> = state
+        .registry
+        .list()
+        .await?
+        .into_iter()
+        .map(|e| ScanEntry {
+            name: e.name,
+            uri: e.uri,
+            kind: ScanKind::Rollout,
+        })
+        .collect();
+    entries.extend(
+        state
+            .generic_registry
+            .list()
+            .await?
+            .into_iter()
+            .map(|e| ScanEntry {
+                name: generic_target(&e.name),
+                uri: e.uri,
+                kind: ScanKind::Generic,
+            }),
+    );
+    if let Some(registry) = &state.managed_registry {
+        let kind = state
+            .config
+            .managed_store_kind
+            .as_deref()
+            .expect("configured registry");
+        entries.extend(registry.list().await?.into_iter().map(|entry| ScanEntry {
+            name: format!("{kind}:{}", entry.name),
+            uri: entry.uri,
+            kind: ScanKind::Registered,
+        }));
+    }
+    let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+    let (entries, ambiguous) = unique_scan_entries(entries);
+    let entries = Arc::new(entries);
+    // Publish before version/pending shortcuts. Discovery must also revisit
+    // cold stores, including intents left by a process that no longer exists.
+    // This send cannot wait for readers, object storage, or collector capacity.
+    if state.retirement_catalog.receiver_count() > 0 {
+        state.retirement_catalog.send_replace(Some(entries.clone()));
+    }
+    let concurrency = state.config.scan_concurrency.max(1);
+
+    // Read the previous snapshot once, up front. Each experiment's row supplies
+    // both its last observed version (to decide whether a full observation is
+    // needed) and its compaction counters (which are carried forward). This
+    // used to be a `stats.get()` per experiment, taking the stats lock once per
+    // experiment per round.
+    operation.phase("previous_snapshot");
+    let previous: HashMap<String, StatRow> = {
+        let mut stats = state.stats.lock().await;
+        stats
+            .list(None, usize::MAX, 0)
+            .await?
+            .into_iter()
+            .map(|row| (row.name.clone(), row))
+            .collect()
+    };
+    let previous = Arc::new(previous);
+    require_scan_admission(state)?;
+    let rollout_options = state.rollout_store_options();
+    let generic_options = state.generic_store_options();
+
+    // Observe experiments concurrently (bounded). `None` means this round could
+    // not observe that experiment; its previous row is carried over below
+    // rather than dropped.
+    operation.phase("observe_tables");
+    let shard_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let scan_entries = stream::iter(entries.iter().cloned());
+    let observations = observations_until_drain(&state.admission, scan_entries)
+        .map(|entry| {
+            let shard_counts = shard_counts.clone();
+            let previous = previous.clone();
+            let rollout_options = rollout_options.clone();
+            let generic_options = generic_options.clone();
+            let state = state.clone();
+            async move {
+                let prev = previous.get(&entry.name);
+                let observed = match entry.kind {
+                    ScanKind::Registered => {
+                        crate::registered_store::observe(&state, &entry.name, &entry.uri, prev)
+                            .await
+                    }
+                    ScanKind::Rollout => {
+                        observe_one_with_shards(
+                            &entry.name,
+                            &entry.uri,
+                            prev,
+                            rollout_options.clone(),
+                        )
+                        .await
+                    }
+                    ScanKind::Generic => {
+                        observe_generic_with_shards(
+                            &entry.name,
+                            &entry.uri,
+                            prev,
+                            generic_options.clone(),
+                        )
+                        .await
+                    }
+                };
+                match observed {
+                    Ok((row, skipped, shard_max)) => {
+                        shard_counts
+                            .lock()
+                            .unwrap()
+                            .insert(row.name.clone(), shard_max);
+                        let result = (row, skipped);
+                        operation.observed_table();
+                        // Demand reconciliation rides the scan: publish every
+                        // shard's watermark as a scan-sourced event. Only the
+                        // bounded stream waits for every table's fair slot;
+                        // the publisher remains detached and time-bounded.
+                        // `entry.name` is already the task target: bare for
+                        // rollout, `generic:<name>` for generic stores.
+                        let target = entry.name.clone();
+                        if state.admission.is_accepting() {
+                            crate::demand_publish::spawn_scan_demand(
+                                state.clone(),
+                                target,
+                                entry.uri.clone(),
+                                entry.kind,
+                                rollout_options,
+                                generic_options,
+                            )
+                            .await;
+                        }
+                        (entry.name, Some(result))
+                    }
+                    Err(e) => {
+                        tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
+                        (entry.name, None)
+                    }
+                }
+            }
+        })
+        .buffer_unordered(concurrency);
+    let mut observed = collect_observations(state, observations).await;
+    // An interrupted scan is not a smaller complete registry. Keep the entire
+    // previously committed stats/cache/summary, with their original ages.
+    require_scan_admission(state)?;
+    // Preserve the previous observation for an ambiguous registry identity,
+    // just as for a failed store read; unrelated tables continue to scan.
+    observed.extend(ambiguous.iter().cloned().map(|name| (name, None)));
+
+    let count = observed.iter().filter(|(_, row)| row.is_some()).count();
+    let failed = observed.len() - count;
+    let skipped = observed
+        .iter()
+        .filter(|(_, row)| matches!(row, Some((_, true))))
+        .count();
+
+    // Build the round's snapshot. This replaces the whole table in one commit
+    // instead of two commits per experiment, and subsumes the old
+    // reconcile-remove pass: an experiment absent from the registry is simply
+    // absent from the snapshot.
+    //
+    // An experiment this round failed to observe keeps its previous row, so a
+    // transient storage error does not blank it from the UI or, worse, hide it
+    // from the compaction and WAL-merge sweeps that read this table.
+    let mut carry_over = (*previous).clone();
+
+    let mut snapshot: Vec<StatRow> = Vec::with_capacity(observed.len());
+    for (name, row) in observed {
+        match row {
+            Some((row, _skipped)) => snapshot.push(row),
+            None => {
+                if let Some(stale) = carry_over.remove(&name) {
+                    snapshot.push(stale);
+                }
+            }
+        }
+    }
+    let mut snapshot = unique_stats_rows(snapshot);
+
+    // Retire experiments with no writes for the configured window. Each is
+    // merged, compacted and verified quiescent first; only then is its row
+    // dropped, because a row absent from this table is invisible to both
+    // auto-sweeps forever. See `retire_cold_experiments`.
+    //
+    // # This must not hold the stats lock
+    //
+    // Retirement genuinely rewrites data: per experiment it opens the store,
+    // runs `cleanup_own_shard` (up to `RETIRE_TIMEOUT`, 600s), waits on the
+    // process-wide compaction semaphore, and compacts (another 600s). It is a
+    // serial loop over every cold row. Running that while holding
+    // `state.stats` put up to `N_cold x ~20min` of object-store IO inside the
+    // mutex that `GET /experiments` needs for its only data source -- and
+    // blocked on a semaphore *inside* a mutex, so a slow compaction elsewhere
+    // in the process extended the hold further. That is the wedge behind
+    // `/experiments` hanging in production.
+    //
+    // Nothing here needs the lock: the loop reads `snapshot` (a local) and
+    // returns a set of names. Taking the lock afterwards, for the write alone,
+    // is equivalent and keeps the critical section to one commit.
+    let retire_after = Duration::from_secs(state.config.stats_cold_retire_secs);
+    let retire_start = std::time::Instant::now();
+    // Retirement opens each row through the rollout store; generic rows are
+    // observed only, never retired by the master.
+    let rollout_rows: Vec<StatRow> = snapshot
+        .iter()
+        .filter(|row| !ambiguous.contains(&row.name))
+        .filter(|row| {
+            !row.name.starts_with("generic:") && state.registered_target(&row.name).is_none()
+        })
+        .cloned()
+        .collect();
+    operation.phase("retire_cold_tables");
+    let retired = retire_cold_experiments(
+        &rollout_rows,
+        retire_after,
+        Utc::now().timestamp_millis(),
+        state.rollout_store_options(),
+        state.compaction_config(),
+        state.compaction_permits.clone(),
+        &state.admission,
+    )
+    .await;
+    if !retired.is_empty() {
+        snapshot.retain(|row| !retired.contains(&row.name));
+    }
+    metrics::histogram!("master_stats_retire_duration_seconds")
+        .record(retire_start.elapsed().as_secs_f64());
+
+    require_scan_admission(state)?;
+    operation.phase("commit_snapshot");
+    let mut stats = state.stats.lock().await;
+    require_scan_admission(state)?;
+
+    let mut total_rows: i64 = 0;
+    let mut total_fragments: i64 = 0;
+    let mut live_count: usize = 0;
+    for row in &snapshot {
+        if live.contains(&row.name) {
+            live_count += 1;
+            total_rows += row.row_count;
+            total_fragments += row.fragment_count;
+        }
+    }
+
+    // Retirement can remove rows after observation. Summarize only retained
+    // stores, and never let a failed observation masquerade as a zero shard.
+    let (largest_shard, stores_with_shard_over_4096) = {
+        let shards = shard_counts.lock().unwrap();
+        let counts: Vec<usize> = snapshot
+            .iter()
+            .filter_map(|row| shards.get(&row.name).copied())
+            .collect();
+        (
+            counts.iter().copied().max().unwrap_or(0),
+            counts.iter().filter(|&&n| n > 4096).count(),
+        )
+    };
+    let mut backlog = crate::backlog_metrics::Snapshot::new(
+        &snapshot,
+        failed,
+        scan_started_ms,
+        largest_shard as u64,
+        stores_with_shard_over_4096 as u64,
+    );
+    publish_snapshot(&mut stats, &state.stats_cache, snapshot, failed).await?;
+    backlog.committed_ms = Utc::now().timestamp_millis();
+
+    metrics::histogram!("master_scan_duration_seconds").record(scan_start.elapsed().as_secs_f64());
+    // How much of the round was avoided by the version check. A ratio near 1 is
+    // the healthy state at scale: most experiments are cold and cost only an
+    // open. A ratio trending to 0 means the incremental path is not engaging --
+    // usually a stats table that keeps losing its rows.
+    metrics::gauge!("master_scan_experiments_skipped").set(skipped as f64);
+    metrics::gauge!("master_scan_experiments_observed").set((count - skipped) as f64);
+    tracing::debug!(
+        total = count,
+        skipped,
+        observed = count - skipped,
+        "scan round complete"
+    );
+    // Named without a `_total` suffix: these are gauges (current value), and
+    // `_total` is the counter convention. Datadog's OpenMetrics check infers
+    // type from the name, so `_total` on a gauge was being ingested as a
+    // monotonic count -- graphing "experiments created per second" for a metric
+    // whose meaning is "how many exist right now". `rate()` was equally
+    // meaningless in Prometheus. The `_total` names are still emitted alongside,
+    // deprecated, so existing dashboards keep working.
+    metrics::gauge!("master_experiments").set(live_count as f64);
+    metrics::gauge!("master_rollout_rows").set(total_rows as f64);
+    metrics::gauge!("master_rollout_fragments").set(total_fragments as f64);
+    // Deprecated aliases -- remove once dashboards have migrated.
+    metrics::gauge!("master_experiments_total").set(live_count as f64);
+    metrics::gauge!("master_rollout_rows_total").set(total_rows as f64);
+    metrics::gauge!("master_rollout_fragments_total").set(total_fragments as f64);
+    drop(stats);
+    // Advisory publication cannot stall or fail a completed stats scan. The
+    // compare fences an old scanner whose writer lease expired during storage I/O.
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        state.task_store.publish_backlog_snapshot(guard, &backlog),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        result => {
+            metrics::counter!("master_backlog_snapshot_publication_errors_total").increment(1);
+            tracing::warn!(?result, "shared backlog metric snapshot was not confirmed; previous observation will age out");
+        }
+    }
+    Ok(count)
+}
+
+/// Caller holds the stats writer coordination lock and the local stats mutex.
+/// A failed or ambiguous write must not replace a previously published backlog
+/// with an uncommitted low/empty observation or count as a successful scan.
+async fn publish_snapshot(
+    stats: &mut crate::stats_store::StatsStore,
+    cache: &tokio::sync::RwLock<Arc<Vec<StatRow>>>,
+    snapshot: Vec<StatRow>,
+    failed_observations: usize,
+) -> lance::Result<()> {
+    // Failed observations normally carry their previous row forward. If no
+    // row survives, absence is unknown, not proof of an empty registry.
+    if snapshot.is_empty() && failed_observations > 0 {
+        return Err(lance::Error::io(
+            "empty stats snapshot contains failed observations; previous snapshot retained",
+        ));
+    }
+    // Empty with no failed observations is an intentional, durable clear.
+    stats.replace_snapshot(&snapshot).await?;
+    // Acquire the cache lock before publishing any gauges: cancellation while
+    // waiting must not expose new gauges paired with the previous cache.
+    let mut cached = cache.write().await;
+    metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
+    *cached = Arc::new(snapshot);
+    Ok(())
+}
+
+/// Open one experiment read-only and refresh its stats row, skipping the
+/// expensive observation when nothing can have changed.
+///
+/// `previous` is the row from the last scan, if any.
+///
+/// # Why the version check pays for itself
+///
+/// Opening the dataset reads its manifest, which already carries the current
+/// version — so comparing it against the last observed version is free. If they
+/// match, no write has landed since, and every derived metric (`row_count`,
+/// `fragment_count`, `pending_wal_generations`) is necessarily unchanged. The
+/// previous row is then reused verbatim.
+///
+/// What that skips is the whole cost of `observe`: listing every MemWAL shard
+/// and reading its manifest, opening each flushed generation to count pending
+/// rows, and a `count_rows` over the base table. At tens of thousands of
+/// experiments, almost all of them cold, that is the difference between a scan
+/// that finishes inside its interval and one that never does.
+/// Which registry a scan entry came from, which decides how it is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanKind {
+    Registered,
+    Rollout,
+    Generic,
+}
+
+/// One store to observe this round. `name` is the stats-row / task-target
+/// name (prefixed for generic stores); `uri` is the physical dataset.
+#[derive(Clone)]
+pub(crate) struct ScanEntry {
+    name: String,
+    uri: String,
+    kind: ScanKind,
+}
+
+/// Deduplicate before opening any datasets: a legacy registry with fourteen
+/// copies of a name must not generate fourteen concurrent observations and
+/// fourteen stats rows. Conflicting identities cannot safely be guessed.
+fn unique_scan_entries(mut entries: Vec<ScanEntry>) -> (Vec<ScanEntry>, HashSet<String>) {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut ambiguous = HashSet::new();
+    for pair in entries.windows(2) {
+        if pair[0].name == pair[1].name
+            && (pair[0].uri != pair[1].uri || pair[0].kind != pair[1].kind)
+        {
+            ambiguous.insert(pair[0].name.clone());
+        }
+    }
+    let physical = entries.len();
+    entries.dedup_by(|a, b| a.name == b.name);
+    if physical != entries.len() {
+        tracing::warn!(
+            duplicate_entries = physical - entries.len(),
+            "stats scan ignored duplicate registry entries"
+        );
+    }
+    for name in &ambiguous {
+        tracing::warn!(
+            name,
+            "registry identity is ambiguous; retaining previous stats"
+        );
+    }
+    entries.retain(|entry| !ambiguous.contains(&entry.name));
+    (entries, ambiguous)
+}
+
+/// Count pending generations under the observe timeout; shard manifests are
+/// one small object read per shard, but object storage still has to answer.
+async fn pending_or_timeout<T>(
+    name: &str,
+    pending: impl std::future::Future<Output = lance::Result<T>>,
+) -> lance::Result<T> {
+    match tokio::time::timeout(OBSERVE_TIMEOUT, pending).await {
+        Ok(result) => result,
+        Err(_) => Err(lance::Error::io(format!(
+            "pending-generation count timed out for store '{name}'"
+        ))),
+    }
+}
+
+/// Pending generations that moved while the base-table version did not.
+/// This is exactly the state that hid a 17k-generation backlog from the
+/// merge sweep before #281: the version-unchanged shortcut reused the stale
+/// count. Counted so it can be alerted on; the row itself is corrected.
+fn note_pending_drift(name: &str, previous: i64, current: usize) {
+    let current = current as i64;
+    if current != previous {
+        metrics::counter!("master_stats_pending_recounted_total").increment(1);
+        if current > previous.max(0) + 256 {
+            tracing::warn!(
+                store = %name,
+                previous,
+                current,
+                "pending WAL generations grew while the base version stood still"
+            );
+        }
+    }
+}
+
+/// Observe one generic store. Only the fields the WAL-merge sweep and the UI
+/// need: version (for the skip-if-unchanged shortcut), base row count,
+/// fragment count and pending MemWAL generations. Compaction counters stay at
+/// their carried-over values because the master does not compact generic
+/// stores.
+#[cfg(test)]
+async fn observe_generic(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    options: GenericStoreOptions,
+) -> lance::Result<(StatRow, bool)> {
+    observe_generic_with_shards(name, uri, previous, options)
+        .await
+        .map(|(row, skipped, _)| (row, skipped))
+}
+
+async fn observe_generic_with_shards(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    mut options: GenericStoreOptions,
+) -> lance::Result<(StatRow, bool, usize)> {
+    // Metadata observation must see shards over the worker read cap.
+    options.pending_generations_max = Some(0);
+    let open = GenericStore::open_existing(uri, options);
+    let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "open timed out for store '{name}'"
+            )))
+        }
+    };
+
+    // WAL flushes never bump the base-table version, so the unchanged-
+    // version shortcut must still recount pending generations: a store that
+    // no worker or master has merged keeps its old version while its shards
+    // accumulate thousands of generations, and the merge sweep reads this
+    // row to decide whether to merge it at all. Only the row count (a
+    // base-table scan) is carried over.
+    let current_version = store.version() as i64;
+    if let Some(prev) = previous {
+        if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
+            let (pending, shard_max) =
+                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
+            note_pending_drift(name, prev.pending_wal_generations, pending);
+            let mut row = prev.clone();
+            row.uri = uri.to_string();
+            row.pending_wal_generations = pending as i64;
+            row.scanned_at = Utc::now().timestamp_millis();
+            return Ok((row, true, shard_max));
+        }
+    }
+
+    let observe = async {
+        let (pending, shard_max) = store.pending_wal_generation_counts().await?;
+        let rows = store.count_base_rows().await?;
+        Ok::<_, lance::Error>((pending, rows, shard_max))
+    };
+    let (pending, rows, shard_max) = match tokio::time::timeout(OBSERVE_TIMEOUT, observe).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "observe timed out for store '{name}'"
+            )));
+        }
+    };
+    let compaction = store.compaction_stats();
+    let (last_compaction, total_compactions) = previous
+        .map_or((StatRow::NO_COMPACTION, 0), |prev| {
+            (prev.last_compaction, prev.total_compactions)
+        });
+
+    Ok((
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: rows as i64,
+            fragment_count: compaction.total_fragments as i64,
+            last_updated: Utc::now().timestamp_millis(),
+            pending_wal_generations: pending as i64,
+            last_compaction,
+            total_compactions,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: current_version,
+        },
+        false,
+        shard_max,
+    ))
+}
+
+async fn observe_one(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    options: RolloutStoreOptions,
+) -> lance::Result<(StatRow, bool)> {
+    observe_one_with_shards(name, uri, previous, options)
+        .await
+        .map(|(row, skipped, _)| (row, skipped))
+}
+
+async fn observe_one_with_shards(
+    name: &str,
+    uri: &str,
+    previous: Option<&StatRow>,
+    options: RolloutStoreOptions,
+) -> lance::Result<(StatRow, bool, usize)> {
+    let open = RolloutStore::open_existing_with_options(uri, options);
+    let store = match tokio::time::timeout(OBSERVE_TIMEOUT, open).await {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "open timed out for store '{name}'"
+            )))
+        }
+    };
+
+    // Free: the manifest is already in hand from the open above. Pending
+    // generations are not: see `observe_generic` for why they are recounted
+    // even when the base-table version is unchanged.
+    let current_version = store.version() as i64;
+    if let Some(prev) = previous {
+        if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
+            let (pending, shard_max) =
+                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
+            note_pending_drift(name, prev.pending_wal_generations, pending);
+            let mut row = prev.clone();
+            row.uri = uri.to_string();
+            row.pending_wal_generations = pending as i64;
+            row.scanned_at = Utc::now().timestamp_millis();
+            return Ok((row, true, shard_max));
+        }
+    }
+
+    let obs = match tokio::time::timeout(OBSERVE_TIMEOUT, store.observe()).await {
+        Ok(Ok(obs)) => obs,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "observe timed out for store '{name}'"
+            )));
+        }
+    };
+
+    // Carry compaction counters forward across scans. Taken from the caller's
+    // snapshot rather than a per-experiment `stats.get()`, which used to take
+    // the stats lock once per experiment per round.
+    let (last_compaction, total_compactions) = previous
+        .map_or((StatRow::NO_COMPACTION, 0), |prev| {
+            (prev.last_compaction, prev.total_compactions)
+        });
+
+    Ok((
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: obs.row_count,
+            fragment_count: obs.fragment_count,
+            last_updated: obs.last_updated,
+            pending_wal_generations: obs.pending_wal_generations,
+            last_compaction,
+            total_compactions,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: obs.version as i64,
+        },
+        false,
+        obs.max_pending_wal_generations_per_shard.max(0) as usize,
+    ))
+}
+
+/// Decide which of `rows` are cold enough to retire, and leave each one in a
+/// state that needs no further maintenance before dropping it.
+///
+/// Returns the names that were successfully retired.
+///
+/// # Ordering is a correctness property, not an optimisation
+///
+/// Both auto-sweeps read the stats table and nothing else, so an experiment
+/// absent from it is invisible to them forever. Retiring one that still has
+/// un-merged MemWAL generations would strand those generations permanently:
+/// their rows stay readable (the read path unions them) but they are never
+/// folded into the base table, read amplification never goes down, and the
+/// `_mem_wal/{shard}/` directories are never reclaimed. That is a storage leak
+/// with no process left to notice it.
+///
+/// So retirement is: merge the WAL, compact, **verify the WAL actually drained**,
+/// and only then drop the row. `compact_files` deliberately does not touch WAL
+/// generations, so compaction alone would not have been enough.
+///
+/// Any step failing leaves the experiment in the table to be retried next
+/// round. Refusing to retire is always safe; retiring early is not.
+async fn retire_cold_experiments(
+    rows: &[StatRow],
+    retire_after: Duration,
+    now_ms: i64,
+    options: RolloutStoreOptions,
+    compaction_config: CompactionConfig,
+    compaction_permits: Arc<Semaphore>,
+    admission: &crate::admission::Admission,
+) -> HashSet<String> {
+    if retire_after.is_zero() {
+        return HashSet::new();
+    }
+    let cutoff_ms = now_ms.saturating_sub(retire_after.as_millis() as i64);
+
+    let mut retired = HashSet::new();
+    for row in rows {
+        // Finish an accepted retirement under the writer guard, but do not
+        // start another table's merge/compaction while draining.
+        if !admission.is_accepting() {
+            break;
+        }
+        if row.last_updated > cutoff_ms {
+            continue;
+        }
+        match prepare_for_retirement(
+            &row.name,
+            &row.uri,
+            options.clone(),
+            compaction_config.clone(),
+            compaction_permits.clone(),
+        )
+        .await
+        {
+            Ok(true) => {
+                retired.insert(row.name.clone());
+                metrics::counter!("master_stats_experiments_retired_total").increment(1);
+                tracing::info!(
+                    store = %row.name,
+                    idle_ms = now_ms.saturating_sub(row.last_updated),
+                    "retiring cold experiment from the stats table"
+                );
+            }
+            Ok(false) => {
+                // Still had pending generations after the merge, so something
+                // else is writing or the merge did not fully drain. Keep it.
+                tracing::debug!(
+                    store = %row.name,
+                    "cold experiment not retired: WAL still pending after merge"
+                );
+            }
+            Err(e) => {
+                metrics::counter!("master_stats_retire_failures_total").increment(1);
+                tracing::warn!(
+                    store = %row.name,
+                    error = %e,
+                    "failed to prepare cold experiment for retirement; keeping it"
+                );
+            }
+        }
+    }
+    retired
+}
+
+/// Merge, compact, and verify one experiment is quiescent.
+///
+/// `Ok(true)` means it is safe to drop from the stats table.
+async fn prepare_for_retirement(
+    name: &str,
+    uri: &str,
+    options: RolloutStoreOptions,
+    compaction_config: CompactionConfig,
+    compaction_permits: Arc<Semaphore>,
+) -> lance::Result<bool> {
+    let mut store = match tokio::time::timeout(
+        OBSERVE_TIMEOUT,
+        RolloutStore::open_existing_with_options(uri, options),
+    )
+    .await
+    {
+        Ok(Ok(store)) => store,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(lance::Error::io(format!(
+                "open timed out retiring store '{name}'"
+            )))
+        }
+    };
+
+    // 1. Drain the WAL. Must precede compaction: `compact_files` rewrites base
+    //    fragments and leaves MemWAL generations untouched.
+    tokio::time::timeout(RETIRE_TIMEOUT, store.cleanup_own_shard())
+        .await
+        .map_err(|_| lance::Error::io(format!("WAL merge timed out retiring '{name}'")))??;
+
+    // 2. Compact, so the retired table is not left as many small fragments that
+    //    nothing will ever come back to tidy.
+    let _permit = compaction_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| lance::Error::io("compaction semaphore closed"))?;
+    tokio::time::timeout(RETIRE_TIMEOUT, store.compact(Some(compaction_config)))
+        .await
+        .map_err(|_| lance::Error::io(format!("compaction timed out retiring '{name}'")))??;
+
+    // 3. Verify. Only a genuinely drained shard may leave the sweeps' view.
+    let obs = tokio::time::timeout(OBSERVE_TIMEOUT, store.observe())
+        .await
+        .map_err(|_| lance::Error::io(format!("observe timed out retiring '{name}'")))??;
+
+    Ok(obs.pending_wal_generations == 0)
+}
+
+/// Observe one experiment on demand, without touching the stats table.
+///
+/// Used for experiments the stats table no longer holds — retired ones surfaced
+/// by search or a detail request. Deliberately does not write a row back:
+/// reading about a cold experiment must not make it hot again, or browsing the
+/// UI would undo retirement and the table would creep back toward holding
+/// everything.
+pub async fn observe_cold(
+    state: &MasterState,
+    name: &str,
+    uri: &str,
+) -> lance::Result<ExperimentSummary> {
+    observe_cold_with_options(name, uri, state.rollout_store_options()).await
+}
+
+async fn observe_cold_with_options(
+    name: &str,
+    uri: &str,
+    options: RolloutStoreOptions,
+) -> lance::Result<ExperimentSummary> {
+    let (row, _) = observe_one(name, uri, None, options).await?;
+    Ok(row.into_summary())
+}
+
+/// Refresh one experiment immediately and persist its new stats row.
+///
+/// Passes `None` as the previous row so this always does a full observation:
+/// callers use it precisely when they believe something just changed (after a
+/// compaction, or on an explicit refresh request), and the version check would
+/// otherwise short-circuit exactly the observation they asked for.
+pub async fn refresh_one(state: &Arc<MasterState>, name: &str, uri: &str) -> lance::Result<()> {
+    let guard = state.task_store.coordination_lock("stats-writer").await?;
+    let result = match observe_one(name, uri, None, state.rollout_store_options()).await {
+        Ok((row, _)) => state.stats.lock().await.upsert(&row).await,
+        Err(error) => Err(error),
+    };
+    let release = state.task_store.release_coordination_lock(guard).await;
+    result.and(release)
+}
+
+/// Traverse each admitted catalog to completion before taking its newest
+/// successor. Replacing a catalog cannot repeatedly starve its cold tail.
+/// Four pending opens/admissions bound work independently of the stats scan;
+/// the collector separately bounds deletion workers, tables and intent streams.
+async fn consume_retirement_catalogs<F, Fut, C, CFut>(
+    admission: Arc<crate::admission::Admission>,
+    mut catalogs: tokio::sync::watch::Receiver<Option<Arc<Vec<ScanEntry>>>>,
+    visit: F,
+    cold: C,
+) where
+    C: Fn() -> CFut + Send + Sync,
+    CFut: std::future::Future<Output = lance::Result<()>> + Send,
+    F: Fn(ScanEntry) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = lance::Result<()>> + Send,
+{
+    loop {
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            changed = catalogs.changed() => if changed.is_err() { return; },
+        }
+        let Some(entries) = catalogs.borrow_and_update().clone() else {
+            continue;
+        };
+        let traversal = stream::iter(entries.iter().cloned()).for_each_concurrent(4, |entry| {
+            let operation = admission.try_admit_named("wal_retirement_discovery");
+            let visit = &visit;
+            async move {
+                let Some(operation) = operation else {
+                    return;
+                };
+                operation.target(&entry.name);
+                operation.phase("admit_retirement_discovery");
+                let name = entry.name.clone();
+                if let Err(error) = visit(entry).await {
+                    tracing::warn!(store = %name, %error, "WAL retirement discovery deferred");
+                }
+            }
+        });
+        // Cancellation only drops metadata opens or pending admissions here.
+        // Already admitted collectors retain durable intents independently.
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            _ = traversal => {},
+        }
+        // Finish the cold traversal before accepting the newest successor;
+        // frequent catalogs must not restart root paging at its first page.
+        let Some(operation) = admission.try_admit_named("wal_cold_retirement_discovery") else {
+            return;
+        };
+        operation.phase("discover_cold_tables");
+        tokio::select! {
+            biased;
+            _ = admission.wait_closed() => return,
+            result = cold() => if let Err(error) = result {
+                tracing::warn!(%error, "Cold WAL retirement traversal deferred");
+            },
+        }
+    }
+}
+
+async fn discover_retired_wal(entry: ScanEntry) -> lance::Result<()> {
+    // Registry URIs are canonical main-branch locations. Recovery must not
+    // depend on opening a typed dataset, schema, index or payload first.
+    lance_context_core::discover_retired_wal_at_uri(&entry.uri).await
+}
+
+async fn discover_cold_stores(state: &MasterState) -> lance::Result<()> {
+    // Only the scan owner's local watch receiver calls this. The root walk
+    // includes unregistered Context stores and cold zero-pending stores.
+    // A namespace error must not suppress registered external Datagen URIs.
+    let root = lance_context_core::discover_retired_wal_under_root(&state.base_uri).await;
+    let datagen = async {
+        // Use the existing registry contract (one metadata catalog, not table
+        // payloads). This API materializes the registry, as the stats scanner
+        // already does for Rollout/Generic; only table admissions are bounded.
+        let entries = tokio::time::timeout(OBSERVE_TIMEOUT, state.datagen_registry.list())
+            .await.map_err(|_| lance::Error::io("Retirement Datagen registry timed out"))??;
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        stream::iter(entries).for_each_concurrent(4, |entry| {
+            let failures = &failures;
+            async move {
+                if let Err(error) = lance_context_core::discover_retired_wal_at_uri(&entry.uri).await {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(store = %entry.name, %error, "Datagen WAL retirement discovery deferred");
+                }
+            }
+        }).await;
+        if failures.load(Ordering::Relaxed) != 0 {
+            return Err(lance::Error::io("Datagen retirement admissions deferred"));
+        }
+        Ok(())
+    }.await;
+    // Log both independent failures, retaining an error for the owning loop.
+    if let Err(error) = &root {
+        tracing::warn!(%error, "Retirement root discovery incomplete");
+    }
+    if let Err(error) = &datagen {
+        tracing::warn!(%error, "Retirement Datagen discovery incomplete");
+    }
+    root.and(datagen)
+}
+
+/// Spawn the periodic scanner. Returns `None` when the interval is `0`.
+pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
+    let interval_secs = state.config.stats_scan_interval_secs;
+    if interval_secs == 0 {
+        return None;
+    }
+    let catalogs = state.retirement_catalog.subscribe();
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        let discovery_state = state.clone();
+        let discovery = async move {
+            match lance_context_core::wal_collection_enabled() {
+                Ok(true) => {
+                    consume_retirement_catalogs(
+                        discovery_state.admission.clone(),
+                        catalogs,
+                        discover_retired_wal,
+                        move || {
+                            let state = discovery_state.clone();
+                            async move { discover_cold_stores(&state).await }
+                        },
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, "WAL collection disabled by invalid lifecycle configuration")
+                }
+            }
+        };
+        let scanning = async {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            let every_n = state.config.stats_maintenance_every_n_scans;
+            let mut round: u64 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = state.admission.wait_closed() => return,
+                    _ = ticker.tick() => {},
+                }
+                round += 1;
+                // Round 1 included: an existing deployment may start with a very
+                // long version chain, and waiting N rounds to reclaim it would
+                // leave cold start slow for another N intervals.
+                let maintain = every_n > 0 && (round == 1 || round.is_multiple_of(every_n));
+                match try_scan_once(&state, maintain).await {
+                    Ok(Some(n)) => tracing::info!(experiments = n, "stats scan complete"),
+                    Ok(None) => {
+                        tracing::debug!("stats scan skipped; another master owns the writer lock")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "stats scan round failed"),
+                }
+            }
+        };
+        tokio::join!(scanning, discovery);
+    }))
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scan_drain_joins_admitted_reads_without_opening_remaining_tables() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let operation = admission.try_admit_named("stats_scan").unwrap();
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let scanning = admission.clone();
+        let pending = release.clone();
+        let opened = started.clone();
+        let scan = tokio::spawn(async move {
+            let rows: Vec<_> = observations_until_drain(&scanning, stream::iter(0..20))
+                .map(|i| {
+                    let opened = opened.clone();
+                    let pending = pending.clone();
+                    async move {
+                        opened.add_permits(1);
+                        pending.acquire().await.unwrap().forget();
+                        i
+                    }
+                })
+                .buffer_unordered(3)
+                .collect()
+                .await;
+            drop(operation);
+            rows
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.acquire_many(3))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        assert!(!scan.is_finished());
+        assert!(!admission.status().drained());
+        release.add_permits(20);
+        let mut observed = tokio::time::timeout(Duration::from_secs(5), scan)
+            .await
+            .unwrap()
+            .unwrap();
+        observed.sort_unstable();
+        assert_eq!(observed, vec![0, 1, 2]);
+        assert_eq!(
+            started.available_permits(),
+            0,
+            "remaining tables must not open"
+        );
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn scan_admission_preserves_full_scan_and_rejects_drained_start() {
+        let admission = crate::admission::Admission::default();
+        let all: Vec<_> = observations_until_drain(&admission, stream::iter(0..20))
+            .collect()
+            .await;
+        assert_eq!(all, (0..20).collect::<Vec<_>>());
+        admission.begin_drain();
+        let none: Vec<_> = observations_until_drain(&admission, stream::iter(0..20))
+            .collect()
+            .await;
+        assert!(none.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod early_merge_tests {
+    use super::*;
+    use clap::Parser;
+
+    async fn fixture(enabled: bool) -> (tempfile::TempDir, Arc<MasterState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::MasterConfig::parse_from(["test"]);
+        config.data_dir = dir.path().to_string_lossy().into_owned();
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("test requires isolated etcd")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix = format!("/early-scan-test/{}", lance_context_core::generate_id());
+        config.merge_wal_interval_secs = if enabled { 600 } else { 0 };
+        config.merge_wal_min_generations = 8;
+        config.stats_scan_interval_secs = 0;
+        config.worker_endpoints.clear();
+        (dir, MasterState::new(config).await.unwrap())
+    }
+
+    fn row(name: &str, pending: i64) -> StatRow {
+        StatRow {
+            name: name.into(),
+            uri: format!("/unused/{name}"),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_drain_preserves_snapshot_and_releases_writer_for_successor() {
+        let (_dir, state) = fixture(false).await;
+        let previous = row("previous", 80);
+        let mut stats = state.stats.lock().await;
+        publish_snapshot(&mut stats, &state.stats_cache, vec![previous.clone()], 0)
+            .await
+            .unwrap();
+        let version = stats.version();
+        let mut summary = crate::backlog_metrics::Snapshot::new(
+            &[previous],
+            0,
+            Utc::now().timestamp_millis(),
+            80,
+            0,
+        );
+        summary.committed_ms = Utc::now().timestamp_millis();
+        let guard = state
+            .task_store
+            .coordination_lock("stats-writer")
+            .await
+            .unwrap();
+        state
+            .task_store
+            .publish_backlog_snapshot(&guard, &summary)
+            .await
+            .unwrap();
+        state
+            .task_store
+            .release_coordination_lock(guard)
+            .await
+            .unwrap();
+        let before = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Hold the actual stats mutex after the scan has acquired its writer
+        // guard. Drain then arrives during an admitted scan, not before entry.
+        let scanning = state.clone();
+        let scan = tokio::spawn(async move { scan_once(&scanning).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .admission
+                    .status()
+                    .operations
+                    .values()
+                    .any(|op| op.phase == "previous_snapshot")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.admission.begin_drain();
+        assert!(!state.admission.status().drained());
+        drop(stats);
+        let result = tokio::time::timeout(Duration::from_secs(5), scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "draining scan must not publish a truncated snapshot"
+        );
+        assert!(state.admission.status().drained());
+        assert_eq!(state.stats.lock().await.version(), version);
+        assert_eq!(
+            state.stats_cache.read().await[0].pending_wal_generations,
+            80
+        );
+        let after = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.1, after.1,
+            "drain must not publish a new summary revision"
+        );
+        assert_eq!(
+            serde_json::to_value(before.0).unwrap(),
+            serde_json::to_value(after.0).unwrap()
+        );
+
+        let successor = MasterState::new(state.config.clone()).await.unwrap();
+        // The registry is genuinely empty: only a fresh complete successor
+        // scan may now clear the previous snapshot.
+        assert_eq!(scan_once(&successor).await.unwrap(), 0);
+        assert!(successor.stats_cache.read().await.is_empty());
+        let next = successor
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(next.1 > after.1);
+        assert_eq!(next.0.generations, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_drain_does_not_enqueue_later_hot_observations() {
+        let (_dir, state) = fixture(true).await;
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.observe(&state, &row("accepted", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "accepted")
+            .await
+            .unwrap()
+            .is_some());
+        state.admission.begin_drain();
+        admission.observe(&state, &row("later", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "later")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "accepted")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn hot_observation_enqueues_before_slow_scan_finishes() {
+        let (_dir, state) = fixture(true).await;
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        // `true` is the unchanged-base fast path: its WAL recount is fresh.
+        let ready = stream::iter(vec![(
+            "generic:hot".into(),
+            Some((row("generic:hot", 80), true)),
+        )]);
+        let slow = stream::once(async move {
+            blocked.await.unwrap();
+            ("slow".into(), None)
+        });
+        let scan_state = state.clone();
+        let scan =
+            tokio::spawn(async move { collect_observations(&scan_state, ready.chain(slow)).await });
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = state
+                    .task_store
+                    .get_active_id(TaskKind::MergeWal, "generic:hot")
+                    .await
+                    .unwrap()
+                {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hot target waited for the rest of the scan");
+        assert!(!scan.is_finished());
+        // The ordinary queue sees exactly the same durable task.
+        assert_eq!(
+            crate::scheduler::enqueue(&state, TaskKind::MergeWal, "generic:hot")
+                .await
+                .unwrap()
+                .id,
+            id
+        );
+        release.send(()).unwrap();
+        assert_eq!(scan.await.unwrap().len(), 2);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "slow")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scoped_wal_admission_limits_scan_without_hiding_observations() {
+        let (_dir, original) = fixture(true).await;
+        let mut config = original.config.clone();
+        config.merge_rollout.fence_legacy = true;
+        config.merge_wal_admission_targets = vec!["selected".into()];
+        let state = MasterState::new(config).await.unwrap();
+        let observations = collect_observations(
+            &state,
+            stream::iter(vec![
+                ("other".into(), Some((row("other", 80), false))),
+                ("selected".into(), Some((row("selected", 80), false))),
+            ]),
+        )
+        .await;
+        assert_eq!(observations.len(), 2);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "other")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "selected")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn early_admission_respects_disable_threshold_and_new_task_budget() {
+        let (_disabled_dir, disabled) = fixture(false).await;
+        collect_observations(
+            &disabled,
+            stream::iter(vec![("hot".into(), Some((row("hot", 80), false)))]),
+        )
+        .await;
+        assert!(disabled
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "hot")
+            .await
+            .unwrap()
+            .is_none());
+
+        let (_dir, state) = fixture(true).await;
+        let existing = crate::scheduler::enqueue(&state, TaskKind::MergeWal, "active")
+            .await
+            .unwrap();
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.remaining = 2;
+        for target in [
+            "active",
+            "active",
+            "small",
+            "new-a",
+            "active",
+            "generic:new-b",
+            "over-budget",
+        ] {
+            admission
+                .observe(&state, &row(target, if target == "small" { 7 } else { 80 }))
+                .await;
+        }
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "active")
+                .await
+                .unwrap(),
+            Some(existing.id)
+        );
+        for target in ["new-a", "generic:new-b"] {
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, target)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        for target in ["small", "over-budget"] {
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, target)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // An exhausted time budget also leaves scanning intact without writes.
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.time_left = Duration::ZERO;
+        admission.observe(&state, &row("time-budget", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "time-budget")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn queue_error_preserves_scan_results_and_stops_early_admission() {
+        let (_dir, state) = fixture(true).await;
+        let task = crate::scheduler::enqueue(&state, TaskKind::MergeWal, "broken")
+            .await
+            .unwrap();
+        // Fault injection is confined to this test's unique local-etcd prefix.
+        // The active pointer now references a malformed queue record.
+        state
+            .task_store
+            .etcd_client()
+            .clone()
+            .put(
+                format!("{}/tasks/{}", state.config.etcd.etcd_prefix, task.id),
+                "malformed",
+                None,
+            )
+            .await
+            .unwrap();
+        let input = vec![
+            ("broken".into(), Some((row("broken", 80), false))),
+            ("later".into(), Some((row("later", 90), false))),
+        ];
+        let observed = collect_observations(&state, stream::iter(input.clone())).await;
+        assert_eq!(observed, input, "admission failure must not lose stats");
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "later")
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_alerting_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Mirrors the failure bookkeeping in `maintain_stats`, which cannot be
+    /// exercised directly without an etcd-backed `MasterState`.
+    ///
+    /// The property under test: a failing maintenance pass must leave a signal.
+    /// Previously it left none -- `master_stats_versions_removed_total` only
+    /// moves on success, so a pass failing for days looked exactly like a pass
+    /// with nothing to reclaim, while manifests piled back up.
+    struct Bookkeeping {
+        failures: AtomicU64,
+        last_reclaimed_version: AtomicU64,
+    }
+
+    impl Bookkeeping {
+        fn new() -> Self {
+            Self {
+                failures: AtomicU64::new(0),
+                last_reclaimed_version: AtomicU64::new(0),
+            }
+        }
+
+        fn on_success(&self, version: u64) -> (u64, u64) {
+            self.failures.store(0, Ordering::Relaxed);
+            self.last_reclaimed_version
+                .store(version, Ordering::Relaxed);
+            (0, 0)
+        }
+
+        fn on_failure(&self, version: u64) -> (u64, u64) {
+            let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+            let unreclaimed =
+                version.saturating_sub(self.last_reclaimed_version.load(Ordering::Relaxed));
+            (failures, unreclaimed)
+        }
+    }
+
+    #[test]
+    fn failures_accumulate_and_reset_on_success() {
+        let b = Bookkeeping::new();
+
+        // A first success establishes the reclaim watermark.
+        assert_eq!(b.on_success(10), (0, 0));
+
+        // Each subsequent failure raises the consecutive count, and the
+        // unreclaimed gap tracks versions written since that watermark.
+        assert_eq!(b.on_failure(11), (1, 1));
+        assert_eq!(b.on_failure(12), (2, 2));
+        assert_eq!(b.on_failure(20), (3, 10));
+
+        // One success clears both signals.
+        assert_eq!(b.on_success(20), (0, 0));
+        assert_eq!(b.on_failure(21), (1, 1));
+    }
+
+    /// The watermark starts at 0, so failures before any successful pass still
+    /// report a non-zero gap rather than silently reporting "nothing pending".
+    #[test]
+    fn failure_before_first_success_still_reports_a_gap() {
+        let b = Bookkeeping::new();
+        let (failures, unreclaimed) = b.on_failure(246_000);
+        assert_eq!(failures, 1);
+        assert_eq!(
+            unreclaimed, 246_000,
+            "a bloated table that has never been reclaimed must report its full backlog"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_publication_tests {
+    use super::*;
+    use crate::stats_store::StatsStore;
+    use tokio::sync::RwLock;
+
+    fn row(pending: i64) -> StatRow {
+        StatRow {
+            name: "hot".into(),
+            uri: "/unused/hot".into(),
+            row_count: 1,
+            fragment_count: 1,
+            last_updated: 1,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: 1,
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_commit_preserves_published_backlog_until_successful_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats.lance");
+        let uri = path.to_str().unwrap();
+        let mut stats = StatsStore::open_or_create(uri, None).await.unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        let previous = cache.read().await.clone();
+
+        // A real storage write failure, without mocking the publication path.
+        // Keep the committed dataset intact so recovery can verify its rows.
+        let retained = dir.path().join("retained.lance");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"storage unavailable").unwrap();
+        let result = publish_snapshot(&mut stats, &cache, vec![row(0)], 0).await;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&retained, &path).unwrap();
+        assert!(result.is_err(), "a failed commit must fail the scan");
+        assert!(Arc::ptr_eq(&previous, &*cache.read().await));
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(5000)));
+
+        publish_snapshot(&mut stats, &cache, vec![row(0)], 0)
+            .await
+            .unwrap();
+        assert_eq!(cache.read().await.as_ref(), &vec![row(0)]);
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(0)));
+    }
+
+    #[tokio::test]
+    async fn failed_observations_cannot_publish_an_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("stats.lance");
+        let mut stats = StatsStore::open_or_create(uri.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        let previous = cache.read().await.clone();
+        assert!(publish_snapshot(&mut stats, &cache, Vec::new(), 1)
+            .await
+            .is_err());
+        assert!(Arc::ptr_eq(&previous, &*cache.read().await));
+        assert_eq!(stats.get("hot").await.unwrap(), Some(row(5000)));
+    }
+
+    #[tokio::test]
+    async fn confirmed_empty_snapshot_clears_storage_and_cache_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("stats.lance");
+        let mut stats = StatsStore::open_or_create(uri.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let cache = RwLock::new(Arc::new(Vec::new()));
+        publish_snapshot(&mut stats, &cache, vec![row(5000)], 0)
+            .await
+            .unwrap();
+        publish_snapshot(&mut stats, &cache, Vec::new(), 0)
+            .await
+            .unwrap();
+        assert!(cache.read().await.is_empty());
+        assert_eq!(stats.count(None).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod incremental_scan_tests {
+    use super::*;
+    use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+    use tempfile::TempDir;
+
+    #[test]
+    fn duplicate_registry_entries_are_observed_once_and_conflicts_are_isolated() {
+        let entry = |name: &str, uri: &str, kind| ScanEntry {
+            name: name.into(),
+            uri: uri.into(),
+            kind,
+        };
+        let mut entries: Vec<_> = (0..14)
+            .map(|_| entry("hot", "/hot", ScanKind::Rollout))
+            .collect();
+        entries.extend([
+            entry("generic:hot", "/generic/hot", ScanKind::Generic),
+            entry("conflict", "/one", ScanKind::Rollout),
+            entry("conflict", "/two", ScanKind::Rollout),
+        ]);
+        let (unique, ambiguous) = unique_scan_entries(entries);
+        assert_eq!(
+            unique.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["generic:hot", "hot"]
+        );
+        assert_eq!(ambiguous, HashSet::from(["conflict".to_string()]));
+    }
+
+    fn rec(id: &str) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "r".to_string(),
+            problem_id: "p".to_string(),
+            dataset: None,
+            sequence_order: 0,
+            role: ROLE_ASSISTANT.to_string(),
+            created_at: Utc::now(),
+            content: Some("x".to_string()),
+            content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: None,
+            num_input_tokens: None,
+            num_output_tokens: None,
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: None,
+            raw_reward: None,
+            grader_id: None,
+            score: None,
+            include_in_training: None,
+            exclude_reason: None,
+            policy_version: None,
+            relationships: vec![],
+            binary_payload: None,
+            payload_size: None,
+            payload_checksum: None,
+            artifact_type: None,
+            metadata: None,
+        }
+    }
+
+    /// An experiment whose base version has not moved must not be re-observed.
+    ///
+    /// This is the property the whole incremental path rests on: at tens of
+    /// thousands of experiments, almost all cold, a scan that fully observes
+    /// every one cannot finish inside its interval. Opening the dataset is
+    /// unavoidable (it is how the version is read), but everything after it --
+    /// listing MemWAL shards, opening each flushed generation, counting rows --
+    /// must be skipped when nothing has changed.
+    #[tokio::test]
+    async fn unchanged_experiment_is_not_reobserved() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        // First pass: nothing known, so a full observation happens.
+        let (first, skipped) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(!skipped, "the first observation cannot be skipped");
+        assert_ne!(first.version, StatRow::UNKNOWN_VERSION);
+
+        // Second pass with the row from the first: the version is unchanged, so
+        // the expensive observation is skipped and the row is reused.
+        let (second, skipped) =
+            observe_one("e", &uri, Some(&first), RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(skipped, "an unchanged experiment must skip re-observation");
+        assert_eq!(second.row_count, first.row_count);
+        assert_eq!(second.fragment_count, first.fragment_count);
+        assert_eq!(second.version, first.version);
+        assert!(
+            second.scanned_at >= first.scanned_at,
+            "a skipped row still refreshes scanned_at so staleness stays visible"
+        );
+    }
+
+    /// A generic store's pending MemWAL generations are observed and written
+    /// under its `generic:` target name. This is the row the WAL-merge sweep
+    /// reads; without it the master never schedules a generic store's merge
+    /// and 20 workers race to commit into its base table on their own timers.
+    #[tokio::test]
+    async fn generic_store_is_observed_with_pending_wal() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        use lance_context_core::{GenericStore, GenericStoreOptions};
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("g.generic.lance")
+            .to_string_lossy()
+            .to_string();
+        let spec = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        {
+            let store = GenericStore::open(
+                &uri,
+                spec,
+                GenericStoreOptions {
+                    seal_on_add: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                store
+                    .add(&[serde_json::json!({"id": format!("r{i}")})
+                        .as_object()
+                        .unwrap()
+                        .clone()])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let name = generic_target("g");
+        let (row, skipped) = observe_generic(&name, &uri, None, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(!skipped);
+        assert_eq!(row.name, "generic:g");
+        assert_eq!(row.pending_wal_generations, 3);
+        assert_ne!(row.version, StatRow::UNKNOWN_VERSION);
+
+        // Unchanged version: skipped like rollout, row reused.
+        let (again, skipped) =
+            observe_generic(&name, &uri, Some(&row), GenericStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(skipped);
+        assert_eq!(again.pending_wal_generations, 3);
+
+        // More flushes do not move the base version, but the merge sweep
+        // reads this count: the skipped row must still carry the new one.
+        {
+            let store = GenericStore::open(
+                &uri,
+                SchemaSpec::new(vec![(
+                    ID_COLUMN.to_string(),
+                    ColumnSpec::required(ColumnType::String { large: false }),
+                )]),
+                GenericStoreOptions {
+                    seal_on_add: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 3..5 {
+                store
+                    .add(&[serde_json::json!({"id": format!("r{i}")})
+                        .as_object()
+                        .unwrap()
+                        .clone()])
+                    .await
+                    .unwrap();
+            }
+        }
+        let (recounted, skipped) =
+            observe_generic(&name, &uri, Some(&again), GenericStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(skipped, "base version unchanged");
+        assert_eq!(recounted.version, again.version);
+        assert_eq!(recounted.pending_wal_generations, 5);
+    }
+
+    /// WAL flushes never bump the base-table version. A store that no one
+    /// has merged keeps its version forever while its shards fill up; the
+    /// unchanged-version shortcut must still recount pending generations or
+    /// the merge sweep never learns about it (17k generations sat behind a
+    /// stale "3" in production).
+    #[tokio::test]
+    async fn skipped_round_recounts_pending_generations() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        store.add(&[rec("a")]).await.unwrap();
+        store.flush().await.unwrap();
+
+        let (prev, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(prev.pending_wal_generations, 1);
+
+        for id in ["b", "c", "d"] {
+            store.add(&[rec(id)]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+        let (next, skipped) = observe_one("e", &uri, Some(&prev), RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(skipped, "base version unchanged");
+        assert_eq!(next.version, prev.version);
+        assert_eq!(next.pending_wal_generations, 4);
+    }
+
+    /// A write moves the base version, so the next scan must observe fully and
+    /// pick up the new counts.
+    #[tokio::test]
+    async fn changed_experiment_is_reobserved() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        let mut store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        store.add(&[rec("a")]).await.unwrap();
+        store.flush().await.unwrap();
+
+        let (first, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+
+        // Merge the WAL into the base table: this advances the base version.
+        store.cleanup_own_shard().await.unwrap();
+
+        let (second, skipped) =
+            observe_one("e", &uri, Some(&first), RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(
+            !skipped,
+            "a changed base version must force a full observation"
+        );
+        assert_ne!(
+            second.version, first.version,
+            "the new row must record the new version"
+        );
+    }
+
+    /// A row from before the `version` column existed carries the sentinel and
+    /// must force one full observation rather than being treated as unchanged.
+    #[tokio::test]
+    async fn unknown_version_forces_observation() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let (mut legacy, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        legacy.version = StatRow::UNKNOWN_VERSION;
+
+        let (refreshed, skipped) =
+            observe_one("e", &uri, Some(&legacy), RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        assert!(
+            !skipped,
+            "an unknown version must not be mistaken for an unchanged one"
+        );
+        assert_ne!(refreshed.version, StatRow::UNKNOWN_VERSION);
+    }
+
+    /// Compaction counters survive a skipped round.
+    #[tokio::test]
+    async fn skipped_round_preserves_compaction_counters() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let (mut prev, _) = observe_one("e", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        prev.last_compaction = 1_700_000_000_000;
+        prev.total_compactions = 7;
+
+        let (next, skipped) = observe_one("e", &uri, Some(&prev), RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert!(skipped);
+        assert_eq!(next.last_compaction, 1_700_000_000_000);
+        assert_eq!(next.total_compactions, 7);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use lance_context_core::{RolloutRecord, RolloutStore, RolloutStoreOptions, ROLE_ASSISTANT};
+    use tempfile::TempDir;
+
+    fn rec(id: &str) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "r".to_string(),
+            problem_id: "p".to_string(),
+            dataset: None,
+            sequence_order: 0,
+            role: ROLE_ASSISTANT.to_string(),
+            created_at: Utc::now(),
+            content: Some("x".to_string()),
+            content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: None,
+            num_input_tokens: None,
+            num_output_tokens: None,
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: None,
+            raw_reward: None,
+            grader_id: None,
+            score: None,
+            include_in_training: None,
+            exclude_reason: None,
+            policy_version: None,
+            relationships: vec![],
+            binary_payload: None,
+            payload_size: None,
+            payload_checksum: None,
+            artifact_type: None,
+            metadata: None,
+        }
+    }
+
+    fn row(name: &str, uri: &str, last_updated: i64) -> StatRow {
+        StatRow {
+            name: name.to_string(),
+            uri: uri.to_string(),
+            row_count: 1,
+            fragment_count: 1,
+            last_updated,
+            pending_wal_generations: 0,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: last_updated,
+            version: 1,
+        }
+    }
+
+    fn compaction_limits() -> (CompactionConfig, Arc<Semaphore>) {
+        (
+            CompactionConfig {
+                num_threads: Some(1),
+                batch_size: Some(8),
+                max_source_fragments: Some(32),
+                max_bytes_per_file: Some(1024 * 1024 * 1024),
+                try_binary_copy: true,
+                ..Default::default()
+            },
+            Arc::new(Semaphore::new(1)),
+        )
+    }
+
+    /// Retirement must drain the WAL before dropping the row.
+    ///
+    /// The sweeps read the stats table and nothing else, so a retired
+    /// experiment is invisible to them forever. Dropping one with pending
+    /// generations would strand them: never merged, read amplification never
+    /// recovers, `_mem_wal/` never reclaimed, and no process left to notice.
+    #[test]
+    fn backlog_summary_distinguishes_store_sum_from_per_shard_threshold() {
+        let mut a = row("a", "u", 100_000);
+        a.pending_wal_generations = 5000;
+        // Two shards of 2500 each exceed the STORE threshold but neither the
+        // per-shard reference cap. This used to count one refused-read store.
+        let summary = crate::backlog_metrics::Snapshot::new(&[a], 0, 100_000, 2500, 0);
+        assert_eq!(summary.generations, 5000);
+        assert_eq!(summary.largest_store, 5000);
+        assert_eq!(summary.largest_shard, 2500);
+        assert_eq!(summary.stores_with_shard_over_4096, 0);
+        assert_eq!(summary.stores_over_1000, 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_drains_the_wal_before_dropping_the_row() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            for i in 0..3 {
+                store.add(&[rec(&format!("r{i}"))]).await.unwrap();
+                store.flush().await.unwrap();
+            }
+            // Pending generations exist at this point.
+            let obs = store.observe().await.unwrap();
+            assert!(
+                obs.pending_wal_generations > 0,
+                "test setup must leave un-merged generations"
+            );
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let (compaction_config, compaction_permits) = compaction_limits();
+        let draining = crate::admission::Admission::default();
+        draining.begin_drain();
+        let deferred = retire_cold_experiments(
+            &[row("e", &uri, old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config.clone(),
+            compaction_permits.clone(),
+            &draining,
+        )
+        .await;
+        assert!(deferred.is_empty());
+        let pending =
+            RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap()
+                .pending_wal_generations()
+                .await
+                .unwrap();
+        assert_eq!(
+            pending, 3,
+            "draining scanner must not start cold-table writes"
+        );
+        let retired = retire_cold_experiments(
+            &[row("e", &uri, old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
+            &crate::admission::Admission::default(),
+        )
+        .await;
+
+        assert!(retired.contains("e"), "a cold experiment should retire");
+
+        // The decisive assertion: nothing was left behind for a sweep that will
+        // never look again.
+        let store = RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        let obs = store.observe().await.unwrap();
+        assert_eq!(
+            obs.pending_wal_generations, 0,
+            "retirement must leave zero pending generations, or they are stranded forever"
+        );
+        assert_eq!(obs.row_count, 3, "no rows may be lost by retirement");
+    }
+
+    /// An experiment written recently must not be retired.
+    #[tokio::test]
+    async fn recently_written_experiment_is_not_retired() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let (compaction_config, compaction_permits) = compaction_limits();
+        let retired = retire_cold_experiments(
+            &[row("e", &uri, now)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
+            &crate::admission::Admission::default(),
+        )
+        .await;
+        assert!(
+            retired.is_empty(),
+            "a hot experiment must stay in the table"
+        );
+    }
+
+    /// Retirement disabled means nothing is ever retired, however old.
+    #[tokio::test]
+    async fn zero_window_disables_retirement() {
+        let now = Utc::now().timestamp_millis();
+        let (compaction_config, compaction_permits) = compaction_limits();
+        let retired = retire_cold_experiments(
+            &[row("e", "/nonexistent", 0)],
+            Duration::from_secs(0),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
+            &crate::admission::Admission::default(),
+        )
+        .await;
+        assert!(retired.is_empty());
+    }
+
+    /// An experiment that cannot be prepared stays in the table rather than
+    /// being dropped. Refusing to retire is always safe; retiring early is not.
+    #[tokio::test]
+    async fn unpreparable_experiment_is_kept() {
+        let now = Utc::now().timestamp_millis();
+        let old = now - Duration::from_secs(30 * 86_400).as_millis() as i64;
+        let (compaction_config, compaction_permits) = compaction_limits();
+        let retired = retire_cold_experiments(
+            &[row("gone", "/no/such/dataset.lance", old)],
+            Duration::from_secs(7 * 86_400),
+            now,
+            RolloutStoreOptions::default(),
+            compaction_config,
+            compaction_permits,
+            &crate::admission::Admission::default(),
+        )
+        .await;
+        assert!(
+            retired.is_empty(),
+            "an experiment that failed to prepare must not be retired"
+        );
+    }
+    /// A cold observation must not write a stats row.
+    ///
+    /// Reading about a retired experiment (search, or opening its detail page)
+    /// must not make it hot again -- otherwise browsing the UI would silently
+    /// undo retirement and the table would creep back toward holding every
+    /// experiment that ever existed, which is the state retirement exists to
+    /// prevent.
+    #[tokio::test]
+    async fn observe_cold_reports_without_rehydrating() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("e.lance").to_string_lossy().to_string();
+        {
+            let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[rec("a")]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+
+        let summary = observe_cold_with_options("e", &uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(summary.name, "e");
+        assert_eq!(
+            summary.row_count, 1,
+            "a cold read still reports real counts"
+        );
+
+        let second = observe_cold_with_options("e", &uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(second.row_count, summary.row_count);
+    }
+
+    /// A missing dataset surfaces as an error rather than a panic, so a search
+    /// hit on a registry entry whose data is gone degrades to one skipped row.
+    #[tokio::test]
+    async fn observe_cold_errors_on_missing_dataset() {
+        assert!(observe_cold_with_options(
+            "gone",
+            "/no/such/dataset.lance",
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod retirement_lifecycle_tests {
+    use super::*;
+
+    fn catalog(prefix: &str, count: usize) -> Arc<Vec<ScanEntry>> {
+        Arc::new(
+            (0..count)
+                .map(|i| ScanEntry {
+                    name: format!("{prefix}{i}"),
+                    uri: format!("memory://{prefix}{i}"),
+                    kind: if i % 2 == 0 {
+                        ScanKind::Rollout
+                    } else {
+                        ScanKind::Generic
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn retirement_catalog_keeps_cold_tail_and_only_latest_successor() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let completed = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = {
+            let (entered, release, completed, seen) = (
+                entered.clone(),
+                release.clone(),
+                completed.clone(),
+                seen.clone(),
+            );
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |entry| {
+                    let (entered, release, completed, seen) = (
+                        entered.clone(),
+                        release.clone(),
+                        completed.clone(),
+                        seen.clone(),
+                    );
+                    async move {
+                        seen.lock().unwrap().push(entry.name.clone());
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        completed.add_permits(1);
+                        // A poisoned table cannot hide the rest of the catalog.
+                        if entry.name == "old0" {
+                            Err(lance::Error::io("fixture failure"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                || async { Ok(()) },
+            ))
+        };
+        sender.send_replace(Some(catalog("old", 8)));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(4))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(admission.status().active_operations, 4);
+        sender.send_replace(Some(catalog("superseded", 4)));
+        sender.send_replace(Some(catalog("new", 4)));
+        release.add_permits(12);
+        tokio::time::timeout(Duration::from_secs(5), completed.acquire_many(12))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 12);
+        for prefix in ["old", "new"] {
+            for i in 0..if prefix == "old" { 8 } else { 4 } {
+                assert_eq!(
+                    seen.iter()
+                        .filter(|n| **n == format!("{prefix}{i}"))
+                        .count(),
+                    1
+                );
+            }
+        }
+        assert!(seen[..8].iter().all(|name| name.starts_with("old")));
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn retirement_drain_cancels_waiting_admissions_without_visiting_remaining_tables() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let entered = Arc::new(Semaphore::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = {
+            let (entered, started) = (entered.clone(), started.clone());
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |_| {
+                    let (entered, started) = (entered.clone(), started.clone());
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        entered.add_permits(1);
+                        std::future::pending::<lance::Result<()>>().await
+                    }
+                },
+                || async { Ok(()) },
+            ))
+        };
+        sender.send_replace(Some(catalog("cold", 20)));
+        tokio::time::timeout(Duration::from_secs(5), entered.acquire_many(4))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        assert!(admission.status().drained());
+    }
+
+    #[tokio::test]
+    async fn cold_phase_finishes_before_latest_successor_and_drain_cancels_it() {
+        let admission = Arc::new(crate::admission::Admission::default());
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let cold_entered = Arc::new(Semaphore::new(0));
+        let cold_release = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handle = {
+            let (entered, release, seen) =
+                (cold_entered.clone(), cold_release.clone(), seen.clone());
+            tokio::spawn(consume_retirement_catalogs(
+                admission.clone(),
+                receiver,
+                move |entry| {
+                    seen.lock().unwrap().push(entry.name);
+                    async { Ok(()) }
+                },
+                move || {
+                    let (entered, release) = (entered.clone(), release.clone());
+                    async move {
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        // Failure must not stop future catalog rounds.
+                        Err(lance::Error::io("cold fixture incomplete"))
+                    }
+                },
+            ))
+        };
+        sender.send_replace(Some(catalog("old", 2)));
+        tokio::time::timeout(Duration::from_secs(5), cold_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        sender.send_replace(Some(catalog("superseded", 2)));
+        sender.send_replace(Some(catalog("new", 2)));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        cold_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), cold_entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(*seen.lock().unwrap(), vec!["old0", "old1", "new0", "new1"]);
+        assert_eq!(admission.status().active_operations, 1);
+        admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(admission.status().drained());
+    }
+}

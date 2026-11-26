@@ -1,0 +1,147 @@
+--- a/src/engine.rs
++++ b/src/engine.rs
+@@ -3,6 +3,7 @@
+ use std::cell::{Cell, RefCell};
+ use std::marker::PhantomData;
+ use std::path::Path;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{mpsc, Arc, Mutex};
+ use std::thread::{Builder as ThreadBuilder, JoinHandle};
+ use std::time::{Duration, Instant};
+@@ -309,6 +310,7 @@
+                 return Ok(Some(read_entry_from_file::<M, _>(
+                     self.pipe_log.as_ref(),
+                     &idx,
++                    self.purge_manager.read_cache_id,
+                 )?));
+             }
+         }
+@@ -337,7 +339,11 @@
+                 .read()
+                 .fetch_entries_to(begin, end, max_size, &mut ents_idx)?;
+             for i in ents_idx.iter() {
+-                vec.push(read_entry_from_file::<M, _>(self.pipe_log.as_ref(), i)?);
++                vec.push(read_entry_from_file::<M, _>(
++                    self.pipe_log.as_ref(),
++                    i,
++                    self.purge_manager.read_cache_id,
++                )?);
+             }
+             ENGINE_READ_ENTRY_COUNT_HISTOGRAM.observe(ents_idx.len() as f64);
+             return Ok(ents_idx.len());
+@@ -550,7 +556,17 @@
+     }
+ }
+ 
++/// Cache owners must remain distinct after an engine is dropped and its memory
++/// address or directory name is reused. Allocated once per engine/purge owner;
++/// no atomics or allocations are added to a cache hit.
++pub(crate) fn next_read_cache_id() -> u64 {
++    static NEXT: AtomicU64 = AtomicU64::new(1);
++    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
++        .expect("read cache identity exhausted")
++}
++
+ struct BlockCache {
++    owner: Cell<u64>,
+     key: Cell<FileBlockHandle>,
+     block: RefCell<Vec<u8>>,
+ }
+@@ -558,6 +574,7 @@
+ impl BlockCache {
+     fn new() -> Self {
+         BlockCache {
++            owner: Cell::new(0),
+             key: Cell::new(FileBlockHandle {
+                 id: FileId::new(LogQueue::Append, 0),
+                 offset: 0,
+@@ -567,7 +584,8 @@
+         }
+     }
+ 
+-    fn insert(&self, key: FileBlockHandle, block: Vec<u8>) {
++    fn insert(&self, owner: u64, key: FileBlockHandle, block: Vec<u8>) {
++        self.owner.set(owner);
+         self.key.set(key);
+         self.block.replace(block);
+     }
+@@ -577,14 +595,19 @@
+     static BLOCK_CACHE: BlockCache = BlockCache::new();
+ }
+ 
+-pub(crate) fn read_entry_from_file<M, P>(pipe_log: &P, idx: &EntryIndex) -> Result<M::Entry>
++pub(crate) fn read_entry_from_file<M, P>(
++    pipe_log: &P,
++    idx: &EntryIndex,
++    owner: u64,
++) -> Result<M::Entry>
+ where
+     M: MessageExt,
+     P: PipeLog,
+ {
+     BLOCK_CACHE.with(|cache| {
+-        if cache.key.get() != idx.entries.unwrap() {
++        if cache.owner.get() != owner || cache.key.get() != idx.entries.unwrap() {
+             cache.insert(
++                owner,
+                 idx.entries.unwrap(),
+                 LogBatch::decode_entries_block(
+                     &pipe_log.read_bytes(idx.entries.unwrap())?,
+@@ -602,13 +625,18 @@
+     })
+ }
+ 
+-pub(crate) fn read_entry_bytes_from_file<P>(pipe_log: &P, idx: &EntryIndex) -> Result<Vec<u8>>
++pub(crate) fn read_entry_bytes_from_file<P>(
++    pipe_log: &P,
++    idx: &EntryIndex,
++    owner: u64,
++) -> Result<Vec<u8>>
+ where
+     P: PipeLog,
+ {
+     BLOCK_CACHE.with(|cache| {
+-        if cache.key.get() != idx.entries.unwrap() {
++        if cache.owner.get() != owner || cache.key.get() != idx.entries.unwrap() {
+             cache.insert(
++                owner,
+                 idx.entries.unwrap(),
+                 LogBatch::decode_entries_block(
+                     &pipe_log.read_bytes(idx.entries.unwrap())?,
+--- a/src/purge.rs
++++ b/src/purge.rs
+@@ -11,7 +11,7 @@
+ use parking_lot::{Mutex, RwLock};
+ 
+ use crate::config::Config;
+-use crate::engine::read_entry_bytes_from_file;
++use crate::engine::{next_read_cache_id, read_entry_bytes_from_file};
+ use crate::event_listener::EventListener;
+ use crate::log_batch::{AtomicGroupBuilder, LogBatch};
+ use crate::memtable::{MemTableHandle, MemTables};
+@@ -48,6 +48,7 @@
+     pipe_log: Arc<P>,
+     global_stats: Arc<GlobalStats>,
+     listeners: Vec<Arc<dyn EventListener>>,
++    pub(crate) read_cache_id: u64,
+ 
+     // Only one thread can run `purge_expired_files` at a time.
+     //
+@@ -73,6 +74,7 @@
+             pipe_log,
+             global_stats,
+             listeners,
++            read_cache_id: next_read_cache_id(),
+             force_rewrite_candidates: Arc::new(Mutex::new(HashMap::default())),
+         }
+     }
+@@ -363,7 +365,8 @@
+             // compression overhead is not too high.
+             let mut entry_indexes = entry_indexes.into_iter().peekable();
+             while let Some(ei) = entry_indexes.next() {
+-                let entry = read_entry_bytes_from_file(self.pipe_log.as_ref(), &ei)?;
++                let entry =
++                    read_entry_bytes_from_file(self.pipe_log.as_ref(), &ei, self.read_cache_id)?;
+                 current_size += entry.len();
+                 current_entries.push(entry);
+                 current_entry_indexes.push(ei);

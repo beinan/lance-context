@@ -1,0 +1,88 @@
+[package]
+name = "lance-context-ingest"
+version = "0.6.7"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Durable rollout ingress over the independent lance-context WAL"
+
+[features]
+service = ["worker", "http", "dep:reqwest", "dep:tokio-rustls", "dep:url", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "tokio/signal"]
+worker = ["materializer", "dep:etcd-client"]
+http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
+http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
+lance-io-metrics = ["lance-context-core/lance-io-metrics", "dep:lance-context-metrics"]
+materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:lance-file", "dep:lance-datafusion", "dep:datafusion-common", "dep:datafusion-physical-plan", "dep:prost", "dep:prost-types", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
+
+[dependencies]
+async-trait = { version = "0.1.92", optional = true }
+tokio-rustls = { version = "0.26.4", optional = true, default-features = false, features = ["ring", "tls12"] }
+etcd-client = { version = "0.19", features = ["tls"], optional = true }
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "http1", "http2", "tokio"] }
+http-body-util = { version = "0.1", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+lance = { version = "14.0.2", optional = true }
+lance-table = { version = "14.0.2", optional = true }
+lance-io = { version = "14.0.2", optional = true }
+lance-index = { version = "14.0.2", optional = true }
+lance-file = { version = "14.0.2", optional = true }
+lance-datafusion = { version = "14.0.2", optional = true }
+datafusion-common = { version = "54", optional = true, default-features = false }
+datafusion-physical-plan = { version = "54", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
+object_store = { version = "0.14.2", optional = true }
+futures = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
+anyhow = "1"
+arrow-array = "58"
+arrow-schema = "58"
+arrow-ipc = { version = "58", optional = true }
+base64 = "0.22"
+bytes = "1"
+lance-context-core = { version = "0.6.7", path = "../lance-context-core" }
+lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
+lance-context-metrics = { path = "../lance-context-metrics", optional = true }
+lance-context-wal = { version = "0.6.7", path = "../lance-context-wal", features = ["peer-transport", "ipc", "arrow-contract"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+uuid = { version = "1.20.0", features = ["v4", "serde"] }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+bincode = "1.3"
+url = "2"
+async-trait = "0.1.92"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+arrow-ipc = "58"
+lance = "14.0.2"
+lance-table = "14.0.2"
+rcgen = "0.14"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "lance-context-ingest"
+path = "src/bin/ingest.rs"
+required-features = ["service"]
+
+[[example]]
+name = "annotation_probe"
+path = "examples/annotation_probe/main.rs"
+required-features = ["service", "http-client"]
+
+[[example]]
+name = "annotation_io_owner"
+required-features = ["service", "lance-io-metrics"]
+
+[[example]]
+name = "annotation_result_probe"
+required-features = ["service"]
+
+[[example]]
+name = "managed_turn_replay"
+required-features = ["service", "http-client"]

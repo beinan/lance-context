@@ -1,0 +1,911 @@
+//! Test-only TLS proxy: forward the actual command, read its quorum result,
+//! withhold one completion reply or return an uncertain control outcome.
+use super::*;
+use bincode::Options as _;
+use lance_context_wal::replication::source;
+use std::path::Path as FsPath;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    task::JoinSet,
+};
+use tokio_rustls::{
+    rustls::{
+        self,
+        pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName},
+        RootCertStore,
+    },
+    TlsAcceptor, TlsConnector,
+};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireScope {
+    _cluster: Uuid,
+    _layout: [u8; 32],
+    _policy: [u8; 32],
+    _node: u64,
+}
+
+type RecordedAppends = Arc<std::sync::Mutex<Vec<(BatchMeta, Vec<u8>)>>>;
+
+pub(in crate::tests) struct Proxy {
+    pub client: Arc<Client>,
+    pub dropped: Arc<AtomicUsize>,
+    pub plans: Arc<AtomicUsize>,
+    pub plan_requests: Arc<std::sync::Mutex<Vec<p::PlanRequest>>>,
+    pub unknown_plans: Arc<AtomicBool>,
+    pub rpc_unknown_plans: Arc<AtomicBool>,
+    pub pause_plan_retry: Arc<AtomicBool>,
+    pub prepares: Arc<AtomicUsize>,
+    pub unknown_prepares: Arc<AtomicBool>,
+    pub pause_uncommitted_prepare: Arc<AtomicBool>,
+    pub prepare_requests: Arc<std::sync::Mutex<Vec<p::PrepareRequest>>>,
+    pub pin_requests: Arc<std::sync::Mutex<Vec<source::Permit>>>,
+    pub unknown_pins: Arc<AtomicBool>,
+    pub confirms: Arc<AtomicUsize>,
+    pub confirm_requests: Arc<std::sync::Mutex<Vec<p::ConfirmPublication>>>,
+    pub unknown_confirms: Arc<AtomicBool>,
+    pub blocked_reads: Arc<AtomicUsize>,
+    blocked_nodes: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>>,
+    observations_restored: Arc<AtomicBool>,
+    pub advances: Arc<AtomicUsize>,
+    pub advance_requests: Arc<std::sync::Mutex<Vec<p::AdvancePublication>>>,
+    pub unknown_advances: Arc<AtomicBool>,
+    pub pause_uncommitted_advance: Arc<AtomicBool>,
+    pub block_advance_observations: Arc<AtomicBool>,
+    pub appends: Arc<AtomicUsize>,
+    pub append_requests: RecordedAppends,
+    pub unknown_appends: Arc<AtomicBool>,
+    pub pending_capacity_appends: Arc<AtomicBool>,
+    pub pause_append_retry: Arc<AtomicBool>,
+    pub lose_append_retry_reply: Arc<AtomicBool>,
+    pub closes: Arc<AtomicUsize>,
+    pub unknown_closes: Arc<AtomicBool>,
+    pub unknown_retirements: Arc<AtomicBool>,
+    /// Drop the TLS connection instead of replying Unknown to Pin/Retire faults.
+    pub disconnect_controls: Arc<AtomicBool>,
+    pub close_permits:
+        Arc<std::sync::Mutex<Vec<lance_context_wal::replication::source::ClosurePermit>>>,
+    pub committed: Arc<Notify>,
+    pub release: Arc<Notify>,
+    _tasks: JoinSet<Result<()>>,
+}
+
+fn codec() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(2 << 20)
+}
+
+fn certificates(path: &FsPath) -> Result<Vec<CertificateDer<'static>>> {
+    Ok(CertificateDer::pem_slice_iter(&std::fs::read(path)?)
+        .collect::<std::result::Result<_, _>>()?)
+}
+
+struct Frame {
+    fixed: [u8; 24],
+    meta: Vec<u8>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum Point {
+    Pin {
+        execute: bool,
+        observe: bool,
+        rpc_unknown: bool,
+    },
+    Prepare {
+        execute: bool,
+        observe: bool,
+        structured: bool,
+    },
+    Append {
+        execute: bool,
+    },
+    Close {
+        execute: bool,
+    },
+    Plan {
+        execute: bool,
+    },
+    Advance {
+        execute: bool,
+    },
+    Reserve {
+        execute: bool,
+    },
+    Retire {
+        execute: bool,
+        rpc_unknown: bool,
+    },
+    Confirm {
+        execute: bool,
+        rpc_unknown: bool,
+    },
+}
+impl Frame {
+    async fn read(io: &mut (impl AsyncRead + Unpin), data: bool) -> Result<Option<Self>> {
+        let mut fixed = [0; 24];
+        match io.read_exact(&mut fixed[..1]).await {
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            result => {
+                result?;
+            }
+        }
+        io.read_exact(&mut fixed[1..]).await?;
+        ensure!(&fixed[..8] == b"LCWCLNT1", "foreign proxy protocol");
+        let size = u32::from_le_bytes(fixed[16..20].try_into()?) as usize;
+        ensure!(
+            (1..=2 << 20).contains(&size)
+                && if data {
+                    u32::from_le_bytes(fixed[20..24].try_into()?) <= 16 << 20
+                } else {
+                    fixed[20..24] == [0; 4]
+                },
+            "invalid control frame"
+        );
+        let mut meta = vec![0; size];
+        io.read_exact(&mut meta).await?;
+        Ok(Some(Self {
+            fixed,
+            meta,
+            body: Vec::new(),
+        }))
+    }
+    async fn write(&self, io: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+        io.write_all(&self.fixed).await?;
+        io.write_all(&self.meta).await?;
+        io.write_all(&self.body).await?;
+        io.flush().await?;
+        Ok(())
+    }
+    async fn payload(&mut self, io: &mut (impl AsyncRead + Unpin), request: bool) -> Result<()> {
+        let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        let bytes = if request && kind == 0 {
+            let (_, _, _, meta): (WireScope, u32, u64, BatchMeta) =
+                codec().reject_trailing_bytes().deserialize(&self.meta)?;
+            meta.body_bytes
+        } else if !request && kind == 2 {
+            let (_, _, meta): (WireScope, u32, Option<BatchMeta>) =
+                codec().reject_trailing_bytes().deserialize(&self.meta)?;
+            meta.map_or(0, |m| m.body_bytes)
+        } else {
+            0
+        };
+        ensure!(
+            bytes <= 16 << 20
+                && bytes == u64::from(u32::from_le_bytes(self.fixed[20..24].try_into()?)),
+            "invalid test proxy body length"
+        );
+        self.body.resize(bytes as usize, 0);
+        io.read_exact(&mut self.body).await?;
+        Ok(())
+    }
+    fn matches_command(&self, point: Point) -> Result<bool> {
+        // The fixed-int wire enum's control discriminant is 1. Decode all of
+        // that command, forwarding original bytes without re-encoding them.
+        let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        if matches!(point, Point::Append { .. }) {
+            return Ok(kind == 0);
+        }
+        if kind != 1 {
+            return Ok(false);
+        }
+        let (_, _, command): (WireScope, u32, Command) =
+            codec().reject_trailing_bytes().deserialize(&self.meta)?;
+        Ok(matches!(
+            (point, command),
+            (Point::Prepare { .. }, Command::Prepare(_))
+                | (Point::Pin { .. }, Command::Pin(_))
+                | (Point::Close { .. }, Command::Close(_))
+                | (Point::Plan { .. }, Command::Plan(_))
+                | (Point::Advance { .. }, Command::Advance(_))
+                | (Point::Reserve { .. }, Command::Reserve(_))
+                | (Point::Retire { .. }, Command::RetireHistory(_))
+                | (Point::Confirm { .. }, Command::Confirm(_))
+        ))
+    }
+    fn observation_query(&self, point: Point) -> Result<bool> {
+        let (_, kind): (WireScope, u32) = codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        if kind != 2 {
+            return Ok(false);
+        }
+        let (_, _, _, query): (
+            WireScope,
+            u32,
+            u64,
+            lance_context_wal::replication::query::Query,
+        ) = codec().reject_trailing_bytes().deserialize(&self.meta)?;
+        Ok(matches!(
+            query,
+            lance_context_wal::replication::query::Query::Publisher { .. }
+        ) || (matches!(point, Point::Pin { .. })
+            && matches!(
+                query,
+                lance_context_wal::replication::query::Query::SourcePin { .. }
+            )))
+    }
+    fn unknown_reply(&self) -> Result<Self> {
+        self.reply(Reply::Commit(Outcome::Unknown))
+    }
+    fn reply(&self, reply: Reply) -> Result<Self> {
+        let (scope, _): (WireScope, u32) =
+            codec().allow_trailing_bytes().deserialize(&self.meta)?;
+        let meta = codec().serialize(&(scope, reply))?;
+        let mut fixed = self.fixed;
+        fixed[16..20].copy_from_slice(&u32::try_from(meta.len())?.to_le_bytes());
+        fixed[20..24].fill(0);
+        Ok(Self {
+            fixed,
+            meta,
+            body: Vec::new(),
+        })
+    }
+    fn successful_reply(&self, point: Point) -> Result<bool> {
+        let (_, reply): (WireScope, Reply) =
+            codec().reject_trailing_bytes().deserialize(&self.meta)?;
+        Ok(matches!(
+            (point, reply),
+            (
+                Point::Pin { .. },
+                Reply::Commit(Outcome::Committed(Applied::Source(
+                    source::Reply::Pinned { .. }
+                )))
+            ) | (
+                Point::Append { .. },
+                Reply::Commit(Outcome::Committed(Applied::Accepted { .. }))
+            ) | (
+                Point::Prepare { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::Prepared { .. }
+                )))
+            ) | (
+                Point::Plan { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::Planned { .. }
+                )))
+            ) | (
+                Point::Advance { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Advanced(
+                    _
+                ))))
+            ) | (
+                Point::Reserve { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::ManifestReserved(_)
+                )))
+            ) | (
+                Point::Retire { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(
+                    p::Reply::ManifestHistory(_)
+                )))
+            ) | (
+                Point::Confirm { .. },
+                Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::Published(
+                    _
+                ))))
+            ) | (
+                Point::Close { .. },
+                Reply::Commit(Outcome::Committed(Applied::Source(
+                    lance_context_wal::replication::source::Reply::Closed { .. }
+                )))
+            )
+        ))
+    }
+}
+
+impl Proxy {
+    pub async fn open_pin(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Pin {
+                execute,
+                observe,
+                rpc_unknown: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_rpc_unknown_pin(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Pin {
+                execute,
+                observe,
+                rpc_unknown: true,
+            },
+        )
+        .await
+    }
+
+    /// Restore catalog reads only after the owner has observed the full outage.
+    pub fn restore_observations(&self) {
+        assert_eq!(
+            *self.blocked_nodes.lock().unwrap(),
+            [1, 2, 3].into_iter().collect()
+        );
+        assert!(self.blocked_reads.load(Ordering::SeqCst) >= 3);
+        self.observations_restored.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn open_append(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Append { execute }).await
+    }
+    pub async fn open(c: &network::Cluster, root: &FsPath) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Prepare {
+                execute: true,
+                observe: false,
+                structured: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_prepare(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        observe: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Prepare {
+                execute,
+                observe,
+                structured: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_close(c: &network::Cluster, root: &FsPath) -> Result<Self> {
+        Self::open_at(c, root, Point::Close { execute: true }).await
+    }
+
+    pub async fn close_fault(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_at_with_timeout(c, root, Point::Close { execute }, timeout).await
+    }
+
+    pub async fn open_plan(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Plan { execute }).await
+    }
+
+    pub async fn open_advance(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Advance { execute }).await
+    }
+
+    pub async fn open_reserve(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(c, root, Point::Reserve { execute }).await
+    }
+
+    pub async fn open_retire(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+        rpc_unknown: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Retire {
+                execute,
+                rpc_unknown,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Confirm {
+                execute,
+                rpc_unknown: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_rpc_unknown_confirm(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Confirm {
+                execute,
+                rpc_unknown: true,
+            },
+        )
+        .await
+    }
+
+    async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
+        Self::open_at_with_timeout(c, root, point, Duration::from_secs(30)).await
+    }
+
+    async fn open_at_with_timeout(
+        c: &network::Cluster,
+        root: &FsPath,
+        point: Point,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut roots = RootCertStore::empty();
+        for cert in certificates(&root.join("roots.pem"))? {
+            roots.add(cert)?;
+        }
+        let roots = Arc::new(roots);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut outbound = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots.clone())
+            .with_client_auth_cert(
+                certificates(&root.join("tls-4.pem"))?,
+                PrivateKeyDer::from_pem_slice(&std::fs::read(root.join("tls-4.key"))?)?,
+            )?;
+        outbound.alpn_protocols =
+            vec![lance_context_wal::replication::runtime::client::ALPN.to_vec()];
+        let outbound = Arc::new(outbound);
+        let connector = TlsConnector::from(outbound.clone());
+        let mut config = c.application.clone();
+        let armed = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let plans = Arc::new(AtomicUsize::new(0));
+        let plan_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_plans = Arc::new(AtomicBool::new(false));
+        let rpc_unknown_plans = Arc::new(AtomicBool::new(false));
+        let pause_plan_retry = Arc::new(AtomicBool::new(false));
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let unknown_prepares = Arc::new(AtomicBool::new(false));
+        let pause_uncommitted_prepare = Arc::new(AtomicBool::new(false));
+        let prepare_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pin_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_pins = Arc::new(AtomicBool::new(false));
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let confirm_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_confirms = Arc::new(AtomicBool::new(false));
+        let blocked_reads = Arc::new(AtomicUsize::new(0));
+        let blocked_nodes = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let observations_restored = Arc::new(AtomicBool::new(false));
+        let advances = Arc::new(AtomicUsize::new(0));
+        let advance_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_advances = Arc::new(AtomicBool::new(false));
+        let pause_uncommitted_advance = Arc::new(AtomicBool::new(false));
+        let block_advance_observations = Arc::new(AtomicBool::new(false));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let append_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_appends = Arc::new(AtomicBool::new(false));
+        let pending_capacity_appends = Arc::new(AtomicBool::new(false));
+        let pause_append_retry = Arc::new(AtomicBool::new(false));
+        let lose_append_retry_reply = Arc::new(AtomicBool::new(false));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let unknown_closes = Arc::new(AtomicBool::new(false));
+        let unknown_retirements = Arc::new(AtomicBool::new(false));
+        let disconnect_controls = Arc::new(AtomicBool::new(false));
+        let close_permits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let committed = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut tasks = JoinSet::new();
+        for (&id, endpoint) in &mut config.endpoints {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let destination = if matches!(point, Point::Append { .. }) {
+                &mut endpoint.data_address
+            } else {
+                &mut endpoint.control_address
+            };
+            let address = destination.clone();
+            *destination = listener.local_addr()?.to_string();
+            let name = ServerName::try_from(endpoint.server_name.clone())?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                roots.clone(),
+                provider.clone(),
+            )
+            .build()?;
+            let mut inbound = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    certificates(&root.join(format!("tls-{id}.pem")))?,
+                    PrivateKeyDer::from_pem_slice(&std::fs::read(
+                        root.join(format!("tls-{id}.key")),
+                    )?)?,
+                )?;
+            inbound.alpn_protocols =
+                vec![lance_context_wal::replication::runtime::client::ALPN.to_vec()];
+            let acceptor = TlsAcceptor::from(Arc::new(inbound));
+            let connector = connector.clone();
+            let armed = armed.clone();
+            let dropped = dropped.clone();
+            let plans = plans.clone();
+            let plan_requests = plan_requests.clone();
+            let unknown_plans = unknown_plans.clone();
+            let rpc_unknown_plans = rpc_unknown_plans.clone();
+            let pause_plan_retry = pause_plan_retry.clone();
+            let prepares = prepares.clone();
+            let unknown_prepares = unknown_prepares.clone();
+            let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
+            let prepare_requests = prepare_requests.clone();
+            let pin_requests = pin_requests.clone();
+            let unknown_pins = unknown_pins.clone();
+            let confirms = confirms.clone();
+            let confirm_requests = confirm_requests.clone();
+            let unknown_confirms = unknown_confirms.clone();
+            let blocked_reads = blocked_reads.clone();
+            let blocked_nodes = blocked_nodes.clone();
+            let observations_restored = observations_restored.clone();
+            let advances = advances.clone();
+            let advance_requests = advance_requests.clone();
+            let unknown_advances = unknown_advances.clone();
+            let pause_uncommitted_advance = pause_uncommitted_advance.clone();
+            let block_advance_observations = block_advance_observations.clone();
+            let appends = appends.clone();
+            let append_requests = append_requests.clone();
+            let unknown_appends = unknown_appends.clone();
+            let pending_capacity_appends = pending_capacity_appends.clone();
+            let pause_append_retry = pause_append_retry.clone();
+            let lose_append_retry_reply = lose_append_retry_reply.clone();
+            let closes = closes.clone();
+            let unknown_closes = unknown_closes.clone();
+            let unknown_retirements = unknown_retirements.clone();
+            let disconnect_controls = disconnect_controls.clone();
+            let close_permits = close_permits.clone();
+            let committed = committed.clone();
+            let release = release.clone();
+            tasks.spawn(async move {
+                let mut connections = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted?;
+                            let (acceptor, connector, name, address, armed, dropped, committed, release) =
+                                (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
+                            let plans = plans.clone();
+            let plan_requests = plan_requests.clone();
+            let unknown_plans = unknown_plans.clone();
+            let rpc_unknown_plans = rpc_unknown_plans.clone();
+            let pause_plan_retry = pause_plan_retry.clone();
+                            let prepares = prepares.clone();
+                            let unknown_prepares = unknown_prepares.clone();
+                            let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
+                            let prepare_requests = prepare_requests.clone();
+                            let pin_requests = pin_requests.clone();
+                            let unknown_pins = unknown_pins.clone();
+                            let confirms = confirms.clone();
+            let confirm_requests = confirm_requests.clone();
+            let unknown_confirms = unknown_confirms.clone();
+                            let blocked_reads = blocked_reads.clone();
+                            let blocked_nodes = blocked_nodes.clone();
+                            let observations_restored = observations_restored.clone();
+                            let advances = advances.clone();
+            let advance_requests = advance_requests.clone();
+            let unknown_advances = unknown_advances.clone();
+            let pause_uncommitted_advance = pause_uncommitted_advance.clone();
+            let block_advance_observations = block_advance_observations.clone();
+                            let appends = appends.clone();
+            let append_requests = append_requests.clone();
+            let unknown_appends = unknown_appends.clone();
+            let pending_capacity_appends = pending_capacity_appends.clone();
+            let pause_append_retry = pause_append_retry.clone();
+            let lose_append_retry_reply = lose_append_retry_reply.clone();
+                            let closes = closes.clone();
+                            let unknown_closes = unknown_closes.clone();
+            let unknown_retirements = unknown_retirements.clone();
+            let disconnect_controls = disconnect_controls.clone();
+                            let close_permits = close_permits.clone();
+                            connections.spawn(async move {
+                                let mut downstream = acceptor.accept(socket).await?;
+                                let mut upstream = connector.connect(name, TcpStream::connect(address).await?).await?;
+                                while let Some(mut request) = Frame::read(&mut downstream, matches!(point, Point::Append { .. })).await? {
+                                    if matches!(point, Point::Append { .. }) { request.payload(&mut downstream, true).await?; }
+                                    if (matches!(point, Point::Prepare { observe: false, .. } | Point::Pin { observe: false, .. }) || (matches!(point, Point::Advance { .. }) && block_advance_observations.load(Ordering::SeqCst))) && dropped.load(Ordering::SeqCst) > 0 && request.observation_query(point)? && !observations_restored.load(Ordering::SeqCst) {
+                                        // Keep every voter unavailable across reconnects and
+                                        // rerouting until the original query deadline expires.
+                                        // A single dropped connection now permits confirmation
+                                        // through another healthy voter.
+                                        blocked_reads.fetch_add(1, Ordering::SeqCst);
+                                        blocked_nodes.lock().unwrap().insert(id);
+                                        return Ok(());
+                                    }
+                                    let hold = request.matches_command(point)?;
+                                    if hold && matches!(point, Point::Append { .. }) {
+                                        let (_, _, _, meta): (WireScope, u32, u64, BatchMeta) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        append_requests.lock().unwrap().push((meta, request.body.clone()));
+                                        if dropped.load(Ordering::SeqCst) > 0 {
+                                            if pause_append_retry.swap(false, Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            if unknown_appends.load(Ordering::SeqCst) {
+                                                dropped.fetch_add(1, Ordering::SeqCst);
+                                                request.unknown_reply()?.write(&mut downstream).await?;
+                                                continue;
+                                            }
+                                            if pending_capacity_appends.load(Ordering::SeqCst) {
+                                                dropped.fetch_add(1, Ordering::SeqCst);
+                                                request.reply(Reply::AppendNotSubmittedPendingCapacity)?.write(&mut downstream).await?;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Pin { .. }) {
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Pin(permit) = command else { bail!("expected a Pin command"); };
+                                        pin_requests.lock().unwrap().push(permit);
+                                        let persistent = unknown_pins.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Pin { execute: false, .. }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            if disconnect_controls.load(Ordering::SeqCst) {
+                                                return Ok(());
+                                            }
+                                            reply.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Confirm { .. }) {
+                                        confirms.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Confirm(confirm) = command else { bail!("expected Confirm"); };
+                                        confirm_requests.lock().unwrap().push(confirm);
+                                        if unknown_confirms.load(Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            let reply = if matches!(point, Point::Confirm { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                        if matches!(point, Point::Confirm { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
+                                            committed.notify_one();
+                                            release.notified().await;
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            let reply = if matches!(point, Point::Confirm { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Prepare { .. }) {
+                                        prepares.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Prepare(preparation) = command else { bail!("expected a Prepare command"); };
+                                        prepare_requests.lock().unwrap().push(preparation);
+                                        let persistent = unknown_prepares.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Prepare { execute: false, .. }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent && pause_uncommitted_prepare.load(Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Close { .. }) {
+                                        closes.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Close(permit) = command else { bail!("expected a Close command"); };
+                                        close_permits.lock().unwrap().push(permit);
+                                        if unknown_closes.load(Ordering::SeqCst) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Retire { .. }) && unknown_retirements.load(Ordering::SeqCst) {
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        if disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
+                                        let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
+                                            request.reply(Reply::Unknown)?
+                                        } else {
+                                            request.unknown_reply()?
+                                        };
+                                        reply.write(&mut downstream).await?;
+                                        continue;
+                                    }
+                                    if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false } | Point::Retire { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
+                                        committed.notify_one(); release.notified().await;
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Retire { .. }) && disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
+                                        let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
+                                            request.reply(Reply::Unknown)?
+                                        } else {
+                                            request.unknown_reply()?
+                                        };
+                                        reply.write(&mut downstream).await?;
+                                        continue;
+                                    }
+                                    if hold && matches!(point, Point::Advance { .. }) {
+                                        advances.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Advance(advance) = command else { bail!("expected an Advance command"); };
+                                        advance_requests.lock().unwrap().push(advance);
+                                        let persistent = unknown_advances.load(Ordering::SeqCst);
+                                        if persistent || (matches!(point, Point::Advance { execute: false }) && armed.swap(false, Ordering::SeqCst)) {
+                                            if !persistent && pause_uncommitted_advance.load(Ordering::SeqCst) {
+                                                committed.notify_one();
+                                                release.notified().await;
+                                            }
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    if hold && matches!(point, Point::Plan { .. }) {
+                                        let previous = plans.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Plan(plan) = command else { bail!("expected a Plan command"); };
+                                        plan_requests.lock().unwrap().push(plan);
+                                        if previous > 0 && pause_plan_retry.swap(false, Ordering::SeqCst) {
+                                            committed.notify_one();
+                                            release.notified().await;
+                                        }
+                                        if unknown_plans.load(Ordering::SeqCst) || (matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst)) {
+                                            dropped.fetch_add(1, Ordering::SeqCst);
+                                            let reply = if rpc_unknown_plans.load(Ordering::SeqCst) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                    }
+                                    request.write(&mut upstream).await?;
+                                    let mut response = Frame::read(&mut upstream, matches!(point, Point::Append { .. })).await?.context("upstream response missing")?;
+                                    if matches!(point, Point::Append { .. }) {
+                                        response.payload(&mut upstream, false).await?;
+                                        if hold && response.successful_reply(point)? { appends.fetch_add(1, Ordering::SeqCst); }
+                                    }
+                                    ensure!(response.fixed[8..16] == request.fixed[8..16], "proxy response ID changed");
+                                    if hold && matches!(point, Point::Append { .. }) && dropped.load(Ordering::SeqCst) > 0 && response.successful_reply(point)? && lose_append_retry_reply.swap(false, Ordering::SeqCst) {
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        request.unknown_reply()?.write(&mut downstream).await?;
+                                        continue;
+                                    }
+                                    if hold && response.successful_reply(point)? && armed.swap(false, Ordering::SeqCst) {
+                                        committed.notify_one();
+                                        release.notified().await;
+                                        dropped.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Pin { .. } | Point::Retire { .. }) && disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
+                                        if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. } | Point::Confirm { rpc_unknown: true, .. }) || (matches!(point, Point::Plan { .. }) && rpc_unknown_plans.load(Ordering::SeqCst)) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
+                                            continue;
+                                        }
+                                        return Ok::<_, anyhow::Error>(());
+                                    }
+                                    response.write(&mut downstream).await?;
+                                }
+                                Ok(())
+                            });
+                        }
+                        finished = connections.join_next(), if !connections.is_empty() => {
+                            // A peer can retire another pooled connection after
+                            // the injected disconnect. Keep the listener alive;
+                            // this fixture drops one reply, not an entire node.
+                            if let Err(error) = finished.unwrap()? {
+                                eprintln!("lost-prepare proxy connection ended: {error:#}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let endpoints = config
+            .endpoints
+            .into_iter()
+            .map(|(id, e)| {
+                (
+                    id,
+                    lance_context_wal::replication::runtime::client::Endpoint {
+                        data_address: e.data_address,
+                        control_address: e.control_address,
+                        server_name: e.server_name,
+                        certificate: e.certificate,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            client: Arc::new(Client::new(
+                &config.layout,
+                &config.limits,
+                endpoints,
+                outbound,
+                lance_context_wal::replication::runtime::client::Options {
+                    timeout,
+                    ..Default::default()
+                },
+            )?),
+            dropped,
+            plans,
+            plan_requests,
+            unknown_plans,
+            rpc_unknown_plans,
+            pause_plan_retry,
+            prepares,
+            unknown_prepares,
+            pause_uncommitted_prepare,
+            prepare_requests,
+            pin_requests,
+            unknown_pins,
+            confirms,
+            confirm_requests,
+            unknown_confirms,
+            blocked_reads,
+            blocked_nodes,
+            observations_restored,
+            advances,
+            advance_requests,
+            unknown_advances,
+            pause_uncommitted_advance,
+            block_advance_observations,
+            appends,
+            append_requests,
+            unknown_appends,
+            pending_capacity_appends,
+            pause_append_retry,
+            lose_append_retry_reply,
+            closes,
+            unknown_closes,
+            unknown_retirements,
+            disconnect_controls,
+            close_permits,
+            committed,
+            release,
+            _tasks: tasks,
+        })
+    }
+}

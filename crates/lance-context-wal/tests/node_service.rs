@@ -1,0 +1,391 @@
+use anyhow::{ensure, Context, Result};
+use bytes::Bytes;
+use lance_context_wal::{
+    record::Batch,
+    replication::{
+        producer,
+        runtime::{
+            client::{self, Client, Reply, Request},
+            Command,
+        },
+        Applied, Outcome,
+    },
+    service::{Config, Service},
+};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use uuid::Uuid;
+#[path = "node_service/fixture.rs"]
+mod fixture;
+use fixture::Fixture;
+#[path = "node_service/benchmark_bootstrap.rs"]
+mod benchmark_bootstrap;
+
+#[test]
+fn configuration_rejects_missing_signers_unknown_fields_and_listener_aliases() -> Result<()> {
+    let f = Fixture::new()?;
+    let original = &f.configs[&1];
+    let mut bad = original.clone();
+    bad.limits.producer_slots = 0;
+    assert!(bad.validate().is_err());
+    let mut bad = original.clone();
+    bad.signing.sources.clear();
+    assert!(bad.validate().is_err());
+    let mut bad = f.configs[&4].clone();
+    bad.signing.catalog = original.signing.catalog.clone();
+    assert!(bad.validate().is_err());
+    let mut bad = original.clone();
+    bad.listen.snapshot = bad.listen.peer;
+    assert!(bad.validate().is_err());
+    let mut bad = original.clone();
+    bad.endpoints.get_mut(&1).unwrap().peer = bad.endpoints[&2].peer.clone();
+    assert!(bad.validate().is_err());
+    let mut bad = original.clone();
+    bad.endpoints.remove(&1);
+    assert!(bad.validate().is_err());
+    let mut json = serde_json::to_value(original)?;
+    json["ignored_typo"] = true.into();
+    assert!(serde_json::from_value::<Config>(json).is_err());
+    for node in 1..=6 {
+        assert_eq!(
+            Config::read(&f.root.path().join(format!("{node}.json")))?.node,
+            node
+        );
+    }
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mismatched_tls_and_signing_identity_fail_before_directory_creation() -> Result<()> {
+    let f = Fixture::new()?;
+    let mut bad = f.configs[&1].clone();
+    bad.tls.private_key = f.configs[&2].tls.private_key.clone();
+    assert!(Service::start(bad).await.is_err());
+    let mut bad = f.configs[&1].clone();
+    bad.signing
+        .sources
+        .insert(10, f.root.path().join("source-20.pk8"));
+    assert!(Service::start(bad).await.is_err());
+    assert!(!f.configs[&1].directory.exists());
+    Ok(())
+}
+async fn accepted(client: &Client, group: u64, batch: &Batch) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            // Explicitly retry transport errors with the same tuple and bytes.
+            if let Ok(response) = client
+                .request_routed(Request::Append {
+                    group,
+                    batch: batch.clone(),
+                })
+                .await
+            {
+                match response.reply {
+                    Reply::Commit(Outcome::Committed(Applied::Accepted { index })) => {
+                        return Ok(index)
+                    }
+                    Reply::Commit(Outcome::Unknown) | Reply::Unknown | Reply::Redirect { .. } => {}
+                    other => anyhow::bail!("unexpected append reply: {other:?}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+async fn leader(f: &Fixture, group: u64) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            for &node in &f.layout.groups[&group] {
+                if let Ok(status) = f.status(node).await {
+                    let leader = status["groups"][group.to_string()]["status"]["leader"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    if leader != 0 && status["ready"] == true {
+                        return Ok(leader);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn actual_node_binaries_maintain_two_disjoint_groups_catch_up_and_relocate() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let result = run_cluster(&mut f).await;
+    if result.is_err() {
+        let path = f.root.keep();
+        eprintln!("failed service fixture retained at {}", path.display());
+    }
+    result
+}
+async fn run_cluster(f: &mut Fixture) -> Result<()> {
+    let mut children = (1..=6)
+        .map(|node| Ok((node, f.spawn(node, 1)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let first_leader = leader(f, 10).await?;
+    leader(f, 20).await?;
+    for child in children.values_mut() {
+        child.assert_live()?;
+    }
+    let table = Uuid::from_u128(50);
+    let producer = producer::producer_id(0, 1);
+    for (group, bucket) in [(10, 0), (20, 1)] {
+        let command = Command::Producer(producer::Command {
+            cluster: f.layout.cluster,
+            layout: f.layout.fingerprint()?,
+            group,
+            table,
+            slot: 0,
+            action: producer::Action::Open {
+                expected_generation: 0,
+                operation: Uuid::from_u128(group.into()),
+                bucket,
+            },
+        });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(reply) = f
+                    .client
+                    .request_routed(Request::Commit(Box::new(command.clone())))
+                    .await
+                {
+                    if matches!(
+                        reply.reply,
+                        Reply::Commit(Outcome::Committed(Applied::Producer(
+                            producer::Reply::Opened { .. }
+                        )))
+                    ) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+    }
+    let lagging = *(1..=3).find(|n| *n != first_leader).as_ref().unwrap();
+    let before_disconnect = f.status(first_leader).await?;
+    assert!(
+        before_disconnect["outbound_snapshots"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 2
+    );
+    let poll = &before_disconnect["groups"]["10"]["durable_poll"];
+    assert!(poll["completed"].as_u64().unwrap() > 0);
+    assert_eq!(poll["failed"], 0);
+    assert!(poll["engine"]["sync_micros"].as_u64().unwrap() > 0);
+    let writes = &poll["storage_write"];
+    assert!(writes["append_batches"].as_u64().unwrap() > 0);
+    assert!(writes["append_bytes"].as_u64().unwrap() > 0);
+    assert!(writes["sync_barriers"].as_u64().unwrap() > 0);
+    for field in [
+        "peer_dropped_outbound",
+        "peer_enqueue_not_ready",
+        "peer_enqueue_byte_capacity",
+        "peer_enqueue_queue_full",
+        "peer_enqueue_queue_closed",
+        "peer_failed_exchanges",
+        "peer_rejected_connections",
+        "peer_rejected_packets",
+    ] {
+        ensure!(
+            before_disconnect[field].is_u64(),
+            "missing counter: {field}"
+        );
+    }
+    let failed_exchanges = before_disconnect["peer_failed_exchanges"].as_u64().unwrap();
+    let rejections = &before_disconnect["peer_rejections"];
+    assert!(rejections["disk_budget"].is_u64());
+    assert!(rejections["other"].is_u64());
+    assert!(rejections["last_disk_refusal"].is_null());
+    let destinations = before_disconnect["peer_destinations"].as_object().unwrap();
+    assert_eq!(destinations.len(), 2);
+    assert!(destinations
+        .values()
+        .any(|d| d["sent_frames"].as_u64().unwrap() > 0));
+    for (node, timing) in destinations {
+        assert_ne!(node.parse::<u64>()?, first_leader);
+        for phase in ["queue_wait", "send"] {
+            for field in [
+                "started",
+                "finished",
+                "elapsed_micros",
+                "max_elapsed_micros",
+            ] {
+                assert!(timing[phase][field].is_u64());
+            }
+        }
+        assert!(timing["sent_frames"].is_u64());
+        assert!(timing["sent_payload_bytes"].is_u64());
+    }
+    children.get_mut(&lagging).unwrap().kill()?;
+    let mut expected = BTreeMap::new();
+    let mut tails = BTreeMap::new();
+    for sequence in 1..=16 {
+        for (group, bucket) in [(10, 0), (20, 1)] {
+            let batch = Batch::new(
+                table,
+                bucket,
+                producer,
+                sequence,
+                Bytes::from(vec![(group + sequence) as u8; 256 << 10]),
+            );
+            let index = accepted(&f.client, group, &batch).await?;
+            tails.insert(group, (index, batch.clone()));
+            expected.insert((group, index), batch);
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = f.status(first_leader).await?;
+            if status["groups"]["10"]["checkpoint_index"]
+                .as_u64()
+                .unwrap_or(0)
+                >= tails[&10].0
+                && status["maintenance"]["log_passes"].as_u64().unwrap_or(0) > 0
+                && status["peer_failed_exchanges"].as_u64().unwrap_or(0) > failed_exchanges
+            {
+                // Real process counters must cover the full accepted bodies
+                // through the checkpoint cut, independently of native writes.
+                let maintenance = &status["maintenance"];
+                assert!(
+                    maintenance["checkpoint_builds"].as_u64().unwrap()
+                        >= maintenance["checkpoints"].as_u64().unwrap()
+                );
+                assert!(maintenance["checkpoint_metadata_bytes"].as_u64().unwrap() > 0);
+                assert!(
+                    maintenance["checkpoint_payload_bytes"].as_u64().unwrap() >= 16 * (256 << 10)
+                );
+                let native = &status["native_io_process"];
+                assert!(native["append"]["bytes"].as_f64().unwrap() >= (16 * (256 << 10)) as f64);
+                assert!(native["append"]["batches"].as_u64().unwrap() >= 16);
+                for queue in ["rewrite_from_append", "rewrite_from_rewrite"] {
+                    assert!(native[queue]["bytes"].as_f64().unwrap() >= 0.0);
+                    assert!(native[queue]["batches"].is_u64());
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    children.insert(lagging, f.spawn(lagging, 2)?);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(status) = f.status(lagging).await {
+                if status["snapshots_installed"].as_u64().unwrap_or(0) > 0
+                    && status["groups"]["10"]["status"]["accepted_records"] == 16
+                {
+                    break;
+                }
+            }
+            children.get_mut(&lagging).unwrap().assert_live()?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    // Observe the actual service's bounded transport record through HTTP,
+    // independently of the client Status wire message used for mutations.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = f.status(first_leader).await?;
+            let transfers = status["outbound_snapshots"].as_array().unwrap();
+            assert!(transfers.len() <= 2);
+            if let Some(sent) = transfers
+                .iter()
+                .find(|v| v["to"] == lagging && v["delivered"] == true)
+            {
+                assert!(sent["group"] == 10 || sent["group"] == 20);
+                for key in [
+                    "index",
+                    "term",
+                    "attempt",
+                    "metadata_bytes",
+                    "payload_bytes",
+                ] {
+                    assert!(sent[key].as_u64().unwrap() > 0);
+                }
+                assert!(
+                    sent["elapsed_ms"].as_u64().unwrap()
+                        <= sent["started_ago_ms"].as_u64().unwrap()
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    children.get_mut(&first_leader).unwrap().kill()?;
+    let batch = Batch::new(table, 0, producer, 17, Bytes::from(vec![0xac; 256 << 10]));
+    let index = accepted(&f.client, 10, &batch).await?;
+    tails.insert(10, (index, batch.clone()));
+    expected.insert((10, index), batch);
+    children.insert(first_leader, f.spawn(first_leader, 2)?);
+    // Allow all replicas to catch up, then exercise SIGTERM during automatic
+    // checkpoint/GC activity. Every new process reuses its original directory.
+    for (&(group, index), batch) in &expected {
+        for &node in &f.layout.groups[&group] {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let Ok(reply) = f
+                        .client
+                        .request(node, Request::Fetch { group, index })
+                        .await
+                    {
+                        if let Reply::Record(Some(meta)) = &reply.reply {
+                            assert_eq!(meta, &batch.meta);
+                            assert_eq!(reply.body, batch.body);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await?;
+        }
+    }
+    for child in children.values_mut() {
+        child.terminate().await?;
+    }
+    // All six processes move to new peer/snapshot/client/health endpoints while
+    // retaining their original directories, durable layout and TLS identities.
+    // The same acknowledged records and producer sequences must still recover.
+    f.rebind()?;
+    for node in 1..=6 {
+        children.insert(node, f.spawn(node, 3)?);
+    }
+    leader(f, 10).await?;
+    leader(f, 20).await?;
+    for (&group, (index, batch)) in &tails {
+        assert_eq!(accepted(&f.client, group, batch).await?, *index);
+    }
+    for (&(group, index), batch) in &expected {
+        for &node in &f.layout.groups[&group] {
+            let reply = f
+                .client
+                .request(node, Request::Fetch { group, index })
+                .await?;
+            ensure!(
+                matches!(&reply.reply,Reply::Record(Some(meta)) if meta==&batch.meta),
+                "record metadata lost across restart"
+            );
+            assert_eq!(reply.body, batch.body);
+        }
+    }
+    for child in children.values_mut() {
+        child.terminate().await?;
+    }
+    Ok(())
+}
+
+#[path = "node_service/shared_groups.rs"]
+mod shared_groups;
+
+#[path = "node_service/live_quorum.rs"]
+mod live_quorum;

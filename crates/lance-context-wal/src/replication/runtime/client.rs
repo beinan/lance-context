@@ -1,0 +1,1232 @@
+//! Bounded mutual-TLS RPCs from trusted ingress/materializer services to WAL nodes.
+//!
+//! Separate data/control listeners and physical-node pools preserve control
+//! capacity. Append metadata and opaque Bytes travel separately in one exchange;
+//! only the durable runtime completion produces a commit response. This is a
+//! trusted service boundary, not end-user table authorization or leader routing.
+use super::{query, source_read, Command, Handle, Outcome, Pending, Work};
+use crate::{
+    placement::Layout,
+    record::{Batch, BatchMeta},
+    replication::{Limits, Status},
+};
+use anyhow::{ensure, Context, Result};
+use bincode::Options as _;
+use bytes::{Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    task::{JoinHandle, JoinSet},
+    time::timeout,
+};
+use tokio_rustls::{
+    rustls::{self, pki_types::ServerName},
+    TlsAcceptor, TlsConnector,
+};
+
+pub const ALPN: &[u8] = b"lance-context-wal-client/1";
+const MAGIC: &[u8; 8] = b"LCWCLNT1";
+const MAX_META: usize = 2 << 20;
+// PublisherBinding contains only fixed identities and the validated binding:
+// dataset <= 4096 bytes, tenant/table <= 1024 bytes each. Leave room for the
+// scope, cut and enum framing; plans and manifest history are not returned.
+const MAX_BINDING_META: usize = 16 << 10;
+// Append replies contain only fixed scope fields, enum tags and at most one
+// u64 (accepted index, expected sequence or leader). They never contain a plan,
+// manifest, producer table or response body. Bound the existing wire encoding
+// without charging every append for a generic multi-megabyte control reply.
+const MAX_APPEND_META: usize = 256;
+const PREFIX: usize = 24;
+
+pub(super) mod observation;
+pub mod timing;
+
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    pub data_address: String,
+    pub control_address: String,
+    pub server_name: String,
+    /// SHA-256 of the configured service's DER leaf certificate.
+    pub certificate: [u8; 32],
+}
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
+pub struct Options {
+    /// Logical live request/response bytes, independent for the two lanes.
+    /// Caller allocations and allocator/decoded metadata overhead are separate.
+    pub data_bytes: usize,
+    pub control_bytes: usize,
+    /// Per node AND lane in one client's physical connection pool.
+    pub connections: usize,
+    /// Per server listener, shared across all independently running clients.
+    pub server_connections: usize,
+    /// Client: entire exchange, including pool/admission and durable completion.
+    /// Server: separate handshake, idle, and active-request deadlines. The active
+    /// deadline starts at the first request bytes and includes the remaining
+    /// frame, admission, durable completion, and reply transmission.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
+    pub timeout: Duration,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            data_bytes: 64 << 20,
+            control_bytes: 32 << 20,
+            connections: 4,
+            server_connections: 64,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+impl Options {
+    pub(crate) fn validate(&self, max_record: usize) -> Result<()> {
+        ensure!(
+            (1..=32).contains(&self.connections)
+                && (1..=256).contains(&self.server_connections)
+                && (2 * max_record + 4 * MAX_META..=256 << 20).contains(&self.data_bytes)
+                && (4 * MAX_META..=256 << 20).contains(&self.control_bytes)
+                && (Duration::from_millis(100)..=Duration::from_secs(120)).contains(&self.timeout),
+            "invalid client transport limits"
+        );
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Scope {
+    cluster: uuid::Uuid,
+    layout: [u8; 32],
+    policy: [u8; 32],
+    node: u64,
+}
+#[derive(Clone, Debug)]
+pub enum Request {
+    Append {
+        group: u64,
+        batch: Batch,
+    },
+    Commit(Box<Command>),
+    Query {
+        group: u64,
+        query: query::Query,
+    },
+    /// Local committed data only. Establish a quorum source pin first; None is
+    /// not evidence that an uncertain append was rejected or never committed.
+    Fetch {
+        group: u64,
+        index: u64,
+    },
+    /// Cached local leadership hint, never a quorum result.
+    Status {
+        group: u64,
+    },
+    /// Background replay only: an applied prefix, never proof of current state.
+    ReadSource {
+        group: u64,
+        request: source_read::Request,
+    },
+}
+#[derive(Debug, Serialize, Deserialize)]
+enum WireRequest {
+    Append {
+        group: u64,
+        meta: BatchMeta,
+    },
+    Control(Box<Command>),
+    Query {
+        group: u64,
+        query: query::Query,
+    },
+    Fetch {
+        group: u64,
+        index: u64,
+    },
+    Status {
+        group: u64,
+    },
+    ReadSource {
+        group: u64,
+        request: source_read::Request,
+    },
+}
+impl WireRequest {
+    fn data(&self) -> bool {
+        matches!(self, Self::Append { .. } | Self::Fetch { .. })
+    }
+
+    fn reply_metadata_limit(&self) -> usize {
+        match self {
+            Self::Append { .. } => MAX_APPEND_META,
+            Self::Query {
+                query: query::Query::PublisherBinding { .. },
+                ..
+            } => MAX_BINDING_META,
+            _ => MAX_META,
+        }
+    }
+
+    // Fixed labels avoid formatting commands, payloads, or table identities.
+    fn diagnostic(&self, catalog: u64) -> (u64, &'static str) {
+        match self {
+            Self::Append { group, .. } => (*group, "append"),
+            Self::Fetch { group, .. } => (*group, "fetch"),
+            Self::Status { group } => (*group, "status"),
+            Self::ReadSource { group, .. } => (*group, "read_source"),
+            Self::Control(command) => (
+                command.group(catalog),
+                match command.as_ref() {
+                    Command::Append { .. } => "append",
+                    Command::Acquire(_) => "acquire",
+                    Command::Plan(_) => "plan",
+                    Command::Prepare(_) => "prepare",
+                    Command::Bootstrap(_) => "bootstrap",
+                    Command::Reserve(_) => "reserve",
+                    Command::Confirm(_) => "confirm",
+                    Command::Advance(_) => "advance",
+                    Command::RetireHistory(_) => "retire_history",
+                    Command::Pin(_) => "pin",
+                    Command::Close(_) => "close",
+                    Command::Producer(_) => "producer",
+                },
+            ),
+            Self::Query { group, query } => (
+                *group,
+                match query {
+                    query::Query::ClosePermit { .. } => "query.close_permit",
+                    query::Query::SourceClosure { .. } => "query.source_closure",
+                    query::Query::Manifest { .. } => "query.manifest",
+                    query::Query::Publisher { .. } => "query.publisher",
+                    query::Query::Accepted { .. } => "query.accepted",
+                    query::Query::Producer { .. } => "query.producer",
+                    query::Query::Pin { .. } => "query.pin",
+                    query::Query::SourcePin { .. } => "query.source_pin",
+                    query::Query::ClosedProof { .. } => "query.closed_proof",
+                    query::Query::ProducerSlot { .. } => "query.producer_slot",
+                    query::Query::Visibility { .. } => "query.visibility",
+                    query::Query::PublisherBinding { .. } => "query.publisher_binding",
+                    query::Query::AcceptedBucket { .. } => "query.accepted_bucket",
+                },
+            ),
+        }
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub enum Reply {
+    Commit(Outcome),
+    Query(query::Outcome),
+    Record(Option<BatchMeta>),
+    Status(Status),
+    /// Reconcile the exact original identity. This does not prove non-commit.
+    Unknown,
+    /// No command was submitted by this handler; leader is only a local hint.
+    Redirect {
+        leader: u64,
+    },
+    /// This append attempt was refused by disk admission before Raft proposal.
+    /// An earlier attempt with the same identity may already have committed.
+    /// This does not resolve that attempt or permit changing its identity/bytes.
+    AppendNotSubmittedDiskBudget,
+    /// Distinct from Query::Observed: this carries no fresh-quorum receipt.
+    Source(source_read::Observation),
+    /// This append attempt exceeded the pending proposal/persistence budget
+    /// before Raft proposal. Earlier attempts with the same identity may have
+    /// committed; retain their identity and bytes until separately resolved.
+    AppendNotSubmittedPendingCapacity,
+}
+/// Holds receive credit through consumption of metadata and a fetched payload.
+/// Cloning body Bytes transfers shared ownership, so callers retaining clones
+/// must provide their own application memory budget before dropping this owner.
+pub struct Response {
+    pub reply: Reply,
+    pub body: Bytes,
+    _credit: OwnedSemaphorePermit,
+}
+struct Budgets {
+    data: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+impl Budgets {
+    fn new(options: &Options) -> Self {
+        Self {
+            data: Arc::new(Semaphore::new(options.data_bytes)),
+            control: Arc::new(Semaphore::new(options.control_bytes)),
+        }
+    }
+    async fn reserve(&self, data: bool, bytes: usize) -> Result<OwnedSemaphorePermit> {
+        Ok(if data { &self.data } else { &self.control }
+            .clone()
+            .acquire_many_owned(u32::try_from(bytes)?)
+            .await?)
+    }
+}
+fn codec() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_META as u64)
+        .reject_trailing_bytes()
+}
+fn certificate(certs: Option<&[rustls::pki_types::CertificateDer<'_>]>) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(
+        certs
+            .and_then(|c| c.first())
+            .context("client TLS certificate missing")?
+            .as_ref(),
+    )
+    .into())
+}
+fn scope(handle: &Handle) -> Scope {
+    Scope {
+        cluster: handle.cluster,
+        layout: handle.layout,
+        policy: handle.policy,
+        node: handle.id,
+    }
+}
+async fn prefix<R: AsyncRead + Unpin>(io: &mut R, max_body: usize) -> Result<(u64, usize, usize)> {
+    let mut fixed = [0; PREFIX];
+    io.read_exact(&mut fixed).await?;
+    decode_prefix(&fixed, max_body)
+}
+fn decode_prefix(fixed: &[u8; PREFIX], max_body: usize) -> Result<(u64, usize, usize)> {
+    ensure!(&fixed[..8] == MAGIC, "foreign client protocol");
+    let id = u64::from_le_bytes(fixed[8..16].try_into()?);
+    let meta = u32::from_le_bytes(fixed[16..20].try_into()?) as usize;
+    let body = u32::from_le_bytes(fixed[20..24].try_into()?) as usize;
+    ensure!(
+        id > 0 && (1..=MAX_META).contains(&meta) && body <= max_body,
+        "invalid client frame bounds"
+    );
+    Ok((id, meta, body))
+}
+async fn receive<R: AsyncRead + Unpin>(io: &mut R, bytes: usize) -> Result<Bytes> {
+    let mut body = BytesMut::with_capacity(bytes);
+    // Fill spare capacity without first zeroing the entire frame. Limit the
+    // reader so any extra capacity cannot consume bytes from the next frame.
+    let mut limited = io.take(bytes as u64);
+    while limited.limit() > 0 {
+        if limited.read_buf(&mut body).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+    }
+    Ok(body.freeze())
+}
+async fn send<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    id: u64,
+    metadata: &[u8],
+    body: &[u8],
+) -> Result<()> {
+    ensure!(
+        (1..=MAX_META).contains(&metadata.len()),
+        "oversized client metadata"
+    );
+    let mut fixed = [0; PREFIX];
+    fixed[..8].copy_from_slice(MAGIC);
+    fixed[8..16].copy_from_slice(&id.to_le_bytes());
+    fixed[16..20].copy_from_slice(&u32::try_from(metadata.len())?.to_le_bytes());
+    fixed[20..24].copy_from_slice(&u32::try_from(body.len())?.to_le_bytes());
+    // TLS owns its encrypted output buffers; no whole-payload concatenation.
+    io.write_all(&fixed).await?;
+    io.write_all(metadata).await?;
+    io.write_all(body).await?;
+    io.flush().await?;
+    Ok(())
+}
+
+impl Handle {
+    /// Node-local append execution counters. See the status endpoint's `appends`
+    /// field. These are not commit receipts or proof that an ACK was delivered.
+    pub fn append_observation(&self) -> BTreeMap<&'static str, u64> {
+        self.shared.appends.snapshot()
+    }
+    /// Most recently observed append disk refusal, retained across successful
+    /// requests. These are decision-time bytes, not a current disk measurement
+    /// or a commit receipt. Keeps one decision per node; resets on restart.
+    pub fn last_append_disk_refusal(&self) -> Option<crate::admission::DiskBudgetExhausted> {
+        self.shared.appends.last_disk_refusal()
+    }
+    /// From receipt of the complete body to execution ending, including worker
+    /// queue, proposal validation and quorum completion. Not pure disk time;
+    /// excludes request transport/admission and sending the reply.
+    pub fn append_execution_timing(&self) -> timing::Observation {
+        self.shared.appends.execution.snapshot()
+    }
+    /// Server-side byte-budget and body-receive intervals for complete append
+    /// bodies. Failed/incomplete receives are excluded. Includes redirects and
+    /// subsequently rejected appends; neither interval is quorum execution.
+    pub fn append_receive_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        BTreeMap::from([
+            (
+                "admission",
+                self.shared.appends.receive_admission.snapshot(),
+            ),
+            ("body", self.shared.appends.receive_body.snapshot()),
+        ])
+    }
+    /// Read on the owner thread with data-lane credit, separate from small
+    /// control replies. Returned bytes describe local committed state only.
+    /// Complete after validating that already durable payload, without waiting
+    /// for the next poll to persist unrelated proposals or peer updates.
+    pub fn read_accepted(&self, group: u64, index: u64) -> Result<Pending<Option<Batch>>> {
+        ensure!(index > 0 && index < u64::MAX, "invalid accepted index");
+        let route = self.route(group)?;
+        let credit = self.shared.data.reserve(self.max_record + 1024)?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let completion = super::Completion {
+            reply,
+            _credit: credit,
+        };
+        self.enqueue(route, Work::Fetch(index, Instant::now(), completion), true)?;
+        Ok(Pending(receive))
+    }
+}
+
+pub struct Server {
+    stop: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<Result<()>>>,
+}
+impl Server {
+    pub fn is_finished(&self) -> bool {
+        self.tasks.iter().any(|task| task.is_finished())
+    }
+    /// Trusted service certificates may access this node's configured groups.
+    /// End-user authorization and table binding stay at the application ingress.
+    pub fn spawn(
+        handle: Handle,
+        data: TcpListener,
+        control: TcpListener,
+        clients: BTreeSet<[u8; 32]>,
+        tls: Arc<rustls::ServerConfig>,
+        options: Options,
+    ) -> Result<Self> {
+        options.validate(handle.max_record)?;
+        ensure!(
+            handle.disk_budget().is_some(),
+            "client listener requires node disk admission"
+        );
+        ensure!(
+            !clients.is_empty() && clients.len() <= 256 && !clients.contains(&[0; 32]),
+            "invalid trusted client pins"
+        );
+        ensure!(
+            tls.alpn_protocols.iter().any(|p| p == ALPN),
+            "missing client RPC ALPN"
+        );
+        let (stop, shutdown) = watch::channel(false);
+        let budgets = Arc::new(Budgets::new(&options));
+        let clients = Arc::new(clients);
+        let mut tasks = Vec::new();
+        for (listener, lane) in [(data, true), (control, false)] {
+            tasks.push(tokio::spawn(listen(
+                listener,
+                lane,
+                handle.clone(),
+                clients.clone(),
+                TlsAcceptor::from(tls.clone()),
+                budgets.clone(),
+                options.clone(),
+                shutdown.clone(),
+            )));
+        }
+        Ok(Self { stop, tasks })
+    }
+    pub async fn shutdown(mut self) -> Result<()> {
+        let _ = self.stop.send(true);
+        let mut error = None;
+        for task in std::mem::take(&mut self.tasks) {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error = Some(e),
+                Err(e) => error = Some(e.into()),
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn listen(
+    listener: TcpListener,
+    data: bool,
+    handle: Handle,
+    clients: Arc<BTreeSet<[u8; 32]>>,
+    acceptor: TlsAcceptor,
+    budgets: Arc<Budgets>,
+    options: Options,
+    mut stop: watch::Receiver<bool>,
+) -> Result<()> {
+    let connections = Arc::new(Semaphore::new(options.server_connections));
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stop.changed() => break,
+            result = tasks.join_next(), if !tasks.is_empty() => { if let Some(Err(error)) = result { if error.is_panic() { return Err(error.into()); } } },
+            incoming = listener.accept() => {
+                let (tcp, _) = incoming?;
+                let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
+                let handle = handle.clone(); let clients = clients.clone(); let acceptor = acceptor.clone(); let budgets = budgets.clone(); let options = options.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let connection = async {
+                        tcp.set_nodelay(true)?; let stream = acceptor.accept(tcp).await?;
+                        ensure!(stream.get_ref().1.alpn_protocol() == Some(ALPN) && clients.contains(&certificate(stream.get_ref().1.peer_certificates())?), "unconfigured client identity");
+                        // Handshake is independently bounded; each exchange has its own deadline.
+                        Ok::<_, anyhow::Error>(stream)
+                    };
+                    if let Ok(Ok(mut stream)) = timeout(options.timeout, connection).await {
+                        loop {
+                            // Idle time cannot shorten the following request's
+                            // processing budget. Start it on the first bytes,
+                            // so a partial header is still deadline-bounded.
+                            let mut fixed = [0; PREFIX];
+                            let Ok(Ok(count)) = timeout(options.timeout, stream.read(&mut fixed)).await else { break; };
+                            if count == 0 { break; }
+                            let exchange = async {
+                                stream.read_exact(&mut fixed[count..]).await?;
+                                let header = decode_prefix(&fixed, if data { handle.max_record } else { 0 })?;
+                                serve_one(&mut stream, data, &handle, &budgets, header).await
+                            };
+                            if !matches!(timeout(options.timeout, exchange).await, Ok(Ok(()))) { break; }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+}
+async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut S,
+    data: bool,
+    handle: &Handle,
+    budgets: &Budgets,
+    (id, meta_len, body_len): (u64, usize, usize),
+) -> Result<()> {
+    // Reserve reply capacity too, before reading any variable-length allocation.
+    // Only Fetch can return a body, and it must have an empty request body.
+    // Nonempty bodies are accepted only for Append by the validation below;
+    // malformed Fetch requests cannot execute under an append-sized reservation.
+    let reply_body = if data && body_len == 0 {
+        handle.max_record
+    } else {
+        0
+    };
+    let admission_started = std::time::Instant::now();
+    let mut credit = budgets
+        .reserve(data, 2 * meta_len + body_len + 2 * MAX_META + reply_body)
+        .await?;
+    let admission_elapsed = admission_started.elapsed();
+    let metadata = receive(io, meta_len).await?;
+    let (request_scope, request): (Scope, WireRequest) = codec().deserialize(&metadata)?;
+    ensure!(
+        request_scope == scope(handle) && request.data() == data,
+        "foreign request scope/lane"
+    );
+    if let WireRequest::Append { meta, .. } = &request {
+        meta.check_body_length(body_len, handle.max_record)?;
+    } else {
+        ensure!(body_len == 0, "unexpected request payload");
+    }
+    // The untrusted prefix cannot select a smaller reservation. Only shrink
+    // after decoding and validating the request; never wait for an upgrade
+    // while holding request credit. Keep the remaining credit through send.
+    let reply_meta = request.reply_metadata_limit();
+    if reply_meta < MAX_META {
+        drop(
+            credit
+                .split(2 * (MAX_META - reply_meta))
+                .context("client reply reservation underflow")?,
+        );
+    }
+    let body_started = std::time::Instant::now();
+    let body = receive(io, body_len).await?;
+    let body_elapsed = body_started.elapsed();
+    let append = matches!(request, WireRequest::Append { .. });
+    if append {
+        handle
+            .shared
+            .appends
+            .receive_admission
+            .record(admission_elapsed);
+        handle.shared.appends.receive_body.record(body_elapsed);
+    }
+    let observation = append.then(|| handle.shared.appends.start());
+    let execution = append.then(|| handle.shared.appends.execution.start());
+    let executed = execute(handle, request, body).await;
+    drop(execution);
+    if let Some(observation) = observation {
+        observation.finish(&executed);
+    }
+    let (reply, body) = match executed {
+        Ok(response) => response,
+        // Node::propose reserves disk before calling Raft::step. Restrict this
+        // proof to append execution; transport cancellation and other failures
+        // do not prove that the request was never submitted.
+        Err(error) if append && error.is::<crate::admission::DiskBudgetExhausted>() => {
+            (Reply::AppendNotSubmittedDiskBudget, Bytes::new())
+        }
+        Err(error)
+            if append
+                && matches!(
+                    error.downcast_ref::<super::super::ProposalRejection>(),
+                    Some(super::super::ProposalRejection::PendingCapacity)
+                ) =>
+        {
+            (Reply::AppendNotSubmittedPendingCapacity, Bytes::new())
+        }
+        Err(_) => (Reply::Unknown, Bytes::new()),
+    };
+    let metadata = codec()
+        .with_limit(reply_meta as u64)
+        .serialize(&(scope(handle), reply))?;
+    send(io, id, &metadata, &body).await
+}
+async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(Reply, Bytes)> {
+    let group = match &request {
+        WireRequest::Append { group, .. }
+        | WireRequest::Query { group, .. }
+        | WireRequest::ReadSource { group, .. } => Some(*group),
+        WireRequest::Control(command) => Some(command.group(handle.catalog)),
+        _ => None,
+    };
+    if let Some(group) = group {
+        let leader = handle.observation(group)?.status.leader;
+        if leader != handle.id {
+            return Ok((Reply::Redirect { leader }, Bytes::new()));
+        }
+    }
+    let mut output = Bytes::new();
+    let reply = match request {
+        WireRequest::Append { group, meta } => Reply::Commit(
+            handle
+                .commit(Command::Append {
+                    group,
+                    batch: Batch { meta, body },
+                })?
+                .await?,
+        ),
+        WireRequest::Control(command) => {
+            ensure!(
+                !matches!(*command, Command::Append { .. }),
+                "append on control lane"
+            );
+            Reply::Commit(handle.commit(*command)?.await?)
+        }
+        WireRequest::Query { group, query } => Reply::Query(handle.query(group, query)?.await?),
+        WireRequest::ReadSource { group, request } => {
+            Reply::Source(handle.read_source(group, request)?.await?)
+        }
+        WireRequest::Fetch { group, index } => {
+            Reply::Record(handle.read_accepted(group, index)?.await?.map(|batch| {
+                output = batch.body;
+                batch.meta
+            }))
+        }
+        WireRequest::Status { group } => Reply::Status(handle.observation(group)?.status),
+    };
+    Ok((reply, output))
+}
+
+type Stream = tokio_rustls::client::TlsStream<TcpStream>;
+struct Pool {
+    idle: Mutex<Vec<Stream>>,
+    slots: Arc<Semaphore>,
+}
+impl Pool {
+    fn new(count: usize) -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            slots: Arc::new(Semaphore::new(count)),
+        }
+    }
+
+    async fn take_idle(&self) -> Result<Option<Stream>> {
+        loop {
+            let candidate = self.idle.lock().unwrap().pop();
+            let Some(mut stream) = candidate else {
+                return Ok(None);
+            };
+            // Poll only input already available at a complete-response boundary.
+            // TLS may consume session tickets; discard an observed disconnect
+            // but propagate other errors and unsolicited application bytes.
+            // Nothing from the next request has been sent, so discarding it
+            // does not replay a mutation. A later disconnect can still race the
+            // send and must retain the existing unknown-outcome behavior.
+            let (read, received) = std::future::poll_fn(|cx| {
+                let mut byte = [0];
+                let mut buffer = tokio::io::ReadBuf::new(&mut byte);
+                let read = std::pin::Pin::new(&mut stream).poll_read(cx, &mut buffer);
+                std::task::Poll::Ready((read, buffer.filled().len()))
+            })
+            .await;
+            match read {
+                std::task::Poll::Pending => return Ok(Some(stream)),
+                std::task::Poll::Ready(Ok(())) => ensure!(
+                    received == 0,
+                    "unexpected application bytes on idle WAL connection"
+                ),
+                std::task::Poll::Ready(Err(error)) => {
+                    let error = anyhow::Error::from(error);
+                    if !disconnected(&error) {
+                        return Err(error.context("invalid idle WAL connection"));
+                    }
+                }
+            }
+        }
+    }
+}
+struct NodePools {
+    endpoint: Endpoint,
+    data: Pool,
+    control: Pool,
+}
+
+/// Kept outside the timed future so cancellation preserves its last boundary.
+/// Updating this state does not allocate or expose addresses and request values.
+#[derive(Default)]
+struct ExchangeProgress {
+    rpc: Option<(&'static str, u64, u64)>,
+    stage: &'static str,
+    reused: Option<bool>,
+}
+
+impl std::fmt::Display for ExchangeProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some((operation, group, node)) = self.rpc else {
+            return f.write_str("WAL RPC not started");
+        };
+        write!(f, "WAL RPC {operation} group={group} node={node}")?;
+        if let Some(reused) = self.reused {
+            write!(f, " reused={reused}")?;
+        }
+        write!(f, " stage={}", self.stage)
+    }
+}
+
+fn disconnected(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        matches!(
+            e.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+        )
+    })
+}
+
+pub struct Client {
+    nodes: BTreeMap<u64, NodePools>,
+    connector: TlsConnector,
+    options: Options,
+    budgets: Budgets,
+    cluster: uuid::Uuid,
+    layout: [u8; 32],
+    policy: [u8; 32],
+    max_record: usize,
+    max_plan_source: u64,
+    max_descriptors: u64,
+    producer_slots: u32,
+    next: AtomicU64,
+    voters: BTreeMap<u64, Vec<u64>>,
+    catalog: u64,
+    leaders: Mutex<BTreeMap<u64, u64>>,
+    append_timings: [timing::Counter; 4],
+    publisher_binding_timings: [timing::Counter; 4],
+}
+impl Client {
+    /// Per-exchange append phases, including redirected, failed and cancelled
+    /// exchanges. Admission waits for byte credit; connection includes pool
+    /// waiting and any TLS handshake; send includes flush; response includes
+    /// peer execution and reply validation. These are not per-request outcomes.
+    pub fn append_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        ["admission", "connection", "send", "response"]
+            .into_iter()
+            .zip(&self.append_timings)
+            .map(|(name, counter)| (name, counter.snapshot()))
+            .collect()
+    }
+    /// PublisherBinding query phases, using the same boundaries as append.
+    /// Admission is per exchange; connection/send/response include any existing
+    /// read-only reconnect attempt. Errors and cancellations finish intervals.
+    /// These queries serve ownership checks for multiple callers, not just reads.
+    pub fn publisher_binding_timings(&self) -> BTreeMap<&'static str, timing::Observation> {
+        ["admission", "connection", "send", "response"]
+            .into_iter()
+            .zip(&self.publisher_binding_timings)
+            .map(|(name, counter)| (name, counter.snapshot()))
+            .collect()
+    }
+    pub fn identity(&self) -> (uuid::Uuid, [u8; 32]) {
+        (self.cluster, self.layout)
+    }
+    pub fn max_record_bytes(&self) -> usize {
+        self.max_record
+    }
+    pub fn max_plan_source_bytes(&self) -> u64 {
+        self.max_plan_source
+    }
+    pub fn max_descriptor_bytes(&self) -> u64 {
+        self.max_descriptors
+    }
+    pub fn producer_slots(&self) -> u32 {
+        self.producer_slots
+    }
+    pub fn catalog_group(&self) -> u64 {
+        self.catalog
+    }
+    pub fn new(
+        layout: &Layout,
+        limits: &Limits,
+        endpoints: BTreeMap<u64, Endpoint>,
+        tls: Arc<rustls::ClientConfig>,
+        options: Options,
+    ) -> Result<Self> {
+        options.validate(limits.max_record_bytes as usize)?;
+        ensure!(
+            tls.alpn_protocols.iter().any(|p| p == ALPN),
+            "missing client RPC ALPN"
+        );
+        ensure!(
+            endpoints.keys().eq(layout.nodes.keys())
+                && endpoints.len() * options.connections * 2 <= 1024,
+            "client endpoints must cover exactly the bounded layout"
+        );
+        let mut pins = BTreeSet::new();
+        for endpoint in endpoints.values() {
+            ensure!(
+                !endpoint.data_address.is_empty()
+                    && endpoint.data_address.len() <= 1024
+                    && !endpoint.control_address.is_empty()
+                    && endpoint.control_address.len() <= 1024
+                    && endpoint.certificate != [0; 32]
+                    && pins.insert(endpoint.certificate),
+                "invalid/duplicate client endpoint identity"
+            );
+            ServerName::try_from(endpoint.server_name.clone())?;
+        }
+        Ok(Self {
+            cluster: layout.cluster,
+            layout: layout.fingerprint()?,
+            policy: Sha256::digest(limits.identity()?).into(),
+            max_record: limits.max_record_bytes as usize,
+            max_plan_source: limits.max_plan_source_bytes,
+            max_descriptors: limits.max_descriptor_bytes,
+            producer_slots: limits.producer_slots,
+            connector: TlsConnector::from(tls),
+            budgets: Budgets::new(&options),
+            nodes: endpoints
+                .into_iter()
+                .map(|(id, endpoint)| {
+                    (
+                        id,
+                        NodePools {
+                            endpoint,
+                            data: Pool::new(options.connections),
+                            control: Pool::new(options.connections),
+                        },
+                    )
+                })
+                .collect(),
+            options,
+            next: AtomicU64::new(1),
+            voters: layout.groups.clone(),
+            catalog: super::p::control_group(layout),
+            leaders: Mutex::new(BTreeMap::new()),
+            append_timings: Default::default(),
+            publisher_binding_timings: Default::default(),
+        })
+    }
+    /// A failure/cancellation is an unknown outcome. Retain and reconcile the
+    /// original producer sequence/control identity. Mutations are never silently
+    /// retried. A read on a disconnected pooled stream may reconnect once within
+    /// the original deadline; a cached leader hint is never treated as an ACK.
+    pub async fn request(&self, node: u64, request: Request) -> Result<Response> {
+        let mut progress = ExchangeProgress::default();
+        timeout(
+            self.options.timeout,
+            self.exchange(node, request, &mut progress),
+        )
+        .await
+        .with_context(|| format!("client exchange timed out; {progress}; outcome unknown"))?
+    }
+    /// Follow configured-voter hints only when the remote confirms it did not
+    /// submit the request. Unknown mutation outcomes require explicit exact retry.
+    /// During an election, refresh exhausted hints within the original deadline.
+    /// An unknown query result, including a generic execution failure, reissues
+    /// the same read-only query with backoff within that deadline. Mutation
+    /// outcomes are never replayed.
+    /// Read-only pooled disconnects may reconnect once per exchange, within this
+    /// method's single overall deadline. Queries, source reads and payload fetches
+    /// can move to another configured voter after a disconnect or refused connection.
+    pub async fn request_routed(&self, request: Request) -> Result<Response> {
+        let mut progress = ExchangeProgress::default();
+        timeout(self.options.timeout, async {
+            let group = match &request {
+                Request::Append { group, .. }
+                | Request::Query { group, .. }
+                | Request::Fetch { group, .. }
+                | Request::ReadSource { group, .. }
+                | Request::Status { group } => *group,
+                Request::Commit(command) => command.group(self.catalog),
+            };
+            let voters = self.voters.get(&group).context("unknown client group")?;
+            let mut node = self
+                .leaders
+                .lock()
+                .unwrap()
+                .get(&group)
+                .copied()
+                .unwrap_or(voters[0]);
+            let mut visited = BTreeSet::new();
+            loop {
+                visited.insert(node);
+                let response = match self.exchange(node, request.clone(), &mut progress).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
+                            % voters.len()];
+                        self.leaders.lock().unwrap().insert(group, next);
+                        if matches!(
+                            &request,
+                            Request::Query { .. }
+                                | Request::ReadSource { .. }
+                                | Request::Fetch { .. }
+                        ) && (disconnected(&error)
+                            || error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused))
+                        {
+                            // Only retry the same read. Exchange has released its
+                            // connection and byte credits; the outer deadline still
+                            // bounds all voters. Protocol and identity errors escape.
+                            node = next;
+                            if visited.len() == voters.len() {
+                                visited.clear();
+                                progress.stage = "routing_backoff";
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Reply::Redirect { leader } = response.reply {
+                    drop(response);
+                    node = if voters.contains(&leader) && !visited.contains(&leader) {
+                        leader
+                    } else if let Some(&next) = voters.iter().find(|n| !visited.contains(n)) {
+                        next
+                    } else {
+                        // Every voter explicitly declined before execution.
+                        // Release reply credits and wait before refreshing the
+                        // hints; a transient election is not a protocol fault.
+                        progress.stage = "routing_backoff";
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        visited.clear();
+                        if voters.contains(&leader) {
+                            leader
+                        } else {
+                            voters[0]
+                        }
+                    };
+                    self.leaders.lock().unwrap().insert(group, node);
+                } else {
+                    if matches!(
+                        response.reply,
+                        Reply::Unknown
+                            | Reply::Commit(Outcome::Unknown)
+                            | Reply::Query(query::Outcome::Unknown)
+                    ) {
+                        let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
+                            % voters.len()];
+                        // An unknown mutation result can come from admission
+                        // pressure on the current leader. It says nothing about
+                        // leadership; keep the hint so the next independent
+                        // append does not send its body through a follower.
+                        // The original mutation still returns without replay.
+                        if !matches!(&request, Request::Append { .. } | Request::Commit(_)) {
+                            self.leaders.lock().unwrap().insert(group, next);
+                        }
+                        if matches!(&request, Request::Query { .. } | Request::ReadSource { .. })
+                            && matches!(
+                                response.reply,
+                                Reply::Unknown | Reply::Query(query::Outcome::Unknown)
+                            )
+                        {
+                            // An election can invalidate a pending read-index
+                            // observation, or race the server's routing check
+                            // before query execution. Reissue only this query,
+                            // within the original outer deadline. Release its
+                            // reply credits before waiting for another leader.
+                            drop(response);
+                            node = next;
+                            visited.clear();
+                            progress.stage = "routing_backoff";
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    } else if matches!(
+                        request,
+                        Request::Append { .. } | Request::Commit(_) | Request::Query { .. }
+                    ) {
+                        self.leaders.lock().unwrap().insert(group, node);
+                    }
+                    return Ok(response);
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("routed exchange timed out; {progress}; outcome unknown"))?
+    }
+    async fn exchange(
+        &self,
+        node: u64,
+        request: Request,
+        progress: &mut ExchangeProgress,
+    ) -> Result<Response> {
+        let pools = self.nodes.get(&node).context("unknown client target")?;
+        let (wire, body) = match request {
+            Request::Append { group, batch } => {
+                batch
+                    .meta
+                    .check_body_length(batch.body.len(), self.max_record)?;
+                (
+                    WireRequest::Append {
+                        group,
+                        meta: batch.meta,
+                    },
+                    batch.body,
+                )
+            }
+            Request::Commit(command) => {
+                ensure!(
+                    !matches!(*command, Command::Append { .. }),
+                    "use the append request for data"
+                );
+                (WireRequest::Control(command), Bytes::new())
+            }
+            Request::Query { group, query } => (WireRequest::Query { group, query }, Bytes::new()),
+            Request::Fetch { group, index } => (WireRequest::Fetch { group, index }, Bytes::new()),
+            Request::Status { group } => (WireRequest::Status { group }, Bytes::new()),
+            Request::ReadSource { group, request } => {
+                (WireRequest::ReadSource { group, request }, Bytes::new())
+            }
+        };
+        let data = wire.data();
+        let (group, operation) = wire.diagnostic(self.catalog);
+        *progress = ExchangeProgress {
+            rpc: Some((operation, group, node)),
+            stage: "admission",
+            reused: None,
+        };
+        let read_only = matches!(
+            wire,
+            WireRequest::Query { .. }
+                | WireRequest::Fetch { .. }
+                | WireRequest::Status { .. }
+                | WireRequest::ReadSource { .. }
+        );
+        let fetch = matches!(wire, WireRequest::Fetch { .. });
+        let append = matches!(wire, WireRequest::Append { .. });
+        let timings = match &wire {
+            WireRequest::Append { .. } => Some(&self.append_timings),
+            WireRequest::Query {
+                query: query::Query::PublisherBinding { .. },
+                ..
+            } => Some(&self.publisher_binding_timings),
+            _ => None,
+        };
+        let reply_kind = match &wire {
+            WireRequest::Append { .. } | WireRequest::Control(_) => 0,
+            WireRequest::Query { .. } => 1,
+            WireRequest::Fetch { .. } => 2,
+            WireRequest::Status { .. } => 3,
+            WireRequest::ReadSource { .. } => 4,
+        };
+        let expected = Scope {
+            cluster: self.cluster,
+            layout: self.layout,
+            policy: self.policy,
+            node,
+        };
+        let size = usize::try_from(codec().serialized_size(&(&expected, &wire))?)?;
+        ensure!(size <= MAX_META, "client metadata too large");
+        let reply_meta = wire.reply_metadata_limit();
+        let admission = timings.map(|c| c[0].start());
+        let credit = self
+            .budgets
+            .reserve(
+                data,
+                2 * size + body.len() + 2 * reply_meta + if fetch { self.max_record } else { 0 },
+            )
+            .await?;
+        drop(admission);
+        let metadata = codec().serialize(&(&expected, wire))?;
+        let pool = if data { &pools.data } else { &pools.control };
+        let mut connection = timings.map(|c| c[1].start());
+        // Keep failures before the first frame distinguishable. Construct the
+        // context only on failure; addresses, credentials and payloads stay out.
+        let connection_error =
+            |stage| format!("WAL RPC {operation} group={group} node={node} stage={stage}");
+        progress.stage = "pool_admission";
+        let _slot = pool
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .with_context(|| connection_error("pool_admission"))?;
+        progress.stage = "idle_connection";
+        let mut idle = pool
+            .take_idle()
+            .await
+            .with_context(|| connection_error("idle_connection"))?;
+        let mut reconnect_read = read_only && idle.is_some();
+        loop {
+            let reused = idle.is_some();
+            progress.reused = Some(reused);
+            let mut stream = match idle.take() {
+                Some(stream) => stream,
+                None => {
+                    let address = if data {
+                        &pools.endpoint.data_address
+                    } else {
+                        &pools.endpoint.control_address
+                    };
+                    progress.stage = "tcp_connect";
+                    let tcp = TcpStream::connect(address)
+                        .await
+                        .with_context(|| connection_error("tcp_connect"))?;
+                    tcp.set_nodelay(true)?;
+                    progress.stage = "tls_handshake";
+                    let stream = self
+                        .connector
+                        .connect(
+                            ServerName::try_from(pools.endpoint.server_name.clone())?,
+                            tcp,
+                        )
+                        .await
+                        .with_context(|| connection_error("tls_handshake"))?;
+                    ensure!(
+                        stream.get_ref().1.alpn_protocol() == Some(ALPN)
+                            && certificate(stream.get_ref().1.peer_certificates())?
+                                == pools.endpoint.certificate,
+                        "foreign WAL service identity"
+                    );
+                    stream
+                }
+            };
+            drop(connection.take());
+            progress.stage = "send";
+            let response: Result<(Reply, Bytes)> = async {
+                let sending = timings.map(|c| c[2].start());
+                let id = self
+                    .next
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("client request ids exhausted"))?;
+                send(&mut stream, id, &metadata, &body).await?;
+                drop(sending);
+                let _receiving = timings.map(|c| c[3].start());
+                progress.stage = "response_prefix";
+                let (received_id, meta_len, body_len) =
+                    prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
+                ensure!(received_id == id, "client response correlation mismatch");
+                ensure!(
+                    meta_len <= reply_meta,
+                    "client response metadata exceeds request bound"
+                );
+                progress.stage = "response_metadata";
+                let metadata = receive(&mut stream, meta_len).await?;
+                let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
+                ensure!(observed == expected, "foreign client response scope");
+                ensure!(
+                    matches!(reply, Reply::Unknown | Reply::Redirect { .. })
+                        || (append
+                            && matches!(
+                                reply,
+                                Reply::AppendNotSubmittedDiskBudget
+                                    | Reply::AppendNotSubmittedPendingCapacity
+                            ))
+                        || matches!(
+                            (&reply, reply_kind),
+                            (Reply::Commit(_), 0)
+                                | (Reply::Query(_), 1)
+                                | (Reply::Record(_), 2)
+                                | (Reply::Status(_), 3)
+                                | (Reply::Source(_), 4)
+                        ),
+                    "unexpected response type"
+                );
+                match &reply {
+                    Reply::Record(Some(meta)) if fetch => {
+                        meta.check_body_length(body_len, self.max_record)?
+                    }
+                    Reply::Record(None) | Reply::Unknown if fetch => {
+                        ensure!(body_len == 0, "unexpected record payload")
+                    }
+                    Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),
+                    _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
+                }
+                progress.stage = "response_body";
+                let body = receive(&mut stream, body_len).await?;
+                Ok((reply, body))
+            }
+            .await;
+            let (reply, body) = match response {
+                Ok(response) => response,
+                Err(error) if reconnect_read && disconnected(&error) => {
+                    // Only a reused connection gets this one read-only recovery.
+                    // Keep the same byte/connection credits; reconnect authenticates
+                    // normally, and fresh-stream failures and invalid replies escape.
+                    reconnect_read = false;
+                    connection = timings.map(|c| c[1].start());
+                    continue;
+                }
+                Err(error) => {
+                    // A transport stage does not establish whether a mutation
+                    // committed. Preserve the cause and original retry policy.
+                    let stage = progress.stage;
+                    return Err(error.context(format!(
+                        "WAL RPC {operation} group={group} node={node} reused={reused} stage={stage}; outcome unknown"
+                    )));
+                }
+            };
+            // The durable owner already validated fetched bytes; checking corruption
+            // here belongs off the async executor for large records. TLS authenticates
+            // this transmission; consumers still match metadata against their pin.
+            pool.idle.lock().unwrap().push(stream);
+            return Ok(Response {
+                reply,
+                body,
+                _credit: credit,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "lance-integration")]
+mod catalog;
+#[cfg(feature = "lance-integration")]
+pub use catalog::Catalog;

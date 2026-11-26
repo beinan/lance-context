@@ -1,0 +1,658 @@
+//! Command-line / environment configuration for the master control-plane.
+
+use clap::Parser;
+
+/// Control-plane (master) process for lance-context rollout stores.
+#[derive(Debug, Clone, Parser)]
+#[command(name = "lance-context-master", version)]
+pub struct MasterConfig {
+    /// Run one identity-verified legacy retirement request from JSON and exit.
+    /// Uses the existing master's service account; starts no scheduler or scans.
+    #[arg(long)]
+    pub legacy_retirement_request: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    pub merge_rollout: lance_context_merge::rollout::MergeRollout,
+    #[command(flatten)]
+    pub maintenance: MaintenanceConfig,
+    #[command(flatten)]
+    pub catchup: crate::catchup::CatchupConfig,
+    #[command(flatten)]
+    pub append: crate::rollout_append::AppendConfig,
+    #[command(flatten)]
+    pub local_merge: crate::local_merge::LocalMergeConfig,
+    #[command(flatten)]
+    pub wal_tail: crate::wal_tail::WalTailConfig,
+    #[command(flatten)]
+    pub planner: crate::planner::PlannerConfig,
+    /// Data directory / object-store prefix shared with the data-plane server.
+    #[arg(long, env = "DATA_DIR", default_value = "./data")]
+    pub data_dir: String,
+
+    /// Additional named store registry to maintain using its persisted table schema.
+    #[arg(long, env = "MANAGED_STORE_KIND")]
+    pub managed_store_kind: Option<String>,
+
+    /// Host to bind the admin API + UI to.
+    #[arg(long, env = "MASTER_HOST", default_value = "0.0.0.0")]
+    pub host: String,
+
+    /// Port to bind the admin API + UI to.
+    #[arg(long, env = "MASTER_PORT", default_value_t = 8090)]
+    pub port: u16,
+
+    /// Interval, in seconds, between full stats scans of every experiment.
+    /// `0` disables the background scanner.
+    #[arg(long, env = "STATS_SCAN_INTERVAL_SECS", default_value_t = 300)]
+    pub stats_scan_interval_secs: u64,
+
+    /// Maximum age of scan observations usable for fleet backlog dashboards.
+    /// Older/incomplete snapshots are unknown, never a zero backlog.
+    #[arg(
+        long,
+        env = "MASTER_BACKLOG_METRICS_MAX_AGE_SECS",
+        default_value_t = 900
+    )]
+    pub backlog_metrics_max_age_secs: u64,
+
+    /// Bounded concurrency when scanning experiments each round.
+    #[arg(long, env = "SCAN_CONCURRENCY", default_value_t = 8)]
+    pub scan_concurrency: usize,
+
+    /// Total byte budget for the Lance metadata/index caches, shared across
+    /// every rollout store opened by this master process.
+    ///
+    /// Without an explicit shared session, Lance gives each store a fresh
+    /// session with caches defaulting to 6 GiB index + 1 GiB metadata. The
+    /// master opens stores for scans, browsing, compaction, and indexing, so
+    /// per-store sessions make RSS grow with the experiments touched. This
+    /// budget is split internally 6:1 (index:metadata), matching Lance's
+    /// default ratio. `0` restores Lance's per-store default sessions.
+    #[arg(long, env = "ROLLOUT_CACHE_BYTES", default_value = "2147483648")]
+    pub rollout_cache_bytes: usize,
+
+    /// Run maintenance (compaction + old-version cleanup) on the `_stats`
+    /// dataset every Nth stats-scan round. `_stats` is written delete-then-
+    /// append, so each scan adds versions and fragments per experiment; without
+    /// maintenance the manifest chain grows without bound and slows cold start
+    /// and `/experiments`. `0` disables stats maintenance.
+    #[arg(long, env = "STATS_MAINTENANCE_EVERY_N_SCANS", default_value_t = 12)]
+    pub stats_maintenance_every_n_scans: u64,
+
+    /// Grace window, in seconds, for `_stats` old-version cleanup. Versions
+    /// newer than this are never removed, so in-flight readers on another
+    /// replica keep working.
+    #[arg(long, env = "STATS_HISTORY_TTL_SECS", default_value_t = 3_600)]
+    pub stats_history_ttl_secs: u64,
+
+    /// Age, in seconds, after which an experiment with no writes is retired
+    /// from the stats table. `0` disables retirement (every known experiment
+    /// stays in the table forever).
+    ///
+    /// Retirement is what keeps the stats table proportional to *active* work
+    /// rather than to everything ever created. A retired experiment is still
+    /// listed in the registry and is observed on demand; it simply stops
+    /// costing a row and an open on every scan round.
+    ///
+    /// Before an experiment is retired its MemWAL generations are merged and
+    /// its fragments compacted, so it is left in a state that needs no further
+    /// maintenance — which is what makes it safe for the sweeps to stop looking
+    /// at it. See `scanner::retire_cold_experiments`.
+    #[arg(long, env = "STATS_COLD_RETIRE_SECS", default_value_t = 604_800)]
+    pub stats_cold_retire_secs: u64,
+
+    /// Interval, in seconds, between automatic compaction sweeps. `0` disables
+    /// automatic compaction (manual triggers still work).
+    #[arg(long, env = "COMPACTION_INTERVAL_SECS", default_value_t = 600)]
+    pub compaction_interval_secs: u64,
+
+    /// Minimum fragment count before an experiment is auto-compacted.
+    #[arg(long, env = "MIN_FRAGMENTS", default_value_t = 16)]
+    pub min_fragments: usize,
+
+    /// Target rows per fragment passed to compaction.
+    #[arg(long, env = "TARGET_ROWS_PER_FRAGMENT", default_value_t = 1_048_576)]
+    pub target_rows_per_fragment: usize,
+
+    /// Maximum number of compactions executing in this master process.
+    #[arg(long, env = "COMPACTION_CONCURRENCY", default_value_t = 1)]
+    pub compaction_concurrency: usize,
+
+    /// Lance rewrite tasks executing inside one compaction.
+    #[arg(long, env = "COMPACTION_THREADS", default_value_t = 1)]
+    pub compaction_threads: usize,
+
+    /// Rows per input batch when compaction must decode and re-encode data.
+    #[arg(long, env = "COMPACTION_BATCH_SIZE", default_value_t = 8)]
+    pub compaction_batch_size: usize,
+
+    /// Maximum source fragments rewritten by one compaction task. `0` disables
+    /// the incremental limit.
+    #[arg(long, env = "COMPACTION_MAX_SOURCE_FRAGMENTS", default_value_t = 32)]
+    pub compaction_max_source_fragments: usize,
+
+    /// Rebuild the `id` ZoneMap index after every compaction that rewrote
+    /// fragments, as a dependent `IndexId` task. Compaction replaces the
+    /// fragments the index describes, so without this the index only ever
+    /// covers whatever was on disk when it was last built by hand.
+    #[arg(long, env = "INDEX_AFTER_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
+    pub index_after_compaction: bool,
+
+    /// Interval between independent base-table index coverage checks. Creates
+    /// missing key indexes and extends existing BTree indexes over new fragments,
+    /// without merging WAL or compacting data. Uses the stats scanner's table
+    /// inventory. `0` disables this sweep; manual/post-compaction tasks still run.
+    /// Reuses ordinary or prepared execution selected by `INDEX_PREPARE_TARGETS`.
+    #[arg(long, env = "INDEX_INTERVAL_SECS", default_value_t = 0)]
+    pub index_interval_secs: u64,
+
+    /// Deprecated compatibility flag. Owned merge executors now ensure the id
+    /// index under the same execution fence as the merge; the master does not
+    /// mutate the base table before admitting a worker.
+    #[arg(long, env = "INDEX_BEFORE_MERGE", default_value_t = true, action = clap::ArgAction::Set)]
+    pub index_before_merge: bool,
+
+    /// Base key index policy. Configure every master and worker consistently.
+    /// ZoneMap uses bounded key-only predicate deletes during WAL merge.
+    #[arg(
+        long,
+        env = "ROLLOUT_KEY_INDEX_TYPE",
+        value_enum,
+        default_value = "btree"
+    )]
+    pub key_index_type: lance_context_core::KeyIndexType,
+
+    /// Maximum bytes per compacted output file. `0` uses Lance's default.
+    #[arg(
+        long,
+        env = "COMPACTION_MAX_BYTES_PER_FILE",
+        default_value_t = 1_073_741_824
+    )]
+    pub compaction_max_bytes_per_file: usize,
+
+    /// Interval, in seconds, between automatic WAL-merge sweeps. Each sweep
+    /// enqueues a `MergeWal` task for every experiment whose pending MemWAL
+    /// generation count crosses `merge_wal_min_generations`; the task fans out
+    /// to the configured worker endpoints. `0` disables automatic WAL merge
+    /// (manual triggers still work).
+    #[arg(long, env = "MERGE_WAL_INTERVAL_SECS", default_value_t = 600)]
+    pub merge_wal_interval_secs: u64,
+
+    /// Minimum pending MemWAL generations (per experiment) before an automatic
+    /// `MergeWal` is enqueued. Read from the periodically-scanned stats table.
+    #[arg(long, env = "MERGE_WAL_MIN_GENERATIONS", default_value_t = 8)]
+    pub merge_wal_min_generations: i64,
+
+    /// Exact targets to which this master's automatic WAL admission policy applies.
+    /// Empty preserves the existing unrestricted policy. This does not change
+    /// execution ownership, manual tasks, or recovery of durable merge requests.
+    #[arg(long, env = "MERGE_WAL_ADMISSION_TARGETS", value_delimiter = ',')]
+    pub merge_wal_admission_targets: Vec<String>,
+
+    /// Data-plane worker base URLs (comma-separated), e.g.
+    /// `http://rollout-0:3000,http://rollout-1:3000`. A `MergeWal` task fans out
+    /// to every endpoint so each worker merges its own MemWAL shard (the master
+    /// cannot merge a shard it does not own without fencing the live writer).
+    /// Empty (the default) means WAL-merge tasks have nowhere to go and fail
+    /// fast with a clear message.
+    #[arg(long, env = "WORKER_ENDPOINTS", value_delimiter = ',')]
+    pub worker_endpoints: Vec<String>,
+
+    #[command(flatten)]
+    pub worker_discovery: crate::worker_discovery::WorkerDiscoveryConfig,
+
+    /// Deadline for synchronous registered-table publication, including all workers.
+    /// Keep this below the caller's HTTP timeout. Publication does not enqueue a merge.
+    #[arg(long, env = "TABLE_FLUSH_TIMEOUT_SECS", default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
+    pub table_flush_timeout_secs: u64,
+
+    /// Maximum number of scheduler tasks executing concurrently. Compaction of
+    /// the *same* experiment is always serialized regardless of this value
+    /// (two `Rewrite`s on one dataset conflict); this only bounds how many
+    /// *distinct* experiments/tasks run at once.
+    ///
+    /// This is a per-process limit, not a cluster-wide one: N master replicas
+    /// run up to `N * task_concurrency` tasks between them. Correctness does
+    /// not depend on the value -- etcd claims and per-target locks already
+    /// prevent two replicas touching one experiment -- so it is purely a
+    /// throughput/resource knob.
+    #[arg(long, env = "TASK_CONCURRENCY", default_value_t = 4)]
+    pub task_concurrency: usize,
+
+    /// Maximum `MergeWal` tasks executing concurrently in this process.
+    ///
+    /// WAL merge shares the scheduler's dispatch loop with compaction but is a
+    /// different kind of work: it is an HTTP fan-out to every worker endpoint,
+    /// so it is slow in wall-clock terms while costing this process almost
+    /// nothing. Drawing from the single `task_concurrency` pool let a backlog
+    /// of slow fan-outs occupy every slot and starve compaction -- exactly when
+    /// both backlogs are growing and both need to drain. Giving merge its own
+    /// budget decouples them.
+    ///
+    /// The budget alone was not sufficient: it bounds concurrency, not
+    /// admission order. Because `MergeWal` is numerically dominant (the
+    /// `merge_wal_interval_secs` sweep enqueues one per over-threshold
+    /// experiment), a single unfiltered poller kept claiming MergeWal tasks and
+    /// a queued `Compact` was never reached. The scheduler therefore runs one
+    /// poller per pool, each claiming only the kinds it can run, so this budget
+    /// now also determines admission.
+    ///
+    /// `0` disables the separate budget and falls back to sharing the general
+    /// `task_concurrency` pool -- which also reinstates the single-poller
+    /// behavior, so prefer a non-zero value when both kinds are in play.
+    #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
+    pub merge_wal_concurrency: usize,
+
+    /// Additional legacy HTTP waits allowed outside the scheduler execution
+    /// slots. Zero disables yielding. Requests/tasks/claims stay alive.
+    #[arg(long, env = "LEGACY_MERGE_WAIT_CONCURRENCY", default_value_t = 32)]
+    pub legacy_merge_wait_concurrency: usize,
+
+    /// Scheduler observation interval, not a worker execution timeout.
+    #[arg(long, env = "LEGACY_MERGE_FOREGROUND_SECS", default_value_t = 30)]
+    pub legacy_merge_foreground_secs: u64,
+
+    /// etcd connection. Scheduler state (task queue, lease-based claims,
+    /// per-experiment write locks) lives in etcd so several stateless master
+    /// replicas can share one queue. `ETCD_ENDPOINTS` is required.
+    #[command(flatten)]
+    pub etcd: lance_context_core::etcd::EtcdConfig,
+
+    /// Which backend the store registries (rollout, generic) live in.
+    #[command(flatten)]
+    pub registry: lance_context_core::etcd::RegistryConfig,
+
+    /// TTL for etcd task claims and distributed locks. The master renews leases
+    /// while work is running; orphaned tasks are requeued after expiry.
+    #[arg(long, env = "ETCD_LEASE_TTL_SECS", default_value_t = 30)]
+    pub etcd_lease_ttl_secs: i64,
+
+    /// Maximum number of terminal scheduler tasks retained in etcd and the
+    /// queue UI. Queued and running tasks are never pruned, and at least one
+    /// terminal task is retained for status polling.
+    #[arg(long, env = "TASK_HISTORY_LIMIT", default_value_t = 1_000)]
+    pub task_history_limit: usize,
+
+    /// Maximum age of terminal (Done/Failed) scheduler tasks before they are
+    /// pruned, in seconds. `0` disables age-based pruning (the count cap in
+    /// `TASK_HISTORY_LIMIT` still applies). Whichever of the two removes a task
+    /// first wins. Queued/running tasks and terminal tasks that a live task
+    /// still depends on are never pruned regardless of age.
+    #[arg(long, env = "TASK_HISTORY_TTL_SECS", default_value_t = 86_400)]
+    pub task_history_ttl_secs: u64,
+
+    /// Consecutive failures of the same (kind, target) after which the
+    /// auto-sweeps stop re-enqueueing it for a while. A store whose manifest
+    /// names a fragment that no longer exists fails every merge and compaction
+    /// forever; without this, each sweep re-enqueued it and each attempt held a
+    /// task slot through a full worker fan-out before failing. `0` disables.
+    #[arg(long, env = "TASK_COOLDOWN_AFTER_FAILURES", default_value_t = 3)]
+    pub task_cooldown_after_failures: u32,
+
+    /// Cooldown after the threshold is reached; doubles per further failure.
+    #[arg(long, env = "TASK_COOLDOWN_BASE_SECS", default_value_t = 600)]
+    pub task_cooldown_base_secs: u64,
+
+    /// Longest cooldown. A success resets the count.
+    #[arg(long, env = "TASK_COOLDOWN_MAX_SECS", default_value_t = 21_600)]
+    pub task_cooldown_max_secs: u64,
+
+    /// Directory of built UI assets to serve. When unset, only the JSON API is
+    /// exposed.
+    #[arg(long, env = "UI_DIR")]
+    pub ui_dir: Option<String>,
+}
+
+impl MasterConfig {
+    pub(crate) fn validate_registered_store(&self) -> lance::Result<()> {
+        let Some(kind) = &self.managed_store_kind else {
+            if self.worker_discovery.managed_worker_service.is_some() {
+                return Err(lance::Error::invalid_input(
+                    "worker Service discovery requires a managed store kind",
+                ));
+            }
+            return Ok(());
+        };
+        if kind.is_empty()
+            || matches!(kind.as_str(), "rollout" | "generic")
+            || !kind
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        {
+            return Err(lance::Error::invalid_input("invalid managed store kind"));
+        }
+        let prefix = format!("{kind}:");
+        if self
+            .merge_rollout
+            .owned_targets
+            .iter()
+            .chain(&self.merge_rollout.drain_targets)
+            .chain(&self.maintenance.compaction_prepare_targets)
+            .chain(&self.local_merge.master_local_merge_targets)
+            .any(|target| target == "*" || target.starts_with(&prefix))
+            || self.merge_rollout.fence_legacy
+            || self.maintenance.fence_legacy_maintenance
+            || self.local_merge.master_local_merge_auto
+        {
+            return Err(lance::Error::invalid_input(
+                "registered stores require worker-owned legacy maintenance",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admits_automatic_wal(&self, target: &str) -> bool {
+        self.merge_wal_admission_targets.is_empty()
+            || self
+                .merge_wal_admission_targets
+                .iter()
+                .any(|name| name == target)
+    }
+
+    pub(crate) fn has_workers_for(&self, target: &str) -> bool {
+        !self.worker_endpoints.is_empty()
+            || (self.worker_discovery.managed_worker_service.is_some()
+                && self.managed_store_kind.as_ref().is_some_and(|kind| {
+                    target
+                        .strip_prefix(kind)
+                        .is_some_and(|rest| rest.starts_with(':'))
+                }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn registered_store_rejects_unsupported_ownership_before_opening() {
+        use super::*;
+        for extra in [
+            vec!["--merge-owned-targets", "events:table"],
+            vec!["--merge-drain-targets", "events:table"],
+            vec!["--compaction-prepare-targets", "*"],
+            vec!["--fence-legacy"],
+            vec!["--fence-legacy-maintenance"],
+            vec!["--master-local-merge-targets", "events:table"],
+            vec!["--master-local-merge-auto"],
+        ] {
+            let args = ["master", "--managed-store-kind", "events"]
+                .into_iter()
+                .chain(extra);
+            let config = MasterConfig::parse_from(args);
+            assert!(matches!(crate::state::MasterState::new(config).await,
+                Err(lance::Error::InvalidInput { source, .. })
+                if source.to_string() == "registered stores require worker-owned legacy maintenance"));
+        }
+    }
+
+    #[test]
+    fn registered_store_kind_must_be_unambiguous() {
+        use super::*;
+        for kind in [
+            "",
+            "rollout",
+            "generic",
+            "Events",
+            "events:table",
+            "../events",
+        ] {
+            let config = MasterConfig::parse_from(["master", "--managed-store-kind", kind]);
+            assert!(config.validate_registered_store().is_err(), "{kind}");
+        }
+        for kind in ["events", "events_v2", "datagen"] {
+            let config = MasterConfig::parse_from(["master", "--managed-store-kind", kind]);
+            config.validate_registered_store().unwrap();
+        }
+    }
+
+    #[test]
+    fn scoped_wal_admission_uses_exact_names_and_keeps_default_unrestricted() {
+        let cfg =
+            MasterConfig::parse_from(["master", "--merge-wal-admission-targets", "a,generic:b"]);
+        assert!(cfg.admits_automatic_wal("a"));
+        assert!(cfg.admits_automatic_wal("generic:b"));
+        assert!(!cfg.admits_automatic_wal("ab"));
+        assert!(!cfg.admits_automatic_wal("b"));
+        assert!(MasterConfig::parse_from(["master"]).admits_automatic_wal("any"));
+    }
+
+    #[test]
+    fn key_index_policy_is_explicit_and_validated() {
+        use clap::Parser;
+        use lance_context_core::KeyIndexType;
+        let config =
+            super::MasterConfig::try_parse_from(["master", "--key-index-type", "zonemap"]).unwrap();
+        assert_eq!(config.key_index_type, KeyIndexType::Zonemap);
+        assert!(
+            super::MasterConfig::try_parse_from(["master", "--key-index-type", "unknown",])
+                .is_err()
+        );
+    }
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn every_config_field_is_an_optional_flag() {
+        let command = MasterConfig::command();
+
+        let positionals: Vec<_> = command
+            .get_positionals()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            positionals.is_empty(),
+            "config fields must be flags, not positional args; found {positionals:?}"
+        );
+
+        for arg in command.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "'{}' has no long flag",
+                arg.get_id()
+            );
+            assert!(
+                arg.get_default_values().len() == 1 || !arg.is_required_set(),
+                "'{}' must have a default or be optional",
+                arg.get_id()
+            );
+        }
+    }
+
+    #[test]
+    fn rollout_cache_defaults_to_two_gib_and_can_be_disabled() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert_eq!(default.rollout_cache_bytes, 2 * 1024 * 1024 * 1024);
+
+        let disabled =
+            MasterConfig::try_parse_from(["lance-context-master", "--rollout-cache-bytes", "0"])
+                .unwrap();
+        assert_eq!(disabled.rollout_cache_bytes, 0);
+    }
+
+    #[test]
+    fn compaction_defaults_bound_parallelism_and_rewrite_size() {
+        let config = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert_eq!(config.compaction_concurrency, 1);
+        assert_eq!(config.compaction_threads, 1);
+        assert_eq!(config.compaction_batch_size, 8);
+        assert_eq!(config.compaction_max_source_fragments, 32);
+        assert_eq!(config.compaction_max_bytes_per_file, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn wal_claims_default_on_and_can_be_explicitly_disabled() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.claim_wal_merges);
+        assert!(MaintenanceConfig::default().claim_wal_merges);
+        let disabled =
+            MasterConfig::try_parse_from(["lance-context-master", "--claim-wal-merges=false"])
+                .unwrap();
+        assert!(!disabled.maintenance.claim_wal_merges);
+    }
+
+    #[test]
+    fn maintenance_claims_can_be_disabled_without_disabling_wal() {
+        let default = MasterConfig::try_parse_from(["master"]).unwrap();
+        assert!(default.maintenance.claim_maintenance_tasks);
+        assert!(MaintenanceConfig::default().claim_maintenance_tasks);
+        let merge_only = MasterConfig::try_parse_from([
+            "master",
+            "--claim-maintenance-tasks=false",
+            "--wal-claim-targets=hot",
+        ])
+        .unwrap();
+        assert!(!merge_only.maintenance.claim_maintenance_tasks);
+        assert!(merge_only.maintenance.claim_wal_merges);
+        assert_eq!(merge_only.maintenance.wal_claim_targets, ["hot"]);
+    }
+
+    #[test]
+    fn wal_claim_targets_are_exact_and_do_not_enable_native_ownership() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.wal_claim_targets.is_empty());
+        let selected = MasterConfig::try_parse_from([
+            "lance-context-master",
+            "--wal-claim-targets=hot,generic:events",
+        ])
+        .unwrap();
+        assert_eq!(
+            selected.maintenance.wal_claim_targets,
+            ["hot", "generic:events"]
+        );
+        assert!(!selected.merge_rollout.owned("hot"));
+        assert!(!crate::local_merge::selected(&selected, "hot"));
+        for invalid in ["--wal-claim-targets=", "--wal-claim-targets=*"] {
+            assert!(MasterConfig::try_parse_from(["lance-context-master", invalid]).is_err());
+        }
+    }
+}
+
+/// Admission and progress deadlines for local master table mutations.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MaintenanceConfig {
+    /// Allow this master to claim Compact, IndexId and Repair tasks. Disable
+    /// on WAL-only executors to keep maintenance out of their memory envelope.
+    /// This does not disable WAL claims, enqueueing, recovery or other masters,
+    /// and is not a runtime drain or proof that previous writes have ended.
+    #[arg(long, env = "MASTER_CLAIM_MAINTENANCE_TASKS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub claim_maintenance_tasks: bool,
+    /// Allow this master's scheduler to claim queued MergeWal tasks. Set false
+    /// for maintenance-only executors; Compact, IndexId and Repair still run.
+    /// This is independent of enqueue intervals and concurrency budgets, and
+    /// is not a runtime drain or proof that a predecessor's writes have ended.
+    #[arg(long, env = "MASTER_CLAIM_WAL_MERGES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub claim_wal_merges: bool,
+    /// Restrict this master's WAL task claims to these exact table names.
+    /// Empty (unset) accepts all targets. This does not select an execution
+    /// protocol, grant ownership, cancel existing work, or restrict maintenance.
+    #[arg(long, env = "MASTER_WAL_CLAIM_TARGETS", value_delimiter = ',', value_parser = parse_wal_claim_target)]
+    pub wal_claim_targets: Vec<String>,
+    /// Fence new master compact/index/repair executions even for rollout and
+    /// generic targets still using legacy worker merges. This does not migrate
+    /// worker admission or retroactively fence pre-upgrade writes.
+    #[arg(long, env = "MASTER_FENCE_LEGACY_MAINTENANCE", default_value_t = false)]
+    pub fence_legacy_maintenance: bool,
+    /// Prepare rollout compaction files without holding the table write lock.
+    /// Explicit rollout targets or '*'; empty keeps legacy behavior. Updates to
+    /// source fragments invalidate preparation instead of being overwritten.
+    #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
+    pub compaction_prepare_targets: Vec<String>,
+    /// Build missing key indexes and extend incomplete key/BTree indexes outside
+    /// the table write lock. Exact rollout/registered targets or '*'; empty keeps
+    /// ordinary execution. Publication uses the existing ownership protocol.
+    /// Retained snapshot requests still run entirely under table ownership.
+    #[arg(long, env = "INDEX_PREPARE_TARGETS", value_delimiter = ',')]
+    pub index_prepare_targets: Vec<String>,
+    /// Exact owned rollout targets whose dedicated publishers all use the
+    /// common fenced task/target/merge-claim protocol. Allows Compact/IndexId
+    /// beside persistent catch-up identity; empty retains legacy exclusion.
+    /// Enable only after verifying publisher compatibility. No wildcard.
+    #[arg(long, env = "MAINTENANCE_CATCHUP_TARGETS", value_delimiter = ',')]
+    pub maintenance_catchup_targets: Vec<String>,
+    /// Validate current rollout data/deletion references without deleting any
+    /// fragments. Exact owned, non-draining rollout targets only. Also permits
+    /// Repair beside a persistent catch-up identity when all its publishers
+    /// obey the common fenced task/target/merge-claim protocol. Verify that
+    /// compatibility before enabling; empty retains existing repair behavior.
+    #[arg(long, env = "REPAIR_VALIDATE_ONLY_TARGETS", value_delimiter = ',', value_parser = parse_repair_validation_target)]
+    pub repair_validate_only_targets: Vec<String>,
+    /// Yield prepared output after this long without observed writer progress.
+    /// Completed work extends the wait; heartbeats do not. Expiry releases
+    /// preparation capacity and never cancels the current table writer.
+    #[arg(long, env = "COMPACTION_COMMIT_WAIT_SECS", default_value_t = 120)]
+    pub compaction_commit_wait_secs: u64,
+    /// Maximum wait without observed writer progress after index files are ready.
+    /// Completed work extends the wait; heartbeats do not. Expiry releases
+    /// preparation capacity, never interrupts the other writer.
+    #[arg(long, env = "INDEX_COMMIT_WAIT_SECS", default_value_t = 120)]
+    pub index_commit_wait_secs: u64,
+    /// Legacy wire field; owned work now uses the real-progress idle timeout.
+    #[arg(long, env = "MAINTENANCE_TIMEOUT_SECS", default_value_t = 3600)]
+    pub maintenance_timeout_secs: u64,
+    /// Maximum time without a completed storage/processing step.
+    #[arg(long, env = "MAINTENANCE_IDLE_TIMEOUT_SECS", default_value_t = 600)]
+    pub maintenance_idle_timeout_secs: u64,
+    /// Grace for in-flight manifest commits before storage fencing.
+    #[arg(long, env = "MAINTENANCE_DRAIN_TIMEOUT_SECS", default_value_t = 30)]
+    pub maintenance_drain_timeout_secs: u64,
+}
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            claim_maintenance_tasks: true,
+            claim_wal_merges: true,
+            wal_claim_targets: Vec::new(),
+            fence_legacy_maintenance: false,
+            compaction_prepare_targets: Vec::new(),
+            index_prepare_targets: Vec::new(),
+            maintenance_catchup_targets: Vec::new(),
+            repair_validate_only_targets: Vec::new(),
+            compaction_commit_wait_secs: 120,
+            index_commit_wait_secs: 120,
+            maintenance_timeout_secs: 3600,
+            maintenance_idle_timeout_secs: 600,
+            maintenance_drain_timeout_secs: 30,
+        }
+    }
+}
+
+fn parse_wal_claim_target(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value == "*" {
+        return Err("WAL claim targets must be nonempty exact table names; omit the option to accept all tables".into());
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod repair_validation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn repair_validation_default_and_exact_target_parser() {
+        let cfg = MasterConfig::try_parse_from(["master"]).unwrap();
+        assert!(cfg.maintenance.repair_validate_only_targets.is_empty());
+        let cfg =
+            MasterConfig::try_parse_from(["master", "--repair-validate-only-targets=aops,t1"])
+                .unwrap();
+        assert_eq!(cfg.maintenance.repair_validate_only_targets, ["aops", "t1"]);
+        for value in ["", "*", "generic:hot", "datagen:hot", "../hot", "_stats"] {
+            assert!(
+                MasterConfig::try_parse_from([
+                    "master",
+                    &format!("--repair-validate-only-targets={value}")
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+    }
+}
+
+fn parse_repair_validation_target(value: &str) -> Result<String, String> {
+    lance_context_core::validate_store_name(value).map_err(|error| {
+        format!("repair validation requires an exact rollout table name: {error}")
+    })?;
+    Ok(value.to_owned())
+}

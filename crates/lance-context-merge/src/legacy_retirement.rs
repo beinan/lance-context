@@ -1,0 +1,1291 @@
+//! Identity-bound retirement journal for pre-fencing worker executions.
+//!
+//! The master verifies process death and replacement admission before preparing
+//! storage barriers. These transactions never release a target lock: the normal
+//! scheduler must still acquire its claim and release the terminal execution.
+use crate::{
+    encode, execution_key, execution_owner, target_lock_key, Coordinator, Execution, Phase, Result,
+};
+use etcd_client::{Compare, CompareOp, TxnOp};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub namespace: String,
+    pub pod: String,
+    pub pod_uid: String,
+    pub container: String,
+    pub container_id: String,
+    pub instance: String,
+    pub writer_id: String,
+}
+
+/// A process registered before replacement, or recovered from an explicitly
+/// completed target retirement. The registration alone is not proof of
+/// death, storage fencing, or permission to remove any target lock.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRetirementIntent {
+    pub id: String,
+    pub endpoint: String,
+    pub base_uri: String,
+    pub process: ProcessIdentity,
+}
+
+/// Immutable evidence captured while Kubernetes still exposes the exact old
+/// container's termination (graceful unless a completed target witness is used).
+/// This proves process death only: every
+/// target still requires its own storage barriers and fenced successor probe.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerTermination {
+    pub intent: WorkerRetirementIntent,
+    pub successor: ProcessIdentity,
+    pub finished_at: String,
+    /// A completed target retirement used to register an already retired
+    /// worker. Unlike a live-process intent, this also supports a verified
+    /// nonzero exit; it never inherits the witness's storage barriers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_execution_id: Option<String>,
+}
+
+impl WorkerTermination {
+    pub fn validate(&self) -> Result<()> {
+        uuid::Uuid::parse_str(&self.intent.id)
+            .map_err(|_| "invalid worker retirement ID".to_string())?;
+        if let Some(id) = &self.witness_execution_id {
+            uuid::Uuid::parse_str(id).map_err(|_| "invalid retirement witness ID".to_string())?;
+        }
+        let old = &self.intent.process;
+        let new = &self.successor;
+        if self.intent.endpoint.is_empty()
+            || self.intent.base_uri.is_empty()
+            || !valid_process(old)
+            || !valid_process(new)
+            || old.namespace != new.namespace
+            || old.pod != new.pod
+            || old.pod_uid != new.pod_uid
+            || old.container != new.container
+            || old.writer_id != new.writer_id
+            || old.container_id == new.container_id
+            || old.instance == new.instance
+            || self.finished_at.is_empty()
+            || self.finished_at.len() > 128
+        {
+            return Err("invalid worker termination receipt".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ClaimProof;
+
+    async fn fixture() -> (Coordinator, ClaimProof, Execution, ProcessIdentity) {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/legacy-retirement-tests/{}", uuid::Uuid::new_v4());
+        let lease = client.lease_grant(60, None).await.unwrap().id();
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/test"),
+            token: "original".into(),
+            lease_id: lease,
+        };
+        for key in [&proof.key, &target_lock_key(&prefix, "table")] {
+            client
+                .put(
+                    key.as_str(),
+                    proof.token.as_str(),
+                    Some(etcd_client::PutOptions::new().with_lease(lease)),
+                )
+                .await
+                .unwrap();
+        }
+        let coordinator = Coordinator::new(client, prefix);
+        let execution = coordinator
+            .admit_legacy(&proof, "table", "http://worker:3000")
+            .await
+            .unwrap();
+        let process = ProcessIdentity {
+            namespace: "test".into(),
+            pod: "worker".into(),
+            pod_uid: "uid".into(),
+            container: "server".into(),
+            container_id: "containerd://old".into(),
+            instance: "instance-old".into(),
+            writer_id: "worker".into(),
+        };
+        (coordinator, proof, execution, process)
+    }
+
+    fn plan() -> BTreeMap<String, u64> {
+        BTreeMap::from([
+            ("base".into(), 12),
+            (format!("shard:{}", uuid::Uuid::nil()), 15),
+        ])
+    }
+
+    async fn completed_witness() -> (Coordinator, Retirement, WorkerTermination) {
+        let (coordinator, _, execution, process) = fixture().await;
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process.clone())
+            .await
+            .unwrap();
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let witness = coordinator
+            .legacy_retirement(&execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = WorkerTermination {
+            intent: WorkerRetirementIntent {
+                id: uuid::Uuid::new_v4().to_string(),
+                endpoint: execution.endpoint.clone(),
+                base_uri: "az://data/root".into(),
+                process: process.clone(),
+            },
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: Some(execution.id),
+        };
+        (coordinator, witness, receipt)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn completed_target_witness_registers_worker_without_releasing_ownership() {
+        let (coordinator, witness, receipt) = completed_witness().await;
+        assert!(coordinator
+            .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+            .await
+            .unwrap()
+            .is_none());
+        let execution_before = coordinator.get("table").await.unwrap();
+        assert!(coordinator
+            .record_worker_termination(receipt.clone())
+            .await
+            .is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .record_worker_termination_from_witness(receipt.clone(), &witness)
+                    .await
+                    .unwrap(),
+                receipt
+            );
+        }
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+                .await
+                .unwrap(),
+            Some(receipt.intent.clone())
+        );
+        assert_eq!(
+            coordinator
+                .worker_termination(&receipt.intent)
+                .await
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(coordinator.get("table").await.unwrap(), execution_before);
+        assert_eq!(
+            coordinator
+                .legacy_retirement(&witness.execution.id)
+                .await
+                .unwrap(),
+            Some(witness.clone())
+        );
+        let lock = coordinator
+            .client
+            .clone()
+            .get(target_lock_key(&coordinator.prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].value(),
+            execution_owner(&witness.execution).as_bytes()
+        );
+        let mut changed = receipt.clone();
+        changed.successor.container_id = "containerd://third".into();
+        assert!(coordinator
+            .record_worker_termination_from_witness(changed, &witness)
+            .await
+            .is_err());
+        // Existing receipts remain readable without the new optional field.
+        let mut old_json = serde_json::to_value(&receipt).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("witness_execution_id");
+        let old: WorkerTermination = serde_json::from_value(old_json).unwrap();
+        assert!(old.witness_execution_id.is_none());
+        old.validate().unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn completed_target_witness_rejects_missing_changed_or_conflicting_evidence() {
+        let (coordinator, witness, receipt) = completed_witness().await;
+        for kind in [
+            "incomplete",
+            "versions",
+            "process",
+            "endpoint",
+            "id",
+            "protocol",
+            "background",
+            "cas",
+        ] {
+            let mut bad = witness.clone();
+            match kind {
+                "incomplete" => bad.completed = false,
+                "versions" => bad.versions = None,
+                "process" => bad.process.container_id = "other".into(),
+                "endpoint" => bad.execution.endpoint = "http://other:3000".into(),
+                "id" => bad.execution.id = uuid::Uuid::new_v4().to_string(),
+                "protocol" => bad.execution.protocol = 2,
+                "background" => bad.execution.background = true,
+                // Passes identity checks but does not match the stored journal.
+                "cas" => {
+                    bad.versions.as_mut().unwrap().insert("base".into(), 99);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                coordinator
+                    .record_worker_termination_from_witness(receipt.clone(), &bad)
+                    .await
+                    .is_err(),
+                "{kind}"
+            );
+            assert!(coordinator
+                .worker_retirement_intent(&receipt.intent.id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(coordinator
+                .worker_termination(&receipt.intent)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let mut conflict = receipt.intent.clone();
+        conflict.id = uuid::Uuid::new_v4().to_string();
+        conflict.process.container_id = "containerd://unrelated".into();
+        coordinator
+            .prepare_worker_retirement(conflict.clone())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .record_worker_termination_from_witness(receipt.clone(), &witness)
+            .await
+            .is_err());
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&receipt.intent.endpoint)
+                .await
+                .unwrap(),
+            Some(conflict)
+        );
+        assert!(coordinator
+            .worker_termination(&receipt.intent)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_death_receipt_survives_reconnect_without_releasing_a_target() {
+        let (coordinator, _, execution, process) = fixture().await;
+        let intent = WorkerRetirementIntent {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: execution.endpoint.clone(),
+            base_uri: "az://data/root".into(),
+            process: process.clone(),
+        };
+        let receipt = WorkerTermination {
+            intent: intent.clone(),
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: None,
+        };
+        // A termination record cannot be installed without the captured intent.
+        assert!(coordinator
+            .record_worker_termination(receipt.clone())
+            .await
+            .is_err());
+        coordinator
+            .prepare_worker_retirement(intent.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .record_worker_termination(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            coordinator
+                .record_worker_termination(receipt.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        let mut conflicting = receipt.clone();
+        conflicting.successor.container_id = "containerd://third".into();
+        assert!(coordinator
+            .record_worker_termination(conflicting)
+            .await
+            .is_err());
+        let fresh_client =
+            etcd_client::Client::connect([std::env::var("ETCD_TEST_ENDPOINTS").unwrap()], None)
+                .await
+                .unwrap();
+        let reconnected = Coordinator::new(fresh_client, coordinator.prefix.clone());
+        assert_eq!(
+            reconnected.worker_termination(&intent).await.unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            reconnected.get(&execution.target).await.unwrap(),
+            Some(execution.clone())
+        );
+        let lock = reconnected
+            .client
+            .clone()
+            .get(
+                target_lock_key(&reconnected.prefix, &execution.target),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].value(),
+            execution_owner(&execution).as_bytes()
+        );
+        let mut wrong = intent.clone();
+        wrong.base_uri = "az://other/root".into();
+        assert!(reconnected.worker_termination(&wrong).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_death_receipt_rejects_changed_endpoint_index() {
+        let (coordinator, _, execution, process) = fixture().await;
+        let intent = WorkerRetirementIntent {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: execution.endpoint,
+            base_uri: "az://data/root".into(),
+            process: process.clone(),
+        };
+        coordinator
+            .prepare_worker_retirement(intent.clone())
+            .await
+            .unwrap();
+        // Simulate an inconsistent concurrent registry mutation in this isolated prefix.
+        coordinator
+            .client
+            .clone()
+            .put(
+                coordinator.worker_retirement_endpoint_key(&intent.endpoint),
+                "changed",
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = WorkerTermination {
+            intent: intent.clone(),
+            successor: ProcessIdentity {
+                container_id: "containerd://second".into(),
+                instance: "second-instance".into(),
+                ..process
+            },
+            finished_at: "2026-10-23T00:00:00Z".into(),
+            witness_execution_id: None,
+        };
+        assert!(coordinator
+            .record_worker_termination(receipt)
+            .await
+            .is_err());
+        assert!(coordinator
+            .worker_termination(&intent)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn worker_intent_without_execution_binds_late_target_without_releasing_ownership() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/worker-retirement-tests/{}", uuid::Uuid::new_v4());
+        let coordinator = Coordinator::new(client.clone(), prefix.clone());
+        let intent = WorkerRetirementIntent {
+            id: uuid::Uuid::new_v4().to_string(),
+            endpoint: "http://worker:3000".into(),
+            base_uri: "az://data/root".into(),
+            process: ProcessIdentity {
+                namespace: "test".into(),
+                pod: "worker".into(),
+                pod_uid: "uid".into(),
+                container: "server".into(),
+                container_id: "containerd://old".into(),
+                instance: "old-instance".into(),
+                writer_id: "worker".into(),
+            },
+        };
+        assert!(coordinator.get("late").await.unwrap().is_none());
+        let captured = coordinator
+            .prepare_worker_retirement(intent.clone())
+            .await
+            .unwrap();
+        assert_eq!(captured, intent);
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&intent.endpoint)
+                .await
+                .unwrap(),
+            Some(intent.clone())
+        );
+        assert_eq!(
+            coordinator
+                .prepare_worker_retirement(intent.clone())
+                .await
+                .unwrap(),
+            intent
+        );
+        let mut altered = intent.clone();
+        altered.process.container_id = "containerd://other".into();
+        assert!(coordinator
+            .prepare_worker_retirement(altered)
+            .await
+            .is_err());
+        let mut second = intent.clone();
+        second.id = uuid::Uuid::new_v4().to_string();
+        second.process.container_id = "containerd://newer".into();
+        assert!(coordinator
+            .prepare_worker_retirement(second.clone())
+            .await
+            .is_err());
+        assert!(coordinator
+            .worker_retirement_intent(&second.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            coordinator
+                .worker_retirement_for_endpoint(&intent.endpoint)
+                .await
+                .unwrap(),
+            Some(intent.clone())
+        );
+        assert!(coordinator.get("late").await.unwrap().is_none());
+        assert!(client
+            .get(target_lock_key(&prefix, "late"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/late"),
+            token: "late-owner".into(),
+            lease_id: 0,
+        };
+        for key in [&proof.key, &target_lock_key(&prefix, "late")] {
+            client
+                .put(key.as_str(), proof.token.as_str(), None)
+                .await
+                .unwrap();
+        }
+        let late = coordinator
+            .admit_legacy(&proof, "late", &intent.endpoint)
+            .await
+            .unwrap();
+        let mut invented = intent.clone();
+        invented.process.instance = "not-captured".into();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_worker(&late, &invented)
+            .await
+            .is_err());
+        assert!(coordinator
+            .legacy_retirement(&late.id)
+            .await
+            .unwrap()
+            .is_none());
+        let journal = coordinator
+            .prepare_legacy_retirement_from_worker(&late, &intent)
+            .await
+            .unwrap();
+        assert_eq!(journal.process, intent.process);
+        assert!(journal.versions.is_none());
+        assert!(coordinator
+            .finish_legacy_retirement(&journal)
+            .await
+            .is_err());
+        assert_eq!(coordinator.get("late").await.unwrap(), Some(late.clone()));
+        let planned = coordinator
+            .plan_legacy_retirement(&journal, plan())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        assert!(!client
+            .get(target_lock_key(&prefix, "late"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        let terminal = coordinator.get("late").await.unwrap().unwrap();
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        let next = Execution::new("late", "new", "new", 600);
+        assert!(coordinator.reserve(&proof, &next).await.unwrap());
+        assert!(coordinator
+            .prepare_legacy_retirement_from_worker(&next, &intent)
+            .await
+            .is_err());
+        assert_eq!(coordinator.get("late").await.unwrap(), Some(next));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn retirement_retains_lock_until_normal_claim_release_and_cannot_touch_successor() {
+        let (coordinator, proof, execution, process) = fixture().await;
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&prepared)
+            .await
+            .is_err());
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(execution.clone())
+        );
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan())
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let terminal = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(terminal.phase, Phase::Finished);
+        assert!(!coordinator
+            .reserve(&proof, &Execution::new("table", "new", "new", 600))
+            .await
+            .unwrap());
+        let wrong_claim = ClaimProof {
+            token: "wrong".into(),
+            ..proof.clone()
+        };
+        assert!(!coordinator.release(&wrong_claim, &terminal).await.unwrap());
+        assert!(coordinator.release(&proof, &terminal).await.unwrap());
+        let next = Execution::new("table", "new", "new", 600);
+        assert!(coordinator.reserve(&proof, &next).await.unwrap());
+        assert!(!coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(next));
+        assert!(
+            coordinator
+                .legacy_retirement(&execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn restart_reuses_first_barrier_plan_and_rejects_different_process_evidence() {
+        let (coordinator, _, execution, process) = fixture().await;
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process.clone())
+            .await
+            .unwrap();
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan())
+            .await
+            .unwrap();
+        let mut newer = plan();
+        newer.insert("base".into(), 1000);
+        assert_eq!(
+            coordinator
+                .plan_legacy_retirement(&prepared, newer)
+                .await
+                .unwrap(),
+            planned
+        );
+        let mut other = process;
+        other.container_id = "containerd://another".into();
+        assert!(coordinator
+            .prepare_legacy_retirement(&execution, other)
+            .await
+            .is_err());
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(execution));
+        assert_eq!(
+            coordinator
+                .legacy_retirement(&planned.execution.id)
+                .await
+                .unwrap(),
+            Some(planned)
+        );
+    }
+}
+
+#[cfg(test)]
+mod witness_tests {
+    use super::*;
+    use crate::ClaimProof;
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn late_admission_inherits_verified_process_but_not_other_target_barriers() {
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let mut client = etcd_client::Client::connect([endpoint], None)
+            .await
+            .unwrap();
+        let prefix = format!("/retirement-witness-tests/{}", uuid::Uuid::new_v4());
+        let proof = ClaimProof {
+            key: format!("{prefix}/claims/test"),
+            token: "owner".into(),
+            lease_id: 0,
+        };
+        client
+            .put(proof.key.as_str(), proof.token.as_str(), None)
+            .await
+            .unwrap();
+        for target in ["first", "late"] {
+            client
+                .put(target_lock_key(&prefix, target), proof.token.as_str(), None)
+                .await
+                .unwrap();
+        }
+        let coordinator = Coordinator::new(client, prefix);
+        let execution = coordinator
+            .admit_legacy(&proof, "first", "http://worker:3000")
+            .await
+            .unwrap();
+        let process = ProcessIdentity {
+            namespace: "test".into(),
+            pod: "worker".into(),
+            pod_uid: "uid".into(),
+            container: "server".into(),
+            container_id: "containerd://old".into(),
+            instance: "old".into(),
+            writer_id: "worker".into(),
+        };
+        let prepared = coordinator
+            .prepare_legacy_retirement(&execution, process.clone())
+            .await
+            .unwrap();
+        let late = coordinator
+            .admit_legacy(&proof, "late", &execution.endpoint)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&late, &prepared)
+            .await
+            .is_err());
+        let plan = BTreeMap::from([
+            ("base".into(), 12),
+            (format!("shard:{}", uuid::Uuid::nil()), 15),
+        ]);
+        let planned = coordinator
+            .plan_legacy_retirement(&prepared, plan)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned)
+            .await
+            .unwrap());
+        let witness = coordinator
+            .legacy_retirement(&execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut invented = witness.clone();
+        invented.process.container_id = "containerd://unverified".into();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&late, &invented)
+            .await
+            .is_err());
+        let mut other_endpoint = late.clone();
+        other_endpoint.endpoint = "http://different-worker:3000".into();
+        assert!(coordinator
+            .prepare_legacy_retirement_from_witness(&other_endpoint, &witness)
+            .await
+            .is_err());
+        let journal = coordinator
+            .prepare_legacy_retirement_from_witness(&late, &witness)
+            .await
+            .unwrap();
+        assert_eq!(journal.process, process);
+        assert_eq!(journal.execution, late);
+        assert!(journal.versions.is_none());
+        assert!(!journal.completed);
+        assert_eq!(coordinator.get("late").await.unwrap(), Some(late.clone()));
+        assert!(coordinator
+            .finish_legacy_retirement(&journal)
+            .await
+            .is_err());
+        let new_plan = BTreeMap::from([
+            ("base".into(), 90),
+            (format!("shard:{}", uuid::Uuid::nil()), 91),
+        ]);
+        let planned_late = coordinator
+            .plan_legacy_retirement(&journal, new_plan)
+            .await
+            .unwrap();
+        assert!(coordinator
+            .finish_legacy_retirement(&planned_late)
+            .await
+            .unwrap());
+        assert_eq!(
+            coordinator.get("late").await.unwrap().unwrap().phase,
+            Phase::Finished
+        );
+        let lock = coordinator
+            .client
+            .clone()
+            .get(target_lock_key(&coordinator.prefix, "late"), None)
+            .await
+            .unwrap();
+        assert_eq!(lock.kvs()[0].value(), execution_owner(&late).as_bytes());
+        assert_eq!(
+            coordinator.legacy_retirement(&execution.id).await.unwrap(),
+            Some(witness)
+        );
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Retirement {
+    pub execution: Execution,
+    pub process: ProcessIdentity,
+    pub versions: Option<BTreeMap<String, u64>>,
+    pub completed: bool,
+}
+
+fn bytes(record: &Retirement) -> Vec<u8> {
+    serde_json::to_vec(record).expect("retirement is JSON serializable")
+}
+
+fn encode_intent(record: &WorkerRetirementIntent) -> Vec<u8> {
+    serde_json::to_vec(record).expect("worker retirement intent is JSON serializable")
+}
+
+fn valid_process(process: &ProcessIdentity) -> bool {
+    [
+        &process.namespace,
+        &process.pod,
+        &process.pod_uid,
+        &process.container,
+        &process.container_id,
+        &process.instance,
+        &process.writer_id,
+    ]
+    .iter()
+    .all(|s| !s.is_empty())
+}
+
+impl Coordinator {
+    fn worker_termination_key(&self, id: &str) -> Result<String> {
+        Ok(self.worker_retirement_key(id)?.replace(
+            "/legacy-worker-retirements/",
+            "/legacy-worker-terminations/",
+        ))
+    }
+
+    pub async fn worker_termination(
+        &self,
+        intent: &WorkerRetirementIntent,
+    ) -> Result<Option<WorkerTermination>> {
+        let reply = self
+            .client
+            .clone()
+            .get(self.worker_termination_key(&intent.id)?, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let record: Option<WorkerTermination> = reply
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        if let Some(receipt) = &record {
+            receipt.validate()?;
+        }
+        if record.as_ref().is_some_and(|r| &r.intent != intent) {
+            return Err("worker termination receipt does not match immutable intent".into());
+        }
+        Ok(record)
+    }
+
+    /// Caller must verify exact graceful death and bracket the successor probe
+    /// with stable Kubernetes identity reads. No target ownership is changed.
+    pub async fn record_worker_termination(
+        &self,
+        record: WorkerTermination,
+    ) -> Result<WorkerTermination> {
+        record.validate()?;
+        if record.witness_execution_id.is_some() {
+            return Err("completed retirement witness requires atomic registration".into());
+        }
+        let key = self.worker_termination_key(&record.intent.id)?;
+        if self
+            .transact(
+                vec![
+                    Compare::value(
+                        self.worker_retirement_key(&record.intent.id)?,
+                        CompareOp::Equal,
+                        encode_intent(&record.intent),
+                    ),
+                    Compare::value(
+                        self.worker_retirement_endpoint_key(&record.intent.endpoint),
+                        CompareOp::Equal,
+                        encode_intent(&record.intent),
+                    ),
+                    Compare::version(key.as_str(), CompareOp::Equal, 0),
+                ],
+                vec![TxnOp::put(
+                    key,
+                    serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                    None,
+                )],
+            )
+            .await?
+        {
+            return Ok(record);
+        }
+        match self.worker_termination(&record.intent).await? {
+            Some(prior) if prior == record => Ok(prior),
+            _ => Err("worker termination intent changed or receipt already differs".into()),
+        }
+    }
+
+    /// Register a process captured in a completed target retirement, together
+    /// with freshly verified termination evidence. The witness, endpoint index,
+    /// intent and receipt are compared/published in one transaction. No task,
+    /// execution, target lock or storage version is changed.
+    pub async fn record_worker_termination_from_witness(
+        &self,
+        record: WorkerTermination,
+        witness: &Retirement,
+    ) -> Result<WorkerTermination> {
+        record.validate()?;
+        if !witness.completed
+            || witness.versions.as_ref().is_none_or(|v| {
+                v.len() != 2 || !v.contains_key("base") || v.values().any(|version| *version == 0)
+            })
+            || witness.execution.protocol != 0
+            || witness.execution.background
+            || witness.execution.maintenance.is_some()
+            || witness.execution.endpoint != record.intent.endpoint
+            || witness.process != record.intent.process
+            || record.witness_execution_id.as_deref() != Some(witness.execution.id.as_str())
+        {
+            return Err("completed retirement must identify this exact retired worker".into());
+        }
+        let intent_key = self.worker_retirement_key(&record.intent.id)?;
+        let endpoint_key = self.worker_retirement_endpoint_key(&record.intent.endpoint);
+        let key = self.worker_termination_key(&record.intent.id)?;
+        let existing_intent = self.worker_retirement_intent(&record.intent.id).await?;
+        let existing_endpoint = self
+            .worker_retirement_for_endpoint(&record.intent.endpoint)
+            .await?;
+        let mut comparisons = vec![
+            Compare::value(
+                self.retirement_key(&witness.execution.id)?,
+                CompareOp::Equal,
+                bytes(witness),
+            ),
+            Compare::version(key.as_str(), CompareOp::Equal, 0),
+        ];
+        for (key, existing) in [
+            (&intent_key, existing_intent.as_ref()),
+            (&endpoint_key, existing_endpoint.as_ref()),
+        ] {
+            comparisons.push(match existing {
+                None => Compare::version(key.as_str(), CompareOp::Equal, 0),
+                Some(intent) if intent == &record.intent => {
+                    Compare::value(key.as_str(), CompareOp::Equal, encode_intent(intent))
+                }
+                Some(_) => return Err("worker retirement identity already differs".into()),
+            });
+        }
+        if self
+            .transact(
+                comparisons,
+                vec![
+                    TxnOp::put(intent_key, encode_intent(&record.intent), None),
+                    TxnOp::put(endpoint_key, encode_intent(&record.intent), None),
+                    TxnOp::put(
+                        key,
+                        serde_json::to_vec(&record).map_err(|e| e.to_string())?,
+                        None,
+                    ),
+                ],
+            )
+            .await?
+        {
+            return Ok(record);
+        }
+        match self.worker_termination(&record.intent).await? {
+            Some(prior) if prior == record => Ok(prior),
+            _ => Err("retirement witness or worker registration changed".into()),
+        }
+    }
+
+    fn worker_retirement_endpoint_key(&self, endpoint: &str) -> String {
+        let encoded: String = endpoint
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!(
+            "{}/legacy-worker-retirement-endpoints/{encoded}",
+            self.prefix.trim_end_matches('/')
+        )
+    }
+
+    /// Exact endpoint lookup lets ordinary retries discover late admissions
+    /// without scanning journals or requiring an agent to bind each target.
+    pub async fn worker_retirement_for_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> Result<Option<WorkerRetirementIntent>> {
+        let result = self
+            .client
+            .clone()
+            .get(self.worker_retirement_endpoint_key(endpoint), None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let intent: Option<WorkerRetirementIntent> = result
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()?;
+        if intent.as_ref().is_some_and(|i| i.endpoint != endpoint) {
+            return Err("worker retirement endpoint index is inconsistent".into());
+        }
+        Ok(intent)
+    }
+
+    fn worker_retirement_key(&self, id: &str) -> Result<String> {
+        uuid::Uuid::parse_str(id).map_err(|_| "invalid worker retirement ID".to_string())?;
+        Ok(format!(
+            "{}/legacy-worker-retirements/{id}",
+            self.prefix.trim_end_matches('/')
+        ))
+    }
+
+    pub async fn worker_retirement_intent(
+        &self,
+        id: &str,
+    ) -> Result<Option<WorkerRetirementIntent>> {
+        let result = self
+            .client
+            .clone()
+            .get(self.worker_retirement_key(id)?, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        result
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Caller must capture the live worker through bracketed identity probes.
+    /// Retrying an intent ID can never replace its original process identity.
+    pub async fn prepare_worker_retirement(
+        &self,
+        intent: WorkerRetirementIntent,
+    ) -> Result<WorkerRetirementIntent> {
+        if intent.endpoint.is_empty()
+            || intent.endpoint.len() > 2048
+            || intent.base_uri.is_empty()
+            || !valid_process(&intent.process)
+        {
+            return Err("invalid worker retirement intent".into());
+        }
+        let key = self.worker_retirement_key(&intent.id)?;
+        let endpoint_key = self.worker_retirement_endpoint_key(&intent.endpoint);
+        if self
+            .transact(
+                vec![
+                    Compare::version(key.as_str(), CompareOp::Equal, 0),
+                    Compare::version(endpoint_key.as_str(), CompareOp::Equal, 0),
+                ],
+                vec![
+                    TxnOp::put(key, encode_intent(&intent), None),
+                    TxnOp::put(endpoint_key, encode_intent(&intent), None),
+                ],
+            )
+            .await?
+        {
+            return Ok(intent);
+        }
+        match self.worker_retirement_intent(&intent.id).await? {
+            Some(prior)
+                if prior == intent
+                    && self
+                        .worker_retirement_for_endpoint(&intent.endpoint)
+                        .await?
+                        .as_ref()
+                        == Some(&intent) =>
+            {
+                Ok(prior)
+            }
+            _ => Err("worker retirement intent already identifies a different process".into()),
+        }
+    }
+
+    /// After exact old-process death and fenced-successor checks, bind one
+    /// target to the immutable intent. Every target still needs its own storage
+    /// barrier plan and canonical completion; this does not release ownership.
+    pub async fn prepare_legacy_retirement_from_worker(
+        &self,
+        old: &Execution,
+        intent: &WorkerRetirementIntent,
+    ) -> Result<Retirement> {
+        if intent.endpoint != old.endpoint {
+            return Err("worker intent belongs to a different endpoint".into());
+        }
+        self.prepare_retirement(
+            old,
+            intent.process.clone(),
+            Some((
+                self.worker_retirement_key(&intent.id)?,
+                encode_intent(intent),
+            )),
+        )
+        .await
+    }
+
+    fn retirement_key(&self, execution_id: &str) -> Result<String> {
+        uuid::Uuid::parse_str(execution_id).map_err(|_| "invalid execution ID".to_string())?;
+        Ok(format!(
+            "{}/legacy-retirements/{execution_id}",
+            self.prefix.trim_end_matches('/')
+        ))
+    }
+
+    pub async fn legacy_retirement(&self, execution_id: &str) -> Result<Option<Retirement>> {
+        let result = self
+            .client
+            .clone()
+            .get(self.retirement_key(execution_id)?, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        result
+            .kvs()
+            .first()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// Called only after a live identity probe bracketed by Kubernetes identity
+    /// checks. It records intent, NOT proof of death or permission to take over.
+    pub async fn prepare_legacy_retirement(
+        &self,
+        old: &Execution,
+        process: ProcessIdentity,
+    ) -> Result<Retirement> {
+        self.prepare_retirement(old, process, None).await
+    }
+
+    /// A target discovered during shutdown can use the already verified death
+    /// of the same worker. The caller must recheck Kubernetes and the fenced
+    /// successor. Only process identity is inherited, never storage versions.
+    pub async fn prepare_legacy_retirement_from_witness(
+        &self,
+        old: &Execution,
+        witness: &Retirement,
+    ) -> Result<Retirement> {
+        if !witness.completed
+            || witness.versions.is_none()
+            || witness.execution.id == old.id
+            || witness.execution.endpoint != old.endpoint
+        {
+            return Err("completed retirement of the same worker is required".into());
+        }
+        self.prepare_retirement(
+            old,
+            witness.process.clone(),
+            Some((self.retirement_key(&witness.execution.id)?, bytes(witness))),
+        )
+        .await
+    }
+
+    async fn prepare_retirement(
+        &self,
+        old: &Execution,
+        process: ProcessIdentity,
+        witness: Option<(String, Vec<u8>)>,
+    ) -> Result<Retirement> {
+        if old.protocol != 0
+            || old.background
+            || old.maintenance.is_some()
+            || !matches!(old.phase, Phase::Running | Phase::Uncertain)
+            || !valid_process(&process)
+        {
+            return Err("invalid legacy retirement preparation".into());
+        }
+        let next = Retirement {
+            execution: old.clone(),
+            process,
+            versions: None,
+            completed: false,
+        };
+        let key = self.retirement_key(&old.id)?;
+        let mut comparisons = vec![
+            Compare::value(
+                execution_key(&self.prefix, &old.target),
+                CompareOp::Equal,
+                encode(old),
+            ),
+            Compare::value(
+                target_lock_key(&self.prefix, &old.target),
+                CompareOp::Equal,
+                execution_owner(old),
+            ),
+            Compare::version(key.as_str(), CompareOp::Equal, 0),
+        ];
+        if let Some((key, value)) = witness {
+            comparisons.push(Compare::value(key, CompareOp::Equal, value));
+        }
+        if self
+            .transact(comparisons, vec![TxnOp::put(key, bytes(&next), None)])
+            .await?
+        {
+            return Ok(next);
+        }
+        let prior = self
+            .legacy_retirement(&old.id)
+            .await?
+            .ok_or("execution changed before retirement preparation")?;
+        if prior.execution == *old && prior.process == next.process {
+            Ok(prior)
+        } else {
+            Err("retirement identity changed; refusing replacement evidence".into())
+        }
+    }
+
+    /// Persist the first post-termination snapshot before issuing any barriers.
+    /// A competing recovery can adopt only the already recorded immutable plan.
+    pub async fn plan_legacy_retirement(
+        &self,
+        old: &Retirement,
+        versions: BTreeMap<String, u64>,
+    ) -> Result<Retirement> {
+        if old.completed
+            || old.versions.is_some()
+            || !versions.contains_key("base")
+            || versions.len() != 2
+            || versions.values().any(|v| *v == 0)
+        {
+            return Err("invalid legacy retirement plan".into());
+        }
+        let mut next = old.clone();
+        next.versions = Some(versions);
+        let key = self.retirement_key(&old.execution.id)?;
+        if self
+            .transact(
+                vec![
+                    Compare::value(key.as_str(), CompareOp::Equal, bytes(old)),
+                    Compare::value(
+                        execution_key(&self.prefix, &old.execution.target),
+                        CompareOp::Equal,
+                        encode(&old.execution),
+                    ),
+                ],
+                vec![TxnOp::put(key, bytes(&next), None)],
+            )
+            .await?
+        {
+            return Ok(next);
+        }
+        let prior = self
+            .legacy_retirement(&old.execution.id)
+            .await?
+            .ok_or("retirement plan disappeared")?;
+        if prior.execution == old.execution
+            && prior.process == old.process
+            && prior.versions.is_some()
+        {
+            Ok(prior)
+        } else {
+            Err("retirement changed before barrier plan was persisted".into())
+        }
+    }
+
+    /// Called only AFTER all persisted manifest versions have been fenced.
+    /// Existing claim and lock remain; ordinary scheduler reconciliation owns
+    /// release, retry accounting and the next attempt.
+    pub async fn finish_legacy_retirement(&self, old: &Retirement) -> Result<bool> {
+        if old.completed || old.versions.is_none() {
+            return Err("retirement requires a persisted storage barrier plan".into());
+        }
+        let execution = &old.execution;
+        let finished = execution.finished(Err("legacy process terminated and storage manifests fenced; retry with replacement executor".into()));
+        let mut done = old.clone();
+        done.completed = true;
+        let key = self.retirement_key(&execution.id)?;
+        self.transact(
+            vec![
+                Compare::value(key.as_str(), CompareOp::Equal, bytes(old)),
+                Compare::value(
+                    execution_key(&self.prefix, &execution.target),
+                    CompareOp::Equal,
+                    encode(execution),
+                ),
+                Compare::value(
+                    target_lock_key(&self.prefix, &execution.target),
+                    CompareOp::Equal,
+                    execution_owner(execution),
+                ),
+            ],
+            vec![
+                TxnOp::put(key, bytes(&done), None),
+                TxnOp::put(
+                    execution_key(&self.prefix, &execution.target),
+                    encode(&finished),
+                    None,
+                ),
+            ],
+        )
+        .await
+    }
+}

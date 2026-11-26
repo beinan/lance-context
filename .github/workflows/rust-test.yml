@@ -1,0 +1,637 @@
+name: Rust Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - crates/**
+      - vendor/raft-engine/**
+      - vendor/lance-io/**
+      - vendor/lance-core/**
+      - vendor/lance/**
+      - vendor/lance-encoding/**
+      - .github/workflows/rust-test.yml
+      - scripts/ci/run-built-tests.sh
+      - Cargo.toml
+      - Cargo.lock
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C debuginfo=1"
+  # Large annotation recovery traverses deep Lance plans. Both the debug HA
+  # suite and coverage overflow an 8 MiB test-thread stack; keep all tests enabled.
+  RUST_MIN_STACK: "16777216"
+  # See .cargo/config.toml: blob-row merges in tests need more than the
+  # 150 MB-per-partition DataFusion default.
+  LANCE_MEM_POOL_SIZE: "1073741824"
+  RUST_BACKTRACE: "1"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  workspace-tests:
+    runs-on: ubuntu-24.04
+    # Keep workspace tests independent of the optional feature build graphs.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - name: Make room for the workspace build cache
+        run: |
+          # Match the HA job: these hosted-runner SDKs are unused by this build.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h / "$RUNNER_TEMP"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-deps"
+          workspaces: "."
+          # Match HA: PR cache cleanup must not fail already passing tests.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Build tests
+        run: cargo test --workspace --all-targets --no-run
+      - name: Run unit and integration tests
+        # `--all-targets` matters: the previous `--lib` compiled the
+        # crates/lance-context-core/tests/*.rs integration tests and then threw
+        # them away without running them, so every WAL-merge and concurrency
+        # regression test was dead weight in CI. `--workspace` covers the crates
+        # that were silently untested (api, server, client, metrics, the facade).
+        run: cargo test --workspace --all-targets
+
+  vendored-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-vendored-deps"
+          workspaces: "vendor/lance-io -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Vendored multipart upload regressions
+        run: |
+          cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --lib object_store::throttle::tests
+          cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --features metrics --lib object_store::metrics::http::tests
+          # Use Lance 14's pinned lint toolchain for its unchanged upstream code.
+          # Runtime tests above still use this repository's current stable Rust.
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          cargo +1.98.1 clippy --locked --manifest-path vendor/lance-io/Cargo.toml --all-targets -- -D warnings
+
+  # Preserve the existing check name for branch protection. Skipped, cancelled
+  # or failed suites must fail the gate, including when a prerequisite fails.
+  test:
+    name: test (stable)
+    needs: [workspace-tests, vendored-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both test suites
+        env:
+          WORKSPACE_RESULT: ${{ needs.workspace-tests.result }}
+          VENDORED_RESULT: ${{ needs.vendored-tests.result }}
+        run: |
+          test "$WORKSPACE_RESULT" = success
+          test "$VENDORED_RESULT" = success
+
+  wal-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-wal-deps"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: WAL component correctness smoke tests
+        run: |
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
+          cargo test -p lance-context-wal --features lab --bin context-wal-lab
+          cargo test -p lance-context-wal --features lab --test engine_cache
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
+      - name: WAL placement, admission, record, contract and IPC decoding tests
+        run: |
+          cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract,vectored-io --lib
+          cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
+      - name: WAL experiment process lifecycle tests
+        run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
+      - name: WAL durable Raft storage tests
+        run: |
+          cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity --test raft_log_checkpoint --test raft_log_snapshot_install
+      - name: Client journal durability and process recovery
+        run: |
+          cargo clippy -p lance-context-wal --features client-journal --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features client-journal --lib client_journal
+      - name: Replicated WAL quorum, TLS peers and process recovery
+        run: |
+          cargo clippy -p lance-context-wal --features peer-transport --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features peer-transport --lib --test replication_process
+      - name: Standalone WAL service and automatic maintenance
+        run: |
+          cargo clippy -p lance-context-wal --features service --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features service --lib replication::runtime::tests::maintenance -- --test-threads=1
+          mkdir -p "$RUNNER_TEMP/wal-node-service-fixtures"
+          TMPDIR="$RUNNER_TEMP/wal-node-service-fixtures" cargo test -p lance-context-wal --features service --test node_service
+      - name: Retain failed WAL process fixtures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wal-node-service-fixtures
+          path: ${{ runner.temp }}/wal-node-service-fixtures/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: WAL resource observation in a container cgroup namespace
+        run: |
+          cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
+          wal_resource_test=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "resource" and (.target.kind | index("test")) and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("expected one resource test executable") end' "$RUNNER_TEMP/wal-resource-build.jsonl")
+          # Hosted runners use a host cgroup path. Remount cgroup2 inside private
+          # mount/cgroup namespaces, then drop privileges before running tests.
+          sudo unshare --mount --cgroup --propagation private sh -eu -c '
+            umount /sys/fs/cgroup
+            mount -t cgroup2 cgroup2 /sys/fs/cgroup
+            exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
+          ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
+
+  lance-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-lance-deps"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Optional Lance object-store metrics
+        run: |
+          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics --test document_store_io --test variant_store_io
+          cargo clippy -p lance-context-core --features lance-io-metrics --test document_store_io --test document_store_backfill --test variant_store_io -- -D warnings
+          cargo test -p lance-context-core --all-features --lib latency_histograms_carry_only_bounded_labels
+          cargo check -p lance-context-server --features lance-io-metrics
+          cargo check -p lance-context-core --no-default-features
+      - name: Prepared WAL descriptors with real Lance files and process recovery
+        run: |
+          cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance
+          cargo test -p lance-context-wal --features lance-integration --test replication_process lance_publication
+
+  ha-suite:
+    runs-on: ubuntu-24.04
+    # Compile independent feature graphs concurrently instead of rebuilding
+    # them sequentially on one runner. Keep each suite's existing test commands.
+    timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [materializer, http, coordination, compaction, recovery]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - name: Make room for the HA build cache
+        run: |
+          # These hosted-runner SDKs are unused by the Rust/Python HA tests.
+          # Free space before restoring the larger optional-feature build graph.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h / "$RUNNER_TEMP"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-ha-${{ matrix.suite }}-deps"
+          workspaces: "."
+          # Saving a PR-scoped cache must not time out already passing tests.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Rollout materialization through the WAL client
+        if: matrix.suite == 'materializer'
+        run: |
+          cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features materializer --lib --test stable_index_selection
+      - name: HTTP ingestion and recoverable producer journal
+        if: matrix.suite == 'http'
+        run: |
+          cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
+          cargo clippy -p lance-context-ingest --features http-client,materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features http-client,materializer --lib
+      - name: Materializer worker feature checks
+        if: matrix.suite == 'http'
+        run: cargo clippy -p lance-context-ingest --features worker --all-targets -- -D warnings
+      - name: Build isolated commit permit regressions
+        if: matrix.suite == 'coordination'
+        # The harness caps its build at ten minutes. The old serial job warmed
+        # these dependencies first; explicitly build them on this fresh runner.
+        run: cargo test --locked -p lance-context-merge --test private_permit_rpc --no-run
+      - name: Start etcd for HA scheduler test
+        # Each matrix job has its own runner and etcd. In particular, compaction
+        # cannot invalidate watches or global RPC counts in the other suites.
+        if: contains(fromJSON('["coordination", "compaction", "recovery"]'), matrix.suite)
+        run: |
+          ETCD_VERSION=3.7.0
+          curl -fsSL -o /tmp/etcd.tar.gz \
+            "https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-amd64.tar.gz"
+          mkdir -p /tmp/etcd
+          tar -xzf /tmp/etcd.tar.gz -C /tmp/etcd --strip-components=1
+          nohup /tmp/etcd/etcd \
+            --data-dir /tmp/etcd-data \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            >/tmp/etcd.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:2379/health && exit 0
+            sleep 1
+          done
+          cat /tmp/etcd.log
+          exit 1
+      # CI already pays to download and start etcd, so restricting this step to a
+      # single named test left the other 18 ignored tests — the scheduler,
+      # routes, and state etcd paths — completely untested. Run the whole suite.
+      - name: Isolated commit permit contention and response-loss regressions
+        if: matrix.suite == 'coordination'
+        run: python3 scripts/ci/test_commit_permits.py --etcd /tmp/etcd/etcd --output /tmp/commit-permit-rpc
+      - name: Run etcd-backed HA test suite
+        if: matrix.suite == 'coordination'
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+        run: |
+          cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored \
+            --skip committed_demand_ \
+            --skip first_worker_turn_reuses_failure_read \
+            --skip private_permit_ \
+            --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip progressing_execution_consumes_watch_without_repeated_reads \
+            --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --skip active_execution_inventory_bounds_duplicate_reads \
+            --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
+            --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
+            --skip demand_controller::dispatch::tests::receiver_reuses_lease_and_watch_and_withdraws_busy_capacity \
+            --skip scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --skip scheduler::tests::periodic_same_policy_followers_stay_quiet_and_take_over_on_drain \
+            --skip scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
+            --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
+            --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
+            --skip demand_controller::aggregate::tests:: \
+            --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --skip owner_watch_compaction_requires_refresh_not_fencing \
+            --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --skip worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
+            --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
+          cargo test -p lance-context-core registry --lib -- --ignored
+          cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
+
+      # Aggregate admission tests also measure global RPC counts and compact
+      # etcd. Keep the whole aggregate module out of the shared parallel suite;
+      # the demand_controller:: filter below runs every test with both opt-ins.
+      # Compaction changes the entire etcd revision history. Keep these tests
+      # serial on the compaction suite's dedicated etcd instance.
+      - name: Check scheduler recovery after etcd compaction
+        if: matrix.suite == 'compaction'
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          ETCD_TEST_ALLOW_COMPACTION: "1"
+          ETCD_TEST_EXCLUSIVE: "1"
+        run: |
+          # Committed-demand storage tests require the same exclusive etcd scope.
+          # Aggregate tests already run under the demand_controller:: filter below.
+          cargo test -p lance-context-master --lib committed_demand_ \
+            -- --ignored --test-threads=1 --skip demand_controller::aggregate::
+          cargo test -p lance-context-master --lib \
+            task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-merge --lib \
+            tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-merge --lib \
+            tests::owner_watch_compaction_requires_refresh_not_fencing \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-server --bin lance-context-server \
+            merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-server --bin lance-context-server \
+            merge_execution::tests::worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::first_worker_turn_reuses_failure_read \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            merge_execution::tests::progressing_execution_consumes_watch_without_repeated_reads \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib demand_controller:: \
+            -- --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::periodic_same_policy_followers_stay_quiet_and_take_over_on_drain \
+            -- --exact --ignored --test-threads=1
+          cargo test -p lance-context-master --lib \
+            scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            -- --exact --ignored --test-threads=1
+
+      - name: Ingestion application process recovery
+        if: matrix.suite == 'recovery'
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          INGEST_TEST_BIN: ${{ github.workspace }}/target/debug/lance-context-ingest
+          INGEST_TEST_ARTIFACTS: ${{ runner.temp }}/ingest-application
+        run: |
+          mkdir -p "$INGEST_TEST_ARTIFACTS"
+          cargo build -p lance-context-ingest --features service,http-client --bin lance-context-ingest
+          cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_http -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::mixed_annotations -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::advance -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::close -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_advance -- --test-threads=1
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::plan -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_plan -- --test-threads=1
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_prepare -- --test-threads=1
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::reader
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::compaction::process::compaction_survives_sigkill
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::application -- --ignored
+      - name: Save ingestion application failure logs
+        if: failure() && matrix.suite == 'recovery'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-application-failure-logs
+          path: ${{ runner.temp }}/ingest-application/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Keep the original required check while all five independent suites run.
+  ha-tests:
+    needs: ha-suite
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every HA suite
+        env:
+          HA_RESULT: ${{ needs.ha-suite.result }}
+        run: test "$HA_RESULT" = success
+
+  coverage:
+    runs-on: ubuntu-24.04
+    # Coverage builds are much slower than the plain test job: instrumentation
+    # defeats most caching wins and the core crate's suite alone is ~6.5 min.
+    timeout-minutes: 60
+    env:
+      CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup component add llvm-tools-preview
+      - name: Make room for the coverage build cache
+        run: |
+          # Match the workspace and HA jobs before restoring instrumented builds.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h / "$RUNNER_TEMP"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-coverage"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Start etcd for HA scheduler test
+        run: |
+          ETCD_VERSION=3.7.0
+          curl -fsSL -o /tmp/etcd.tar.gz \
+            "https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-amd64.tar.gz"
+          mkdir -p /tmp/etcd
+          tar -xzf /tmp/etcd.tar.gz -C /tmp/etcd --strip-components=1
+          nohup /tmp/etcd/etcd \
+            --data-dir /tmp/etcd-data \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            >/tmp/etcd.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:2379/health && exit 0
+            sleep 1
+          done
+          cat /tmp/etcd.log
+          exit 1
+      - name: Clean stale coverage profile data
+        run: cargo llvm-cov clean --workspace
+      - name: Collect coverage (unit and integration tests)
+        run: |
+          # All features include the resource integration test. Give coverage
+          # the same cgroup scope as the ordinary test job, without running
+          # Cargo or test executables as root. Preserve the build configuration.
+          sudo --preserve-env=CARGO_HOME,RUSTUP_HOME,RUSTUP_TOOLCHAIN,RUSTFLAGS,RUST_MIN_STACK,LANCE_MEM_POOL_SIZE,RUST_BACKTRACE,CARGO_INCREMENTAL,CARGO_LLVM_COV_TARGET_DIR \
+            unshare --mount --cgroup --propagation private sh -eu -c '
+              umount /sys/fs/cgroup
+              mount -t cgroup2 cgroup2 /sys/fs/cgroup
+              wal_test_uid=$1
+              wal_test_gid=$2
+              shift 2
+              exec setpriv --reuid "$wal_test_uid" --regid "$wal_test_gid" --clear-groups --no-new-privs "$@"
+            ' sh "$(id -u)" "$(id -g)" env "HOME=$HOME" "PATH=$PATH" \
+            cargo llvm-cov --no-report --workspace --all-features
+      - name: Index the workspace coverage test executables
+        run: |
+          # Keep the feature union from the first workspace run. Re-selecting
+          # packages with Cargo rebuilt native dependencies for each later step.
+          # show-env exports the Cargo metadata target directory. Set it before
+          # generating that environment, or it redirects indexing to target/.
+          export CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR"
+          cargo llvm-cov show-env --sh > "$RUNNER_TEMP/coverage-env.sh"
+          source "$RUNNER_TEMP/coverage-env.sh"
+          cargo test --tests --workspace --all-features --no-run --message-format=json \
+            > "$RUNNER_TEMP/coverage-tests.jsonl"
+      - name: Collect coverage (etcd-backed ignored tests)
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+        run: |
+          source "$RUNNER_TEMP/coverage-env.sh"
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" \
+            lance-context-master,lance-context-server,lance-context-merge all --ignored \
+            --skip committed_demand_ \
+            --skip first_worker_turn_reuses_failure_read \
+            --skip private_permit_ \
+            --skip quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --skip progressing_execution_consumes_watch_without_repeated_reads \
+            --skip recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --skip active_execution_inventory_bounds_duplicate_reads \
+            --skip demand_controller::tests::one_ten_fifty_followers_do_not_multiply_discovery_reads_and_take_over \
+            --skip demand_controller::tests::active_inventory_reconciles_without_rpc_and_watch_releases_suppression \
+            --skip demand_controller::dispatch::tests::receiver_reuses_lease_and_watch_and_withdraws_busy_capacity \
+            --skip scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --skip scheduler::tests::periodic_same_policy_followers_stay_quiet_and_take_over_on_drain \
+            --skip scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            --skip demand_controller::dispatch::tests::fifty_executors_do_not_repeat_blocked_candidate_reads_and_reach_tail \
+            --skip demand_controller::dispatch::tests::long_dependency_chain_yields_and_unrelated_changes_do_not_repeat_reads \
+            --skip demand_controller::tests::compaction_forces_consistent_relist_and_retains_new_demand \
+            --skip demand_controller::aggregate::tests:: \
+            --skip execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --skip owner_watch_compaction_requires_refresh_not_fencing \
+            --skip ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --skip worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
+            --skip task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-core lib registry --ignored
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-ingest lib tests::worker --ignored
+      - name: Collect coverage (isolated etcd compaction)
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          ETCD_TEST_ALLOW_COMPACTION: "1"
+          ETCD_TEST_EXCLUSIVE: "1"
+        run: |
+          source "$RUNNER_TEMP/coverage-env.sh"
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            committed_demand_ --ignored --test-threads=1 --skip demand_controller::aggregate::
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            task_store::tests::bounded_scheduler_compacted_snapshot_restarts_without_stealing_locks \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-merge lib \
+            tests::execution_watch_compaction_requires_fresh_snapshot_then_resumes \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-merge lib \
+            tests::owner_watch_compaction_requires_refresh_not_fencing \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-server bin:lance-context-server \
+            merge_execution::tests::ownership_observer_does_not_poll_or_wake_on_own_progress \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-server bin:lance-context-server \
+            merge_execution::tests::worker_progress_coalesces_real_etcd_writes_and_preserves_owner_watch \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            merge_execution::tests::first_worker_turn_reuses_failure_read \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            merge_execution::tests::quiet_execution_bounds_etcd_reads_without_delaying_completion \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            merge_execution::tests::progressing_execution_consumes_watch_without_repeated_reads \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            task_store::tests::recovery_enqueue_rechecks_execution_after_dedupe_snapshot \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            scheduler::tests::active_execution_inventory_bounds_duplicate_reads \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            demand_controller:: --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            scheduler::tests::quiet_maintenance_commit_wait_does_not_poll_etcd \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            scheduler::tests::periodic_same_policy_followers_stay_quiet_and_take_over_on_drain \
+            --exact --ignored --test-threads=1
+          bash scripts/ci/run-built-tests.sh "$RUNNER_TEMP/coverage-tests.jsonl" lance-context-master lib \
+            scheduler::tests::maintenance_watch_registration_compaction_requires_fresh_snapshot \
+            --exact --ignored --test-threads=1
+      - name: Merge coverage reports
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Save coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage-upload:
+    needs: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-lcov
+      - name: Upload coverage to Codecov
+        # v5 uses the maintained shell uploader, including signature checks.
+        # Keep network upload independently retryable after tests have passed.
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

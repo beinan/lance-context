@@ -1,0 +1,3543 @@
+//! Shared low-level storage layer for every fixed-schema store.
+//!
+//! [`StorageBase`] owns everything about talking to Lance that is not
+//! schema-specific: opening/creating the dataset, the resident MemWAL
+//! [`ShardWriter`] lifecycle, the durable append, the seal/flush, the
+//! WAL→base-table merge, compaction, scalar-index management, and the LSM read
+//! scanner. A concrete store (`RolloutStore`, `DatagenStore`, `ContextStore`)
+//! is then only a *schema* plus an encode/decode pair on top of it.
+//!
+//! # Rollout semantics are the contract
+//!
+//! The behavior here is `RolloutStore`'s, verbatim — it was the only one of the
+//! three fixed-schema stores with a complete and correct implementation of all
+//! of the above. Every store that adopts this base therefore gets the same
+//! answer to the questions the three used to answer differently:
+//!
+//! - **`add` is a durable `put` and nothing else.** It reuses a *resident*
+//!   writer (epoch claimed once, object-store connection pooled) and retries
+//!   exactly once on a fence. It does **not** seal, so concurrent appends are
+//!   not serialized behind one seal+drain — and correspondingly it offers **no
+//!   read-your-write guarantee**. Visibility is [`StorageBase::flush`]'s job.
+//! - **Merge is surgical.** It drains only the generations it actually merged,
+//!   reusing the shard's current epoch (so it never fences the live writer),
+//!   and deletes generation directories only *after* the manifest drain.
+//! - **Compaction defers index remap**, because the MemWAL index is fieldless
+//!   and Lance's inline remap panics on it.
+//! - **Every dataset open goes through [`StorageBase::load_with_options`]**, so
+//!   storage options and the shared session are never silently dropped.
+//!
+//! # What stays in the concrete store
+//!
+//! Anything that needs to know the schema: the Arrow schema itself,
+//! record↔`RecordBatch` conversion, filter expressions, projections, and
+//! typed read APIs. The base is handed the two things it needs to be
+//! schema-agnostic — the merge/primary key column name and (optionally) the
+//! latest schema to evolve a base table to — via [`StorageBaseOptions`].
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow_array::{new_null_array, RecordBatch, RecordBatchIterator, UInt32Array};
+use arrow_schema::{ArrowError, Schema};
+use arrow_select::take::take;
+use chrono::{DateTime, Utc};
+use datafusion::common::ScalarValue;
+use futures::{stream, StreamExt, TryStreamExt};
+use lance::dataset::index::DatasetIndexRemapperOptions;
+use lance::dataset::mem_wal::{
+    DatasetMemWalExt, LsmScanner, ShardManifestStore, ShardSnapshot, ShardWriter,
+    ShardWriterConfig, TOMBSTONE,
+};
+use lance::dataset::optimize::{
+    commit_compaction, compact_files, plan_compaction, CompactionMetrics, CompactionMode,
+    CompactionOptions, RewriteResult,
+};
+use lance::dataset::{
+    builder::DatasetBuilder, Dataset, NewColumnTransform, WriteMode, WriteParams,
+};
+use lance::index::DatasetIndexExt;
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance::session::Session;
+use lance::{Error as LanceError, Result as LanceResult};
+use lance_context_api::MaintenanceErrorCode;
+use lance_index::mem_wal::{ShardManifest, MEM_WAL_INDEX_NAME};
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use crate::merge_budget::{MergeMemoryBudget, MergeReservation};
+use crate::metrics::{
+    count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
+};
+use crate::store::{CompactionConfig, CompactionStats, DroppedFragment, RepairReport};
+
+mod grouped;
+pub use grouped::PreparedShardMerge;
+mod index_maintenance;
+pub use index_maintenance::PreparedIndexOptimization;
+use index_maintenance::PreparedIndexSource;
+
+/// Number of shard manifest files to scan per batch when discovering the latest
+/// shard state.
+pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
+
+/// Maximum number of shard manifests or flushed-generation datasets opened
+/// concurrently while collecting observability metrics.
+pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
+
+// Cold WAL replay decodes payloads. Serialize maintenance-triggered recovery
+// across tables rather than opening a writer for every cold store at once.
+static OWN_WAL_RECOVERY_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Flushed generations folded into the base table by one merge pass, by default.
+///
+/// A merge buffers every row of every generation it takes before appending, and
+/// rollout rows store `binary_payload` inline, so the pass's peak memory is the
+/// total blob volume of the generations it took. Unbounded, a worker merging a
+/// backlog materialised several GiB at once; freed to glibc but retained in its
+/// arenas, that ratcheted RSS up a step per merge until the pod was OOMKilled.
+///
+/// 8 is deliberately well under the deployed `ROLLOUT_MERGE_AFTER_GENERATIONS`
+/// (50 in the deployment that OOMed), so the cap actually binds there, while
+/// staying high enough that a merge still amortises its fixed costs -- manifest
+/// CAS, base-table commit, directory deletes -- over a useful number of
+/// generations. Leftovers are not dropped: they stay pending and the next pass
+/// takes them.
+pub(crate) const DEFAULT_MERGE_MAX_GENERATIONS: usize = 8;
+
+/// Buffered Arrow array bytes per merge pass, checked at generation boundaries.
+pub(crate) const DEFAULT_MERGE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Default per-shard pending-generation count at which an LSM read warns.
+///
+/// Sized well above the count trigger (`merge_after_generations`, 50 in the
+/// reference deployment) and the per-pass cap (`merge_max_generations`, 8), so a
+/// healthy store never trips it, while sitting far below the counts that make a
+/// read unaffordable: at ~1,500 per shard, reads exhausted a 32 GiB worker.
+pub(crate) const DEFAULT_PENDING_GENERATIONS_WARN: usize = 256;
+
+/// Unpublished rewrite files. No dataset handle or commit authorization escapes
+/// preparation. A fresh, fenced handle must publish this result.
+#[derive(Debug)]
+pub struct PreparedCompaction {
+    read_version: u64,
+    uri: String,
+    schema: Schema,
+    options: CompactionOptions,
+    tasks: Vec<RewriteResult>,
+}
+
+impl PreparedCompaction {
+    pub fn read_version(&self) -> u64 {
+        self.read_version
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+}
+
+/// Immutable index files built against one snapshot. The publishing handle
+/// must be opened separately under commit ownership; no authorization or
+/// mutable dataset handle escapes preparation.
+#[derive(Debug)]
+pub struct PreparedKeyIndex {
+    source: PreparedIndexSource,
+    index: lance_table::format::IndexMetadata,
+}
+
+impl PreparedKeyIndex {
+    pub fn name(&self) -> &str {
+        &self.index.name
+    }
+}
+
+/// Execute only the first `max_source_fragments` from a Lance compaction plan.
+///
+/// Lance's built-in `max_source_fragments` stops before a whole planned task
+/// that exceeds the budget. A long run of tiny fragments can therefore produce
+/// one oversized task and compact nothing. Truncating the public task data
+/// keeps the rewrite contiguous while guaranteeing incremental progress.
+async fn prepare_compaction_files(
+    dataset: &Dataset,
+    mut options: CompactionOptions,
+    max_source_fragments: usize,
+) -> LanceResult<Vec<RewriteResult>> {
+    options.max_source_fragments = None;
+    let plan = plan_compaction(dataset, &options).await?;
+    let mut remaining = max_source_fragments;
+    let mut tasks = Vec::new();
+    for mut task in plan.compaction_tasks() {
+        if remaining == 0 {
+            break;
+        }
+        task.task.fragments.truncate(remaining);
+        remaining -= task.task.fragments.len();
+        if !task.task.fragments.is_empty() {
+            tasks.push(task);
+        }
+    }
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let concurrency = options.num_threads.unwrap_or(1).max(1);
+    let dataset_snapshot = dataset.clone();
+    let completed = stream::iter(tasks)
+        .map(|task| {
+            let dataset_snapshot = dataset_snapshot.clone();
+            async move { task.execute(&dataset_snapshot).await }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+
+    Ok(completed)
+}
+
+async fn compact_files_incremental(
+    dataset: &mut Dataset,
+    options: CompactionOptions,
+    max_source_fragments: usize,
+) -> LanceResult<CompactionMetrics> {
+    let completed =
+        prepare_compaction_files(dataset, options.clone(), max_source_fragments).await?;
+    commit_compaction(
+        dataset,
+        completed,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+}
+
+/// Name of the scalar index on the base table's key column. One name across
+/// every store, so all tables index their primary key identically.
+pub(crate) const ID_INDEX_NAME: &str = "id_idx";
+
+/// Error-message prefix for a read refused because a shard has too many
+/// flushed generations pending merge. Servers match on it to answer 503.
+pub const PENDING_GENERATIONS_EXCEEDED: &str = "too many pending WAL generations";
+
+/// Default for [`StorageBaseOptions::pending_generations_max`].
+pub const DEFAULT_PENDING_GENERATIONS_MAX: usize = 4096;
+
+/// Whether `err` is a read refused by the pending-generations cap.
+/// A writer shard's position, read from its own MemWAL manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardWatermark {
+    pub shard_id: Uuid,
+    pub writer_epoch: u64,
+    /// Highest flushed generation number, retained after drain; 0 before any flush.
+    pub sealed_through: u64,
+    /// Flushed generations not yet merged into the base table.
+    pub pending_generations: usize,
+    /// Conservative completed prefix from the base index and durable shard drain.
+    /// Advisory only, never a replay/commit fence. `None` means unobserved;
+    /// `Some(0)` means no completed prefix was established.
+    pub merged_through: Option<u64>,
+}
+
+pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
+    err.to_string().contains(PENDING_GENERATIONS_EXCEEDED)
+}
+
+/// Result of a [`StorageBase::flush_with_outcome`] operation.
+///
+/// This describes the writer operation, not a receipt for a particular append
+/// or a publication watermark. In particular, recovery does not identify which
+/// in-flight requests were included in the replayed WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FlushOutcome {
+    /// A memtable was sealed and drained into a flushed generation.
+    Sealed,
+    /// No resident writer, so nothing to seal (the common case).
+    Noop,
+    /// A fenced writer was reopened and its durable WAL replayed and sealed.
+    RecoveredFence,
+}
+
+/// Which physical sources a read scans.
+///
+/// A store's rows live in two places: the **base table** fragments
+/// (`self.dataset`) and the pending **MemWAL** generations that have been
+/// flushed but not yet merged into it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListSource {
+    /// Scan only the base table, skipping all MemWAL generations. Fast and
+    /// bounded; may lag the most recent (un-merged) writes. This is the default.
+    #[default]
+    Fragments,
+    /// Scan only the flushed MemWAL generations (the not-yet-merged tail),
+    /// excluding the base table.
+    Wal,
+    /// Scan the base table unioned with every flushed MemWAL generation — fully
+    /// consistent, and the behavior of the historical union read path.
+    All,
+}
+
+/// Rows read out of the flushed generations, ready to be appended to the base
+/// table and drained from the shard manifest.
+///
+/// Produced by `StorageBase::prepare_merge_if_ready` under `&self` (so appends
+/// keep running while it reads object storage) and consumed by
+/// `StorageBase::commit_prepared_merge` under `&mut self`. `PreparedMerge` is
+/// public because it appears in [`RolloutStore`]'s prepare/commit split, but
+/// its fields are opaque.
+///
+/// [`RolloutStore`]: crate::RolloutStore
+pub struct PreparedMerge {
+    shard_id: Uuid,
+    merged_generations: HashSet<u64>,
+    merged_paths: Vec<String>,
+    batches: Vec<RecordBatch>,
+    merge_schema: Arc<Schema>,
+    /// Bytes reserved from the process-wide merge budget for `batches`.
+    /// Released when this is dropped, i.e. right after the commit consumes
+    /// the batches. `None` when no budget is configured.
+    reservation: Option<MergeReservation>,
+    bulk_key_delete: bool,
+    parallel_upsert_io: bool,
+    staged: Option<StagedMergeFiles>,
+    preparation_owner: Option<crate::merge_write_scope::PreparationOwner>,
+}
+
+/// One prepared shard, including its durable manifest and held byte reservation.
+/// This names the existing public prepare/commit tuple; it grants no ownership.
+pub type PreparedMergeInput = (ShardManifestStore, ShardManifest, PreparedMerge);
+
+/// Encoded files have no visible effect until the ordered merge commit.
+struct StagedMergeFiles {
+    uri: String,
+    schema: lance::datatypes::Schema,
+    fragments: Vec<lance_table::format::Fragment>,
+}
+
+impl StagedMergeFiles {
+    fn validate(&self, dataset: &Dataset) -> LanceResult<()> {
+        if self.uri != dataset.uri()
+            || self.schema.fields != dataset.schema().fields
+            || self.schema.metadata != dataset.schema().metadata
+        {
+            return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
+                "base schema or location changed after WAL encoding; reprepare",
+            )));
+        }
+        Ok(())
+    }
+}
+
+async fn encode_merge_files(
+    snapshot: Arc<Dataset>,
+    batches: Vec<RecordBatch>,
+) -> LanceResult<StagedMergeFiles> {
+    use lance::dataset::transaction::Operation;
+    let _phase = crate::merge_write_scope::work_stage("file_encoding");
+    let uri = snapshot.uri().to_string();
+    let schema = snapshot.schema().clone();
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        write_progress: Some(crate::merge_write_scope::write_progress()),
+        ..Default::default()
+    };
+    let tx = lance::dataset::InsertBuilder::new(snapshot)
+        .with_params(&params)
+        .execute_uncommitted(batches)
+        .await?;
+    match tx.operation {
+        Operation::Append { fragments } => Ok(StagedMergeFiles {
+            uri,
+            schema,
+            fragments,
+        }),
+        _ => Err(LanceError::io(
+            "upsert staging produced a non-append transaction",
+        )),
+    }
+}
+
+impl PreparedMerge {
+    /// Opt in to a key-only hash-join deletion before the normal append.
+    /// Publication, WAL draining, and replay semantics remain unchanged.
+    /// Full BTree coverage can be faster with predicate deletion; callers must
+    /// qualify this mode for their workload rather than enabling it globally.
+    pub fn use_bulk_key_delete(&mut self) {
+        self.bulk_key_delete = true;
+    }
+
+    /// Encode immutable replacement files while deleting the same batch's old
+    /// keys. Both operations finish before the serial append publication.
+    pub fn use_parallel_upsert_io(&mut self) {
+        self.parallel_upsert_io = true;
+    }
+
+    /// Number of generations this merge will reclaim.
+    #[must_use]
+    pub fn generation_count(&self) -> usize {
+        self.merged_generations.len()
+    }
+
+    /// Shard and highest generation represented by this prepared merge.
+    /// This describes preparation, not committed progress. A caller may publish
+    /// it as merged only after this exact preparation's commit and WAL drain
+    /// have acknowledged success; cancellation or an error is not proof.
+    #[must_use]
+    pub fn prepared_watermark(&self) -> Option<(Uuid, u64)> {
+        self.merged_generations
+            .iter()
+            .max()
+            .map(|generation| (self.shard_id, *generation))
+    }
+}
+
+/// Configuration for opening a [`StorageBase`].
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct StorageBaseOptions {
+    /// Object-store credentials/config (e.g. S3), forwarded to Lance.
+    pub storage_options: Option<HashMap<String, String>>,
+    /// Stable identity of the writing server instance. Writes go to the MemWAL
+    /// shard derived from this id, so each instance owns exactly one shard and
+    /// no two instances ever contend for the same shard. `None` falls back to a
+    /// single fixed `"default"` shard.
+    pub shard_id: Option<String>,
+    /// Count-triggered self-merge threshold; `None`/`0` disables it.
+    pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
+    pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
+    /// Warn when a single shard has at least this many flushed generations
+    /// pending merge (sampled on every LSM read). `None` uses the crate default
+    /// (256); `Some(0)` disables the warning. The metric is always emitted.
+    pub pending_generations_warn: Option<usize>,
+    /// Refuse a read that would open more flushed generations than this, in
+    /// any one shard or across all shards, instead of opening every one of
+    /// them. `None` uses the crate default (4096); `Some(0)` disables the
+    /// cap. See [`StorageBase::wal_shard_snapshots`].
+    pub pending_generations_max: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs.
+    /// `merge_max_bytes` bounds one merge; this bounds all of them together,
+    /// and a merge that cannot fit waits for another to release. `None`
+    /// disables the bound. See [`crate::merge_budget`].
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Shared, capacity-bounded Lance session. `None` preserves Lance's
+    /// per-open default (a fresh 6 GiB index + 1 GiB metadata session *per
+    /// store*, which is the source of unbounded per-append RSS growth).
+    pub session: Option<Arc<Session>>,
+    /// Schema used to create the dataset when it does not exist.
+    pub schema: Arc<Schema>,
+    /// Merge/primary key column. Used as the LSM dedup key and as the column
+    /// the scalar index is built on. Must exist in `schema`.
+    pub key_column: String,
+    /// Latest schema this store expects. When set, a WAL merge first evolves an
+    /// older base table to it by adding missing nullable columns as all-nulls
+    /// (see [`StorageBase::ensure_latest_schema`]). `None` disables evolution.
+    pub latest_schema: Option<Arc<Schema>>,
+    /// Whether [`StorageBase::put`] seals the memtable before returning, making
+    /// the rows immediately readable.
+    ///
+    /// This is the one deliberate behavioral difference between the stores, and
+    /// it is a **visibility/throughput trade, not a durability one** — a `put`
+    /// is durable either way.
+    ///
+    /// - `false` (rollout): `put` is a durable WAL append only. Concurrent
+    ///   appends are not serialized behind a per-append seal, but there is **no
+    ///   read-your-write guarantee** — visibility is bounded by whatever drives
+    ///   [`StorageBase::flush`] (the server's flush sweeper, 30s by default), by
+    ///   Lance's own memtable-size thresholds, or by an explicit per-request
+    ///   flush.
+    /// - `true` (context): `put` seals before returning, so a subsequent read
+    ///   sees the rows. Required by any store whose writes read the table back —
+    ///   `ContextStore`'s id/external-id uniqueness validation, upsert, and
+    ///   tombstones all depend on it.
+    ///
+    /// Sealing per write produces a flushed generation per call, which is
+    /// exactly the read amplification the high-fan-in rollout path avoids.
+    pub seal_on_put: bool,
+}
+
+impl StorageBaseOptions {
+    /// Configure an application-owned Arrow schema and merge key.
+    ///
+    /// Writes seal before returning by default. Set `seal_on_put = false` only
+    /// when the application drives publication separately. Concurrent writer
+    /// instances must supply distinct, stable `shard_id` values.
+    pub fn new(schema: Arc<Schema>, key_column: impl Into<String>) -> Self {
+        Self {
+            storage_options: None,
+            shard_id: None,
+            merge_after_generations: None,
+            merge_max_generations: None,
+            merge_max_bytes: None,
+            key_index_type: crate::KeyIndexType::default(),
+            pending_generations_warn: None,
+            pending_generations_max: None,
+            merge_budget: None,
+            session: None,
+            schema,
+            key_column: key_column.into(),
+            latest_schema: None,
+            seal_on_put: true,
+        }
+    }
+}
+
+/// Schema-agnostic storage for applications that own their Arrow schema and
+/// domain logic. Provides WAL writes, consistent base/WAL reads and maintenance.
+///
+/// Each live writer must own a distinct, stable shard identity. Configure it
+/// with [`StorageBaseOptions::shard_id`]; opening a successor writer is not a
+/// distributed ownership protocol. Reads should use [`Self::read_consistent`]
+/// to include published WAL and refresh the base manifest together.
+pub struct StorageBase {
+    /// The base table. `pub(crate)` because concrete stores build their own
+    /// schema-specific scans and projections directly against it.
+    pub(crate) dataset: Dataset,
+    /// MemWAL shard this instance writes to (derived from `shard_id`).
+    pub(crate) write_shard: Uuid,
+    /// Object-store options, retained so a self-merge can re-append flushed
+    /// generation data into the base table with the same credentials.
+    pub(crate) storage_options: Option<HashMap<String, String>>,
+    /// Shared Lance session used for the base dataset and every reload
+    /// (compact, index, generation reads), so all resident stores share one
+    /// capacity-bounded cache.
+    pub(crate) session: Option<Arc<Session>>,
+    /// Merge/primary key column; the LSM dedup key and indexed column.
+    pub(crate) key_column: String,
+    /// Latest expected schema for merge-time evolution; see the option.
+    latest_schema: Option<Arc<Schema>>,
+    /// Whether `put` seals before returning; see [`StorageBaseOptions::seal_on_put`].
+    seal_on_put: bool,
+    /// Self-merge threshold; `0` disables it.
+    merge_after_generations: usize,
+    merge_max_generations: usize,
+    merge_max_bytes: usize,
+    key_index_type: crate::KeyIndexType,
+    /// Per-shard pending-generation count at which reads warn; `0` disables.
+    pending_generations_warn: usize,
+    /// Refuse reads that would open more flushed generations than this, per
+    /// shard or in total (0 = unbounded). See [`Self::wal_shard_snapshots`].
+    pending_generations_max: usize,
+    /// Process-wide merge byte budget; `None` means unbounded.
+    merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Enabled in both rollout phases. Only regression tests disable this to
+    /// reproduce an old, unregistered reader.
+    pub(crate) wal_read_protection: bool,
+    pub(crate) wal_collection: crate::wal_gc::Mode,
+    #[cfg(test)]
+    pub(crate) wal_snapshot_pause:
+        std::sync::Mutex<Option<Arc<crate::wal_read_lifetime::ReadCapturePause>>>,
+    /// Serializes split preparation/commit on this handle, before taking a store lock.
+    merge_preparation_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Timestamp of the last successful [`Self::compact`] on this handle.
+    last_compaction: Option<DateTime<Utc>>,
+    /// Number of successful compactions performed by this handle.
+    total_compactions: u64,
+    /// Error message from the most recent failed compaction on this handle.
+    last_compaction_error: Option<String>,
+    /// Explicit time-travel version selected by [`Self::checkout`].
+    ///
+    /// A point-read miss may refresh an ordinary long-lived handle to avoid a
+    /// false negative from a stale manifest, but must never advance a handle
+    /// whose caller deliberately selected a historical version.
+    pinned_version: Option<u64>,
+    /// A deleted (or partially deleted) handle must never reopen a writer.
+    deleted: bool,
+    /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
+    /// concurrent access. The [`tokio::sync::Mutex`] is held only to
+    /// fetch-or-open and clone the `Arc`, including replacement of a fenced
+    /// writer (see [`Self::resident_writer`]); it is
+    /// **never** held across `put`, so steady-state appends run concurrently.
+    write_writer: tokio::sync::Mutex<Option<Arc<ShardWriter>>>,
+}
+
+impl StorageBase {
+    /// Build a shared, capacity-bounded Lance [`Session`].
+    ///
+    /// Split the total cache budget across Lance's two caches:
+    /// `index_cache_bytes` bounds opened-index data, `metadata_cache_bytes`
+    /// bounds file/dataset metadata. Both are byte-weighted LRUs keyed by
+    /// dataset URI, so one session shared across every resident store caps the
+    /// process's *total* Lance cache at this budget.
+    #[must_use]
+    pub fn build_session(index_cache_bytes: usize, metadata_cache_bytes: usize) -> Arc<Session> {
+        Arc::new(Session::new(
+            index_cache_bytes,
+            metadata_cache_bytes,
+            Arc::default(),
+        ))
+    }
+
+    /// Open the dataset at `uri`, creating it from `options.schema` when absent
+    /// and `create_if_missing` is set, then initialize the MemWAL index.
+    ///
+    /// The MemWAL index is initialized up front (idempotent, cheap when already
+    /// present) so the hot `add(&self)` path never needs `&mut self` to lazily
+    /// create it.
+    pub async fn open(
+        uri: &str,
+        options: StorageBaseOptions,
+        create_if_missing: bool,
+    ) -> LanceResult<Self> {
+        let StorageBaseOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            merge_max_generations,
+            merge_max_bytes,
+            key_index_type,
+            pending_generations_warn,
+            pending_generations_max,
+            merge_budget,
+            session,
+            schema,
+            key_column,
+            latest_schema,
+            seal_on_put,
+        } = options;
+
+        let dataset =
+            match Self::load_with_options(uri, storage_options.clone(), session.clone()).await {
+                Ok(dataset) => dataset,
+                Err(LanceError::DatasetNotFound { .. }) if create_if_missing => {
+                    Self::create_with_options(
+                        uri,
+                        schema.clone(),
+                        storage_options.clone(),
+                        session.clone(),
+                    )
+                    .await?
+                }
+                Err(err) => return Err(err),
+            };
+
+        Self::from_dataset(
+            dataset,
+            StorageBaseOptions {
+                storage_options,
+                shard_id,
+                merge_after_generations,
+                merge_max_generations,
+                merge_max_bytes,
+                key_index_type,
+                pending_generations_warn,
+                pending_generations_max,
+                merge_budget,
+                session,
+                schema,
+                key_column,
+                latest_schema,
+                seal_on_put,
+            },
+        )
+        .await
+    }
+
+    /// Wrap an already-open [`Dataset`].
+    ///
+    /// For stores that must inspect the dataset before they can describe
+    /// themselves: `ContextStore` reads the embedding width and distance metric
+    /// out of the existing schema (and validates them against the caller's
+    /// request) before it knows what schema to hand the base. [`Self::open`] is
+    /// the simpler path when the schema is known up front.
+    pub async fn from_dataset(dataset: Dataset, options: StorageBaseOptions) -> LanceResult<Self> {
+        let StorageBaseOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            merge_max_generations,
+            merge_max_bytes,
+            key_index_type,
+            pending_generations_warn,
+            pending_generations_max,
+            merge_budget,
+            session,
+            schema,
+            key_column,
+            latest_schema,
+            seal_on_put,
+        } = options;
+
+        if schema.field_with_name(&key_column).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "key column '{key_column}' is not present in the store schema"
+            ))
+            .into());
+        }
+
+        let mut base = Self {
+            dataset,
+            write_shard: derive_shard_id(shard_id.as_deref()),
+            storage_options,
+            session,
+            key_column,
+            latest_schema,
+            seal_on_put,
+            merge_after_generations: merge_after_generations.unwrap_or(0),
+            merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
+            merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
+            key_index_type,
+            pending_generations_warn: pending_generations_warn
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
+            pending_generations_max: pending_generations_max
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
+            merge_budget,
+            wal_read_protection: true,
+            wal_collection: crate::wal_gc::Mode::configured()?,
+            #[cfg(test)]
+            wal_snapshot_pause: std::sync::Mutex::new(None),
+            merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_compaction: None,
+            total_compactions: 0,
+            last_compaction_error: None,
+            pinned_version: None,
+            deleted: false,
+            write_writer: tokio::sync::Mutex::new(None),
+        };
+        // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
+        // race, which is why it must run here where we hold `&mut`.
+        base.ensure_mem_wal().await?;
+        Ok(base)
+    }
+
+    /// Wrap an existing dataset without initializing WAL metadata or opening a writer.
+    /// Reads still publish reader registrations to protect captured WAL files.
+    /// Use [`Self::from_dataset`] to prepare a store for writing.
+    pub fn from_dataset_for_read(
+        dataset: Dataset,
+        options: StorageBaseOptions,
+    ) -> LanceResult<Self> {
+        let StorageBaseOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            merge_max_generations,
+            merge_max_bytes,
+            key_index_type,
+            pending_generations_warn,
+            pending_generations_max,
+            merge_budget,
+            session,
+            schema,
+            key_column,
+            latest_schema,
+            seal_on_put,
+        } = options;
+
+        if schema.field_with_name(&key_column).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "key column '{key_column}' is not present in the store schema"
+            ))
+            .into());
+        }
+
+        let base = Self {
+            dataset,
+            write_shard: derive_shard_id(shard_id.as_deref()),
+            storage_options,
+            session,
+            key_column,
+            latest_schema,
+            seal_on_put,
+            merge_after_generations: merge_after_generations.unwrap_or(0),
+            merge_max_generations: merge_max_generations.unwrap_or(DEFAULT_MERGE_MAX_GENERATIONS),
+            merge_max_bytes: merge_max_bytes.unwrap_or(DEFAULT_MERGE_MAX_BYTES),
+            key_index_type,
+            pending_generations_warn: pending_generations_warn
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_WARN),
+            pending_generations_max: pending_generations_max
+                .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
+            merge_budget,
+            wal_read_protection: true,
+            wal_collection: crate::wal_gc::Mode::configured()?,
+            #[cfg(test)]
+            wal_snapshot_pause: std::sync::Mutex::new(None),
+            merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_compaction: None,
+            total_compactions: 0,
+            last_compaction_error: None,
+            pinned_version: None,
+            deleted: false,
+            write_writer: tokio::sync::Mutex::new(None),
+        };
+        Ok(base)
+    }
+
+    /// URI of the underlying Lance dataset.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        self.dataset.uri()
+    }
+
+    /// Base-table handle for metadata inspection. Its fragments alone do not
+    /// include pending WAL; use `read_consistent` for a complete read view.
+    #[must_use]
+    pub fn dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+
+    /// Column used to deduplicate WAL and base-table rows.
+    #[must_use]
+    pub fn key_column(&self) -> &str {
+        &self.key_column
+    }
+
+    /// Current base dataset manifest version.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.dataset.manifest.version
+    }
+
+    /// Check out a read-only base dataset version. Call `refresh_latest` to resume writes.
+    pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
+        self.dataset = self.dataset.checkout_version(version_id).await?;
+        self.pinned_version = Some(version_id);
+        Ok(())
+    }
+
+    /// Whether this handle was explicitly checked out to a historical version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.pinned_version.is_some()
+    }
+
+    /// Refresh this handle to the latest base-table manifest while retaining its
+    /// session and metadata caches.
+    ///
+    /// Long-lived read handles call this before a new request so compaction or
+    /// WAL merges committed by another process become visible without paying the
+    /// cost of reopening the dataset and rebuilding all session caches.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.dataset.checkout_latest().await?;
+        self.pinned_version = None;
+        Ok(())
+    }
+
+    /// Reject mutations on historical snapshots and on handles being deleted.
+    pub(crate) fn ensure_writable(&self) -> LanceResult<()> {
+        if self.deleted {
+            return Err(LanceError::invalid_input(
+                "store deletion has started; reopen after recreation",
+            ));
+        }
+        if self.is_version_pinned() {
+            return Err(LanceError::invalid_input(
+                "checked-out store is read-only; call refresh_latest before writing",
+            ));
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- writes
+
+    /// Durably append `batches` through this instance's MemWAL shard.
+    ///
+    /// # Always durable on return; visible on return only if `seal_on_put`
+    ///
+    /// `put` returns once the WAL entry has been PUT to object storage. The rows
+    /// are then **durable** — they survive a crash and are replayed on reopen.
+    /// Whether they are also **readable** depends on
+    /// [`StorageBaseOptions::seal_on_put`]:
+    ///
+    /// - `false` (rollout): the rows sit in the active memtable, invisible to
+    ///   every reader including this one, until something seals them into a
+    ///   flushed generation and commits it to the shard manifest — [`Self::flush`]
+    ///   (driven by the server's flush sweeper), [`Self::close`], the merge path,
+    ///   or Lance's own memtable-size thresholds. Callers get **no
+    ///   read-your-write guarantee**.
+    /// - `true` (context): this call seals before returning, so a subsequent
+    ///   read sees the rows.
+    ///
+    /// Deferring the seal is what lets concurrent appends run without
+    /// serializing behind one seal+drain, and it avoids emitting a flushed
+    /// generation per call. Either way a single resident [`ShardWriter`] is
+    /// reused, so the shard epoch is claimed once and the object-store
+    /// connection is pooled, rather than paying a cold DNS resolution + TCP/TLS
+    /// handshake + epoch claim per append.
+    ///
+    /// Retried exactly once on a fence: either this writer self-fenced after a
+    /// persistence failure or a successor superseded its epoch. Reopening
+    /// claims a new epoch and replays durable WAL. Rows are
+    /// de-duplicated by the key column at read time, so a retried append can
+    /// never double-count.
+    pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
+        self.ensure_writable()?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let started = timer_start!();
+        let result = self.put_sealing(batches).await;
+        // Success-path latency only. A failed append's *duration* is not
+        // actionable, but its *rate* is, so errors increment a flat counter
+        // rather than doubling this histogram's series count.
+        match &result {
+            Ok(()) => observe_duration!(
+                crate::metrics::ROLLOUT_ADD_DURATION,
+                timer_elapsed!(started),
+            ),
+            Err(error) => {
+                count!(crate::metrics::ROLLOUT_ADD_ERRORS);
+                if matches!(error, lance_core::Error::Backpressure { .. }) {
+                    count!("rollout_memtable_flush_backpressure_rejections_total");
+                }
+            }
+        }
+        result
+    }
+
+    /// [`Self::put_inner`], then seal if this store wants read-your-write.
+    ///
+    /// The seal is inside the timed region because for a `seal_on_put` store it
+    /// is part of what the caller is waiting for; excluding it would understate
+    /// the write latency such a store actually sees.
+    async fn put_sealing(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
+        self.put_inner(batches).await?;
+        if self.seal_on_put {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn put_inner(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
+        let writer = self.resident_writer(None).await?;
+        match writer.put(batches.clone()).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_fenced_error(&err) => {
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after put failure; replaying durable WAL");
+                // Last-owner drop cancels the old background tasks without
+                // trying to flush against its dead epoch. Reopen replays WAL.
+                let writer = self.resident_writer(Some(&writer)).await?;
+                writer.put(batches).await?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Fetch the resident [`ShardWriter`], opening one on first use. The mutex is
+    /// held only to read-or-open and clone the `Arc`; it is released before the
+    /// caller `put`s, so steady-state appends run concurrently. Opening under the
+    /// lock serializes only the (rare) first open / post-fence reopen.
+    /// When replacing a fence, reuse an already-installed successor. Keep the
+    /// old slot until opening succeeds so a failed or cancelled reopen remains
+    /// visible to the next periodic flush, even without another append.
+    async fn resident_writer(
+        &self,
+        replace: Option<&Arc<ShardWriter>>,
+    ) -> LanceResult<Arc<ShardWriter>> {
+        let mut guard = self.write_writer.lock().await;
+        if let Some(writer) = guard.as_ref() {
+            if replace.is_none_or(|stale| !Arc::ptr_eq(writer, stale)) {
+                return Ok(writer.clone());
+            }
+        }
+        let config = ShardWriterConfig {
+            shard_id: self.write_shard,
+            #[cfg(feature = "metrics")]
+            observer: Some(Arc::new(crate::metrics::MemtableFlushMetrics::new(
+                self.uri(),
+                self.write_shard,
+            ))),
+            ..Default::default()
+        };
+        let writer = Arc::new(
+            self.dataset
+                .mem_wal_writer(self.write_shard, config)
+                .await?,
+        );
+        *guard = Some(writer.clone());
+        Ok(writer)
+    }
+
+    /// Materialize the active memtable into a flushed, queryable generation:
+    /// `force_freeze_active` freezes it and hands it to the background flusher,
+    /// then `wait_for_flush_drain` blocks until every frozen memtable has landed
+    /// in the shard manifest (and is therefore visible to reads on every
+    /// instance).
+    ///
+    /// This is the visibility half of the write path, decoupled from the durable
+    /// append in [`Self::put`]. A no-op when no writer is resident.
+    pub async fn flush(&self) -> LanceResult<()> {
+        self.flush_with_outcome().await.map(|_| ())
+    }
+
+    /// Publish the resident writer's buffered rows and report whether it sealed,
+    /// had no resident writer, or recovered a fenced writer. This has the same
+    /// publication behavior as [`Self::flush`]; see [`FlushOutcome`] for limits.
+    pub async fn flush_with_outcome(&self) -> LanceResult<FlushOutcome> {
+        let started = timer_start!();
+        let result = self.flush_inner().await;
+        // `outcome` is worth its cardinality: the three paths differ by orders of
+        // magnitude, and `noop` is by far the most common, so a blended histogram
+        // would be dominated by near-zero samples. Failures are counted, not timed.
+        match &result {
+            Ok(_outcome) => {
+                observe_duration!(
+                    crate::metrics::ROLLOUT_FLUSH_DURATION,
+                    timer_elapsed!(started),
+                    "outcome" => match _outcome {
+                        FlushOutcome::Sealed => "sealed",
+                        FlushOutcome::Noop => "noop",
+                        FlushOutcome::RecoveredFence => "recovered_fence",
+                    },
+                );
+            }
+            Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
+        }
+        result
+    }
+
+    /// Recover a restarted instance's durable WAL before its cleanup merge.
+    /// Ordinary flush sweeps stay cheap: they only touch resident writers.
+    /// This path is for this handle's OWN write shard, never a foreign shard;
+    /// as with `put`, the caller must have exclusive ownership of that writer ID.
+    /// Opening a writer claims its epoch, so this is not a mechanism for taking
+    /// over an instance that is still alive.
+    /// Returns false when there is no own shard to merge.
+    async fn recover_and_flush_own_wal(&self) -> LanceResult<bool> {
+        if self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        if self.write_writer.lock().await.is_some() {
+            self.flush().await?;
+            return Ok(true);
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        // A worker with no own shard must not queue behind another table's
+        // recovery. Serial master fan-out visits many such workers.
+        if manifest_store.refresh_latest().await?.is_none() {
+            return Ok(false);
+        }
+        let _recovery_slot = OWN_WAL_RECOVERY_SLOT
+            .acquire()
+            .await
+            .expect("WAL recovery semaphore is never closed");
+        // Manifest WAL-tip hints can lag acknowledged PUTs, so an existing
+        // own shard needs replay even if its hint says it is empty. The normal
+        // writer open rechecks under its mutex if ingest won the race. Reuse its
+        // normal replay limits (including Lance's streaming seals); changing
+        // those here would also change future ingest's generation sizes because
+        // this writer remains resident. One indivisible entry can exceed the
+        // configured soft memory ceiling.
+        info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
+        self.resident_writer(None).await?;
+        // Keep the recovered writer resident so concurrent ingest shares it;
+        // a later cheap flush can also finish sealing if this caller is cancelled.
+        self.flush().await?;
+        Ok(true)
+    }
+
+    async fn flush_inner(&self) -> LanceResult<FlushOutcome> {
+        let writer = {
+            let guard = self.write_writer.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(writer) = writer else {
+            return Ok(FlushOutcome::Noop);
+        };
+        let seal = async { writer.force_freeze_active().await?.wait().await }.await;
+        match seal {
+            Ok(()) => Ok(FlushOutcome::Sealed),
+            // Either the freeze or its asynchronous flush can discover a fence.
+            // Recover here, even when no new put arrives to reopen the writer.
+            Err(err) if is_fenced_error(&err) => {
+                warn!(uri = %self.uri(), shard = %self.write_shard,
+                    fence_reason = ?err.fence_reason(), error = %err,
+                    "reopening fenced writer after flush failure; replaying durable WAL");
+                let writer = self.resident_writer(Some(&writer)).await?;
+                writer.force_freeze_active().await?.wait().await?;
+                Ok(FlushOutcome::RecoveredFence)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Gracefully close the resident writer, draining its background tasks.
+    ///
+    /// Dropping the last writer cancels its tasks but does not seal its WAL.
+    /// Call this before dropping a store on a
+    /// path that can `await` (e.g. an LRU eviction that owns the last handle).
+    /// Idempotent: a no-op when no writer is resident.
+    pub async fn close(&mut self) -> LanceResult<()> {
+        // `&mut self` gives exclusive access, so `get_mut` avoids an async lock.
+        if let Some(writer) = self.write_writer.get_mut().take() {
+            match Arc::try_unwrap(writer) {
+                // Sole owner: drain the writer's background tasks gracefully.
+                Ok(writer) => writer.close().await?,
+                // Another handle (an in-flight append that cloned the Arc) still
+                // holds it; it will be dropped when that append completes.
+                Err(_shared) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Close this handle's writer, then remove the dataset using its configured
+    /// backend. Keep failed deletions retryable while refusing further appends.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.deleted = true;
+        self.close().await?;
+        let store = self.dataset.object_store(None).await?;
+        let path = self.dataset.branch_location().path.clone();
+        match store.remove_dir_all(path).await {
+            Err(err) if is_not_found_error(&err) => Ok(()),
+            result => result,
+        }
+    }
+
+    /// Rows buffered in this instance's resident writer that have not yet been
+    /// sealed into a flushed generation.
+    ///
+    /// Best-effort and non-failing: no resident writer, a WAL-only writer with
+    /// no memtable, or a fenced writer all report `0` rather than erroring, so
+    /// an observability read never fails because of writer state.
+    pub async fn unflushed_rows(&self) -> i64 {
+        if self.is_version_pinned() {
+            return 0;
+        }
+        let writer = {
+            let guard = self.write_writer.lock().await;
+            guard.as_ref().cloned()
+        };
+        let Some(writer) = writer else {
+            return 0;
+        };
+        writer
+            .memtable_stats()
+            .await
+            .map(|stats| stats.row_count as i64)
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------- WAL merging
+
+    /// Merge this instance's flushed generations into the base table **if** the
+    /// shard has accumulated at least `merge_after_generations` of them (the
+    /// count trigger; `0` disables it). No-op otherwise.
+    pub async fn maybe_merge_own_shard(&mut self) -> LanceResult<usize> {
+        if self.merge_after_generations == 0 {
+            return Ok(0);
+        }
+        self.merge_own_shard_if_ready(self.merge_after_generations)
+            .await
+    }
+
+    /// Run one periodic WAL-cleanup pass over this instance's own shard: fold
+    /// **every** flushed generation into the base table. This is the *time* half
+    /// of the "time OR count" trigger, so it is deliberately *not* gated by any
+    /// generation-count threshold: once the interval elapses, whatever is
+    /// pending gets merged even if the count trigger never fired. Returns the
+    /// number of generations reclaimed.
+    ///
+    /// # Seals first
+    ///
+    /// This flushes the active memtable before looking at the manifest. Without
+    /// that, a deployment with the periodic flush sweeper disabled could never
+    /// make progress: nothing would seal the memtable, so `flushed_generations`
+    /// would stay empty, so the threshold check would return `0` and never reach
+    /// the merge — leaving rows durable but permanently invisible until a
+    /// process restart replayed the WAL.
+    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+        self.flush().await?;
+        // Threshold `1`: merge whenever at least one generation is pending. The
+        // time trigger must not depend on the count threshold — that is what
+        // makes the two triggers a true OR.
+        self.merge_own_shard_if_ready(1).await
+    }
+
+    async fn merge_own_shard_if_ready(&mut self, threshold: usize) -> LanceResult<usize> {
+        let Some((manifest_store, manifest, prepared)) =
+            self.prepare_merge_if_ready(threshold).await?
+        else {
+            return Ok(0);
+        };
+        let pending = prepared.generation_count();
+        let committed = self
+            .commit_merge(&manifest_store, &manifest, prepared)
+            .await?;
+        Ok(if committed { pending } else { 0 })
+    }
+
+    /// Clone this gate under a short read lock, then drop that read guard before
+    /// awaiting the gate. Hold the permit through preparation and commit.
+    /// Otherwise a second preparation can hold a read lock while waiting for
+    /// memory owned by the first preparation, which needs the write lock to commit.
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.merge_preparation_gate.clone()
+    }
+
+    /// The shared-lock half of a merge: decide whether one is due and read the
+    /// flushed generations into memory.
+    ///
+    /// Takes `&self`, so a caller holding a *read* lock can run the expensive
+    /// part while appends continue, then take the write lock only to hand the
+    /// result to [`Self::commit_prepared_merge`]. Returns `None` when nothing is
+    /// due.
+    ///
+    /// ```ignore
+    /// let merge_gate = { store.read().await.merge_preparation_gate() };
+    /// let _merge = merge_gate.lock().await;
+    /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
+    /// if let Some((manifest_store, manifest, prepared)) = prepared {
+    ///     store.write().await.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;
+    /// }
+    /// ```
+    pub async fn prepare_merge_if_ready(
+        &self,
+        threshold: usize,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.prepare_merge_if_ready_inner(threshold, false, None)
+            .await
+    }
+
+    /// The shared-lock half of the *count*-triggered merge: prepare only if the
+    /// shard has at least `merge_after_generations` flushed generations pending
+    /// (`0` disables the trigger, so this returns `None`). Same threshold as
+    /// [`Self::maybe_merge_own_shard`], but split so the expensive generation
+    /// read runs under a read lock and only [`Self::commit_prepared_merge`]
+    /// needs the write lock.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if self.merge_after_generations == 0 {
+            return Ok(None);
+        }
+        self.prepare_merge_if_ready_inner(self.merge_after_generations, false, None)
+            .await
+    }
+
+    /// This writer's shard watermark from its own manifest: highest flushed
+    /// generation, writer epoch and flushed generation count. Metadata only.
+    /// `None` when the shard has no manifest yet.
+    pub async fn own_shard_watermark(&self) -> LanceResult<Option<ShardWatermark>> {
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        Ok(manifest_store
+            .refresh_latest()
+            .await?
+            .map(|manifest| crate::wal_watermarks::from_manifest(&manifest, None)))
+    }
+
+    /// Metadata-only count trigger for a coordinated sweeper. Never prepares
+    /// batches or takes a merge-memory reservation just to enqueue work.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        if self.merge_after_generations == 0 || self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        Ok(manifest_store
+            .refresh_latest()
+            .await?
+            .is_some_and(|manifest| manifest.sstables.len() >= self.merge_after_generations))
+    }
+
+    /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
+    /// consulting the manifest — the time-triggered (`threshold = 1`) behavior
+    /// of [`Self::cleanup_own_shard`]. See that method for why the ordering is
+    /// load-bearing.
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.prepare_merge_if_ready_inner(1, true, None).await
+    }
+
+    /// Recover and seal this instance's durable WAL before preparing cleanup.
+    /// The caller MUST own the ingestion writer ID exclusively. A maintenance
+    /// master merging a live worker's sealed shard must use the ordinary
+    /// preparation methods, which never acquire an ingestion epoch.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if !self.recover_and_flush_own_wal().await? {
+            return Ok(None);
+        }
+        self.prepare_merge_if_ready_inner(1, false, None).await
+    }
+
+    /// Prepare sealed WAL with a reservation acquired before opening readers.
+    /// A native master may admit several shards without waiting while already
+    /// holding prepared results. This method never opens a resident writer.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        let budget = self.merge_budget.as_ref().ok_or_else(|| {
+            LanceError::invalid_input("reserved WAL preparation requires a shared budget")
+        })?;
+        let want = if self.merge_max_bytes == 0 {
+            budget.limit()
+        } else {
+            self.merge_max_bytes.min(budget.limit())
+        };
+        if !reservation.belongs_to(budget) || reservation.bytes() < want {
+            return Err(LanceError::invalid_input(
+                "WAL reservation has the wrong budget or allowance",
+            ));
+        }
+        self.prepare_merge_if_ready_inner(1, false, Some(reservation))
+            .await
+    }
+
+    async fn prepare_merge_if_ready_inner(
+        &self,
+        threshold: usize,
+        seal_first: bool,
+        reservation: Option<MergeReservation>,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        // Periodic maintenance must not advance an explicitly selected snapshot.
+        if self.is_version_pinned() || self.deleted {
+            return Ok(None);
+        }
+        if seal_first {
+            self.flush().await?;
+        }
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_location = self.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        let Some(manifest) = manifest_store.refresh_latest().await? else {
+            return Ok(None);
+        };
+        let pending = manifest.sstables.len();
+        if pending == 0 || pending < threshold.max(1) {
+            return Ok(None);
+        }
+        let Some(prepared) = self.prepare_merge(&manifest, reservation).await? else {
+            return Ok(None);
+        };
+        Ok(Some((manifest_store, manifest, prepared)))
+    }
+
+    /// Encode immutable files before the ordered commit. Keep the decoded
+    /// batches and their reservation for key deletion against the latest base.
+    /// No data, deletion masks, or WAL coverage are published here. The caller
+    /// must join this future before releasing its preparation/ownership scope.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        if prepared.staged.is_some() || prepared.batches.is_empty() {
+            return Ok(());
+        }
+        if matches!(
+            self.dataset.manifest().data_storage_format.version,
+            lance_file::version::ConcreteFileVersion::V1
+                | lance_file::version::ConcreteFileVersion::V2_0
+        ) {
+            // Legacy encoders use untracked async tasks rather than spawn_cpu.
+            // Leave their encoding in the existing ordered commit path.
+            return Ok(());
+        }
+        prepared.staged = Some(
+            encode_merge_files(Arc::new(self.dataset.clone()), prepared.batches.clone()).await?,
+        );
+        Ok(())
+    }
+
+    /// Stage worker output while the caller still holds only a shared store
+    /// guard. The original owner and reservation follow every admitted encoder
+    /// until actual IO/CPU exit, including when the request is cancelled.
+    /// Legacy/unbudgeted operations retain their existing serial commit path.
+    /// This does not publish or acquire an ingestion writer epoch.
+    pub async fn stage_owned_prepared_merge(
+        &self,
+        input: Option<PreparedMergeInput>,
+    ) -> LanceResult<Option<PreparedMergeInput>> {
+        let Some((manifests, manifest, mut prepared)) = input else {
+            return Ok(None);
+        };
+        if prepared.preparation_owner.is_some()
+            && !crate::merge_write_scope::same_preparation_owner(
+                &prepared.preparation_owner,
+                &crate::merge_write_scope::preparation_owner(),
+            )
+        {
+            return Err(LanceError::io("worker staging owner changed or closed"));
+        }
+        if prepared.preparation_owner.is_none()
+            || prepared.reservation.is_none()
+            || prepared.staged.is_some()
+            || prepared.batches.is_empty()
+            || matches!(
+                self.dataset.manifest().data_storage_format.version,
+                lance_file::version::ConcreteFileVersion::V1
+                    | lance_file::version::ConcreteFileVersion::V2_0
+            )
+        {
+            return Ok(Some((manifests, manifest, prepared)));
+        }
+        if prepared.shard_id != self.write_shard || manifests.shard_id() != self.write_shard {
+            return Err(LanceError::invalid_input("worker staging shard differs"));
+        }
+        let snapshot = Arc::new(self.dataset.clone());
+        let hold = prepared.reservation.as_ref().unwrap().retain();
+        let prepared = crate::merge_write_scope::run_owned_preparation(hold, async move {
+            prepared.staged = Some(encode_merge_files(snapshot, prepared.batches.clone()).await?);
+            Ok::<_, LanceError>(prepared)
+        })
+        .await??;
+        Ok(Some((manifests, manifest, prepared)))
+    }
+
+    /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        let pending = prepared.generation_count();
+        let committed = self
+            .commit_merge(manifest_store, manifest, prepared)
+            .await?;
+        Ok(if committed { pending } else { 0 })
+    }
+
+    /// The `&self` half of a merge: everything that can run while appends
+    /// continue — sealing the memtable and reading the budgeted generations
+    /// into memory.
+    ///
+    /// # Concurrency: the expensive phase does not need exclusive access
+    ///
+    /// A merge only ever touches *sealed* generations — history — while a `put`
+    /// writes the active memtable at the WAL tail. They operate on disjoint
+    /// data, which is the whole point of an LSM, so a merge must not stop the
+    /// write path. Notably the merge does **not** `claim_epoch`: the epoch is an
+    /// *ownership* token, not a per-commit token, and
+    /// [`ShardManifestStore::commit_update`] only rejects a writer whose epoch is
+    /// **older** than the stored one. Reusing the shard's current epoch commits
+    /// the drain and leaves the live writer untouched.
+    async fn prepare_merge(
+        &self,
+        manifest: &ShardManifest,
+        reservation: Option<MergeReservation>,
+    ) -> LanceResult<Option<PreparedMerge>> {
+        // A staged append publishes its recovery watermark atomically with its
+        // files. Honor it even when returning to the legacy merge implementation.
+        let latest = Self::load_with_options(
+            self.uri(),
+            self.storage_options.clone(),
+            self.session.clone(),
+        )
+        .await?;
+        crate::rollout_append::reconcile_shard(&latest, self.write_shard, self.wal_collection)
+            .await?;
+        let marks = crate::rollout_append::watermarks(&latest).await?;
+        let mut manifest = manifest.clone();
+        if let Some(high) = marks.get(&self.write_shard) {
+            manifest.sstables.retain(|g| g.generation > *high);
+        }
+        manifest.sstables.sort_by_key(|g| g.generation);
+        let manifest = &manifest;
+        if manifest.sstables.is_empty() {
+            return Ok(None);
+        }
+
+        // Seal the active memtable so its rows are in a generation rather than
+        // buffered. Uses `&self` (the writer lives behind a Mutex) and does not
+        // close the writer, so appends continue throughout.
+        observe_phase!("seal", self.flush().await)?;
+
+        // The expensive phase: pull a budgeted prefix of generations out of object
+        // storage. Buffered in memory, so this is the part that must not hold an
+        // exclusive lock.
+        let (merged_generations, merged_paths, batches, merge_schema, reservation) = observe_phase!(
+            "read",
+            self.read_flushed_generations(manifest, reservation).await
+        )?;
+
+        Ok(Some(PreparedMerge {
+            shard_id: self.write_shard,
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+            reservation,
+            bulk_key_delete: false,
+            parallel_upsert_io: false,
+            staged: None,
+            preparation_owner: crate::merge_write_scope::preparation_owner(),
+        }))
+    }
+
+    /// The `&mut self` half of a merge: append the prepared rows to the base
+    /// table, drain the merged generations from the manifest, and delete their
+    /// directories.
+    ///
+    /// # Surgical drain, not blanket clear
+    ///
+    /// The drain removes only the generation ids this call actually merged,
+    /// retaining anything else present. This is load-bearing now that a
+    /// concurrent flush can seal a new generation mid-merge: `commit_update`
+    /// re-runs the closure against a freshly-read manifest on every CAS retry,
+    /// so a *relative* edit (retain-not-in-set) composes with a concurrent
+    /// flush's append, while an absolute `flushed_generations = []` would
+    /// silently discard a generation that was never merged — data loss. For the
+    /// same reason the closure must preserve `current_generation`,
+    /// `replay_after_wal_entry_position` and `wal_entry_position_last_seen`,
+    /// which a concurrent flush advances; `..current.clone()` carries them.
+    ///
+    /// The base write is a merge-insert keyed by `key_column`, so even if a
+    /// crash interrupts the sequence (data committed but the shard manifest not
+    /// yet drained), retrying the same generations replaces those keys instead
+    /// of appending physical duplicates. The next attempt can then drain the
+    /// manifest without relying on a particular Lance read-plan shape.
+    async fn commit_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<bool> {
+        // Checkout or deletion may have happened after shared-lock preparation.
+        if self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        let PreparedMerge {
+            shard_id: _,
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+            reservation,
+            bulk_key_delete,
+            parallel_upsert_io,
+            staged,
+            preparation_owner: _,
+        } = prepared;
+
+        // Several sweepers can prepare the same immutable generations under a
+        // shared lock. Once the first commit drains them, later prepared copies
+        // are stale and must not write the same rows again.
+        let Some(current_manifest) = manifest_store.refresh_latest().await? else {
+            return Ok(false);
+        };
+        if !current_manifest
+            .sstables
+            .iter()
+            .any(|generation| merged_generations.contains(&generation.generation))
+        {
+            return Ok(false);
+        }
+
+        // A prior cancelled merge may have completed a shielded manifest
+        // commit after this handle's future was dropped. Always reopen latest
+        // before retrying, including generic stores without schema evolution.
+        self.refresh_latest().await?;
+        if let Some(files) = &staged {
+            files.validate(&self.dataset)?;
+        }
+        self.ensure_latest_schema().await?;
+        if crate::rollout_append::watermarks(&self.dataset)
+            .await?
+            .get(&self.write_shard)
+            .is_some_and(|high| merged_generations.iter().any(|g| g <= high))
+        {
+            return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
+                "prepared merge overlaps committed rollout watermark; reprepare",
+            )));
+        }
+
+        // Publish coverage with the data, including legacy/upsert merges. A
+        // reader can then distinguish immutable generations already in base
+        // from WAL that must still overlay it.
+        let watermark = merged_generations
+            .iter()
+            .max()
+            .map(|high| (self.write_shard, *high))
+            .into_iter()
+            .collect();
+        if !batches.is_empty() {
+            observe_phase!(
+                "append",
+                Box::pin(self.merge_prepared_batches(
+                    batches,
+                    merge_schema,
+                    watermark,
+                    bulk_key_delete,
+                    parallel_upsert_io,
+                    staged
+                ))
+                .await
+            )?;
+            self.pinned_version = None;
+        }
+        // The batches are consumed; give the bytes back before the manifest
+        // drain and directory deletes, which hold no merge data.
+        drop(reservation);
+
+        // Reuse the shard's *current* epoch rather than claiming a new one:
+        // claiming would fence our own live writer. `commit_update` still fails
+        // cleanly if a genuinely new writer has claimed the shard meanwhile —
+        // its epoch would exceed ours — which is the correct outcome, since that
+        // writer now owns the shard.
+        let epoch = manifest.writer_epoch;
+
+        let retiring: Vec<_> = manifest
+            .sstables
+            .iter()
+            .filter(|g| merged_generations.contains(&g.generation))
+            .map(|g| crate::rollout_append::Generation {
+                number: g.generation,
+                path: g.path.clone(),
+            })
+            .collect();
+        if retiring.len() != merged_generations.len()
+            || retiring.iter().any(|g| !merged_paths.contains(&g.path))
+        {
+            return Err(LanceError::io(
+                "Prepared retirement identities no longer match",
+            ));
+        }
+        let retirements = crate::wal_retirement::record(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            retiring,
+        )
+        .await?;
+
+        let drain_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        observe_phase!(
+            "drain",
+            crate::merge_write_scope::drain_generations(drain_store, epoch, merged_generations)
+                .await
+        )?;
+
+        self.reclaim_retired_generations(retirements).await?;
+        self.pinned_version = None;
+        Ok(true)
+    }
+
+    /// Reclaim directories after manifest drain and reader lifetime checks.
+    /// Drain prevents fresh captures from discovering these generations, but
+    /// readers that already captured them may still need the physical files.
+    /// Physical deletion runs off the merge's critical path: base publication
+    /// and manifest drain have already completed. Failure retains files and
+    /// does not undo the logical merge. The pre-drain durable intent remains
+    /// available to recovery if this process or its background task fails.
+    async fn reclaim_retired_generations(
+        &self,
+        retirements: Vec<object_store::path::Path>,
+    ) -> LanceResult<()> {
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        crate::wal_gc::schedule(self.wal_collection, object_store, branch_path, retirements);
+        Ok(())
+    }
+
+    /// Background lifecycle admission, including cold and zero-pending stores.
+    /// May wait for collector capacity; never call from pending/read probes or
+    /// while holding a merge claim. Persisted intents survive cancellation.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        if self.wal_collection == crate::wal_gc::Mode::Retain {
+            return Ok(());
+        }
+        let store = self.dataset.object_store(None).await?;
+        crate::wal_gc::discover(
+            self.wal_collection,
+            store,
+            self.dataset.branch_location().path.clone(),
+        )
+        .await
+    }
+
+    /// Read a budgeted prefix of flushed generations in `manifest`, aligned
+    /// to the base table's current schema.
+    ///
+    /// Returns the merged generation ids, their on-storage folder names (needed
+    /// to delete the directories after the manifest drain), the batches, and the
+    /// schema they were aligned to.
+    #[allow(clippy::type_complexity)]
+    async fn read_flushed_generations(
+        &self,
+        manifest: &ShardManifest,
+        reserved: Option<MergeReservation>,
+    ) -> LanceResult<(
+        HashSet<u64>,
+        Vec<String>,
+        Vec<RecordBatch>,
+        Arc<Schema>,
+        Option<MergeReservation>,
+    )> {
+        // Reserve the whole per-merge allowance from the process budget before
+        // reading anything. Growth beyond this allowance must be nonblocking:
+        // concurrent readers can fill the initial budget (see `merge_budget`).
+        // With the count cap disabled and no byte cap, the allowance is the
+        // full budget: the merge may read everything pending, alone.
+        let mut reservation = match (reserved, &self.merge_budget) {
+            (Some(reservation), _) => Some(reservation),
+            (None, Some(budget)) => {
+                let want = if self.merge_max_bytes == 0 {
+                    budget.limit()
+                } else {
+                    self.merge_max_bytes.min(budget.limit())
+                };
+                let wait = timer_start!();
+                let reservation = budget.reserve(want).await;
+                observe_duration!(
+                    crate::metrics::ROLLOUT_MERGE_BUDGET_WAIT,
+                    timer_elapsed!(wait)
+                );
+                Some(reservation)
+            }
+            (None, None) => None,
+        };
+        let base_uri = self.dataset.uri().trim_end_matches('/').to_string();
+        let mut merged_generations: HashSet<u64> = HashSet::new();
+        let mut merged_paths: Vec<String> = Vec::new();
+        let mut generation_batches: Vec<(u64, Vec<RecordBatch>)> = Vec::new();
+        let merge_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+
+        // Stop when either cap binds. Count the aligned batches before dedup:
+        // all of their arrays (including inline blobs) are resident during this
+        // read phase, even if dedup will later discard some rows.
+        //
+        // The manifest drains whole generation ids, so a generation is the
+        // smallest indivisible unit. Finish the generation that reaches the
+        // byte budget and stop before opening the next one. This may overshoot
+        // by one generation, but always makes progress, including when the
+        // first generation alone exceeds the budget. Leftovers stay pending.
+        let mut buffered_bytes = 0usize;
+        let budget = if self.merge_max_generations == 0 {
+            manifest.sstables.len()
+        } else {
+            self.merge_max_generations
+        };
+
+        'generations: for flushed in manifest.sstables.iter().take(budget) {
+            let gen_uri = format!(
+                "{}/_mem_wal/{}/{}",
+                base_uri, self.write_shard, flushed.path
+            );
+            let gen_dataset = Self::load_with_options(
+                &gen_uri,
+                self.storage_options.clone(),
+                self.session.clone(),
+            )
+            .await?;
+            let mut current_batches = Vec::new();
+            let mut stream = gen_dataset.scan().try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                if batch.num_rows() > 0 {
+                    let batch = align_batch_to_schema(batch, merge_schema.clone())?;
+                    buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
+                    // Never wait for more permits while holding a reservation:
+                    // all concurrent readers may need to grow simultaneously.
+                    if let Some(reservation) = reservation.as_mut() {
+                        if !reservation.try_grow_to(buffered_bytes) {
+                            if merged_generations.is_empty() {
+                                return Err(LanceError::io(
+                                    "merge memory budget busy while reading first generation; retry".to_string(),
+                                ));
+                            }
+                            // This generation is incomplete. Drop its batches,
+                            // keep it in the manifest, and commit only the fully
+                            // read prefix so the current reservation is released.
+                            break 'generations;
+                        }
+                    }
+                    crate::merge_write_scope::wal_batch_read(
+                        batch.num_rows(),
+                        batch.get_array_memory_size(),
+                    );
+                    current_batches.push(batch);
+                }
+            }
+            generation_batches.push((flushed.generation, current_batches));
+            merged_generations.insert(flushed.generation);
+            merged_paths.push(flushed.path.clone());
+            if self.merge_max_bytes != 0 && buffered_bytes >= self.merge_max_bytes {
+                break;
+            }
+        }
+        let batches =
+            dedupe_merge_batches(generation_batches, &self.key_column, merge_schema.clone())?;
+        Ok((
+            merged_generations,
+            merged_paths,
+            batches,
+            merge_schema,
+            reservation,
+        ))
+    }
+
+    /// Merge prepared WAL rows into the base table by primary key.
+    ///
+    /// `read_flushed_generations` reduces the source to the newest row per key.
+    /// Prepare deletion masks from keys/row IDs and encode new fragments, then
+    /// publish both with their WAL coverage in one manifest transaction. Neither
+    /// preparation publishes partial deletion or reads old target blob values.
+    /// Existing BTree/ZoneMap coverage can accelerate key lookup; this path never
+    /// builds an index as a merge prerequisite.
+    ///
+    /// Avoid `WhenMatched::UpdateAll`: reading full target rows for a join has
+    /// previously loaded gigabytes of old inline blobs. The delete-only join
+    /// carries only keys and row IDs, within the existing merge byte reservation.
+    ///
+    /// A crash before publication leaves base and WAL intact. A crash after
+    /// publication leaves an atomic watermark that the next executor reconciles
+    /// before preparing, so already committed rows are never replayed over newer
+    /// values. Typed commit conflicts may reprepare masks against a newer base;
+    /// unknown commit results and ownership errors must return to recovery.
+    async fn merge_prepared_batches(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        merge_schema: Arc<Schema>,
+        watermarks: Vec<(Uuid, u64)>,
+        bulk_key_delete: bool,
+        parallel_upsert_io: bool,
+        staged: Option<StagedMergeFiles>,
+    ) -> LanceResult<()> {
+        use lance::dataset::{transaction::Operation, CommitBuilder};
+
+        if parallel_upsert_io
+            && self.dataset.manifest().data_storage_format.version
+                == lance_file::version::ConcreteFileVersion::V1
+        {
+            return Err(LanceError::invalid_input(
+                "parallel upsert IO requires Lance V2 files",
+            ));
+        }
+        if let Some(files) = &staged {
+            files.validate(&self.dataset)?;
+        }
+        merge_schema.index_of(&self.key_column)?;
+        let delete_batches = batches.clone();
+        let snapshot = Arc::new(self.dataset.clone());
+        let schema = self.dataset.schema().clone();
+        let coverage = crate::rollout_append::watermarks(&self.dataset).await?;
+        let initial_coverage: Vec<_> = watermarks
+            .iter()
+            .map(|(shard, _)| (*shard, coverage.get(shard).copied()))
+            .collect();
+        let key_column = self.key_column.clone();
+        let delete = |snapshot| {
+            let batches = delete_batches.clone();
+            let key_column = key_column.clone();
+            async move {
+                observe_phase!(
+                    "delete_keys",
+                    crate::wal_key_delete::prepare(
+                        snapshot,
+                        &batches,
+                        &key_column,
+                        bulk_key_delete
+                    )
+                    .await
+                )
+            }
+        };
+        let deleting = delete(snapshot.clone());
+        let stage = async move {
+            let files = match staged {
+                Some(files) => files,
+                None => encode_merge_files(snapshot.clone(), batches).await?,
+            };
+            Ok::<_, LanceError>(files.fragments)
+        };
+        let (mut deleted, fragments) = if parallel_upsert_io {
+            // Join both admitted operations even on failure; retain the decoded
+            // byte reservation until both finish. Neither publishes base state.
+            let (deleted, staged) = tokio::join!(deleting, stage);
+            (deleted?, staged?)
+        } else {
+            (deleting.await?, stage.await?)
+        };
+        // A definitive conflict means no publication took place. Recompute
+        // deletion masks on the newer base while reusing the immutable encoded
+        // files. Never replay an unknown result or an ownership/fencing error.
+        for attempt in 0..=10 {
+            let Operation::Update {
+                new_fragments,
+                compacted_sstables,
+                ..
+            } = &mut deleted.transaction.operation
+            else {
+                return Err(LanceError::io(
+                    "key deletion produced a non-update transaction",
+                ));
+            };
+            if !new_fragments.is_empty() || !compacted_sstables.is_empty() {
+                return Err(LanceError::io(
+                    "delete-only preparation unexpectedly inserted rows",
+                ));
+            }
+            *new_fragments = fragments.clone();
+            compacted_sstables.extend(
+                watermarks.iter().map(|(shard, high)| {
+                    lance_index::mem_wal::CompactedSsTable::new(*shard, *high)
+                }),
+            );
+            let version = self.dataset.version().version;
+            if deleted.transaction.read_version != version {
+                return Err(LanceError::io(
+                    "upsert deletion and encoding snapshots differ",
+                ));
+            }
+            let mut commit = CommitBuilder::new(Arc::new(self.dataset.clone())).with_max_retries(0);
+            if let Some(affected) = deleted.affected_rows {
+                commit = commit.with_affected_rows(affected);
+            }
+            let result = {
+                let _phase = crate::merge_write_scope::work_stage("base_commit");
+                crate::merge_write_scope::at_base_version(
+                    version + 1,
+                    commit.execute(deleted.transaction),
+                )
+                .await
+            };
+            match result {
+                Ok(_) => {
+                    crate::merge_write_scope::base_committed();
+                    self.dataset.checkout_latest().await?;
+                    return Ok(());
+                }
+                Err(LanceError::CommitConflict { .. }) if attempt < 10 => {
+                    self.dataset.checkout_latest().await?;
+                    if self.dataset.schema().fields != schema.fields
+                        || self.dataset.schema().metadata != schema.metadata
+                    {
+                        return Err(LanceError::io(MaintenanceErrorCode::StalePreparation.tag(
+                            "base fields or metadata changed during atomic upsert; reprepare",
+                        )));
+                    }
+                    // Another executor may have published this shard while
+                    // we staged files. Replaying our old keys over its newer
+                    // values would undo that progress, even if the files are
+                    // reusable. Let the caller reconcile and prepare again.
+                    let coverage = crate::rollout_append::watermarks(&self.dataset).await?;
+                    if initial_coverage
+                        .iter()
+                        .any(|(shard, initial)| coverage.get(shard).copied() != *initial)
+                    {
+                        return Err(LanceError::io(
+                            MaintenanceErrorCode::StalePreparation
+                                .tag("shard coverage changed during atomic upsert; reprepare"),
+                        ));
+                    }
+                    deleted = delete(Arc::new(self.dataset.clone())).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("last commit attempt always returns")
+    }
+
+    pub async fn create_configured_key_index(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
+        let kind = match self.key_index_type {
+            crate::KeyIndexType::Btree => IndexType::BTree,
+            crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
+        };
+        self.dataset
+            .create_index_builder(
+                &[self.key_column.as_str()],
+                kind,
+                &ScalarIndexParams::default(),
+            )
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+        self.reload().await
+    }
+
+    /// Build files only. Callers must open this handle in a preparation-only
+    /// write scope so even an unexpected metadata write is rejected.
+    pub async fn prepare_key_index(&self) -> LanceResult<PreparedKeyIndex> {
+        self.ensure_writable()?;
+        let mut snapshot = self.dataset.clone();
+        let source = PreparedIndexSource::capture(&snapshot, &[ID_INDEX_NAME.into()]).await?;
+        let kind = match self.key_index_type {
+            crate::KeyIndexType::Btree => IndexType::BTree,
+            crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
+        };
+        let index = snapshot
+            .create_index_builder(
+                &[self.key_column.as_str()],
+                kind,
+                &ScalarIndexParams::default(),
+            )
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .execute_uncommitted()
+            .await?;
+        Ok(PreparedKeyIndex { source, index })
+    }
+
+    /// Publish on a fresh fenced handle. Appends may have added uncovered
+    /// fragments; deletion vectors can hide indexed rows without changing their
+    /// values or addresses. Other source or same-name index changes require
+    /// rebuilding. Keep the original read version so Lance still rejects a
+    /// concurrent restore that could make previously deleted rows visible.
+    pub async fn commit_prepared_key_index(
+        &mut self,
+        prepared: PreparedKeyIndex,
+    ) -> LanceResult<()> {
+        use lance::dataset::transaction::{Operation, Transaction};
+        use lance::dataset::write::CommitBuilder;
+
+        self.ensure_writable()?;
+        self.dataset.checkout_latest().await?;
+        prepared.source.validate(&self.dataset).await?;
+        let transaction = Transaction::new(
+            prepared.index.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![prepared.index],
+                removed_indices: prepared.source.indices,
+            },
+            None,
+        );
+        self.dataset = CommitBuilder::new(Arc::new(self.dataset.clone()))
+            .execute(transaction)
+            .await?;
+        self.reload().await
+    }
+
+    /// Evolve an older base table to the store's latest additive schema.
+    ///
+    /// Missing nullable columns are added as all-null arrays. Existing unknown
+    /// columns, type changes, and missing required columns remain hard errors.
+    /// A no-op when the store declared no `latest_schema`.
+    pub async fn ensure_latest_schema(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
+        let Some(latest_schema) = self.latest_schema.clone() else {
+            return Ok(());
+        };
+        self.refresh_latest().await?;
+
+        let base_schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+        align_batch_to_schema(
+            RecordBatch::new_empty(base_schema.clone()),
+            latest_schema.clone(),
+        )?;
+
+        let missing_fields = latest_schema
+            .fields()
+            .iter()
+            .filter(|field| base_schema.field_with_name(field.name()).is_err())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_fields.is_empty() {
+            if let Err(err) = self
+                .dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(missing_fields))),
+                    None,
+                    None,
+                )
+                .await
+            {
+                // Another opener may have committed the same additive upgrade.
+                // Accept that race only after validating the resulting schema.
+                self.refresh_latest().await?;
+                let schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+                if latest_schema
+                    .fields()
+                    .iter()
+                    .any(|field| schema.field_with_name(field.name()).is_err())
+                {
+                    return Err(err);
+                }
+                align_batch_to_schema(RecordBatch::new_empty(schema), latest_schema)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------- compaction & indexing
+
+    fn compaction_options(config: &CompactionConfig) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: config.target_rows_per_fragment,
+            max_rows_per_group: config.max_rows_per_group,
+            materialize_deletions: config.materialize_deletions,
+            materialize_deletions_threshold: config.materialize_deletions_threshold,
+            num_threads: config.num_threads,
+            max_bytes_per_file: config.max_bytes_per_file,
+            batch_size: config.batch_size,
+            max_source_fragments: config.max_source_fragments,
+            compaction_mode: config
+                .try_binary_copy
+                .then_some(CompactionMode::TryBinaryCopy),
+            // Every base table here carries a MemWAL index, which is fieldless
+            // (it tracks shard/generation bookkeeping, not a data column).
+            // Lance's inline index remap panics on a fieldless index ("An index
+            // existed with no fields"), so defer remapping: compaction records a
+            // fragment-reuse index and remaps lazily instead of touching the
+            // MemWAL index during the rewrite.
+            defer_index_remap: true,
+            ..Default::default()
+        }
+    }
+
+    /// Read a fixed snapshot and write new immutable files, without publishing.
+    /// Callers must forbid manifest commits while this future runs.
+    pub async fn prepare_compaction(
+        &self,
+        config: CompactionConfig,
+    ) -> LanceResult<PreparedCompaction> {
+        self.ensure_writable()?;
+        // A resident handle may predate another executor's completed rewrite.
+        // Prepare against a fresh immutable view, without changing the caller's
+        // cached handle or the read versions carried into the commit checks.
+        let mut dataset = self.dataset.clone();
+        dataset.checkout_latest().await?;
+        let options = Self::compaction_options(&config);
+        let tasks = prepare_compaction_files(
+            &dataset,
+            options.clone(),
+            config.max_source_fragments.unwrap_or(usize::MAX).max(1),
+        )
+        .await?;
+        Ok(PreparedCompaction {
+            read_version: dataset.version().version,
+            uri: dataset.uri().to_owned(),
+            schema: Schema::from(dataset.schema()),
+            options,
+            tasks,
+        })
+    }
+
+    /// Publish prepared files under a fresh owner. Preserve the original
+    /// RewriteResult read versions so Lance checks every intervening write.
+    pub async fn commit_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+    ) -> LanceResult<CompactionMetrics> {
+        self.ensure_writable()?;
+        self.dataset.checkout_latest().await?;
+        if prepared.uri != self.dataset.uri()
+            || prepared.schema != Schema::from(self.dataset.schema())
+        {
+            return Err(LanceError::invalid_input(
+                MaintenanceErrorCode::StalePreparation
+                    .tag("compaction dataset or schema changed; reprepare"),
+            ));
+        }
+        // Reject a stale rewrite before any ReserveFragments/index commit.
+        // Append-only merges leave these source fragments unchanged.
+        let sources: HashMap<_, _> = self
+            .dataset
+            .manifest()
+            .fragments
+            .iter()
+            .map(|f| (f.id, f))
+            .collect();
+        for task in &prepared.tasks {
+            for old in &task.original_fragments {
+                if sources.get(&old.id).copied() != Some(old) {
+                    return Err(LanceError::invalid_input(
+                        MaintenanceErrorCode::StalePreparation
+                            .tag("compaction source fragment changed; reprepare"),
+                    ));
+                }
+            }
+        }
+        let metrics = commit_compaction(
+            &mut self.dataset,
+            prepared.tasks,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &prepared.options,
+        )
+        .await?;
+        self.reload().await?;
+        Ok(metrics)
+    }
+
+    /// Compact the base table's small fragments into larger ones.
+    ///
+    /// Every WAL merge `append`s a new fragment to the base table, so a
+    /// long-running store accumulates many small fragments that slow scans.
+    ///
+    /// # Distributed use: run from ONE compactor, not every worker
+    ///
+    /// Unlike WAL merge — where each worker touches only its own shard and can
+    /// never contend — compaction rewrites the *shared* base table. Lance treats
+    /// two concurrent `Rewrite` commits as a retryable conflict, so N workers
+    /// each compacting the same table degenerates into a thundering herd of
+    /// wasted rewrites. Drive this from a *single* external trigger. It is safe
+    /// to call while other workers are appending or WAL-merging: `Append` vs
+    /// `Rewrite` is non-conflicting in Lance's matrix.
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
+        self.ensure_writable()?;
+        // Refresh before planning: retrying a stale handle can otherwise keep
+        // rewriting fragments a peer already replaced, even with serial calls.
+        // A rewrite racing after this refresh still goes through Lance's normal
+        // commit conflict checks.
+        self.dataset.checkout_latest().await?;
+        let config = options.unwrap_or_default();
+
+        let lance_options = Self::compaction_options(&config);
+
+        let result = match config.max_source_fragments {
+            Some(max_source_fragments) => {
+                compact_files_incremental(
+                    &mut self.dataset,
+                    lance_options,
+                    max_source_fragments.max(1),
+                )
+                .await
+            }
+            None => compact_files(&mut self.dataset, lance_options, None).await,
+        };
+
+        match result {
+            Ok(metrics) => {
+                // Reload the handle so the caller (and subsequent reads on this
+                // instance) observe the compacted version.
+                self.reload().await?;
+                self.last_compaction = Some(Utc::now());
+                self.total_compactions += 1;
+                self.last_compaction_error = None;
+                info!(
+                    fragments_removed = metrics.fragments_removed,
+                    fragments_added = metrics.fragments_added,
+                    "base-table compaction completed"
+                );
+                Ok(metrics)
+            }
+            Err(e) => {
+                warn!(error = %e, "base-table compaction failed");
+                self.last_compaction_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Relative paths (under `data/`) of every data file the base table's
+    /// current manifest references, in fragment order. For tests and
+    /// diagnostics.
+    pub fn base_data_files(&self) -> Vec<String> {
+        self.dataset
+            .fragments()
+            .iter()
+            .flat_map(|f| f.files.iter().map(|d| d.path.clone()))
+            .collect()
+    }
+
+    /// Check current data and deletion file references with one metadata
+    /// request at a time. Never reads row payloads or commits a repair. The
+    /// caller must hold exclusive write authority for the complete operation;
+    /// a changed version fails instead of declaring an unchecked version healthy.
+    pub async fn validate_fragment_references(
+        &mut self,
+    ) -> LanceResult<crate::ReferenceValidation> {
+        self.reload().await?;
+        let read_version = self.dataset.version().version;
+        let object_store = self.dataset.object_store(None).await?;
+        let data_dir = self.dataset.data_dir();
+        let deletions_dir = self.dataset.deletions_dir();
+        let mut references_checked = 0;
+        for fragment in self.dataset.fragments().iter() {
+            for file in &fragment.files {
+                let path = data_dir.clone().join(file.path.as_str());
+                if !object_store.exists(&path).await? {
+                    return Err(lance::Error::io(format!(
+                        "repair validation: missing data reference {} at version {read_version}; no data changed",
+                        file.path
+                    )));
+                }
+                references_checked += 1;
+                crate::merge_write_scope::reference_validated();
+            }
+            if let Some(deletion) = &fragment.deletion_file {
+                let name = format!(
+                    "{}-{}-{}.{}",
+                    fragment.id,
+                    deletion.read_version,
+                    deletion.id,
+                    deletion.file_type.suffix()
+                );
+                let path = deletions_dir.clone().join(name.as_str());
+                if !object_store.exists(&path).await? {
+                    return Err(lance::Error::io(format!(
+                        "repair validation: missing deletion reference {name} at version {read_version}; no data changed"
+                    )));
+                }
+                references_checked += 1;
+                crate::merge_write_scope::reference_validated();
+            }
+        }
+        self.reload().await?;
+        let latest = self.dataset.version().version;
+        if latest != read_version {
+            return Err(lance::Error::io(format!(
+                "repair validation: base version changed {read_version} -> {latest}; retry validation; no data changed"
+            )));
+        }
+        Ok(crate::ReferenceValidation {
+            read_version,
+            references_checked,
+        })
+    }
+
+    /// Drop every base-table fragment whose data or deletion file is missing
+    /// from storage, so the manifest stops naming files that do not exist.
+    ///
+    /// A manifest can outlive its files (a cleanup that ran against a stale
+    /// listing, an object-store soft-delete that expired, an interrupted
+    /// rewrite). From then on every scan, merge and compaction of the table
+    /// fails with `Not found: .../data/<file>.lance` and nothing retries it
+    /// into existence: the rows in those fragments are already gone. This
+    /// commits a `Delete` of exactly those fragment ids, which is the same
+    /// transaction a row delete that empties a fragment would commit, and
+    /// leaves every other fragment and every WAL generation untouched.
+    ///
+    /// Returns what was dropped so the caller can record it. A dataset with
+    /// nothing missing commits nothing and returns an empty report.
+    pub async fn repair_missing_fragments(&mut self) -> LanceResult<RepairReport> {
+        use lance::dataset::transaction::{Operation, Transaction};
+        use lance::dataset::write::CommitBuilder;
+
+        self.ensure_writable()?;
+        self.reload().await?;
+        let object_store = self.dataset.object_store(None).await?;
+        let data_dir = self.dataset.data_dir();
+        let deletions_dir = self.dataset.deletions_dir();
+        let read_version = self.dataset.version().version;
+
+        let mut dropped = Vec::new();
+        for fragment in self.dataset.fragments().iter() {
+            let mut missing = Vec::new();
+            for file in &fragment.files {
+                let path = data_dir.clone().join(file.path.as_str());
+                if !object_store.exists(&path).await? {
+                    missing.push(file.path.clone());
+                }
+            }
+            if let Some(deletion) = &fragment.deletion_file {
+                // Mirrors lance_table::io::deletion::deletion_file_path.
+                let name = format!(
+                    "{}-{}-{}.{}",
+                    fragment.id,
+                    deletion.read_version,
+                    deletion.id,
+                    deletion.file_type.suffix()
+                );
+                let path = deletions_dir.clone().join(name.as_str());
+                if !object_store.exists(&path).await? {
+                    missing.push(format!("_deletions/{name}"));
+                }
+            }
+            if !missing.is_empty() {
+                dropped.push(DroppedFragment {
+                    id: fragment.id,
+                    physical_rows: fragment.physical_rows,
+                    missing_files: missing,
+                });
+            }
+        }
+        if dropped.is_empty() {
+            return Ok(RepairReport {
+                read_version,
+                committed_version: None,
+                dropped,
+            });
+        }
+
+        let operation = Operation::Delete {
+            updated_fragments: Vec::new(),
+            deleted_fragment_ids: dropped.iter().map(|d| d.id).collect(),
+            predicate: "repair: fragment data file missing from storage".to_string(),
+        };
+        let committed = CommitBuilder::new(Arc::new(self.dataset.clone()))
+            .execute(Transaction::new(read_version, operation, None))
+            .await?;
+        let committed_version = committed.version().version;
+        self.reload().await?;
+        warn!(
+            read_version,
+            committed_version,
+            fragments = dropped.len(),
+            rows = dropped
+                .iter()
+                .map(|d| d.physical_rows.unwrap_or(0))
+                .sum::<usize>(),
+            "repaired base table: dropped fragments whose files are missing from storage"
+        );
+        Ok(RepairReport {
+            read_version,
+            committed_version: Some(committed_version),
+            dropped,
+        })
+    }
+
+    /// Build or replace a BTree scalar index on the base table's key column.
+    ///
+    /// The index accelerates base-table point lookups and range scans. WAL
+    /// merges use available coverage but do not create or extend indexes;
+    /// their predicate deletes scan only keys and row IDs when uncovered.
+    /// Index publication belongs to explicit maintenance, avoiding conflicts
+    /// between independently merging shards.
+    ///
+    /// MemWAL flushes do not extend base-table index coverage. Lance combines
+    /// indexed lookups with scans of uncovered fragments, preserving correctness.
+    pub async fn create_key_btree_index(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
+        info!(column = %self.key_column, "creating BTree index on key column");
+        self.dataset
+            .create_index_builder(
+                &[self.key_column.as_str()],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name(ID_INDEX_NAME.to_string())
+            .replace(true)
+            .await?;
+        // Reload the handle so subsequent reads on this instance observe the new
+        // index (mirrors the reload done after `compact`).
+        self.reload().await
+    }
+
+    /// Extend the key column's BTree index over every base-table fragment it
+    /// does not yet cover, appending an index delta rather than rebuilding.
+    ///
+    /// This is explicit index maintenance. WAL merges leave new fragments
+    /// uncovered until maintenance runs, and query planning scans their key
+    /// columns rather than rebuilding the index on every merge.
+    ///
+    /// Returns how many fragments were unindexed beforehand (0 = no commit).
+    /// A table without the BTree at all is left alone; the caller builds it
+    /// with [`Self::create_key_btree_index`] first.
+    pub async fn extend_key_btree_index(&mut self) -> LanceResult<usize> {
+        use lance::index::{DatasetIndexExt as _, DatasetIndexInternalExt as _};
+        use lance_index::optimize::OptimizeOptions;
+
+        self.ensure_writable()?;
+        self.reload().await?;
+        if !self.has_key_btree_index().await? {
+            return Ok(0);
+        }
+        let unindexed = self.dataset.unindexed_fragments(ID_INDEX_NAME).await?.len();
+        if unindexed == 0 {
+            return Ok(0);
+        }
+        // `merge(1)`, not `append()`: fold the new fragments into the existing
+        // delta so the index stays a single delta. Compaction refuses to bin
+        // fragments covered by different index-delta sets together, so one
+        // delta per merge would leave every fragment in its own bin and
+        // compaction would never coalesce anything.
+        self.dataset
+            .optimize_indices(
+                &OptimizeOptions::merge(1).index_names(vec![ID_INDEX_NAME.to_string()]),
+            )
+            .await?;
+        self.reload().await?;
+        info!(
+            column = %self.key_column,
+            fragments = unindexed,
+            "extended key index over newly appended fragments"
+        );
+        Ok(unindexed)
+    }
+
+    /// Whether the base table's key column has a BTree index (the one
+    /// `merge_insert` can use). A ZoneMap under the same name does not count.
+    pub async fn has_key_btree_index(&self) -> LanceResult<bool> {
+        let indices = self.dataset.load_indices().await?;
+        for index in indices.iter().filter(|i| i.name == ID_INDEX_NAME) {
+            if let Some(details) = &index.index_details {
+                if details.type_url.ends_with("BTreeIndexDetails") {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the base table has accumulated at least `min_fragments`
+    /// fragments (and is thus worth compacting). Quiet-hours gating from
+    /// [`CompactionConfig`] is honored so an external scheduler can pass the
+    /// same config it would pass to [`Self::compact`].
+    #[must_use]
+    pub fn should_compact(&self, config: &CompactionConfig) -> bool {
+        if self.dataset.count_fragments() < config.min_fragments {
+            return false;
+        }
+        if !config.quiet_hours.is_empty() {
+            use chrono::Timelike;
+            let hour = Utc::now().hour() as u8;
+            for (start, end) in &config.quiet_hours {
+                if hour >= *start && hour < *end {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Current compaction statistics for the base table.
+    ///
+    /// `is_compacting` is always `false`: compaction runs synchronously under
+    /// the caller's `&mut self`, so a stats read cannot observe an in-flight
+    /// compaction on this handle.
+    #[must_use]
+    pub fn compaction_stats(&self) -> CompactionStats {
+        CompactionStats {
+            total_fragments: self.dataset.count_fragments(),
+            is_compacting: false,
+            last_compaction: self.last_compaction,
+            last_error: self.last_compaction_error.clone(),
+            total_compactions: self.total_compactions,
+        }
+    }
+
+    /// Reload the base dataset handle through [`Self::load_with_options`], so
+    /// the shared session and storage options are never dropped.
+    pub async fn reload(&mut self) -> LanceResult<()> {
+        let uri = self.dataset.uri().to_string();
+        self.dataset =
+            Self::load_with_options(&uri, self.storage_options.clone(), self.session.clone())
+                .await?;
+        self.pinned_version = None;
+        Ok(())
+    }
+
+    // -------------------------------------------------------- MemWAL plumbing
+
+    /// Initialize the (unsharded) MemWAL index on first write, exactly once.
+    ///
+    /// # Concurrent first-writers
+    ///
+    /// `initialize_mem_wal` commits a `CreateIndex` transaction, and Lance
+    /// treats two concurrent `CreateIndex` commits as a hard conflict: when two
+    /// instances take their very first write at the same time, both observe no
+    /// index, both try to create it, and the loser gets
+    /// `RetryableCommitConflict`. That is benign here — the winner created
+    /// exactly the index we wanted — so we reload and treat "index now present"
+    /// as success. Any other error propagates.
+    async fn ensure_mem_wal(&mut self) -> LanceResult<()> {
+        if self.mem_wal_index_present().await? {
+            return Ok(());
+        }
+        match self
+            .dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // A concurrent first-writer may have created the index between
+                // our check and our commit. Reload and accept it if so.
+                self.reload().await?;
+                if self.mem_wal_index_present().await? {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    async fn mem_wal_index_present(&self) -> LanceResult<bool> {
+        let indices = self.dataset.load_indices().await?;
+        Ok(indices.iter().any(|i| i.name == MEM_WAL_INDEX_NAME))
+    }
+
+    /// Absolute URI of one flushed generation's dataset.
+    #[must_use]
+    pub fn flushed_generation_uri(&self, shard_id: Uuid, path: &str) -> String {
+        format!(
+            "{}/_mem_wal/{shard_id}/{path}",
+            self.dataset.uri().trim_end_matches('/')
+        )
+    }
+
+    /// Open a flushed generation dataset, inheriting the base dataset's session
+    /// and this store's storage options.
+    pub async fn open_flushed_dataset(&self, uri: &str) -> LanceResult<Dataset> {
+        let mut builder = DatasetBuilder::from_uri(uri).with_session(self.dataset.session());
+        if let Some(options) = self.storage_options.clone() {
+            builder = builder.with_storage_options(options);
+        }
+        builder.load().await
+    }
+
+    /// Every shard's watermark (highest flushed generation and writer epoch)
+    /// from its latest manifest. Metadata only; bounded-concurrent like
+    /// [`Self::wal_shard_snapshots`], but does not enforce the read cap:
+    /// the scheduler must see an over-cap shard, not be refused by it.
+    pub async fn all_shard_watermarks(&self) -> LanceResult<Vec<ShardWatermark>> {
+        if self.is_version_pinned() {
+            return Ok(Vec::new());
+        }
+        crate::wal_watermarks::from_dataset(&self.dataset).await
+    }
+
+    /// Read the latest manifest for every MemWAL shard. Manifest reads are
+    /// bounded-concurrent so stores with many writer instances do not pay one
+    /// object-store round trip per shard serially.
+    pub async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
+        // A checked-out version names a base-table snapshot, never the live WAL.
+        if self.is_version_pinned() {
+            return Ok(Vec::new());
+        }
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let warn_at = self.pending_generations_warn;
+        let max_at = self.pending_generations_max;
+        let uri: Arc<str> = Arc::from(self.dataset.uri());
+
+        let snapshots: Vec<Option<ShardSnapshot>> = stream::iter(shard_ids)
+            .map(|shard_id| {
+                let object_store = object_store.clone();
+                let branch_path = branch_path.clone();
+                let uri = uri.clone();
+                async move {
+                    let manifest_store = ShardManifestStore::new(
+                        object_store,
+                        &branch_path,
+                        shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    let Some(manifest) = manifest_store.refresh_latest().await? else {
+                        return Ok(None);
+                    };
+                    let pending = manifest.sstables.len();
+                    observe_value!(crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS, pending);
+                    if max_at != 0 && pending > max_at {
+                        // A read over this shard would open `pending` datasets
+                        // and hold their metadata at once. Past the cap that is
+                        // gigabytes per request (a 16k-generation shard took a
+                        // worker to its 32 GiB limit on one point lookup), and
+                        // the only cure is the merge that is already behind.
+                        // Fail the read fast so the caller retries after the
+                        // merge instead of taking the worker down with it.
+                        note_read_refused(&uri);
+                        return Err(LanceError::io(format!(
+                            "{PENDING_GENERATIONS_EXCEEDED}: shard {shard_id} has {pending} \
+                             flushed generations pending merge (cap {max_at}); retry after \
+                             the merge catches up"
+                        )));
+                    }
+                    if warn_at != 0 && pending >= warn_at {
+                        // Every pending generation is one more dataset this read
+                        // must open; past this point the shard's owner has stopped
+                        // keeping up and reads are on their way to exhausting memory.
+                        warn!(
+                            uri = %uri,
+                            shard = %shard_id,
+                            pending,
+                            warn_at,
+                            "MemWAL shard has many flushed generations pending merge; \
+                             reads open every one of them"
+                        );
+                    }
+                    let mut snapshot = ShardSnapshot::new(shard_id)
+                        .with_spec_id(manifest.shard_spec_id)
+                        .with_current_generation(manifest.current_generation);
+                    for sstable in manifest.sstables {
+                        snapshot = snapshot.with_sstable(sstable.generation, sstable.path);
+                    }
+                    Ok::<_, LanceError>(Some(snapshot))
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        let snapshots: Vec<ShardSnapshot> = snapshots.into_iter().flatten().collect();
+        // A read opens every pending generation of every shard, so the cap
+        // has to hold for the store as a whole, not just the worst shard: 20
+        // writer shards at ~1,400 generations each passed the per-shard check
+        // and still opened 25k datasets on one lookup (OOMKilled the worker).
+        let total: usize = snapshots
+            .iter()
+            .map(|snapshot| snapshot.sstables.len())
+            .sum();
+        if max_at != 0 && total > max_at {
+            note_read_refused(self.dataset.uri());
+            return Err(LanceError::io(format!(
+                "{PENDING_GENERATIONS_EXCEEDED}: {total} flushed generations pending merge \
+                 across {} shards (cap {max_at}); retry after the merge catches up",
+                snapshots.len()
+            )));
+        }
+        #[cfg(test)]
+        {
+            let pause = self.wal_snapshot_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                pause.captured.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+        Ok(snapshots)
+    }
+
+    /// Number of flushed MemWAL generations pending merge into the base table
+    /// across all shards. Read-only: unlike [`Self::cleanup_own_shard`] it never
+    /// merges.
+    pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
+        Ok(self.pending_wal_generation_counts().await?.0)
+    }
+
+    /// Total and largest per-shard pending counts from the same manifest read.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        let snapshots = self.wal_shard_snapshots().await?;
+        Ok((
+            snapshots.iter().map(|s| s.sstables.len()).sum(),
+            snapshots
+                .iter()
+                .map(|s| s.sstables.len())
+                .max()
+                .unwrap_or(0),
+        ))
+    }
+
+    /// Count rows in all immutable flushed-generation datasets using metadata
+    /// reads rather than a payload scan.
+    pub async fn pending_wal_rows(&self, snapshots: &[ShardSnapshot]) -> LanceResult<u64> {
+        let generation_paths: Vec<String> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.sstables.iter().map(|generation| {
+                    self.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                })
+            })
+            .collect();
+        let session = self.dataset.session();
+        let storage_options = self.storage_options.clone();
+
+        stream::iter(generation_paths)
+            .map(|path| {
+                let session = session.clone();
+                let storage_options = storage_options.clone();
+                async move {
+                    let mut builder = DatasetBuilder::from_uri(&path).with_session(session);
+                    if let Some(options) = storage_options {
+                        builder = builder.with_storage_options(options);
+                    }
+                    let dataset = builder.load().await?;
+                    Ok::<_, LanceError>(dataset.count_rows(None).await? as u64)
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY)
+            .try_fold(0_u64, |total, rows| async move { Ok(total + rows) })
+            .await
+    }
+
+    // ------------------------------------------------------------ LSM reads
+
+    /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
+    /// commits base before draining/deleting its generations, so an unchanged
+    /// base data view must bracket the WAL manifest capture. Metadata/index-only
+    /// publication does not change that view. Validate that pair
+    /// before reading payloads. A later commit does not invalidate a completed
+    /// read of that snapshot. Retry missing generations even when the base
+    /// version is unchanged; never return a partial result after one disappears.
+    /// Ordinary WAL appends do not force retries. Pinned reads use only their
+    /// selected base version. A progressing merge may invalidate several fresh
+    /// views in a few milliseconds: bound refreshes separately from repeated
+    /// missing-file failures at the same base version. Metadata retries get a
+    /// bounded window starting at the first invalidated capture, so slow initial
+    /// metadata IO cannot suppress the first retry before any payload is read.
+    /// Payload retries similarly start at the first missing-file failure: a
+    /// slow initial read must still be able to recover WAL reclaimed by a merge.
+    /// The retry budget limits starting another attempt, not a valid scan.
+    ///
+    /// The callback must complete the actual read before its future returns:
+    /// await `try_collect` or fully consume any stream inside the callback.
+    /// Do not return a lazy scanner, stream, or future, or retain the captured
+    /// dataset or shard snapshots for later reads. Read protection and retries
+    /// do not cover reads performed after the callback returns. The callback
+    /// may be invoked more than once, so keep it free of business side effects.
+    pub async fn read_consistent<T, F, Fut>(&self, source: ListSource, read: F) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+    {
+        self.read_consistent_with_snapshots(source, || self.wal_shard_snapshots(), read)
+            .await
+    }
+
+    pub(crate) async fn read_consistent_with_snapshots<T, F, Fut, S, Snapshot>(
+        &self,
+        source: ListSource,
+        capture: S,
+        read: F,
+    ) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+        S: FnMut() -> Snapshot,
+        Snapshot: std::future::Future<Output = LanceResult<Vec<ShardSnapshot>>>,
+    {
+        let operation = self.read_consistent_inner(source, capture, read);
+        self.protect_wal_read(source, operation).await
+    }
+
+    /// Register before either a fresh or cached read captures WAL metadata.
+    /// Keeping this separate preserves cached point-read refresh semantics.
+    pub(crate) async fn protect_wal_read<T>(
+        &self,
+        source: ListSource,
+        operation: impl std::future::Future<Output = LanceResult<T>>,
+    ) -> LanceResult<T> {
+        if self.wal_read_protection && !self.is_version_pinned() && source != ListSource::Fragments
+        {
+            crate::wal_read_lifetime::protect(
+                self.dataset.object_store(None).await?,
+                &self.dataset.branch_location().path,
+                crate::wal_read_lifetime::Policy::default(),
+                operation,
+            )
+            .await
+        } else {
+            operation.await
+        }
+    }
+
+    async fn read_consistent_inner<T, F, Fut, S, Snapshot>(
+        &self,
+        source: ListSource,
+        mut capture: S,
+        mut read: F,
+    ) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+        S: FnMut() -> Snapshot,
+        Snapshot: std::future::Future<Output = LanceResult<Vec<ShardSnapshot>>>,
+    {
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 16;
+        const MAX_MISSING_AT_VERSION: usize = 3;
+        let started = std::time::Instant::now();
+        // Report only terminal failures. Preserve the original error and retry
+        // decisions while distinguishing metadata failures from payload limits.
+        let report_failure = |phase: &'static str,
+                              attempt: usize,
+                              version: Option<u64>,
+                              missing_count: usize,
+                              payload_retry_ms: Option<u128>,
+                              error: &LanceError| {
+            warn!(uri = %self.dataset.uri(), phase, attempt = attempt + 1,
+                ?version, missing_count, ?payload_retry_ms, ?source,
+                missing_file = is_not_found_error(error),
+                elapsed_ms = started.elapsed().as_millis(),
+                "consistent read failed");
+        };
+        let retry_budget = std::time::Duration::from_secs(2);
+        let mut metadata_retry_started = None;
+        let mut payload_retry_started: Option<std::time::Instant> = None;
+        let mut next_dataset = None;
+        let mut captures = 0;
+        let mut last_missing_view: Option<Arc<lance_table::format::Manifest>> = None;
+        let mut missing_at_version = 0;
+        let mut base_open_secs = 0.0;
+        let mut wal_capture_secs = 0.0;
+        let mut base_validate_secs = 0.0;
+        let mut last_versions = None;
+        for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
+            // Once payload recovery begins, metadata churn and newer base
+            // versions cannot reset or extend that recovery window.
+            let retry_started = payload_retry_started
+                .or(metadata_retry_started)
+                .unwrap_or(started);
+            if attempt != 0 && retry_started.elapsed() >= retry_budget {
+                break;
+            }
+            captures += 1;
+            let phase_started = std::time::Instant::now();
+            let mut dataset = match next_dataset.take() {
+                Some(dataset) => dataset,
+                None => {
+                    let mut dataset = self.dataset.clone();
+                    if !self.is_version_pinned() {
+                        dataset.checkout_latest().await.inspect_err(|error| {
+                            report_failure(
+                                "base_open",
+                                attempt,
+                                None,
+                                missing_at_version,
+                                payload_retry_started.map(|t| t.elapsed().as_millis()),
+                                error,
+                            );
+                        })?;
+                    }
+                    dataset
+                }
+            };
+            base_open_secs += phase_started.elapsed().as_secs_f64();
+            let version = dataset.manifest.version;
+            let phase_started = std::time::Instant::now();
+            let mut snapshots = if source == ListSource::Fragments {
+                Vec::new()
+            } else {
+                capture().await.inspect_err(|error| {
+                    report_failure(
+                        "wal_capture",
+                        attempt,
+                        Some(version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        error,
+                    );
+                })?
+            };
+            wal_capture_secs += phase_started.elapsed().as_secs_f64();
+            if !self.is_version_pinned() {
+                let phase_started = std::time::Instant::now();
+                let mut latest = dataset.clone();
+                latest.checkout_latest().await.inspect_err(|error| {
+                    report_failure(
+                        "base_validate",
+                        attempt,
+                        Some(version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        error,
+                    );
+                })?;
+                let compatible = latest.manifest.version == version
+                    || same_base_read_data(&dataset.manifest, &latest.manifest)
+                    || rebase_wal_read_snapshot(&dataset, &latest, &mut snapshots)
+                        .await
+                        .inspect_err(|error| {
+                            report_failure(
+                                "wal_rebase",
+                                attempt,
+                                Some(version),
+                                missing_at_version,
+                                payload_retry_started.map(|t| t.elapsed().as_millis()),
+                                error,
+                            );
+                        })?;
+                // Include transaction-history IO in validation time so slow
+                // reads do not acquire an unaccounted metadata phase.
+                base_validate_secs += phase_started.elapsed().as_secs_f64();
+                last_versions = Some((version, latest.manifest.version));
+                if !compatible {
+                    // A merge could have drained WAL after we opened base.
+                    // Retry this metadata pair before scanning any payloads,
+                    // otherwise the view could omit its newly merged rows.
+                    metadata_retry_started.get_or_insert_with(std::time::Instant::now);
+                    // This version was observed before the next WAL capture.
+                    // Keep it as that capture's lower bound rather than opening
+                    // latest once more and discarding the work just completed.
+                    next_dataset = Some(latest);
+                    continue;
+                }
+                // Prefer the validated newer base. Either its data is unchanged,
+                // or atomic WAL coverage proves how to rebase the captured WAL.
+                dataset = latest;
+            }
+            // A successful metadata capture ends that metadata-only window.
+            // The payload window, once started, remains fixed across captures.
+            metadata_retry_started = None;
+            let result = read(dataset.clone(), snapshots).await;
+            if self.is_version_pinned() {
+                if let Err(error) = &result {
+                    report_failure(
+                        "payload_pinned",
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        None,
+                        error,
+                    );
+                }
+                return result;
+            }
+            if let Err(err) = &result {
+                if !is_not_found_error(err) {
+                    report_failure(
+                        "payload_non_missing",
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        payload_retry_started.map(|t| t.elapsed().as_millis()),
+                        err,
+                    );
+                    return result;
+                }
+                let payload_started =
+                    payload_retry_started.get_or_insert_with(std::time::Instant::now);
+                if last_missing_view.as_ref().is_some_and(|previous| {
+                    previous.version == dataset.manifest.version
+                        || same_base_read_data(previous, &dataset.manifest)
+                }) {
+                    missing_at_version += 1;
+                } else {
+                    missing_at_version = 1;
+                }
+                last_missing_view = Some(dataset.manifest.clone());
+                // Actual data changes justify refreshing again, but repeated
+                // failures with unchanged data retain the old three-attempt
+                // bound. Neither continuous commits nor missing data permit
+                // unlimited repeated payload decoding.
+                if missing_at_version >= MAX_MISSING_AT_VERSION
+                    || attempt + 1 == MAX_SNAPSHOT_ATTEMPTS
+                    || payload_started.elapsed() >= retry_budget
+                {
+                    let phase = if missing_at_version >= MAX_MISSING_AT_VERSION {
+                        "payload_same_view_limit"
+                    } else if attempt + 1 == MAX_SNAPSHOT_ATTEMPTS {
+                        "payload_attempt_limit"
+                    } else {
+                        "payload_time_limit"
+                    };
+                    report_failure(
+                        phase,
+                        attempt,
+                        Some(dataset.manifest.version),
+                        missing_at_version,
+                        Some(payload_started.elapsed().as_millis()),
+                        err,
+                    );
+                    return result;
+                }
+                // A merge may already have committed before this read began.
+                // Its later WAL GC can invalidate our snapshot without changing
+                // the base version. Refresh both snapshots even in that case.
+                continue;
+            }
+            // The immutable base/WAL view was complete at capture. A commit
+            // after capture may force a missing-file retry, but cannot make
+            // successfully read rows disappear. Requiring the base to stay
+            // unchanged throughout payload decoding starves reads under
+            // continuous merging and repeats all their decoding work.
+            return result;
+        }
+        warn!(uri = %self.dataset.uri(), captures, ?source, ?last_versions,
+            base_open_secs, wal_capture_secs, base_validate_secs,
+            elapsed_secs = started.elapsed().as_secs_f64(),
+            "read could not capture stable base/WAL metadata within retry limits");
+        Err(LanceError::io(
+            "dataset changed during read; retry the request",
+        ))
+    }
+
+    /// Build an LSM scanner over the base table unioned with every shard's
+    /// flushed MemWAL generations, discovered from object storage. Because the
+    /// snapshot is rebuilt from shard manifests on each call, one instance sees
+    /// every other instance's flushed appends — reads are not pinned to the
+    /// writing instance. Deduplicates by the key column.
+    #[cfg(test)]
+    pub async fn lsm_scanner(&self) -> LanceResult<LsmScanner> {
+        let shard_snapshots = self.wal_shard_snapshots().await?;
+        Ok(self.lsm_scanner_for_source(ListSource::All, shard_snapshots))
+    }
+
+    /// Build a paginating scanner for the requested [`ListSource`],
+    /// deduplicating by the key column:
+    /// - `Fragments`: base table only (`shard_snapshots` is ignored — callers
+    ///   pass an empty vec so no manifest reads happen);
+    /// - `All`: base table ∪ the flushed generations in `shard_snapshots`;
+    /// - `Wal`: only the flushed generations, resolving relative generation
+    ///   paths against the dataset root.
+    pub fn lsm_scanner_for_source(
+        &self,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LsmScanner {
+        Self::lsm_scanner_for_dataset(&self.dataset, &self.key_column, source, shard_snapshots)
+    }
+
+    pub fn lsm_scanner_for_dataset(
+        dataset: &Dataset,
+        key_column: &str,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LsmScanner {
+        let merge_key = vec![key_column.to_string()];
+        match source {
+            ListSource::Fragments => {
+                LsmScanner::new(Arc::new(dataset.clone()), Vec::new(), merge_key)
+            }
+            ListSource::All => {
+                LsmScanner::new(Arc::new(dataset.clone()), shard_snapshots, merge_key)
+            }
+            ListSource::Wal => {
+                let arrow_schema: Schema = dataset.schema().into();
+                LsmScanner::without_base_table(
+                    Arc::new(arrow_schema),
+                    dataset.uri().trim_end_matches('/').to_string(),
+                    shard_snapshots,
+                    merge_key,
+                )
+                .with_session(dataset.session())
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- open/create
+
+    /// Open a Lance dataset with this store's storage options and session.
+    ///
+    /// Every open in the storage layer goes through here. A plain
+    /// `Dataset::open` builds a fresh per-store session (Lance's 6 GiB index +
+    /// 1 GiB metadata default) and silently drops storage options, which breaks
+    /// on credentialed object stores.
+    pub async fn load_with_options(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+    ) -> LanceResult<Dataset> {
+        let mut store_params = storage_options.clone().map(|options| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        });
+        if let Some(wrapper) = crate::merge_write_scope::preparation_store_wrapper() {
+            store_params
+                .get_or_insert_with(ObjectStoreParams::default)
+                .object_store_wrapper = Some(wrapper);
+        }
+        let handler = lance_table::io::commit::commit_handler_from_url(uri, &store_params).await?;
+        let mut builder = DatasetBuilder::from_uri(uri)
+            .with_read_params(lance::dataset::ReadParams {
+                store_options: store_params,
+                ..Default::default()
+            })
+            .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+                handler,
+            )));
+        if let Some(options) = storage_options {
+            builder = builder.with_storage_options(options);
+        }
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        let dataset = builder.load().await?;
+        if crate::merge_write_scope::observes_preparation_io() {
+            let store = dataset.object_store(None).await?;
+            crate::merge_write_scope::register_local_preparation_io(&store);
+        }
+        Ok(dataset)
+    }
+
+    /// Create an empty Lance dataset with `schema` at `uri`.
+    pub async fn create_with_options(
+        uri: &str,
+        schema: Arc<Schema>,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+    ) -> LanceResult<Dataset> {
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
+            schema,
+        );
+
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            ..Default::default()
+        };
+        if let Some(options) = storage_options {
+            params.store_params = Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(options),
+                )),
+                ..Default::default()
+            });
+        }
+        params.session = session;
+        let handler =
+            lance_table::io::commit::commit_handler_from_url(uri, &params.store_params).await?;
+        params.commit_handler = Some(Arc::new(crate::merge_write_scope::GuardedCommit::new(
+            handler,
+        )));
+
+        crate::merge_write_scope::at_initial_version(Dataset::write(batches, uri, Some(params)))
+            .await
+    }
+}
+
+impl Drop for StorageBase {
+    /// Best-effort drain of a still-resident writer's background tasks.
+    ///
+    /// Dropping the last writer cancels its tasks without sealing its WAL.
+    /// The graceful path is [`Self::close`], but a
+    /// store can also be dropped without an `await` (e.g. LRU eviction). When a
+    /// Tokio runtime is available we move the writer into a detached task that
+    /// closes it; otherwise we can only drop it.
+    ///
+    /// `ShardWriter::close` seals the active memtable, so this path is also what
+    /// keeps an evicted-but-unflushed store's rows from being stranded. Each way
+    /// it can fail to do that is logged rather than swallowed: a stranded
+    /// memtable leaves rows durable in the WAL but invisible to reads until the
+    /// next process restart replays it, which is near-impossible to diagnose
+    /// without a signal here.
+    fn drop(&mut self) {
+        // `&mut self` in drop → exclusive access, so `get_mut` avoids a lock.
+        if let Some(writer) = self.write_writer.get_mut().take() {
+            let shard = self.write_shard;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    // Only the sole owner can close; if an append still shares
+                    // the Arc it will drop last. Best-effort either way.
+                    match Arc::try_unwrap(writer) {
+                        Ok(writer) => {
+                            if let Err(err) = writer.close().await {
+                                warn!(
+                                    shard = %shard,
+                                    error = %err,
+                                    "detached close of a dropped writer failed; unflushed \
+                                     rows stay durable in the WAL but remain invisible \
+                                     until the next replay"
+                                );
+                            }
+                        }
+                        Err(_shared) => {
+                            tracing::debug!(
+                                shard = %shard,
+                                "dropped writer is still shared by an in-flight append; \
+                                 task cancellation deferred to the last Arc holder; \
+                                 unsealed rows require WAL replay"
+                            );
+                        }
+                    }
+                });
+            } else {
+                warn!(
+                    shard = %shard,
+                    "writer dropped with no Tokio runtime available for close; \
+                     unflushed rows remain invisible until the next WAL replay"
+                );
+            }
+        }
+    }
+}
+
+/// Whether a Lance error is a MemWAL writer-fence error — i.e. this writer's
+/// shard epoch was superseded by a later claimer. Matched on the error text
+/// because Lance surfaces the fence as a generic error rather than a dedicated
+/// variant (see `ShardWriter::check_fenced`, which reports "Writer fenced").
+pub(crate) fn is_fenced_error(err: &LanceError) -> bool {
+    let text = err.to_string();
+    text.contains("fenced") || text.contains("Fenced")
+}
+
+/// Whether a Lance error means the target dataset/path does not exist.
+///
+/// WAL reads can race with a merge draining and deleting a generation. A read
+/// must then refresh its base/WAL view, not return a partial result. Both the
+/// structured variants and the object-store message are matched; the latter
+/// can arrive as a generic wrapped IO error with different capitalization.
+pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
+    if matches!(
+        err,
+        LanceError::DatasetNotFound { .. } | LanceError::NotFound { .. }
+    ) {
+        return true;
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("not found") || text.contains("notfound")
+}
+
+/// Keep the newest prepared row for each merge key.
+///
+/// Generations are ordered newest-first and rows within each generation are
+/// visited in reverse physical order, matching the LSM scanner's last-write-
+/// wins behavior. Returning a duplicate-free source also keeps Lance's
+/// merge-insert semantics deterministic when one key was retried before seal.
+fn dedupe_merge_batches(
+    mut generation_batches: Vec<(u64, Vec<RecordBatch>)>,
+    key_column: &str,
+    target_schema: Arc<Schema>,
+) -> LanceResult<Vec<RecordBatch>> {
+    generation_batches.sort_by_key(|batch| std::cmp::Reverse(batch.0));
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for (_, batches) in generation_batches {
+        for batch in batches.into_iter().rev() {
+            let key_index = batch.schema().index_of(key_column)?;
+            let key_array = batch.column(key_index);
+            let mut selected = Vec::new();
+            for row in (0..batch.num_rows()).rev() {
+                let key = ScalarValue::try_from_array(key_array, row)
+                    .map_err(|err| ArrowError::ComputeError(err.to_string()))?;
+                if key.is_null() {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "merge key column '{key_column}' contains a null value"
+                    ))
+                    .into());
+                }
+                if seen.insert(key) {
+                    selected.push(u32::try_from(row).map_err(|_| {
+                        ArrowError::InvalidArgumentError(
+                            "merge batch row index exceeds u32::MAX".to_string(),
+                        )
+                    })?);
+                }
+            }
+            if selected.is_empty() {
+                continue;
+            }
+
+            // All rows survived: their original order is already the desired
+            // order. Reuse the arrays instead of copying every payload through
+            // Arrow take while the other generation batches remain resident.
+            // Keep applying the requested schema, including its metadata.
+            if selected.len() == batch.num_rows() {
+                deduped.push(RecordBatch::try_new(
+                    target_schema.clone(),
+                    batch.columns().to_vec(),
+                )?);
+                continue;
+            }
+
+            // Restore source order within each retained batch. Cross-batch
+            // ordering no longer affects results because keys are now unique.
+            selected.reverse();
+            let indices = UInt32Array::from(selected);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column.as_ref(), &indices, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            deduped.push(RecordBatch::try_new(target_schema.clone(), columns)?);
+        }
+    }
+    Ok(deduped)
+}
+
+#[cfg(test)]
+#[path = "store_base_dedupe_tests.rs"]
+mod dedupe_tests;
+
+/// Align a flushed-generation batch with the base table schema before append.
+///
+/// Nullable columns added after the generation was written are materialized as
+/// null arrays. Missing required columns, type changes, and generation-only
+/// columns remain hard errors so a merge cannot silently corrupt or discard
+/// data.
+pub(crate) fn align_batch_to_schema(
+    batch: RecordBatch,
+    target_schema: Arc<Schema>,
+) -> LanceResult<RecordBatch> {
+    let source_schema = batch.schema();
+
+    for source_field in source_schema.fields() {
+        if source_field.name() == TOMBSTONE {
+            continue;
+        }
+        if target_schema.field_with_name(source_field.name()).is_err() {
+            return Err(ArrowError::SchemaError(format!(
+                "WAL generation column '{}' does not exist in the base table schema",
+                source_field.name()
+            ))
+            .into());
+        }
+    }
+
+    let columns = target_schema
+        .fields()
+        .iter()
+        .map(
+            |target_field| match source_schema.column_with_name(target_field.name()) {
+                Some((index, source_field)) => {
+                    if source_field.data_type() != target_field.data_type() {
+                        return Err(ArrowError::SchemaError(format!(
+                            "WAL generation column '{}' has type {}, expected {}",
+                            target_field.name(),
+                            source_field.data_type(),
+                            target_field.data_type()
+                        ))
+                        .into());
+                    }
+                    Ok(batch.column(index).clone())
+                }
+                None if target_field.is_nullable() => {
+                    Ok(new_null_array(target_field.data_type(), batch.num_rows()))
+                }
+                None => Err(ArrowError::SchemaError(format!(
+                    "required base table column '{}' is missing from the WAL generation",
+                    target_field.name()
+                ))
+                .into()),
+            },
+        )
+        .collect::<LanceResult<Vec<_>>>()?;
+
+    Ok(RecordBatch::try_new(target_schema, columns)?)
+}
+
+/// A read refused because the store's WAL backlog is over the cap. Labeled by
+/// store so the fleet can see *which* store is unreadable, not just that one
+/// is: a single store answered 503 for five hours today before anyone
+/// noticed. The label is the dataset directory name, bounded by the number
+/// of stores a worker touches.
+fn note_read_refused(_uri: &str) {
+    count!(
+        "rollout_reads_refused_pending_total",
+        "store" => _uri
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    );
+}
+
+/// Compare the immutable read view while excluding publication bookkeeping.
+/// Fragment data/deletion/row-id files, schema, configuration, external paths,
+/// feature flags and every other manifest field must still match. Normalizing
+/// a clone retains comparison of future manifest fields too; the potentially
+/// large fragment vector remains shared through its Arc.
+fn same_base_read_data(
+    before: &lance_table::format::Manifest,
+    after: &lance_table::format::Manifest,
+) -> bool {
+    let mut comparable = after.clone();
+    comparable.version = before.version;
+    comparable.version_aux_data = before.version_aux_data;
+    comparable.index_section = before.index_section;
+    comparable.timestamp_nanos = before.timestamp_nanos;
+    comparable.tag = before.tag.clone();
+    comparable.transaction_file = before.transaction_file.clone();
+    comparable.transaction_section = before.transaction_section;
+    comparable.table_metadata = before.table_metadata.clone();
+    *before == comparable
+}
+
+/// Accept a newer base only when every intervening data publication proves
+/// that its WAL coverage moved atomically with its rows. Legacy delete/append,
+/// external mutations, restore and missing history retain the original retry.
+/// No writer lock or etcd request is needed for immutable transaction history.
+async fn rebase_wal_read_snapshot(
+    before: &Dataset,
+    after: &Dataset,
+    snapshots: &mut [ShardSnapshot],
+) -> LanceResult<bool> {
+    use lance::dataset::transaction::Operation;
+
+    const MAX_READ_REBASE_VERSIONS: u64 = 32;
+    let lower = before.version().version;
+    let upper = after.version().version;
+    if upper <= lower
+        || upper - lower > MAX_READ_REBASE_VERSIONS
+        || before.schema().fields != after.schema().fields
+        || before.schema().metadata != after.schema().metadata
+    {
+        return Ok(false);
+    }
+    let mut required = HashMap::<Uuid, u64>::new();
+    for version in lower + 1..=upper {
+        let transaction = match after.read_transaction_by_version(version).await {
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => return Ok(false),
+            Err(error) if is_not_found_error(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        match transaction.operation {
+            // Compaction reserves fragment IDs before its data-preserving
+            // rewrite. Reservation changes no rows and needs no WAL coverage.
+            Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Rewrite { .. } => {}
+            Operation::Update {
+                compacted_sstables,
+                fields_modified,
+                updated_fragment_offsets,
+                ..
+            } if !compacted_sstables.is_empty()
+                && fields_modified.is_empty()
+                && updated_fragment_offsets.is_none() =>
+            {
+                for covered in compacted_sstables {
+                    required
+                        .entry(covered.shard_id)
+                        .and_modify(|high| *high = (*high).max(covered.generation))
+                        .or_insert(covered.generation);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    let watermarks = crate::rollout_append::watermarks(after).await?;
+    if required
+        .iter()
+        .any(|(shard, high)| watermarks.get(shard).is_none_or(|actual| actual < high))
+    {
+        return Ok(false);
+    }
+    // Never let captured but already committed WAL override the newer base,
+    // and never open files its merge is now permitted to garbage collect.
+    for snapshot in snapshots {
+        if let Some(high) = watermarks.get(&snapshot.shard_id) {
+            snapshot.sstables.retain(|table| table.generation > *high);
+        }
+    }
+    Ok(true)
+}
+
+/// Derive the MemWAL shard UUID a server instance writes to from its stable
+/// instance id. Deterministic (UUID v5), so the same instance id always maps to
+/// the same shard across restarts and reopens — the losing/gaining semantics of
+/// StatefulSet rescheduling therefore keep writing the same physical shard.
+/// `None` maps to a single fixed `"default"` shard for single-instance use.
+#[must_use]
+pub fn derive_shard_id(instance_id: Option<&str>) -> Uuid {
+    let input = instance_id.unwrap_or("default");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
+}
+
+#[cfg(test)]
+mod cold_recovery_tests {
+    use super::OWN_WAL_RECOVERY_SLOT;
+    use crate::RolloutStore;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn empty_shard_cleanup_does_not_wait_for_other_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let _occupied = OWN_WAL_RECOVERY_SLOT.acquire().await.unwrap();
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.prepare_recovered_cleanup_merge(),
+        )
+        .await
+        .expect("absent own shard must bypass cold recovery admission")
+        .unwrap();
+        assert!(prepared.is_none());
+        assert!(store.own_shard_watermark().await.unwrap().is_none());
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod flush_retry_tests;

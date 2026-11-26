@@ -1,0 +1,2617 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::response::Response;
+use axum::{Extension, Json};
+use lance_context_api::{
+    AddRolloutRequest, AddRolloutsRequest, AddRolloutsResponse, CheckoutRequest, CompactRequest,
+    CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
+    ListRolloutStoresResponse, ListRolloutsResponse, RolloutStoreInfo, VersionResponse,
+};
+#[cfg(test)]
+use lance_context_core::rollout_record_from_add_request;
+use lance_context_core::rollout_record_to_dto;
+use lance_context_core::{
+    CompactionConfig, RolloutFilters, RolloutRecord, RolloutStore, RolloutStoreOptions,
+};
+use tokio::sync::RwLock;
+
+use crate::drain::ClientCancellation;
+use crate::error::AppError;
+use crate::state::AppState;
+
+/// Upper bound on a single rollout append request body (JSON or multipart).
+/// Artifact blobs routinely exceed axum's 2 MiB default, so the batch endpoint
+/// raises the ceiling well above it while still bounding memory.
+pub const MAX_ROLLOUT_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Frame size for chunked blob download responses. The in-memory `Vec<u8>` is
+/// sliced into frames of this size so the HTTP send path never holds an extra
+/// full-blob copy and a slow reader exerts backpressure at frame granularity
+/// rather than after the whole payload is queued. 256 KiB keeps per-frame
+/// overhead negligible while capping the amount buffered ahead of the socket.
+const BLOB_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Build a chunked [`Body`] from an owned blob. `Bytes` frames share one
+/// backing allocation (cheap refcounted slices — no per-frame copy), so this
+/// does not duplicate the payload; it only changes how it is fed to the socket.
+///
+/// `reservation` (the in-flight blob-budget guard, if any) is moved into the
+/// stream and released only when the last frame has been produced, so the
+/// budget accounts for a slow download for its full lifetime.
+fn blob_stream_body(
+    bytes: Vec<u8>,
+    mut reservation: Option<crate::state::BlobReservation>,
+) -> Body {
+    let buf = bytes::Bytes::from(bytes);
+    let len = buf.len();
+    let mut offset = 0usize;
+    let stream = futures::stream::poll_fn(move |_| {
+        if offset >= len {
+            // Drop the reservation exactly when the stream ends.
+            let _ = reservation.take();
+            return std::task::Poll::Ready(None);
+        }
+        let end = (offset + BLOB_STREAM_CHUNK_BYTES).min(len);
+        let frame = buf.slice(offset..end);
+        offset = end;
+        std::task::Poll::Ready(Some(Ok::<_, std::convert::Infallible>(frame)))
+    });
+    Body::from_stream(stream)
+}
+
+/// Unknown lengths need exclusive admission before any body buffering.
+fn content_length(headers: &header::HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+/// Whether the request asked for a synchronous flush via `?flush=true`.
+///
+/// Accepts `flush=true` or a bare `flush`; anything else (including
+/// `flush=false`) leaves the default asynchronous-visibility behavior. Parsed
+/// by hand because [`add_rollouts`] consumes the whole `Request` to dispatch on
+/// `Content-Type` and so cannot also use a `Query` extractor.
+fn flush_requested(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    query.split('&').any(|pair| match pair.split_once('=') {
+        Some(("flush", value)) => value.eq_ignore_ascii_case("true") || value == "1",
+        None => pair == "flush",
+        _ => false,
+    })
+}
+
+/// Whether a blob of `len` bytes crosses the large-blob log threshold.
+///
+/// Split out from [`observe_blob_sizes`] so the boundary is testable without a
+/// tracing-capture harness: `0` disables, and the comparison is inclusive so a
+/// blob exactly at the threshold logs.
+fn should_log_large_blob(len: usize, threshold: usize) -> bool {
+    threshold > 0 && len >= threshold
+}
+
+/// Record the size of every inline artifact blob in `records`, and warn for any
+/// that crosses `ROLLOUT_LARGE_BLOB_LOG_BYTES`.
+///
+/// Called once after parsing, where the multipart and JSON paths converge, so
+/// both content types are covered by a single site: a record can arrive with
+/// `binary_payload` already populated from an inline-JSON body, never passing
+/// through the multipart blob loop.
+///
+/// The histogram is deliberately unlabelled. Tagging by experiment would be the
+/// more useful signal, but a deployment can carry thousands of experiments and
+/// each label value is a separate time series; the warn log supplies the
+/// identifying detail for the outliers that actually matter instead.
+fn observe_blob_sizes(state: &AppState, experiment: &str, records: &[AddRolloutRequest]) {
+    let threshold = state.rollout_large_blob_log_bytes;
+    for record in records {
+        let Some(payload) = record.binary_payload.as_ref() else {
+            continue;
+        };
+        metrics::histogram!("rollout_blob_bytes").record(payload.len() as f64);
+        if should_log_large_blob(payload.len(), threshold) {
+            tracing::warn!(
+                experiment = %experiment,
+                record_id = %record.id,
+                blob_bytes = payload.len(),
+                "large inline blob written"
+            );
+        }
+    }
+}
+
+/// Reserve `bytes` from the instance's in-flight blob budget (if configured),
+/// returning the RAII guard to hold for the request's duration. Returns
+/// `503 Overloaded` when the budget cannot currently admit the request. When no
+/// budget is configured (`None`) this is a no-op that always admits.
+fn acquire_blob_budget(
+    state: &AppState,
+    bytes: Option<usize>,
+) -> Result<Option<crate::state::BlobReservation>, AppError> {
+    match &state.blob_budget {
+        None => Ok(None),
+        Some(budget) => bytes
+            .map_or_else(
+                || budget.try_acquire_unknown(),
+                |bytes| budget.try_acquire(bytes),
+            )
+            .map(Some)
+            .ok_or_else(|| {
+                metrics::counter!("rollout_blob_budget_rejections_total").increment(1);
+                AppError::Overloaded(
+                    "server is at its in-flight blob memory limit; retry shortly".to_string(),
+                )
+            }),
+    }
+}
+
+/// Reserve before polling a payload read. Stored payload_size is optional and
+/// caller supplied, so it cannot be used to admit an allocation safely.
+async fn load_blob_with_budget(
+    state: &AppState,
+    load: impl std::future::Future<Output = Result<Option<Vec<u8>>, AppError>>,
+) -> Result<(Option<Vec<u8>>, Option<crate::state::BlobReservation>), AppError> {
+    let mut reservation = acquire_blob_budget(state, None)?;
+    let bytes = load.await?;
+    if let Some(reservation) = reservation.as_mut() {
+        reservation.shrink_to(bytes.as_ref().map_or(0, Vec::len));
+    }
+    Ok((bytes, reservation))
+}
+
+/// Response for the internal WAL-merge trigger: how many flushed generations
+/// this worker's shard folded into the base table.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct MergeWalResponse {
+    pub reclaimed: usize,
+}
+
+pub async fn create_rollout_store(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateRolloutStoreRequest>,
+) -> Result<(StatusCode, Json<RolloutStoreInfo>), AppError> {
+    AppState::validate_name(&req.name)?;
+    let mut handle = state.rollout_handles.lock(&req.name).await;
+    // Existence is tracked durably in the registry, not by cache membership.
+    if state
+        .rollout_registry
+        .contains(&req.name)
+        .await
+        .map_err(AppError::from_lance)?
+    {
+        return Err(AppError::AlreadyExists(format!(
+            "Rollout store '{}' already exists",
+            req.name
+        )));
+    }
+
+    let uri = state.rollout_uri(&req.name);
+    let options = RolloutStoreOptions {
+        storage_options: req.storage_options,
+        shard_id: state.instance_id.clone(),
+        merge_after_generations: (state.rollout_merge_after_generations > 0)
+            .then_some(state.rollout_merge_after_generations),
+        merge_max_generations: Some(state.rollout_merge_max_generations),
+        merge_max_bytes: Some(state.rollout_merge_max_bytes),
+        key_index_type: Default::default(),
+        pending_generations_warn: Some(state.rollout_wal_pending_warn_generations),
+        pending_generations_max: Some(state.rollout_wal_pending_max_generations),
+        merge_budget: state.merge_budget.clone(),
+        session: state.rollout_session.clone(),
+    };
+
+    let store = RolloutStore::open_with_options(&uri, options)
+        .await
+        .map_err(AppError::from_lance)?;
+    let version = store.version();
+
+    let store = Arc::new(RwLock::new(store));
+    // Record in the durable registry and the LRU. WAL cleanup is handled by the
+    // single process-wide sweeper (see `AppState::spawn_global_sweeper`), so no
+    // per-store timer is started here.
+    state
+        .register_rollout(&req.name, &uri, store, &mut handle)
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RolloutStoreInfo {
+            name: req.name,
+            uri,
+            version: Some(version),
+        }),
+    ))
+}
+
+pub async fn list_rollout_stores(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ListRolloutStoresResponse>, AppError> {
+    // Served from the durable registry so it enumerates *all* stores, not just
+    // those currently resident in the LRU. `version` is omitted here to avoid
+    // opening every dataset.
+    let entries = state
+        .rollout_registry
+        .list()
+        .await
+        .map_err(AppError::from_lance)?;
+    let out = entries
+        .into_iter()
+        .map(|entry| RolloutStoreInfo {
+            name: entry.name,
+            uri: entry.uri,
+            version: None,
+        })
+        .collect();
+
+    Ok(Json(ListRolloutStoresResponse { stores: out }))
+}
+
+pub async fn get_rollout_store(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<RolloutStoreInfo>, AppError> {
+    use crate::store_timing::{measure, Stage};
+    let store_lock = measure(
+        &name,
+        Stage::InfoResolve,
+        state.get_or_open_rollout_store(&name),
+    )
+    .await?;
+    let store = measure(&name, Stage::InfoLock, store_lock.read()).await;
+
+    Ok(Json(RolloutStoreInfo {
+        name,
+        uri: store.uri().to_string(),
+        version: Some(store.version()),
+    }))
+}
+
+pub async fn delete_rollout_store(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, AppError> {
+    // Removes from the durable registry and evicts any resident handle; 404 when
+    // the store is not registered.
+    if !state.unregister_rollout(&name).await? {
+        return Err(AppError::NotFound(format!(
+            "Rollout store '{}' does not exist",
+            name
+        )));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Append rollout rows. The single POST endpoint accepts either encoding,
+/// chosen by `Content-Type`:
+///
+/// - `application/json`: an [`AddRolloutsRequest`]; any `binary_payload` rides
+///   inline as base64.
+/// - `multipart/form-data`: a first part named `metadata` holding the records
+///   array (with each `binary_payload` null), followed by one raw binary part
+///   per record that carries a blob, named for that record's zero-based index.
+///
+/// Both encodings funnel into a single [`RolloutStore::add`]. A rollout append
+/// is atomic and feeds training, so the multipart path is validated strictly:
+/// any part whose name is not a valid record index, any index with no matching
+/// record, a duplicate index, a byte length disagreeing with the record's
+/// `payload_size`, or a record that declares `payload_size` yet receives no
+/// bytes rejects the whole request with `400` before anything is written.
+///
+/// # Visibility
+///
+/// By default the append is **durable but not yet readable**: `add` persists
+/// the WAL entry and returns, and the row becomes visible once the server's
+/// flush sweeper seals the memtable (`ROLLOUT_FLUSH_INTERVAL_SECS`, default
+/// 30s). Callers that must read their own write — a training loop verifying a
+/// trajectory, a write-then-assert test — can pass `?flush=true` to seal before
+/// responding, trading latency for immediate visibility. See
+/// [`RolloutStore::add`] for the full contract.
+pub async fn add_rollouts(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Result<(StatusCode, Json<AddRolloutsResponse>), AppError> {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Parsed from the URI rather than a `Query` extractor because this handler
+    // consumes the whole `Request` to dispatch on Content-Type.
+    let flush = flush_requested(req.uri().query());
+
+    // Admit against the in-flight blob budget before buffering the body, using
+    // the declared Content-Length, or exclusive admission for an unknown size.
+    // Held for the whole handler so concurrent uploads cannot collectively exceed the budget and
+    // OOM the worker; dropped when the request completes.
+    let _budget = acquire_blob_budget(&state, content_length(req.headers()))?;
+
+    let records = if content_type_is(&content_type, "multipart/form-data") {
+        let multipart = Multipart::from_request(req, &state)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("invalid multipart request: {e}")))?;
+        parse_multipart_rollouts(multipart).await?
+    } else if content_type_is(&content_type, "application/json") {
+        let bytes = axum::body::to_bytes(req.into_body(), MAX_ROLLOUT_UPLOAD_BYTES)
+            .await
+            .map_err(|e| AppError::InvalidRequest(format!("failed to read request body: {e}")))?;
+        let manifest: AddRolloutsRequest = serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::InvalidRequest(format!("invalid JSON body: {e}")))?;
+        manifest.records
+    } else {
+        return Err(AppError::InvalidRequest(format!(
+            "unsupported Content-Type '{content_type}': expected application/json or multipart/form-data"
+        )));
+    };
+
+    if records.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "records array must not be empty".to_string(),
+        ));
+    }
+
+    observe_blob_sizes(&state, &name, &records);
+
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
+    let core_records: Vec<RolloutRecord> = records.into_iter().map(RolloutRecord::from).collect();
+    let count = core_records.len();
+
+    // A read lock: `add` is `&self` and MemWAL appends are internally
+    // concurrent, so multiple ingest requests to the same store run in parallel.
+    // Mutating ops (merge, compact, checkout, close) still take the write lock.
+    let store = store_lock.read().await;
+
+    // Times only the store work (`add` + optional `flush`), excluding body
+    // parsing, multipart decode and blob-budget admission. Subtracting this from
+    // `http_request_duration_seconds` gives the framing overhead. The `flush`
+    // label is what makes a flushing add separable at all: flush is a query
+    // param on this same route, so `MatchedPath` (and therefore the HTTP
+    // metric's `path` label) is byte-identical for both.
+    //
+    // Success path only: failures already surface as `http_requests_total`
+    // with a 4xx/5xx status, so a `result` label here would double this
+    // histogram's series count to say something already observable.
+    let flush_label = if flush { "true" } else { "false" };
+    let store_start = std::time::Instant::now();
+    let version = store
+        .add(&core_records)
+        .await
+        .map_err(AppError::from_lance)?;
+
+    // Opt-in read-your-write: seal the memtable so the rows just appended are
+    // readable by the time this responds. Still the read lock — `flush` is
+    // `&self`, and concurrent appends are safe against it.
+    if flush {
+        store.flush().await.map_err(AppError::from_lance)?;
+        metrics::counter!("rollout_appends_flushed_total").increment(1);
+    }
+
+    metrics::histogram!(
+        "rollout_add_request_duration_seconds",
+        "flush" => flush_label,
+    )
+    .record(store_start.elapsed().as_secs_f64());
+
+    metrics::counter!("rollout_appends_total", "flush" => flush_label).increment(1);
+    metrics::counter!("rollout_records_appended_total").increment(count as u64);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AddRolloutsResponse {
+            version,
+            ids,
+            count,
+        }),
+    ))
+}
+
+/// Parse a `multipart/form-data` rollout append into records with their blob
+/// bytes attached. Enforces the strict-reject contract described on
+/// [`add_rollouts`].
+async fn parse_multipart_rollouts(
+    mut multipart: Multipart,
+) -> Result<Vec<AddRolloutRequest>, AppError> {
+    // The manifest must arrive first so blob parts can be matched by index as
+    // they stream in.
+    let first = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("malformed multipart body: {e}")))?
+        .ok_or_else(|| AppError::InvalidRequest("multipart body is empty".to_string()))?;
+    if first.name() != Some("metadata") {
+        return Err(AppError::InvalidRequest(format!(
+            "first multipart part must be named 'metadata', found '{}'",
+            first.name().unwrap_or("<unnamed>")
+        )));
+    }
+    let metadata_bytes = first
+        .bytes()
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("failed to read metadata part: {e}")))?;
+    let manifest: AddRolloutsRequest = serde_json::from_slice(&metadata_bytes)
+        .map_err(|e| AppError::InvalidRequest(format!("invalid metadata JSON: {e}")))?;
+    let mut records = manifest.records;
+
+    // Collect the raw binary parts, keyed by the record index they target.
+    let mut blobs: HashMap<usize, Vec<u8>> = HashMap::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::InvalidRequest(format!("malformed multipart body: {e}")))?
+    {
+        let part_name = field
+            .name()
+            .ok_or_else(|| {
+                AppError::InvalidRequest("multipart part is missing a name".to_string())
+            })?
+            .to_string();
+        let idx: usize = part_name.parse().map_err(|_| {
+            AppError::InvalidRequest(format!(
+                "unexpected multipart part '{part_name}': expected a record index"
+            ))
+        })?;
+        if idx >= records.len() {
+            return Err(AppError::InvalidRequest(format!(
+                "multipart part '{idx}' has no matching record ({} records supplied)",
+                records.len()
+            )));
+        }
+        let bytes = field.bytes().await.map_err(|e| {
+            AppError::InvalidRequest(format!("failed to read binary part '{idx}': {e}"))
+        })?;
+        if blobs.insert(idx, bytes.to_vec()).is_some() {
+            return Err(AppError::InvalidRequest(format!(
+                "duplicate multipart part for record index {idx}"
+            )));
+        }
+    }
+
+    // Attach each blob to its record, verifying the declared size.
+    for (idx, bytes) in blobs {
+        let record = &mut records[idx];
+        if let Some(expected) = record.payload_size {
+            if expected != bytes.len() as i64 {
+                return Err(AppError::InvalidRequest(format!(
+                    "record index {idx}: payload_size {expected} does not match received {} bytes",
+                    bytes.len()
+                )));
+            }
+        }
+        record.binary_payload = Some(bytes);
+    }
+
+    // Symmetric strict-reject: a record that declares a payload but received no
+    // bytes (no inline payload and no matching part) would be written with an
+    // empty artifact, silently dropping training data. Reject it.
+    for (idx, record) in records.iter().enumerate() {
+        if record.payload_size.is_some() && record.binary_payload.is_none() {
+            return Err(AppError::InvalidRequest(format!(
+                "record index {idx} declares payload_size but no binary part was supplied"
+            )));
+        }
+    }
+
+    Ok(records)
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RolloutListParams {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub filters: Option<String>,
+}
+
+const LIST_READ_STAGES: [&str; 4] = ["resolve_store", "store_lock", "list_records", "record_dto"];
+
+fn list_read_error_category(error: &lance_context_core::LanceError) -> &'static str {
+    use lance_context_core::LanceError;
+    match error {
+        LanceError::DatasetNotFound { .. } => "dataset_not_found",
+        LanceError::NotFound { .. } => "not_found",
+        LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. } => "invalid_request",
+        LanceError::IO { .. } => "storage_io",
+        LanceError::Execution { .. } => "execution",
+        LanceError::Internal { .. } => "internal",
+        LanceError::Wrapped { .. } => "wrapped",
+        LanceError::Cloned { .. } => "cloned",
+        LanceError::Timeout { .. } => "timeout",
+        LanceError::Arrow { .. } => "arrow",
+        LanceError::Schema { .. } => "schema",
+        LanceError::Index { .. } => "index",
+        LanceError::IndexNotFound { .. } => "index_not_found",
+        LanceError::CorruptFile { .. } => "corrupt_file",
+        LanceError::PrerequisiteFailed { .. } => "prerequisite_failed",
+        _ => "other_lance",
+    }
+}
+
+/// Inspect typed causes only. Never format errors, which may contain records,
+/// filters, storage URLs or credentials. Bound traversal even for cyclic sources.
+fn list_read_error_source(error: &lance_context_core::LanceError) -> (&'static str, bool) {
+    use std::error::Error;
+    let mut source = error.source();
+    let mut category = if source.is_some() {
+        "unclassified"
+    } else {
+        "none"
+    };
+    for _ in 0..8 {
+        let Some(current) = source else {
+            return (category, false);
+        };
+        if let Some(lance) = current.downcast_ref::<lance_context_core::LanceError>() {
+            category = list_read_error_category(lance);
+        } else if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            category = match io.kind() {
+                std::io::ErrorKind::NotFound => "io_not_found",
+                std::io::ErrorKind::TimedOut => "io_timeout",
+                std::io::ErrorKind::ConnectionReset => "io_connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+                std::io::ErrorKind::Interrupted => "io_interrupted",
+                _ => "io_other",
+            };
+        }
+        source = current.source();
+    }
+    (category, source.is_some())
+}
+
+/// Handler work only: excludes JSON serialization and response-body transfer.
+/// Drop also reports interrupted requests without retaining records or filters.
+struct ListReadTrace<'a> {
+    target: &'a str,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    filtered: bool,
+    started: tokio::time::Instant,
+    stage_started: tokio::time::Instant,
+    stage: usize,
+    elapsed: [std::time::Duration; 4],
+    error_category: Option<&'static str>,
+    error_source_category: &'static str,
+    error_source_truncated: bool,
+    rows: Option<usize>,
+}
+
+impl<'a> ListReadTrace<'a> {
+    fn new(target: &'a str, params: &RolloutListParams) -> Self {
+        let started = tokio::time::Instant::now();
+        Self {
+            target,
+            limit: params.limit,
+            offset: params.offset,
+            filtered: params.filters.is_some(),
+            started,
+            stage_started: started,
+            stage: 0,
+            elapsed: [std::time::Duration::ZERO; 4],
+            error_category: None,
+            error_source_category: "none",
+            error_source_truncated: false,
+            rows: None,
+        }
+    }
+
+    fn advance(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.elapsed[self.stage] = now.duration_since(self.stage_started);
+        self.stage += 1;
+        self.stage_started = now;
+    }
+
+    fn open_error(&mut self, error: &AppError) {
+        self.error_category = Some(match error {
+            AppError::NotFound(_) => "not_found",
+            AppError::AlreadyExists(_) => "already_exists",
+            AppError::InvalidRequest(_) => "invalid_request",
+            AppError::Internal(_) => "internal",
+            AppError::CompactionInProgress => "compaction_in_progress",
+            AppError::Overloaded(_) => "overloaded",
+            AppError::ClientDisconnected => "client_disconnected",
+        });
+    }
+
+    fn list_error(&mut self, error: &lance_context_core::LanceError) {
+        self.error_category = Some(list_read_error_category(error));
+        (self.error_source_category, self.error_source_truncated) = list_read_error_source(error);
+    }
+}
+
+impl Drop for ListReadTrace<'_> {
+    fn drop(&mut self) {
+        let total = self.started.elapsed();
+        let complete = self.stage == LIST_READ_STAGES.len();
+        if !complete {
+            self.elapsed[self.stage] = self.stage_started.elapsed();
+        }
+        let outcome = if self.error_category.is_some() {
+            "error"
+        } else if complete {
+            "success"
+        } else {
+            "incomplete"
+        };
+        // Fixed labels only: table names, pagination and filters are not metrics labels.
+        for (index, stage) in LIST_READ_STAGES.iter().enumerate().take(self.stage + 1) {
+            metrics::histogram!("rollout_list_stage_duration_seconds", "stage" => *stage, "outcome" => outcome)
+                .record(self.elapsed[index].as_secs_f64());
+        }
+        metrics::histogram!("rollout_list_handler_duration_seconds", "outcome" => outcome)
+            .record(total.as_secs_f64());
+        let actionable_error = self.error_category.is_some_and(|kind| {
+            !matches!(kind, "not_found" | "dataset_not_found" | "invalid_request")
+        });
+        if total >= std::time::Duration::from_secs(5) || actionable_error {
+            tracing::warn!(
+                target: "lance_context_server::rollout_list",
+                table = %self.target.chars().take(256).collect::<String>(),
+                limit = ?self.limit,
+                offset = ?self.offset,
+                filtered = self.filtered,
+                outcome,
+                phase = LIST_READ_STAGES.get(self.stage).copied().unwrap_or("complete"),
+                error_category = self.error_category.unwrap_or("none"),
+                error_source_category = self.error_source_category,
+                error_source_truncated = self.error_source_truncated,
+                rows = ?self.rows,
+                handler_ms = total.as_millis() as u64,
+                resolve_store_ms = self.elapsed[0].as_millis() as u64,
+                store_lock_ms = self.elapsed[1].as_millis() as u64,
+                list_records_ms = self.elapsed[2].as_millis() as u64,
+                record_dto_ms = self.elapsed[3].as_millis() as u64,
+                "rollout records list handler diagnostic"
+            );
+        }
+    }
+}
+
+pub async fn list_rollouts(
+    cancellation: Option<Extension<ClientCancellation>>,
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<RolloutListParams>,
+) -> Result<Json<ListRolloutsResponse>, AppError> {
+    let filters = params
+        .filters
+        .as_deref()
+        .map(|raw| {
+            let value = serde_json::from_str(raw).map_err(|err| {
+                AppError::InvalidRequest(format!("invalid rollout filters: {err}"))
+            })?;
+            RolloutFilters::from_json_value(value).map_err(AppError::InvalidRequest)
+        })
+        .transpose()?;
+
+    let mut trace = ListReadTrace::new(&name, &params);
+    let store_lock = state
+        .get_or_open_rollout_store(&name)
+        .await
+        .inspect_err(|error| trace.open_error(error))?;
+    trace.advance();
+
+    // Lazy opening may publish storage state and remains protected. Only the
+    // read, including its table-lock wait, opts into client cancellation.
+    let read = async {
+        let store = store_lock.read().await;
+        trace.advance();
+        let records = store
+            .list_with_filters(params.limit, params.offset, filters.as_ref())
+            .await
+            .map_err(|error| {
+                trace.list_error(&error);
+                AppError::from_lance(error)
+            })?;
+        Ok::<_, AppError>((store, records))
+    };
+    let (_store, records) = match cancellation {
+        Some(Extension(cancellation)) => tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AppError::ClientDisconnected),
+            records = read => records?,
+        },
+        None => read.await?,
+    };
+    trace.advance();
+    trace.rows = Some(records.len());
+
+    let response = Json(ListRolloutsResponse {
+        records: records.into_iter().map(rollout_record_to_dto).collect(),
+    });
+    trace.advance();
+    Ok(response)
+}
+
+/// Core point reads refresh cloned snapshots around WAL fallback. A stale-base
+/// hit or final miss therefore stays under the shared store guard.
+async fn get_rollout_shared(
+    store_lock: &RwLock<RolloutStore>,
+    id: &str,
+) -> Result<Option<RolloutRecord>, AppError> {
+    let store = store_lock.read().await;
+    store.get_by_id(id).await.map_err(AppError::from_lance)
+}
+
+/// Core blob lookup refreshes cloned base snapshots around WAL fallback and
+/// retries missing-file races. Even a final miss stays under the shared guard,
+/// so it does not queue an exclusive refresh behind concurrent append/flush.
+async fn get_rollout_blob_shared(
+    store_lock: &RwLock<RolloutStore>,
+    id: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let store = store_lock.read().await;
+    store.get_blob(id).await.map_err(AppError::from_lance)
+}
+
+pub async fn get_rollout(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<GetRolloutResponse>, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let record = get_rollout_shared(&store_lock, &id).await?;
+
+    Ok(Json(GetRolloutResponse {
+        record: record.map(rollout_record_to_dto),
+    }))
+}
+
+/// Materialize a rollout row's `binary_payload` bytes. The artifact
+/// bytes are opaque, so they stream as `application/octet-stream`. `404` when
+/// the row is absent or carries no payload.
+///
+/// The payload is sent as a **chunked** body ([`blob_stream_body`]) rather than
+/// a single giant frame: the response yields fixed-size frames so the HTTP
+/// layer never re-buffers the whole blob and a slow client applies backpressure
+/// instead of forcing the server to hold an extra full copy in the send queue.
+pub async fn fetch_rollout_blob(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let (bytes, reservation) =
+        load_blob_with_budget(&state, get_rollout_blob_shared(&store_lock, &id)).await?;
+    let bytes =
+        bytes.ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
+
+    let len = bytes.len();
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, len)
+        .body(blob_stream_body(bytes, reservation))
+        .map_err(|err| AppError::Internal(err.to_string()))
+}
+
+pub async fn checkout_rollout(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CheckoutRequest>,
+) -> Result<Json<VersionResponse>, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let mut store = store_lock.write().await;
+    store
+        .checkout(req.version)
+        .await
+        .map_err(AppError::from_lance)?;
+
+    Ok(Json(VersionResponse {
+        version: store.version(),
+    }))
+}
+
+/// Compact the rollout store's base table (fold small fragments produced by WAL
+/// merges into larger ones).
+///
+/// Intended to be driven by an external scheduler (cron / k8s CronJob) from a
+/// single caller — not every worker — since two concurrent base-table rewrites
+/// conflict and waste work. Safe to run while workers append or WAL-merge.
+pub async fn compact_rollout(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CompactRequest>,
+) -> Result<Json<CompactResponse>, AppError> {
+    // This legacy HTTP path has no durable execution or commit authorizer.
+    // Once a table is draining or owned, only the master's fenced maintenance
+    // path may publish a rewrite. Check before opening or locking its handle.
+    state.merge_executions.legacy_allowed(&name)?;
+    if state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "fenced table maintenance must run through the master".into(),
+        ));
+    }
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
+        let mut c = CompactionConfig::default();
+        if let Some(v) = req.target_rows_per_fragment {
+            c.target_rows_per_fragment = v;
+        }
+        if let Some(v) = req.materialize_deletions {
+            c.materialize_deletions = v;
+        }
+        Some(c)
+    } else {
+        None
+    };
+
+    let lock_start = std::time::Instant::now();
+    let mut store = store_lock.write().await;
+    ::metrics::histogram!("rollout_compaction_lock_wait_seconds")
+        .record(lock_start.elapsed().as_secs_f64());
+    let compact_start = std::time::Instant::now();
+    let compact_result = store.compact(config).await;
+    ::metrics::histogram!("rollout_compaction_duration_seconds")
+        .record(compact_start.elapsed().as_secs_f64());
+    let metrics = match compact_result {
+        Ok(m) => {
+            ::metrics::counter!("rollout_compactions_total", "result" => "success").increment(1);
+            m
+        }
+        Err(e) => {
+            ::metrics::counter!("rollout_compactions_total", "result" => "failed").increment(1);
+            return Err(AppError::from_lance(e));
+        }
+    };
+
+    Ok(Json(CompactResponse {
+        fragments_removed: metrics.fragments_removed,
+        fragments_added: metrics.fragments_added,
+        files_removed: metrics.files_removed,
+        files_added: metrics.files_added,
+    }))
+}
+
+/// Base-table compaction statistics for a rollout store.
+pub async fn compact_rollout_stats(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CompactStatsResponse>, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+
+    let store = store_lock.read().await;
+    let stats = store.compaction_stats();
+
+    Ok(Json(CompactStatsResponse {
+        total_fragments: stats.total_fragments,
+        is_compacting: stats.is_compacting,
+        last_compaction: stats.last_compaction,
+        last_error: stats.last_error,
+        total_compactions: stats.total_compactions,
+    }))
+}
+
+/// Trigger a WAL merge on this worker's own shard for `name`.
+///
+/// This is the worker half of the master-driven "MergeWal" task: the master
+/// cannot merge a shard it does not own without fencing the live writer, so it
+/// fans this call out to every worker and each worker folds *its own* flushed
+/// MemWAL generations into the base table via [`RolloutStore::cleanup_own_shard`]
+/// (which merges whatever is pending, no count threshold). A worker whose shard
+/// has nothing pending simply reports `reclaimed: 0`.
+pub async fn merge_wal(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MergeWalResponse>, AppError> {
+    state.merge_executions.legacy_allowed(&name)?;
+    if state.merge_executions.fenced_mode().await? {
+        crate::merge_execution::publish_background_request(state.clone(), name.clone());
+        let result = crate::merge_execution::spawn_background(state, name).await?;
+        let reclaimed = result
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(AppError::Internal)?;
+        return Ok(Json(MergeWalResponse { reclaimed }));
+    }
+    let execution_state = state.clone();
+    let execution_name = name.clone();
+    state
+        .merge_executions
+        .legacy
+        .run(&name, "http", true, |started| async move {
+            let _slot = execution_state.acquire_merge_slot().await;
+            started.running();
+            merge_wal_owned(State(execution_state.clone()), Path(execution_name)).await
+        })
+        .await
+}
+
+pub(crate) async fn merge_wal_owned(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MergeWalResponse>, AppError> {
+    let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let merge_gate = { store_lock.read().await.merge_preparation_gate() };
+    let _merge = merge_gate.lock().await;
+    // Prepare and encode owned, budgeted merges under the shared guard.
+    // Publication, key deletion and manifest drain still require the exclusive
+    // guard and can wait on storage; their duration is not bounded here.
+    let lock_start = std::time::Instant::now();
+    let prepared = {
+        let store = store_lock.read().await;
+        ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
+            .record(lock_start.elapsed().as_secs_f64());
+        let preparation = async {
+            let prepared = store.prepare_recovered_cleanup_merge().await?;
+            store.stage_owned_prepared_merge(prepared).await
+        }
+        .await;
+        match preparation {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
+                return Err(AppError::from_lance(e));
+            }
+        }
+    };
+
+    let merge_start = std::time::Instant::now();
+    let reclaimed = match prepared {
+        Some((manifest_store, manifest, prepared)) => {
+            let mut store = store_lock.write().await;
+            match store
+                .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed")
+                        .increment(1);
+                    return Err(AppError::from_lance(e));
+                }
+            }
+        }
+        None => 0,
+    };
+    // Emitted unconditionally: gating on `reclaimed > 0` made the common no-op
+    // merge invisible, so a worker that never has anything to merge and a worker
+    // that is never called looked identical. `result` stays on this *counter*
+    // (1 series per value) rather than on a histogram (1 series per bucket).
+    ::metrics::counter!(
+        "rollout_wal_cleanup_total",
+        "result" => if reclaimed > 0 { "merged" } else { "noop" },
+    )
+    .increment(1);
+    ::metrics::histogram!("rollout_wal_merge_request_duration_seconds")
+        .record(merge_start.elapsed().as_secs_f64());
+    ::metrics::counter!("rollout_wal_generations_reclaimed_total").increment(reclaimed as u64);
+    Ok(Json(MergeWalResponse { reclaimed }))
+}
+
+fn content_type_is(content_type: &str, expected: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .is_some_and(|mime| mime.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lance_context_api::CreateRolloutStoreRequest;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::state::AppState;
+
+    #[tokio::test]
+    async fn worker_prestage_cached_writer_supports_successive_owned_http_and_sweeper_merges() {
+        use crate::sweeper::Sweepable;
+        use lance_context_core::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug, Default)]
+        struct Authorizer(AtomicUsize);
+        impl CommitAuthorizer for Authorizer {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> Pin<Box<dyn Future<Output = lance::Result<()>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+        for mode in ["http", "count", "cleanup"] {
+            let dir = TempDir::new().unwrap();
+            let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+            let budget = lance_context_core::MergeMemoryBudget::new(4 * 1024 * 1024);
+            state.merge_budget = Some(budget.clone());
+            state.rollout_merge_max_bytes = 1024 * 1024;
+            state.rollout_merge_after_generations = 1;
+            let state = Arc::new(state);
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: "rl".into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            // Exactly the production cache lifetime: opened before either owner.
+            let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+            for i in 0..2 {
+                let id = format!("row-{i}");
+                let row = rollout_record_from_add_request(&record_with_size(&id, None));
+                cached.read().await.add(&[row]).await.unwrap();
+                cached.read().await.flush().await.unwrap();
+                assert_eq!(
+                    cached.read().await.pending_wal_generations().await.unwrap(),
+                    1
+                );
+                let authorizer = Arc::new(Authorizer::default());
+                let scope = MergeWriteScope::with_authorizer(authorizer.clone());
+                let count = scope
+                    .run(async {
+                        match mode {
+                            "http" => {
+                                merge_wal_owned(State(state.clone()), Path("rl".into()))
+                                    .await
+                                    .unwrap()
+                                    .0
+                                    .reclaimed
+                            }
+                            "count" => cached.merge_if_due().await.unwrap(),
+                            _ => cached.merge_wal().await.unwrap(),
+                        }
+                    })
+                    .await;
+                scope.drain().await;
+                assert_eq!(count, 1);
+                assert_eq!(scope.work().encoded_files, 1);
+                assert_eq!(scope.work().base_commits, 1);
+                assert_eq!(scope.work().generations_reclaimed, 1);
+                assert!(authorizer.0.load(Ordering::SeqCst) > 0);
+                assert_eq!(budget.reserved(), 0);
+                assert_eq!(
+                    cached.read().await.pending_wal_generations().await.unwrap(),
+                    0
+                );
+                assert_eq!(
+                    cached
+                        .read()
+                        .await
+                        .get_by_id(&id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id,
+                    id
+                );
+                assert!(Arc::ptr_eq(
+                    &cached,
+                    &state.get_or_open_rollout_store("rl").await.unwrap()
+                ));
+            }
+            assert_eq!(cached.read().await.list(None, None).await.unwrap().len(), 2);
+            cached.write().await.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_cannot_bypass_owned_or_draining_admission() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.merge_executions.rollout.owned_targets = vec!["owned".into()];
+        state.merge_executions.rollout.drain_targets = vec!["draining".into()];
+        let state = Arc::new(state);
+        for name in ["owned", "draining", "legacy"] {
+            let (status, Json(_)) = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::CREATED);
+            let handle = state.get_or_open_rollout_store(name).await.unwrap();
+            // A live reader must not make rejection wait for the write lock.
+            let reader = handle.read().await;
+            let version = reader.version();
+            if name != "legacy" {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    compact_rollout(
+                        State(state.clone()),
+                        Path(name.into()),
+                        Json(CompactRequest::default()),
+                    ),
+                )
+                .await
+                .expect("protected maintenance must reject before acquiring a store lock");
+                assert!(matches!(result, Err(AppError::Overloaded(_))));
+                assert_eq!(reader.version(), version);
+            } else {
+                drop(reader);
+                let Json(compacted) = compact_rollout(
+                    State(state.clone()),
+                    Path(name.into()),
+                    Json(CompactRequest::default()),
+                )
+                .await
+                .expect("unowned legacy compaction remains available");
+                assert_eq!(compacted.fragments_removed, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_miss_does_not_require_exclusive_store_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = RolloutStore::open_with_options(
+            dir.path().to_str().unwrap(),
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let store_lock = RwLock::new(store);
+        // Appends hold a shared guard while adding/flushing. A missing blob
+        // must finish without upgrading to an exclusive guard behind them.
+        let concurrent_request = store_lock.read().await;
+        let version = concurrent_request.version();
+        let payload = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_rollout_blob_shared(&store_lock, "absent"),
+        )
+        .await
+        .expect("a missing blob must not wait for another shared store guard")
+        .unwrap();
+        assert!(payload.is_none());
+        assert_eq!(concurrent_request.version(), version);
+    }
+
+    #[test]
+    fn flush_query_param_is_parsed_conservatively() {
+        // Opt-in only: the default (and any non-affirmative spelling) must keep
+        // the asynchronous-visibility fast path, so a typo cannot silently make
+        // every append pay a seal.
+        assert!(flush_requested(Some("flush=true")));
+        assert!(flush_requested(Some("flush=TRUE")));
+        assert!(flush_requested(Some("flush=1")));
+        assert!(flush_requested(Some("flush")));
+        assert!(flush_requested(Some("other=x&flush=true")));
+
+        assert!(!flush_requested(None));
+        assert!(!flush_requested(Some("")));
+        assert!(!flush_requested(Some("flush=false")));
+        assert!(!flush_requested(Some("flush=0")));
+        assert!(!flush_requested(Some("flush=yes")));
+        // Must not match on a different key that merely contains "flush".
+        assert!(!flush_requested(Some("noflush=true")));
+        assert!(!flush_requested(Some("flushed=true")));
+    }
+
+    #[tokio::test]
+    async fn blob_stream_body_reassembles_across_chunk_boundaries() {
+        // A payload spanning several BLOB_STREAM_CHUNK_BYTES frames must
+        // reassemble byte-for-byte, and a reservation moved into the body is
+        // held until the stream is fully drained.
+        let payload: Vec<u8> = (0..(BLOB_STREAM_CHUNK_BYTES * 2 + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let budget = crate::state::BlobBudget::new(payload.len());
+        let reservation = budget.try_acquire(payload.len());
+        assert!(reservation.is_some());
+        // Budget is now fully occupied.
+        assert!(budget.try_acquire(1).is_none());
+
+        let body = blob_stream_body(payload.clone(), reservation);
+        let collected = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(&collected[..], &payload[..]);
+
+        // Once the body is consumed the reservation dropped, freeing the budget.
+        assert!(budget.try_acquire(payload.len()).is_some());
+    }
+
+    #[test]
+    fn content_length_distinguishes_unknown_from_empty() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(content_length(&headers), None);
+        headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from(4096));
+        assert_eq!(content_length(&headers), Some(4096));
+    }
+
+    /// The threshold is inclusive and `0` disables the log entirely, so an
+    /// operator who leaves the knob unset is never spammed.
+    #[test]
+    fn large_blob_log_threshold_is_inclusive_and_zero_disables() {
+        assert!(!should_log_large_blob(1023, 1024));
+        assert!(should_log_large_blob(1024, 1024), "threshold is inclusive");
+        assert!(should_log_large_blob(4096, 1024));
+        // Disabled: not even an enormous blob logs.
+        assert!(!should_log_large_blob(usize::MAX, 0));
+    }
+
+    /// Every inline blob is measured, including one supplied through the
+    /// inline-JSON path rather than a multipart part.
+    ///
+    /// This is why the instrumentation sits after the two parse paths converge
+    /// instead of inside the multipart blob loop: a JSON body populates
+    /// `binary_payload` directly and never enters that loop, so instrumenting
+    /// there would silently miss it.
+    #[tokio::test]
+    async fn blob_sizes_are_recorded_for_records_with_payloads() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let dir = TempDir::new().unwrap();
+        let state = AppState::new_for_test(dir.path().to_path_buf()).await;
+
+        let record = |id: &str, payload: Option<Vec<u8>>| AddRolloutRequest {
+            id: id.to_string(),
+            binary_payload: payload,
+            ..Default::default()
+        };
+        let records = vec![
+            record("with-blob", Some(vec![0u8; 512])),
+            record("no-blob", None),
+            record("bigger-blob", Some(vec![0u8; 2048])),
+        ];
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            observe_blob_sizes(&state, "exp", &records);
+        });
+
+        let samples = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                (key.kind() == MetricKind::Histogram && key.key().name() == "rollout_blob_bytes")
+                    .then_some(value)
+            })
+            .expect("rollout_blob_bytes histogram must be emitted");
+
+        let DebugValue::Histogram(values) = samples else {
+            panic!("rollout_blob_bytes must be a histogram");
+        };
+        let mut observed: Vec<f64> = values.into_iter().map(|v| v.into_inner()).collect();
+        observed.sort_by(f64::total_cmp);
+        // The payload-less record contributes nothing: two samples, not three.
+        assert_eq!(observed, vec![512.0, 2048.0]);
+    }
+
+    #[tokio::test]
+    async fn chunked_upload_respects_exhausted_budget() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        let budget = crate::state::BlobBudget::new(1024);
+        state.blob_budget = Some(budget.clone());
+        let state = Arc::new(state);
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _occupied = budget.try_acquire(1024).unwrap();
+        assert!(budget.try_acquire(1).is_none());
+        let body = serde_json::json!({"records":[{
+            "id":"chunked-blob", "rollout_id":"r", "problem_id":"p",
+            "sequence_order":0, "role":"assistant", "content_type":"application/octet-stream",
+            "binary_payload":"eA=="
+        }]})
+        .to_string();
+        let known_length = Request::builder()
+            .method("POST")
+            .uri("/rollouts/rl/records?flush=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert!(matches!(
+            add_rollouts(State(state.clone()), Path("rl".to_string()), known_length).await,
+            Err(AppError::Overloaded(_))
+        ));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rollouts/rl/records?flush=true")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(Body::from(body))
+            .unwrap();
+        assert!(request.headers().get(header::CONTENT_LENGTH).is_none());
+        let result = add_rollouts(State(state), Path("rl".to_string()), request).await;
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "a blob upload must not bypass an exhausted global budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_uri_store_does_not_resurrect_rows() {
+        let dir = TempDir::new().unwrap();
+        let base_uri = std::path::PathBuf::from(format!("file://{}", dir.path().display()));
+        let state = Arc::new(AppState::new_for_test(base_uri).await);
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("?flush=true", "deleted-row"),
+        )
+        .await
+        .unwrap();
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        cached.write().await.cleanup_own_shard().await.unwrap();
+        assert_eq!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let reopened = state.get_or_open_rollout_store("rl").await.unwrap();
+        let rows = reopened.read().await.list(None, None).await.unwrap();
+        let ids: Vec<_> = rows.into_iter().map(|r| r.id).collect();
+        assert!(
+            ids.is_empty(),
+            "deleted rows reappeared after recreation: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_budget_admits_before_loading_and_releases_on_cancellation() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        let budget = crate::state::BlobBudget::new(1024);
+        state.blob_budget = Some(budget.clone());
+        let occupied = budget.try_acquire(1024).unwrap();
+        let loaded = std::cell::Cell::new(false);
+        let result = load_blob_with_budget(&state, async {
+            loaded.set(true);
+            Ok(Some(vec![0; 256]))
+        })
+        .await;
+        assert!(matches!(result, Err(AppError::Overloaded(_))));
+        assert!(
+            !loaded.get(),
+            "admission must happen before payload allocation"
+        );
+        drop(occupied);
+
+        let (bytes, guard) = load_blob_with_budget(&state, async { Ok(Some(vec![0; 256])) })
+            .await
+            .unwrap();
+        assert_eq!(bytes.unwrap().len(), 256);
+        let remaining = budget.try_acquire(768).unwrap();
+        assert!(budget.try_acquire_unknown().is_none());
+        drop(remaining);
+        drop(guard);
+
+        let mut pending = Box::pin(load_blob_with_budget(&state, std::future::pending()));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert!(budget.try_acquire(1).is_none());
+        drop(pending);
+        assert!(budget.try_acquire(1024).is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_deletion_retains_registry_and_can_be_retried() {
+        let (state, dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        cached.write().await.close().await.unwrap();
+        let path = std::path::PathBuf::from(state.rollout_uri("rl"));
+        let saved = dir.path().join("saved-dataset");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::write(&path, b"not a directory").unwrap();
+        assert!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(state.rollout_registry.contains("rl").await.unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(
+            delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(!path.exists());
+        assert!(!state.rollout_registry.contains("rl").await.unwrap());
+        let row = rollout_record_from_add_request(&record_with_size("late-write", None));
+        assert!(cached.read().await.add(&[row]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn review_evicted_handle_cannot_write_after_delete() {
+        let (state, _dir) = rollout_state().await;
+        let in_flight = state.get_or_open_rollout_store("rl").await.unwrap();
+        let row = rollout_record_from_add_request(&record_with_size("before-delete", None));
+        in_flight.read().await.add(&[row]).await.unwrap();
+        // Reopening an evicted but live store must reuse its writer.
+        state.rollout_stores.lock().await.pop("rl");
+        let reopened = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(Arc::ptr_eq(&in_flight, &reopened));
+        state.rollout_stores.lock().await.pop("rl");
+        delete_rollout_store(State(state.clone()), Path("rl".into()))
+            .await
+            .unwrap();
+        let row = rollout_record_from_add_request(&record_with_size("late-write", None));
+        assert!(in_flight
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .is_err());
+        assert!(state.get_or_open_rollout_store("rl").await.is_err());
+
+        // Recreation gets a new writable handle; the old request stays fenced.
+        let _ = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".into(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let recreated = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(!Arc::ptr_eq(&in_flight, &recreated));
+        assert!(in_flight
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .is_err());
+        recreated.read().await.add(&[row]).await.unwrap();
+        recreated.write().await.close().await.unwrap();
+    }
+
+    async fn rollout_state() -> (Arc<AppState>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+        let (_status, _info) = create_rollout_store(
+            State(state.clone()),
+            Json(CreateRolloutStoreRequest {
+                name: "rl".to_string(),
+                storage_options: None,
+            }),
+        )
+        .await
+        .expect("create rollout store");
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn point_lookup_routes_keep_shared_guard_for_fresh_base_and_miss() {
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let uri = state.rollout_uri("rl");
+        let mut writer = RolloutStore::open_existing_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = rollout_record_from_add_request(&record_with_size("merged-record", None));
+        writer.add(std::slice::from_ref(&first)).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert!(writer.version() > cached.read().await.version());
+
+        let resident_read = cached.read().await;
+        let original_version = resident_read.version();
+        let Json(found) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), first.id.clone())),
+            ),
+        )
+        .await
+        .expect("a newly merged row must not wait for an exclusive store lock")
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, first.id);
+        let Json(missing) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), "absent".to_string())),
+            ),
+        )
+        .await
+        .expect("a missing row must not wait for an exclusive store lock")
+        .unwrap();
+        assert!(missing.record.is_none());
+        assert_eq!(resident_read.version(), original_version);
+        drop(resident_read);
+
+        // Establish a cached base hit for the second half of the test without
+        // making point reads mutate the resident store.
+        cached.write().await.refresh_latest().await.unwrap();
+
+        let cached_version = cached.read().await.version();
+        let payload = b"externally-merged-blob".to_vec();
+        let mut blob_request = record_with_size("merged-blob", Some(payload.len() as i64));
+        blob_request.binary_payload = Some(payload.clone());
+        let blob_record = rollout_record_from_add_request(&blob_request);
+        writer
+            .add(std::slice::from_ref(&blob_record))
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert!(writer.version() > cached_version);
+
+        // A hit in the cached base remains on the shared-lock fast path and
+        // does not advance the handle just because a newer version exists.
+        let Json(found) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), first.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, first.id);
+        assert_eq!(cached.read().await.version(), cached_version);
+
+        // Another shared reader must not delay a blob found in the new base.
+        // Holding this guard exposes any regression to an exclusive refresh.
+        let resident_read = cached.read().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_rollout_blob(
+                State(state.clone()),
+                Path(("rl".to_string(), blob_record.id)),
+            ),
+        )
+        .await
+        .expect("a newly merged blob must not wait for an exclusive store lock")
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+        assert_eq!(resident_read.version(), cached_version);
+        drop(resident_read);
+    }
+
+    #[tokio::test]
+    async fn point_lookup_miss_preserves_explicit_checkout() {
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let pinned_version = cached.read().await.version();
+        let uri = state.rollout_uri("rl");
+        let mut writer = RolloutStore::open_existing_with_options(
+            &uri,
+            RolloutStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let record = rollout_record_from_add_request(&record_with_size("future-record", None));
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert!(writer.version() > pinned_version);
+
+        let Json(version) = checkout_rollout(
+            State(state.clone()),
+            Path("rl".to_string()),
+            Json(CheckoutRequest {
+                version: pinned_version,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(version.version, pinned_version);
+        assert!(cached.read().await.is_version_pinned());
+
+        let Json(missing) = get_rollout(State(state), Path(("rl".to_string(), record.id)))
+            .await
+            .unwrap();
+        assert!(missing.record.is_none());
+        let cached = cached.read().await;
+        assert_eq!(cached.version(), pinned_version);
+        assert!(cached.is_version_pinned());
+    }
+
+    /// Build a JSON append request for `add_rollouts`, with an optional query.
+    fn append_request(query: &str, id: &str) -> Request {
+        let body = serde_json::json!({
+            "records": [{
+                "id": id,
+                "rollout_id": "r-1",
+                "problem_id": "p-1",
+                "sequence_order": 0,
+                "role": "assistant",
+                "content": "hello",
+                "content_type": "text/plain",
+            }]
+        });
+        Request::builder()
+            .method("POST")
+            .uri(format!("/rollouts/rl/records{query}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flush_true_gives_read_your_write_and_default_does_not() {
+        // End-to-end contract for `?flush=true`. The default path is durable but
+        // asynchronously visible (the flush sweeper is not running in this test,
+        // so an unflushed row stays invisible indefinitely) while the opt-in must
+        // make the row readable by the time the response is returned.
+        let (state, _dir) = rollout_state().await;
+
+        // Default: durable, not visible.
+        let (status, _resp) = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("", "async-0"),
+        )
+        .await
+        .expect("append succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        assert!(
+            store
+                .read()
+                .await
+                .list(None, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "default append must not seal; visibility is the sweeper's job"
+        );
+
+        // Opt-in: visible on return.
+        let (status, _resp) = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            append_request("?flush=true", "sync-0"),
+        )
+        .await
+        .expect("append with flush succeeds");
+        assert_eq!(status, StatusCode::CREATED);
+
+        let seen = store.read().await.list(None, None).await.unwrap();
+        let ids: Vec<&str> = seen.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"sync-0"),
+            "?flush=true must make the row readable before responding, got {ids:?}"
+        );
+        // The flush also seals the earlier append that shared the memtable.
+        assert!(ids.contains(&"async-0"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_names_that_are_not_portable_path_segments() {
+        let dir = TempDir::new().unwrap();
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+
+        for name in [
+            "../escape",
+            "nested/store",
+            r"nested\store",
+            "_registry",
+            &"a".repeat(lance_context_core::MAX_STORE_NAME_LEN + 1),
+        ] {
+            let err = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AppError::InvalidRequest(_)), "{name}");
+        }
+        assert!(state.rollout_stores.lock().await.is_empty());
+        assert!(state.rollout_registry.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_rollout_names_before_registry_access() {
+        let dir = TempDir::new().unwrap();
+        let state = AppState::new_for_test(dir.path().to_path_buf()).await;
+
+        let err = match state.get_or_open_rollout_store("../escape").await {
+            Ok(_) => panic!("invalid name unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    fn record_with_size(id: &str, payload_size: Option<i64>) -> AddRolloutRequest {
+        AddRolloutRequest {
+            id: id.to_string(),
+            rollout_id: format!("traj-{id}"),
+            payload_size,
+            ..Default::default()
+        }
+    }
+
+    fn filtered_record(id: &str, policy_version: &str, training: bool) -> AddRolloutRequest {
+        AddRolloutRequest {
+            id: id.to_string(),
+            rollout_id: format!("traj-{id}"),
+            problem_id: Some(format!("problem-{id}")),
+            role: "assistant".to_string(),
+            policy_version: Some(policy_version.to_string()),
+            include_in_training: Some(training),
+            ..Default::default()
+        }
+    }
+
+    fn json_request(body: Vec<u8>) -> Request {
+        Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Flush a rollout store's MemWAL so just-added rows become visible to reads.
+    /// `add` is durable-but-async now (visible only after a flush / the periodic
+    /// flush sweeper), so tests that add then read must flush explicitly.
+    async fn flush_store(state: &Arc<AppState>, name: &str) {
+        let store = state.get_or_open_rollout_store(name).await.unwrap();
+        store.read().await.flush().await.unwrap();
+    }
+
+    /// Assemble a `multipart/form-data` body from ordered (name, bytes) parts.
+    fn multipart_request(boundary: &str, parts: &[(&str, Vec<u8>)]) -> Request {
+        let mut body = Vec::new();
+        for (name, data) in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_stops_waiting_for_the_table_read_lock() {
+        let (state, _dir) = rollout_state().await;
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        let write_guard = store.write().await;
+        let (lifetime, cancellation) = ClientCancellation::channel();
+        let read = list_rollouts(
+            Some(Extension(cancellation)),
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        );
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(lifetime);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(AppError::ClientDisconnected)));
+        drop(write_guard);
+        assert!(store.try_write().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_keeps_store_lookup_protected() {
+        let (state, _dir) = rollout_state().await;
+        let cache_guard = state.rollout_stores.lock().await;
+        let (lifetime, cancellation) = ClientCancellation::channel();
+        let read = list_rollouts(
+            Some(Extension(cancellation)),
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        );
+        tokio::pin!(read);
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(lifetime);
+        // Cancellation cannot drop lazy store opening or its protected setup.
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(cache_guard);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), read)
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(AppError::ClientDisconnected)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_list_socket_does_not_hold_shutdown_behind_the_table_lock() {
+        use tokio::io::AsyncWriteExt;
+        let (state, _dir) = rollout_state().await;
+        let store = state.get_or_open_rollout_store("rl").await.unwrap();
+        let write_guard = store.write().await;
+        let baseline = Arc::strong_count(&store);
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/rollouts/{name}/records",
+                axum::routing::get(list_rollouts),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopping) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(crate::drain::serve(
+            listener,
+            app,
+            std::time::Duration::from_millis(10),
+            async {
+                let _ = stopping.await;
+            },
+        ));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /api/v1/rollouts/rl/records HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        // The real handler has obtained the cached store and cannot acquire its
+        // read guard while this test owns the write guard.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&store) == baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let client = client.into_std().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Shutdown completed without releasing the lock that blocked the read.
+        assert_eq!(Arc::strong_count(&store), baseline);
+        drop(write_guard);
+        assert!(store.try_write().is_ok());
+    }
+
+    async fn count_rollouts(state: &Arc<AppState>) -> usize {
+        let Json(list) = list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        )
+        .await
+        .unwrap();
+        list.records.len()
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_json_projects_blob_out_but_fetch_materializes() {
+        let (state, _dir) = rollout_state().await;
+        let payload = b"artifact-bytes".to_vec();
+        let mut record = record_with_size("r0", Some(payload.len() as i64));
+        record.binary_payload = Some(payload.clone());
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record],
+        })
+        .unwrap();
+
+        let (status, Json(resp)) = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.count, 1);
+        assert_eq!(resp.ids, vec!["r0".to_string()]);
+        flush_store(&state, "rl").await;
+
+        // A plain get projects the binary column out, reading it back as None...
+        let Json(got) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
+        let dto = got.record.expect("row present");
+        assert_eq!(dto.payload_size, Some(payload.len() as i64));
+        assert!(dto.binary_payload.is_none());
+
+        // ...but the blob endpoint materializes the bytes.
+        let resp = fetch_rollout_blob(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_attaches_blob_by_index() {
+        let (state, _dir) = rollout_state().await;
+        let payload = b"raw-multipart-bytes".to_vec();
+        let metadata = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", Some(payload.len() as i64))],
+        })
+        .unwrap();
+        let req = multipart_request("BOUND", &[("metadata", metadata), ("0", payload.clone())]);
+
+        let (status, Json(resp)) = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.count, 1);
+        flush_store(&state, "rl").await;
+
+        let resp = fetch_rollout_blob(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_rejects_metadata_not_first() {
+        let (state, _dir) = rollout_state().await;
+        let req = multipart_request("BOUND", &[("0", b"bytes".to_vec())]);
+        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+        assert_eq!(count_rollouts(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_rejects_orphan_index() {
+        let (state, _dir) = rollout_state().await;
+        let metadata = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", Some(4))],
+        })
+        .unwrap();
+        // Part "1" has no matching record (only index 0 exists).
+        let req = multipart_request("BOUND", &[("metadata", metadata), ("1", b"data".to_vec())]);
+        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+        assert_eq!(count_rollouts(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_rejects_duplicate_index() {
+        let (state, _dir) = rollout_state().await;
+        let metadata = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", Some(4))],
+        })
+        .unwrap();
+        let req = multipart_request(
+            "BOUND",
+            &[
+                ("metadata", metadata),
+                ("0", b"data".to_vec()),
+                ("0", b"dupe".to_vec()),
+            ],
+        );
+        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+        assert_eq!(count_rollouts(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_rejects_size_mismatch() {
+        let (state, _dir) = rollout_state().await;
+        // Declared payload_size (999) disagrees with the 4 bytes received.
+        let metadata = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", Some(999))],
+        })
+        .unwrap();
+        let req = multipart_request("BOUND", &[("metadata", metadata), ("0", b"data".to_vec())]);
+        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+        assert_eq!(count_rollouts(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_multipart_rejects_declared_payload_without_part() {
+        let (state, _dir) = rollout_state().await;
+        // Record declares payload_size but no binary part is attached.
+        let metadata = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", Some(4))],
+        })
+        .unwrap();
+        let req = multipart_request("BOUND", &[("metadata", metadata)]);
+        let err = add_rollouts(State(state.clone()), Path("rl".to_string()), req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+        assert_eq!(count_rollouts(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn add_rollouts_rejects_empty_records() {
+        let (state, _dir) = rollout_state().await;
+        let body = serde_json::to_vec(&AddRolloutsRequest { records: vec![] }).unwrap();
+        let err = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    /// The internal merge-wal endpoint folds this worker's pending flushed
+    /// generations into the base table and reports how many it reclaimed. A
+    /// second call with nothing pending is a no-op reporting `0`.
+    #[tokio::test]
+    async fn merge_wal_reclaims_pending_then_is_noop() {
+        let (state, _dir) = rollout_state().await;
+        // One append flushes one generation into this instance's shard.
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("append succeeds");
+        // Seal the append into a flushed generation so the merge has something
+        // to reclaim (appends no longer flush inline).
+        flush_store(&state, "rl").await;
+
+        let Json(first) = merge_wal(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("merge succeeds");
+        assert_eq!(first.reclaimed, 1, "one pending generation merged");
+
+        let Json(second) = merge_wal(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("second merge succeeds");
+        assert_eq!(second.reclaimed, 0, "nothing left to merge");
+
+        // The row survives the merge, readable exactly once.
+        let Json(got) = get_rollout(
+            State(state.clone()),
+            Path(("rl".to_string(), "r0".to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(got.record.is_some());
+    }
+
+    /// A second server instance (distinct in-memory cache, shared data dir)
+    /// that never `create`d the store must still serve reads/writes for it by
+    /// lazily loading from storage — the multi-replica 404 regression.
+    #[tokio::test]
+    async fn second_instance_lazily_opens_store_created_elsewhere() {
+        // Pod A: create the store and write a row.
+        let (state_a, dir) = rollout_state().await;
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r0", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state_a.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("write on instance A");
+        // Flush A's shard so its row is visible to any reader (reads union all
+        // shards' flushed generations).
+        flush_store(&state_a, "rl").await;
+
+        // Pod B: a fresh AppState over the SAME data dir, with an empty cache and
+        // a different instance id (its own shard). It never saw the `create`.
+        let state_b = Arc::new(
+            AppState::new_for_test_with_instance(
+                dir.path().to_path_buf(),
+                Some("rollout-1".to_string()),
+            )
+            .await,
+        );
+
+        // Read routed to B must lazily open the store, not 404.
+        let Json(list) = list_rollouts(
+            None,
+            State(state_b.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams::default()),
+        )
+        .await
+        .expect("instance B lazily opens the store instead of 404");
+        assert_eq!(list.records.len(), 1);
+        assert_eq!(list.records[0].id, "r0");
+
+        // And a write on B lands in the same dataset (visible back on A).
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![record_with_size("r1", None)],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state_b.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .expect("write on instance B");
+        // Flush B's shard so its row is visible to A's reader too.
+        flush_store(&state_b, "rl").await;
+        assert_eq!(count_rollouts(&state_a).await, 2);
+    }
+
+    /// A read for a store that was never created anywhere must still 404 — lazy
+    /// open must not silently materialize an empty dataset for a bad name.
+    #[tokio::test]
+    async fn read_of_nonexistent_store_still_404s() {
+        let (state, _dir) = rollout_state().await;
+        let err = list_rollouts(
+            None,
+            State(state.clone()),
+            Path("no-such-store".to_string()),
+            Query(RolloutListParams::default()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// With a capacity-1 LRU, creating a second store must evict the first — but
+    /// the evicted store is still reachable, transparently reopened from storage
+    /// via the durable registry, not falsely 404'd.
+    #[tokio::test]
+    async fn evicted_store_is_transparently_reopened() {
+        let dir = TempDir::new().unwrap();
+        // Force a capacity-1 cache so the second create evicts the first.
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_stores =
+            tokio::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1).unwrap()));
+        let state = Arc::new(state);
+
+        for name in ["exp-a", "exp-b"] {
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .expect("create");
+        }
+
+        // exp-a was evicted (cache holds only exp-b now), yet a lookup succeeds.
+        assert_eq!(state.rollout_stores.lock().await.len(), 1);
+        let info = get_rollout_store(State(state.clone()), Path("exp-a".to_string()))
+            .await
+            .expect("evicted store reopens instead of 404");
+        assert_eq!(info.name, "exp-a");
+    }
+
+    /// `list` is served from the durable registry, so it enumerates every store
+    /// that exists — including ones evicted from (or never resident in) the LRU.
+    #[tokio::test]
+    async fn list_enumerates_all_registered_stores() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_stores =
+            tokio::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1).unwrap()));
+        let state = Arc::new(state);
+
+        for name in ["e0", "e1", "e2"] {
+            let _ = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.to_string(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .expect("create");
+        }
+        // Only one store is resident, but list must return all three.
+        assert_eq!(state.rollout_stores.lock().await.len(), 1);
+        let Json(listed) = list_rollout_stores(State(state.clone()))
+            .await
+            .expect("list");
+        let mut names: Vec<String> = listed.stores.into_iter().map(|s| s.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["e0", "e1", "e2"]);
+    }
+
+    /// Delete removes the store from the durable registry, so a subsequent read
+    /// 404s and it no longer appears in `list`.
+    #[tokio::test]
+    async fn delete_unregisters_store() {
+        let (state, _dir) = rollout_state().await;
+        delete_rollout_store(State(state.clone()), Path("rl".to_string()))
+            .await
+            .expect("delete");
+        let err = get_rollout_store(State(state.clone()), Path("rl".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+        let Json(listed) = list_rollout_stores(State(state.clone())).await.unwrap();
+        assert!(listed.stores.is_empty());
+    }
+
+    #[test]
+    fn list_rollouts_diagnostics_classify_typed_sources_without_formatting() {
+        use lance_context_core::LanceError;
+        use std::{
+            error::Error,
+            fmt, io,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        let nested = LanceError::wrapped(Box::new(LanceError::wrapped(Box::new(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "private-storage-url",
+        )))));
+        assert_eq!(list_read_error_category(&nested), "wrapped");
+        assert_eq!(list_read_error_source(&nested), ("io_timeout", false));
+        let cloned = LanceError::cloned("private-message-not-found");
+        assert_eq!(list_read_error_category(&cloned), "cloned");
+        // A message is not structured evidence of a source or error kind.
+        assert_eq!(list_read_error_source(&cloned), ("none", false));
+
+        #[derive(Debug)]
+        struct Cycle(AtomicUsize);
+        impl fmt::Display for Cycle {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("diagnostics must not format source errors")
+            }
+        }
+        impl Error for Cycle {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Some(self)
+            }
+        }
+        let cycle = LanceError::wrapped(Box::new(Cycle(AtomicUsize::new(0))));
+        assert_eq!(list_read_error_source(&cycle), ("unclassified", true));
+        assert_eq!(
+            cycle
+                .source()
+                .unwrap()
+                .downcast_ref::<Cycle>()
+                .unwrap()
+                .0
+                .load(Ordering::Relaxed),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_diagnostics_attribute_lock_wait_and_cancellation_without_data() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::{io, sync::Mutex, time::Duration};
+
+        // Isolate tracing callsite caches from concurrently running route tests.
+        const ISOLATED: &str = "LANCE_CONTEXT_LIST_DIAGNOSTIC_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::rollouts::tests::list_rollouts_diagnostics_attribute_lock_wait_and_cancellation_without_data",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        #[derive(Clone)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (state, _dir) = rollout_state().await;
+        let cached = state.get_or_open_rollout_store("rl").await.unwrap();
+        let record = filtered_record("private-row-id", "private-filter-value", true);
+        cached
+            .read()
+            .await
+            .add(&[rollout_record_from_add_request(&record)])
+            .await
+            .unwrap();
+        flush_store(&state, "rl").await;
+        let params = || RolloutListParams {
+            limit: Some(1),
+            offset: Some(0),
+            filters: Some(
+                serde_json::json!({"policy_version": "private-filter-value"}).to_string(),
+            ),
+        };
+        let Json(expected) = list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        )
+        .await
+        .unwrap();
+        let log = Log(Arc::default());
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+
+        let held = cached.write().await;
+        let mut request = Box::pin(list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        ));
+        tokio::time::pause();
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        drop(held);
+        // Resume before storage I/O: only the deliberate lock wait is simulated.
+        tokio::time::resume();
+        let Json(actual) = request.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+
+        let held = cached.write().await;
+        let mut cancelled = Box::pin(list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".into()),
+            Query(params()),
+        ));
+        tokio::time::pause();
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        tokio::time::advance(Duration::from_secs(7)).await;
+        drop(cancelled);
+        tokio::time::resume();
+        drop(held);
+
+        // Raw storage errors and arbitrarily long names must not enter diagnostics.
+        let name = format!("{}private-name-suffix", "x".repeat(256));
+        let mut error = ListReadTrace::new(&name, &params());
+        error.advance();
+        error.advance();
+        error.list_error(&lance_context_core::LanceError::io("private-error-payload"));
+        drop(error);
+
+        let mut wrapped = ListReadTrace::new(&name, &params());
+        wrapped.advance();
+        wrapped.advance();
+        wrapped.list_error(&lance_context_core::LanceError::wrapped(Box::new(
+            io::Error::new(io::ErrorKind::TimedOut, "private-source-payload"),
+        )));
+        drop(wrapped);
+
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let diagnostics: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("rollout records list handler diagnostic"))
+            .collect();
+        assert_eq!(diagnostics.len(), 4, "{output}");
+        assert!(
+            diagnostics[0].contains("outcome=\"success\"")
+                && diagnostics[0].contains("phase=\"complete\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[1].contains("outcome=\"incomplete\"")
+                && diagnostics[1].contains("phase=\"store_lock\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[2].contains("error_category=\"storage_io\"")
+                && diagnostics[2].contains("phase=\"list_records\""),
+            "{output}"
+        );
+        assert!(
+            diagnostics[3].contains("error_category=\"wrapped\"")
+                && diagnostics[3].contains("error_source_category=\"io_timeout\"")
+                && diagnostics[3].contains("error_source_truncated=false"),
+            "{output}"
+        );
+        for line in diagnostics {
+            assert!(!line.contains("private-"), "{line}");
+        }
+        let series = snapshotter.snapshot().into_vec();
+        for (outcome, minimum, maximum, expected_stages) in
+            [("success", 6.0, 7.0, 4), ("incomplete", 7.0, 8.0, 2)]
+        {
+            let stages: Vec<_> = series
+                .iter()
+                .filter(|(key, _, _, _)| {
+                    key.key().name() == "rollout_list_stage_duration_seconds"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                })
+                .collect();
+            assert_eq!(stages.len(), expected_stages);
+            for (key, _, _, value) in stages {
+                assert_eq!(key.key().labels().count(), 2);
+                let DebugValue::Histogram(values) = value else {
+                    panic!("expected histogram")
+                };
+                assert_eq!(values.len(), 1);
+                let seconds = values[0].into_inner();
+                if key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "stage" && label.value() == "store_lock")
+                {
+                    assert!(
+                        (minimum..maximum).contains(&seconds),
+                        "{outcome}: {seconds}"
+                    );
+                } else {
+                    assert!(seconds < 1.0, "{key:?}: {seconds}");
+                }
+            }
+        }
+        cached.write().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_applies_json_filters() {
+        let (state, _dir) = rollout_state().await;
+        let body = serde_json::to_vec(&AddRolloutsRequest {
+            records: vec![
+                filtered_record("a", "ckpt-1", true),
+                filtered_record("b", "ckpt-2", false),
+            ],
+        })
+        .unwrap();
+        let _ = add_rollouts(
+            State(state.clone()),
+            Path("rl".to_string()),
+            json_request(body),
+        )
+        .await
+        .unwrap();
+        flush_store(&state, "rl").await;
+
+        let Json(response) = list_rollouts(
+            None,
+            State(state),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some(
+                    serde_json::json!({
+                        "policy_version": "ckpt-2",
+                        "include_in_training": false
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].id, "b");
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_rejects_invalid_filters() {
+        let (state, _dir) = rollout_state().await;
+        let invalid_json = list_rollouts(
+            None,
+            State(state.clone()),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some("{not-json}".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(invalid_json, AppError::InvalidRequest(_)));
+
+        let unsupported = list_rollouts(
+            None,
+            State(state),
+            Path("rl".to_string()),
+            Query(RolloutListParams {
+                filters: Some(serde_json::json!({"reward": 1.0}).to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(unsupported, AppError::InvalidRequest(_)));
+    }
+}

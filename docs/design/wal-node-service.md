@@ -1,0 +1,197 @@
+# Independent WAL node service
+
+`context-wal-node` starts the durable runtime, authenticated peer replication,
+separate snapshot transfer, and separate client data/control listeners. It also
+runs automatic checkpoint, image collection, disk measurement and native log
+maintenance. Build the service without Arrow or Lance dependencies:
+
+```sh
+cargo build --release -p lance-context-wal --features service --bin context-wal-node
+context-wal-node --config /etc/wal/node.json --io-threads 2 --blocking-threads 4
+```
+
+The service supplies the storage side of ingestion. HTTP ingestion and Lance
+materialization are separate application components; this executable does not
+publish rows into Lance by itself.
+
+## Configuration and identity
+
+The JSON configuration is `service::Config`; unknown top-level and transport
+option fields are rejected. `tests/node_service/fixture.rs` builds a complete
+configuration for six real processes in two independent three-voter groups.
+
+Required fields are the node ID, data directory, complete immutable `layout` and
+replication `limits`, advertised `endpoints`, local `listen` addresses, TLS file
+paths, trusted application certificate pins, per-group signing file paths and
+node disk budget. `storage`, `runtime`, `peer`, `snapshot`, `client` and
+`maintenance` have bounded defaults and accept explicit overrides. Durations in
+transport/runtime JSON are integer milliseconds; memory/disk fields are bytes.
+All paths relative to a configuration file resolve against its containing
+directory. The executable reads at most 1 MiB of configuration.
+
+`runtime.async_persistence` defaults to `false`. When enabled, each hosted group
+has an ordered native writer for its Raft Ready operations. The original group
+worker retains Raft ownership; successful persistence receipts gate durable
+status, application, persisted messages and client acknowledgments. Pending log
+payloads share buffers with their write tasks. This does not change the physical
+WAL format or eliminate decoding when application reads the persisted log.
+
+The native writer coalesces at most 32 Ready tasks already waiting in its queue.
+It does not wait for more work to arrive. Adjacent entries and their final
+HardState share one append/sync; their payload buffers are moved without decoding
+or copying the bodies. A suffix replacement begins a separate native write, and
+checkpoint tasks remain ordered barriers. Every original Ready keeps its own
+receipt and application boundary, released only after the batch succeeds. A
+failed write releases no successful receipt from that batch and stops the runtime.
+The existing pending window still accounts for every original task until its
+receipt is consumed. Native `io` timing counts writer batches; it is not an
+append request count. The synchronous runtime and persisted format are unchanged.
+
+The per-group pending window bounds Ready records, entries and their encoded
+bytes/descriptors, including deferred application and message ownership. Its
+byte limit derives from the configured data, peer and control byte budgets;
+transport admission separately bounds backing allocations. A full window
+refuses new proposals and defers new read barriers. Leaders continue their
+heartbeat and quorum-check ticks, accept current-term heartbeat responses, and
+send the messages Raft permits before persistence. This does not advance durable
+indices or release commit/read completions. Other peer input and follower ticks
+remain capacity-limited; transport pressure and checkpoint/snapshot barriers can
+still interrupt progress. Those barriers wait for original pending writes.
+Shutdown joins native writers, and persistence failures stop the runtime.
+
+With this option enabled, each group's `persistence` status reports pending
+ownership and native-writer `io` timing separately from `durable_poll`, which
+remains the Raft worker's timing. Moving a sync wait between these fields is not
+evidence of a throughput gain; validate the complete mixed workload and drain.
+
+Each advertised node has distinct peer, snapshot, data and control addresses, a
+TLS server name and a SHA-256 leaf-certificate pin. Prefer stable service names.
+Actual connection addresses in `endpoints` may be updated after Pod replacement;
+keep the original `layout`, node IDs, certificate pins and persistent directories.
+The layout's original addresses remain part of its durable identity and are not
+rewritten to match new Pod IPs. This does not add voters, transfer ownership or
+rotate certificates. Changing the durable layout is a migration. Listeners may bind wildcard
+addresses, but must have distinct, nonzero ports. Only voters sharing a hosted
+group have peer queues and certificate authorization on a physical node; adding
+unrelated groups does not create a full mesh of peer tasks.
+
+TLS certificate chains and root bundles use PEM, as does the local private key.
+Catalog/source attestation files contain Ed25519 PKCS#8 DER. Existing persistent
+keys must match the public keys in the immutable replication policy. The local
+TLS certificate is checked against its configured pin, DNS name, roots and
+private key before opening storage. Startup never generates replacement keys,
+producer policy or a new layout. Catalog keys are supplied only to catalog
+replicas; source private keys cover exactly the groups hosted by each node.
+
+Provision files through per-node mounted configuration and secrets. A node
+requires its original persistent directory across process/Pod replacement.
+For Kubernetes, use stable DNS, persistent volumes, and a termination grace
+period sufficient for the largest native maintenance operation. Startup must
+permit all voters to resolve each other before readiness; a headless service
+normally needs `publishNotReadyAddresses: true`. Configure one process per
+physical engine, not one process per virtual bucket.
+
+## Automatic maintenance and shutdown
+
+Snapshot transport is attached before maintenance starts. Each node has one
+maintenance scheduler and at most one of its blocking jobs outstanding.
+Checkpointing captures applied state on the owner thread, builds a complete
+application image outside it, and durably installs that image before logically
+compacting the covered log. Retained acknowledged payloads remain in the image.
+The scheduler uses both an entry threshold and a maximum interval, and acts on
+native-engine checkpoint suggestions without treating them as deletion permits.
+
+Image collection retains a scan cursor across bounded batches and protects
+installed images and live transfers/readers. Physical native log maintenance
+runs once per node, with explicit rewrite headroom. It can pause persistence
+while holding the engine's maintenance gate; it has no hard execution deadline.
+Counters expose its duration separately from checkpoint work. Admission errors
+or a busy image permit are observed and retried; a failed replica/transport task
+causes the service to drain and exit.
+Only successful checkpoints and log passes reset their scheduling intervals.
+Failed work stays eligible on the next scheduler tick, so a temporary busy
+permit or rewrite reservation does not add a full retention interval. The
+scheduler still runs one job at a time and enforces the existing disk budgets;
+this does not guarantee recovery after replicated traffic exhausts headroom.
+
+SIGTERM/SIGINT stops client admission, joins maintenance and snapshot file work,
+then stops and joins peer/runtime owners. Cancelling a shutdown waiter does not
+abort the owning supervisor or free the engine while filesystem work is still
+running. Unanswered writes remain unknown, and clients must retry their exact
+persisted producer/sequence/body tuple.
+
+Disk admission is an application control window, not a filesystem quota or a
+promise of unlimited ingest. New local data proposals use the lower producer
+limit. Peer appends have already passed their leader's admission and may use
+reserved headroom up to the total node budget, even when they contain data.
+Applying the follower's producer limit would also block later control entries
+behind an admitted data prefix. Peer reservations still cover all new entries
+until persistence or discard; total-budget exhaustion refuses new peer payloads.
+Without
+publication/source retirement, acknowledged data must accumulate and admission
+must eventually stop; checkpoints cannot discard that data to improve a score.
+
+## Observation and qualification
+
+The diagnostic HTTP listener serves `/health/live`, `/health/ready` and `/status`.
+The status and readiness responses include `admission` observations for data,
+control, incoming peers and outgoing peers. Each lane reports request and byte
+capacity, current usage, and separate rejection counters. These independently
+sampled local values distinguish request pressure from response-byte pressure;
+they exclude the transport's separate budgets and do not change readiness.
+
+Peer transport counters complement the runtime-only `peer_drops` pair:
+`peer_dropped_outbound` counts frames or snapshots discarded during dispatch,
+disconnects or failed sends; `peer_failed_exchanges` counts failed connection or
+frame exchanges, including timeouts; `peer_rejected_connections` counts inbound
+connection admission and TLS/identity failures; `peer_rejected_packets` counts
+complete received frames rejected by runtime validation or admission. The latter
+can overlap runtime rejection counters. These counters are sampled independently and reset
+on process restart. They describe transport events, so they cannot be added to
+HTTP retry counts or interpreted as lost acknowledged records.
+
+Normal peer-frame enqueue failures additionally report the first failed gate:
+`peer_enqueue_not_ready`, `peer_enqueue_byte_capacity`, `peer_enqueue_queue_full`
+or `peer_enqueue_queue_closed`. Destination byte credits cover both queued and
+actively transmitting frames. These counters distinguish byte pressure from
+message-count pressure; they exclude snapshot dispatch, failed exchanges and
+queued frames discarded on reconnect. Each rejected enqueue also contributes to
+`peer_dropped_outbound`, but independently sampled counters are not an atomic
+partition of that broader total.
+
+`peer_destinations` reports queue residence and send intervals per configured
+destination node. Queue intervals are recorded only when dequeued; pending or
+purged frames are absent. Send intervals cover frame encoding, writes and flush,
+including errors and cancellations but excluding connection setup and unfinished
+intervals. Successful sends separately count frames and Raft entry payload bytes;
+these include retransmissions, exclude framing/TLS bytes, and do not prove remote
+receipt or persistence. Fields are independently sampled cumulative counters.
+Intervals for different destinations overlap, so they are not additive CPU or
+disk time. No table, session, or request identifiers appear in these observations.
+
+The `appends` counters distinguish disk-budget refusal, runtime request/byte
+credits, queue unavailability, pending-proposal capacity, leadership changes,
+committed capacity/sequence rejections, and stopped workers. They use typed
+causes before RPC errors become `Unknown`; unclassified execution failures stay
+in `execution_other`. Labels have fixed cardinality and contain no request data.
+Counting starts after a complete append body reaches execution. TLS/frame
+failures, transport admission waits, ingress-to-node timeouts and response
+delivery failures are outside this observation. `cancelled` means execution was
+dropped (for example by the server deadline or shutdown), not that its Raft
+proposal was aborted. `accepted` includes exact retries and only means the server
+observed a durable acceptance, not that the client received the ACK. Counters
+reset on process restart and are sampled independently. A routed request may
+produce redirects on other nodes, so these are not HTTP retry counts.
+
+The diagnostic listener allows at most 16 connections, bounds header buffers, disables keepalive and
+uses a two-second connection deadline, independently of WAL RPC capacity.
+Readiness reports active local workers and fresh local observations; it is not
+a quorum lease or proof of Lance visibility. Status includes each group's log
+and checkpoint positions, disk accounting and maintenance/transfer counters.
+
+The process test starts the actual executable on six independent directories,
+stops a follower until automatic checkpointing has compacted its missing log,
+requires a snapshot to catch it up, kills a leader, then stops/restarts every
+process with the same configuration. Exact last-batch retries and complete
+metadata/payload reads are checked on every replica. These are correctness and
+lifecycle checks, not sustained throughput results.

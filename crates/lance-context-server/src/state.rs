@@ -1,0 +1,1596 @@
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use lance_context_core::etcd::open_registry;
+use lance_context_core::{
+    join_uri, validate_store_name, ContextStore, ContextStoreOptions, DatagenStore,
+    DatagenStoreOptions, GenericStore, GenericStoreOptions, MergeMemoryBudget, RolloutStore,
+    RolloutStoreOptions, Session, StoreRegistry,
+};
+use lru::LruCache;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, Semaphore};
+use tokio::task::JoinHandle;
+
+use crate::config::ServerConfig;
+use crate::error::AppError;
+use crate::sweeper;
+
+/// Default upper bound on resident rollout-store handles when the config does
+/// not specify one. Sized for peak *concurrent* experiments, not the total
+/// number of experiments (which may be hundreds of thousands).
+pub const DEFAULT_ROLLOUT_CACHE_CAPACITY: usize = 2000;
+
+type StoreSlot<T> = Arc<Mutex<Weak<RwLock<T>>>>;
+
+/// Weak handles survive LRU eviction without retaining datasets. The per-name
+/// lock serializes create/open/delete across storage I/O, so an evicted handle
+/// is reused and an old open cannot cross a delete/recreate boundary.
+pub(crate) struct StoreHandles<T> {
+    slots: std::sync::Mutex<HandleSlots<T>>,
+}
+
+struct HandleSlots<T> {
+    by_name: HashMap<String, StoreSlot<T>>,
+    prune_at: usize,
+}
+
+impl<T> Default for HandleSlots<T> {
+    fn default() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            prune_at: 64,
+        }
+    }
+}
+
+impl<T> Default for StoreHandles<T> {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+        }
+    }
+}
+
+impl<T> StoreHandles<T> {
+    pub(crate) async fn lock(&self, name: &str) -> OwnedMutexGuard<Weak<RwLock<T>>> {
+        let slot = {
+            let mut slots = self.slots.lock().unwrap();
+            if !slots.by_name.contains_key(name) && slots.by_name.len() >= slots.prune_at {
+                // Amortize collection and keep slots with either a live store
+                // or an operation holding/waiting for the per-name lock.
+                slots.by_name.retain(|_, slot| {
+                    Arc::strong_count(slot) > 1
+                        || slot
+                            .try_lock()
+                            .map_or(true, |handle| handle.strong_count() > 0)
+                });
+                slots.prune_at = (slots.by_name.len() * 2).max(64);
+            }
+            slots.by_name.entry(name.to_string()).or_default().clone()
+        };
+        slot.lock_owned().await
+    }
+}
+
+pub struct AppState {
+    pub(crate) demand_publisher: Arc<crate::demand_publish::DemandPublisher>,
+    pub merge_executions: crate::merge_execution::Executions,
+    pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
+    /// Bounded LRU of resident rollout-store handles.
+    ///
+    /// With one physical dataset per experiment, the deployment may hold
+    /// hundreds of thousands of stores; keeping them all resident would exhaust
+    /// memory and (formerly) spawn one background timer each. This cache bounds
+    /// residency: on overflow the least-recently-used handle is evicted and its
+    /// `Arc<RwLock<RolloutStore>>` dropped. Existence is tracked durably by
+    /// [`Self::rollout_registry`], not by membership in this cache.
+    ///
+    /// # Eviction does not strand unflushed rows
+    ///
+    /// The flush sweeper only visits *resident* stores, so it is worth being
+    /// explicit about why evicting a store that still has an unsealed memtable
+    /// is safe: dropping the last handle runs `RolloutStore`'s `Drop`, which
+    /// spawns a detached `ShardWriter::close`, and that seals the active
+    /// memtable before draining. An evicted store's rows therefore still become
+    /// visible without the sweeper ever seeing it.
+    ///
+    /// The residual risk is that the detached close is best-effort — it cannot
+    /// be awaited from `drop`, and it no-ops if an in-flight append still shares
+    /// the `Arc`. Both cases are logged (see that `Drop` impl) rather than
+    /// silently stranding rows.
+    pub rollout_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
+    pub(crate) rollout_handles: StoreHandles<RolloutStore>,
+    /// Durable directory of which rollout stores exist. Consulted on a cache
+    /// miss (existence check) and to back the list endpoint. Guarded by a lock
+    /// because every operation refreshes the snapshot and therefore takes
+    /// `&mut`.
+    pub rollout_registry: Arc<dyn StoreRegistry>,
+    pub base_uri: String,
+    /// Stable identity of this server instance, used as the MemWAL shard key for
+    /// every server-managed store so each instance owns exactly one shard.
+    /// `None` falls back to a single shared shard (single-instance deployments
+    /// only).
+    pub instance_id: Option<String>,
+    /// Count-triggered self-merge threshold for rollout MemWAL shards; `0`
+    /// disables it. See `RolloutStoreOptions::merge_after_generations`.
+    pub rollout_merge_after_generations: usize,
+    /// Master demand notification threshold, independent of self-merge.
+    pub rollout_master_merge_after_generations: usize,
+    /// Per-pass cap on flushed generations folded into the base table. `0` is
+    /// disabled; the byte budget still applies. See
+    /// `ServerConfig::rollout_merge_max_generations`.
+    pub rollout_merge_max_generations: usize,
+    /// Buffered Arrow array byte budget per merge pass; `0` disables this cap.
+    pub rollout_merge_max_bytes: usize,
+    pub rollout_key_index_type: lance_context_core::KeyIndexType,
+    /// Per-shard pending-generation count at which reads warn; `0` disables.
+    pub rollout_wal_pending_warn_generations: usize,
+    pub rollout_wal_pending_max_generations: usize,
+    /// Process-wide merge memory budget shared by every store; `None` when
+    /// disabled. See `lance_context_core::merge_budget`.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Worker-wide cap on concurrent merge-wal requests; `None` when disabled.
+    pub merge_slots: Option<Arc<Semaphore>>,
+    /// Periodic per-shard WAL-cleanup interval in seconds; `0` disables the
+    /// global sweeper. See [`Self::spawn_global_sweeper`].
+    pub rollout_cleanup_interval_secs: u64,
+    /// Periodic MemWAL flush interval in seconds; `0` disables periodic flush.
+    /// Bounds rollout read-after-write latency (appends are durable but not
+    /// visible until flushed). See [`Self::spawn_global_sweeper`].
+    pub rollout_flush_interval_secs: u64,
+    /// Admission budget for in-flight artifact-blob bytes across concurrent
+    /// uploads/downloads. `None` disables the budget (unbounded). See
+    /// [`BlobBudget`].
+    pub blob_budget: Option<Arc<BlobBudget>>,
+    /// Byte size at or above which a single inline blob is logged at `WARN`.
+    /// `0` disables the log. See `Config::rollout_large_blob_log_bytes`.
+    pub rollout_large_blob_log_bytes: usize,
+    /// Shared Lance cache session attached to every resident rollout store, so
+    /// the process's total metadata/index cache is bounded by one budget rather
+    /// than Lance's default 6 GiB *per store*. `None` restores the per-store
+    /// default session (leak-prone; only when the budget is configured to `0`).
+    pub rollout_session: Option<Arc<Session>>,
+    /// Bounded LRU of resident datagen-store handles, mirroring
+    /// [`Self::rollout_stores`]. Datagen delta-log datasets are also one per
+    /// experiment, so the same residency bound and durable-registry existence
+    /// model applies.
+    pub datagen_stores: Mutex<LruCache<String, Arc<RwLock<DatagenStore>>>>,
+    pub(crate) datagen_handles: StoreHandles<DatagenStore>,
+    /// Durable directory of which datagen stores exist. A separate registry
+    /// dataset from [`Self::rollout_registry`] so the two store kinds never
+    /// collide on a shared name.
+    pub datagen_registry: Arc<dyn StoreRegistry>,
+    /// Bounded LRU of resident generic-store handles, mirroring
+    /// [`Self::rollout_stores`].
+    pub generic_stores: Mutex<LruCache<String, Arc<RwLock<GenericStore>>>>,
+    pub(crate) generic_handles: StoreHandles<GenericStore>,
+    /// Durable directory of which generic stores exist.
+    ///
+    /// Records only name and URI: a generic store's **schema is stored in its
+    /// own dataset**, so the registry deliberately does not carry a second
+    /// copy. Two writable copies of a schema is exactly the divergence this
+    /// refactor exists to remove. The cost is that listing stores cannot report
+    /// their schemas without opening each dataset, which is why
+    /// `GenericStoreInfo::schema` is `None` in list responses.
+    pub generic_registry: Arc<dyn StoreRegistry>,
+}
+
+/// Process-wide admission control for the total artifact-blob payload held in
+/// memory across concurrent rollout uploads and downloads.
+///
+/// Each blob request materializes its whole payload as an in-memory buffer, so
+/// unbounded concurrency of large requests can OOM the worker. A request calls
+/// [`BlobBudget::try_acquire`] with its byte size before allocating; the guard
+/// returned holds the reservation and releases it on drop (i.e. when the
+/// request completes). When the budget cannot fit the request the caller
+/// rejects it with `503` rather than proceeding to allocate.
+///
+/// This bounds *concurrency*, not maximum blob size: a single request larger
+/// than the entire budget is still admitted when nothing else is in flight (it
+/// transiently reserves the full budget), so a lone big download never
+/// deadlocks against its own limit.
+#[derive(Debug)]
+pub struct BlobBudget {
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+
+/// RAII reservation returned by [`BlobBudget::try_acquire`]. Releases its bytes
+/// back to the budget when dropped.
+#[derive(Debug)]
+pub struct BlobReservation {
+    budget: Arc<BlobBudget>,
+    bytes: usize,
+}
+
+impl BlobBudget {
+    /// Create a budget admitting up to `limit` concurrent in-flight blob bytes.
+    #[must_use]
+    pub fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Reserve `bytes` if they fit alongside what is already in flight. Returns
+    /// `None` (request should be rejected with `503`) when admitting the request
+    /// would exceed the limit, *unless* nothing is currently in flight — in that
+    /// case an over-limit request is admitted so a lone large blob is never
+    /// permanently rejected.
+    pub fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BlobReservation> {
+        use std::sync::atomic::Ordering;
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            // Admit when it fits, or when the instance is otherwise idle (so a
+            // single request bigger than the whole budget can still proceed).
+            let next = current.checked_add(bytes)?;
+            let fits = next <= self.limit;
+            if !fits && current != 0 {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(BlobReservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Admit one unknown-size materialization only while the budget is idle.
+    /// Missing or client-supplied payload sizes cannot safely predict the
+    /// allocation. Holding the full budget excludes other blob allocations.
+    pub fn try_acquire_unknown(self: &Arc<Self>) -> Option<BlobReservation> {
+        self.try_acquire(self.limit.max(1))
+    }
+}
+
+impl BlobReservation {
+    /// After an exclusive load, return unused capacity for concurrent responses.
+    /// An oversized blob keeps the full reservation until it is released.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        let retained = bytes.min(self.bytes);
+        self.budget
+            .used
+            .fetch_sub(self.bytes - retained, std::sync::atomic::Ordering::AcqRel);
+        self.bytes = retained;
+    }
+}
+
+impl Drop for BlobReservation {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Build the process-wide shared Lance cache session for rollout stores from a
+/// single total byte budget, or `None` when the budget is `0` (which restores
+/// Lance's per-store default session).
+///
+/// The budget is split 6:1 index:metadata to mirror Lance's own default ratio
+/// (`DEFAULT_INDEX_CACHE_SIZE` = 6 GiB, `DEFAULT_METADATA_CACHE_SIZE` = 1 GiB).
+fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
+    if cache_bytes == 0 {
+        return None;
+    }
+    let metadata_bytes = cache_bytes / 7;
+    let index_bytes = cache_bytes - metadata_bytes;
+    Some(RolloutStore::build_session(index_bytes, metadata_bytes))
+}
+
+impl AppState {
+    /// Wait for a merge slot (see `ServerConfig::rollout_merge_concurrency`).
+    pub async fn acquire_merge_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let slots = self.merge_slots.as_ref()?;
+        let wait = std::time::Instant::now();
+        // Only fails if the semaphore is closed, which we never do.
+        let permit = Arc::clone(slots).acquire_owned().await.ok()?;
+        metrics::histogram!("rollout_wal_merge_slot_wait_seconds")
+            .record(wait.elapsed().as_secs_f64());
+        Some(permit)
+    }
+
+    /// Build the shared server state, opening (or creating) the rollout registry
+    /// under `data_dir`. Async because opening the registry touches storage.
+    pub async fn new(config: ServerConfig) -> Result<Self, AppError> {
+        let instance_id = config.resolved_instance_id();
+        let base_uri = config.data_dir.clone();
+        let etcd_client = if config.etcd.is_configured()
+            && (matches!(
+                config.registry.registry_backend,
+                lance_context_core::etcd::RegistryBackend::Etcd
+            ) || config.registry.registry_mirror.is_some())
+        {
+            Some(config.etcd.connect().await.map_err(AppError::from_lance)?)
+        } else {
+            None
+        };
+        let etcd = etcd_client.as_ref().map(|c| (c, config.etcd.prefix()));
+        let registry = open_registry(
+            "rollout",
+            &join_uri(&base_uri, "_registry.rollout.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+        let capacity = NonZeroUsize::new(config.rollout_cache_capacity)
+            .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap());
+        let blob_budget = (config.rollout_max_inflight_blob_bytes > 0)
+            .then(|| BlobBudget::new(config.rollout_max_inflight_blob_bytes));
+        let rollout_session = build_rollout_session(config.rollout_cache_bytes);
+        let generic_registry = open_registry(
+            "generic",
+            &join_uri(&base_uri, "_registry.generic.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+        config
+            .merge_rollout
+            .validate()
+            .map_err(AppError::InvalidRequest)?;
+        if !config.merge_rollout.owned_targets.is_empty() && config.etcd.etcd_endpoints.is_empty() {
+            return Err(AppError::InvalidRequest(
+                "owned targets require ETCD_ENDPOINTS".into(),
+            ));
+        }
+        if config.merge_execution_timeout_secs == 0
+            || config.merge_queue_timeout_secs == 0
+            || config.merge_idle_timeout_secs == 0
+        {
+            return Err(AppError::InvalidRequest(
+                "merge execution, queue and idle timeouts must be positive".into(),
+            ));
+        }
+        if config.merge_fence_this_worker && instance_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::InvalidRequest(
+                "worker fencing requires a stable INSTANCE_ID or HOSTNAME".into(),
+            ));
+        }
+        if config.merge_rollout.fence_legacy
+            || config.merge_fence_this_worker
+            || config.merge_executor_endpoint.is_some()
+        {
+            let endpoint = config.merge_executor_endpoint.as_deref().unwrap_or("");
+            let valid_endpoint = endpoint.parse::<axum::http::Uri>().is_ok_and(|url| {
+                matches!(url.scheme_str(), Some("http" | "https"))
+                    && url
+                        .authority()
+                        .is_some_and(|a| !a.host().is_empty() && !a.as_str().contains('@'))
+                    && url.query().is_none()
+                    && matches!(url.path(), "" | "/")
+                    && !endpoint.contains('#')
+            });
+            if !valid_endpoint
+                || config.etcd.etcd_endpoints.is_empty()
+                || config.rollout_merge_concurrency == 0
+            {
+                return Err(AppError::InvalidRequest(
+                    "fenced legacy merges require ETCD_ENDPOINTS, a stable MERGE_EXECUTOR_ENDPOINT and positive ROLLOUT_MERGE_CONCURRENCY".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            demand_publisher: crate::demand_publish::DemandPublisher::new(capacity.get()),
+            merge_executions: crate::merge_execution::Executions::configured(
+                config.merge_etcd_config(),
+                config.merge_rollout.clone(),
+                config.merge_executor_endpoint.clone(),
+                config.merge_execution_timeout_secs,
+                config.merge_queue_timeout_secs,
+                config.merge_idle_timeout_secs,
+                crate::merge_execution::WorkerAdmission {
+                    writer_id: instance_id.clone(),
+                    enable_fencing: config.merge_fence_this_worker,
+                },
+            ),
+            stores: RwLock::new(std::collections::HashMap::new()),
+            rollout_stores: Mutex::new(LruCache::new(capacity)),
+            rollout_handles: StoreHandles::default(),
+            rollout_registry: registry,
+            base_uri,
+            instance_id,
+            rollout_merge_after_generations: config.rollout_merge_after_generations,
+            rollout_master_merge_after_generations: config.rollout_master_merge_after_generations,
+            rollout_merge_max_generations: config.rollout_merge_max_generations,
+            rollout_merge_max_bytes: config.rollout_merge_max_bytes,
+            rollout_key_index_type: config.rollout_key_index_type,
+            rollout_wal_pending_warn_generations: config.rollout_wal_pending_warn_generations,
+            rollout_wal_pending_max_generations: config.rollout_wal_pending_max_generations,
+            merge_budget: (config.rollout_merge_memory_bytes > 0)
+                .then(|| MergeMemoryBudget::new(config.rollout_merge_memory_bytes)),
+            merge_slots: (config.rollout_merge_concurrency > 0)
+                .then(|| Arc::new(Semaphore::new(config.rollout_merge_concurrency))),
+            rollout_cleanup_interval_secs: config.rollout_cleanup_interval_secs,
+            rollout_flush_interval_secs: config.rollout_flush_interval_secs,
+            blob_budget,
+            rollout_large_blob_log_bytes: config.rollout_large_blob_log_bytes,
+            rollout_session,
+            datagen_stores: Mutex::new(LruCache::new(capacity)),
+            datagen_handles: StoreHandles::default(),
+            datagen_registry,
+            generic_stores: Mutex::new(LruCache::new(capacity)),
+            generic_handles: StoreHandles::default(),
+            generic_registry,
+        })
+    }
+
+    pub fn context_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.lance", name))
+    }
+
+    /// Options shared by every context-store open path in this server.
+    pub(crate) fn context_store_options(&self) -> ContextStoreOptions {
+        ContextStoreOptions {
+            shard_id: self.instance_id.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a default-configured `AppState` rooted at `base_path`, for tests.
+    /// Opens a fresh registry under the directory; cleanup interval disabled.
+    #[cfg(test)]
+    pub async fn new_for_test(base_path: PathBuf) -> Self {
+        Self::new_for_test_with_instance(base_path, None).await
+    }
+
+    /// Like [`Self::new_for_test`] but with an explicit MemWAL instance id, so a
+    /// second in-process "instance" can present its own shard.
+    #[cfg(test)]
+    pub async fn new_for_test_with_instance(
+        base_path: PathBuf,
+        instance_id: Option<String>,
+    ) -> Self {
+        let base_uri = base_path.to_string_lossy().to_string();
+        let lance_only = lance_context_core::etcd::RegistryConfig::default();
+        let registry = open_registry(
+            "rollout",
+            &join_uri(&base_uri, "_registry.rollout.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test registry");
+        let generic_registry = open_registry(
+            "generic",
+            &join_uri(&base_uri, "_registry.generic.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test generic registry");
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            None,
+            &lance_only,
+        )
+        .await
+        .expect("open test datagen registry");
+        Self {
+            demand_publisher: crate::demand_publish::DemandPublisher::new(
+                DEFAULT_ROLLOUT_CACHE_CAPACITY,
+            ),
+            merge_executions: crate::merge_execution::Executions::new(None, 600),
+            stores: RwLock::new(std::collections::HashMap::new()),
+            rollout_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            rollout_handles: StoreHandles::default(),
+            rollout_registry: registry,
+            base_uri,
+            instance_id,
+            rollout_merge_after_generations: 0,
+            rollout_master_merge_after_generations: 8,
+            rollout_merge_max_generations: 8,
+            rollout_merge_max_bytes: 1024 * 1024 * 1024,
+            rollout_key_index_type: Default::default(),
+            rollout_wal_pending_warn_generations: 256,
+            rollout_wal_pending_max_generations: 0,
+            merge_budget: None,
+            merge_slots: None,
+            rollout_cleanup_interval_secs: 0,
+            rollout_flush_interval_secs: 0,
+            blob_budget: None,
+            rollout_large_blob_log_bytes: 16 * 1024 * 1024,
+            rollout_session: build_rollout_session(2 * 1024 * 1024 * 1024),
+            generic_stores: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            generic_handles: StoreHandles::default(),
+            generic_registry,
+            datagen_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
+            )),
+            datagen_handles: StoreHandles::default(),
+            datagen_registry,
+        }
+    }
+
+    /// Rollout datasets live under a distinct `.rollout.lance` suffix so a
+    /// rollout store and a context store may share the same name without
+    /// colliding on disk.
+    pub fn rollout_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
+    }
+
+    fn rollout_store_options(&self) -> RolloutStoreOptions {
+        RolloutStoreOptions {
+            // No request body on the read path: object-store credentials come
+            // from the pod's workload-identity environment.
+            storage_options: None,
+            shard_id: self.instance_id.clone(),
+            merge_after_generations: (self.rollout_merge_after_generations > 0)
+                .then_some(self.rollout_merge_after_generations),
+            merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
+            pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
+            merge_budget: self.merge_budget.clone(),
+            session: self.rollout_session.clone(),
+        }
+    }
+
+    /// Record that a rollout store exists, in both the durable registry and the
+    /// in-memory LRU. The caller must hold this name's handle lock throughout
+    /// the existence check, dataset creation, and registration.
+    pub async fn register_rollout(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<RolloutStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<RolloutStore>>>,
+    ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
+        self.rollout_registry
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        // Insertion may evict the LRU's least-recently-used entry; dropping the
+        // returned handle releases it (no per-store timer to abort — cleanup is
+        // now global).
+        **handle = Arc::downgrade(&store);
+        self.rollout_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a rollout store from the durable registry and evict any resident
+    /// handle. Returns whether the store existed.
+    pub async fn unregister_rollout(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
+        let mut handle = self.rollout_handles.lock(name).await;
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let registry = &self.rollout_registry;
+        let Some(entry) = registry.get(name).await.map_err(AppError::from_lance)? else {
+            return Ok(false);
+        };
+        let live = handle.upgrade();
+        if let Some(store) = live {
+            let mut store = store.write().await;
+            if store.uri() != entry.uri {
+                return Err(AppError::Overloaded(format!(
+                    "Rollout store '{name}' registry changed; refusing to delete a different dataset"
+                )));
+            }
+            store.delete_data().await.map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&entry.uri)
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
+        self.rollout_stores.lock().await.pop(name);
+        *handle = Weak::new();
+        Ok(true)
+    }
+
+    /// Look up a rollout store by name, lazily loading it from object storage on
+    /// a local cache miss.
+    ///
+    /// Unlike the previous implementation, a cache miss is **not** a 404: the
+    /// bounded LRU may have evicted a store that still exists. Existence is
+    /// resolved against the durable [`RolloutRegistry`]; only a store absent
+    /// from the registry yields [`AppError::NotFound`]. This closes the
+    /// multi-replica gap (create on pod A, read on pod B) *and* the
+    /// eviction-induced false-404 that per-experiment partitioning introduces.
+    pub async fn get_or_open_rollout_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<RolloutStore>>, AppError> {
+        use crate::store_timing::{measure, Stage};
+        Self::validate_name(name)?;
+        // Fast path: resident in this process's LRU (updates recency).
+        if let Some(store) = measure(name, Stage::CacheLock, self.rollout_stores.lock())
+            .await
+            .get(name)
+        {
+            metrics::counter!("rollout_store_cache_hits_total").increment(1);
+            return Ok(store.clone());
+        }
+        metrics::counter!("rollout_store_cache_misses_total").increment(1);
+
+        let mut handle = measure(name, Stage::NameLock, self.rollout_handles.lock(name)).await;
+        if let Some(store) = handle.upgrade() {
+            measure(name, Stage::CacheLock, self.rollout_stores.lock())
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
+        }
+
+        // The registry owns both existence and the physical dataset location.
+        let entry = measure(name, Stage::RegistryLookup, self.rollout_registry.get(name))
+            .await
+            .map_err(AppError::from_lance)?
+            .ok_or_else(|| AppError::NotFound(format!("Rollout store '{name}' does not exist")))?;
+
+        // Load from storage WITHOUT holding the LRU lock, so a slow open does
+        // not block other stores' requests.
+        let opened = measure(
+            name,
+            Stage::DatasetOpen,
+            RolloutStore::open_existing_with_options(&entry.uri, self.rollout_store_options()),
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+        // Reject a removal or replacement observed during this open. This is
+        // not a distributed lease: cached handles still need lifecycle fencing.
+        match measure(
+            name,
+            Stage::RegistryRecheck,
+            self.rollout_registry.get(name),
+        )
+        .await
+        .map_err(AppError::from_lance)?
+        {
+            Some(current) if current == entry => {}
+            Some(_) => {
+                return Err(AppError::Overloaded(format!(
+                    "Rollout store '{name}' registry changed while opening; retry"
+                )));
+            }
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "Store '{name}' was deleted while opening"
+                )));
+            }
+        }
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
+        let mut cache = measure(name, Stage::CacheLock, self.rollout_stores.lock()).await;
+        cache.put(name.to_string(), opened.clone());
+        metrics::gauge!("rollout_stores_resident").set(cache.len() as f64);
+        Ok(opened)
+    }
+
+    /// Look up a context store by name, lazily loading it from object storage on
+    /// a local cache miss. See [`Self::get_or_open_rollout_store`] for the
+    /// multi-replica rationale; the same in-memory-cache-as-existence-check bug
+    /// affects context stores.
+    pub async fn get_or_open_context_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<ContextStore>>, AppError> {
+        Self::validate_name(name)?;
+        if let Some(store) = self.stores.read().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        let uri = self.context_uri(name);
+        let opened = ContextStore::open_existing_with_options(&uri, self.context_store_options())
+            .await
+            .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+
+        let mut stores = self.stores.write().await;
+        if let Some(existing) = stores.get(name) {
+            return Ok(existing.clone());
+        }
+        stores.insert(name.to_string(), opened.clone());
+        Ok(opened)
+    }
+
+    pub fn validate_name(name: &str) -> Result<(), AppError> {
+        validate_store_name(name).map_err(AppError::InvalidRequest)
+    }
+
+    /// Datagen delta-log datasets live under a distinct `.datagen.lance` suffix
+    /// so a datagen store shares neither a rollout nor a context store's path.
+    pub fn datagen_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.datagen.lance", name))
+    }
+
+    fn datagen_store_options(&self) -> DatagenStoreOptions {
+        DatagenStoreOptions {
+            storage_options: None,
+            shard_id: self.instance_id.clone(),
+            merge_after_generations: (self.rollout_merge_after_generations > 0)
+                .then_some(self.rollout_merge_after_generations),
+            merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
+            pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
+            merge_budget: self.merge_budget.clone(),
+            cleanup_interval_secs: None,
+        }
+    }
+
+    /// Record that a datagen store exists, in both the durable registry and the
+    /// in-memory LRU. The caller must hold this name's handle lock throughout
+    /// the existence check, dataset creation, and registration.
+    pub async fn register_datagen(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<DatagenStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<DatagenStore>>>,
+    ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
+        self.datagen_registry
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        **handle = Arc::downgrade(&store);
+        self.datagen_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a datagen store from the durable registry and evict any resident
+    /// handle. Returns whether the store existed.
+    pub async fn unregister_datagen(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
+        let mut handle = self.datagen_handles.lock(name).await;
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let registry = &self.datagen_registry;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Ok(false);
+        }
+        let live = handle.upgrade();
+        if let Some(store) = live {
+            store
+                .write()
+                .await
+                .delete_data()
+                .await
+                .map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&self.datagen_uri(name))
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
+        self.datagen_stores.lock().await.pop(name);
+        *handle = Weak::new();
+        Ok(true)
+    }
+
+    /// Look up a datagen store by name, lazily loading it from object storage on
+    /// a local cache miss. Existence is resolved against the durable registry, so
+    /// an evicted-but-registered store reopens rather than 404ing. See
+    /// [`Self::get_or_open_rollout_store`] for the full rationale.
+    pub async fn get_or_open_datagen_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<DatagenStore>>, AppError> {
+        Self::validate_name(name)?;
+        if let Some(store) = self.datagen_stores.lock().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        let mut handle = self.datagen_handles.lock(name).await;
+        if let Some(store) = handle.upgrade() {
+            self.datagen_stores
+                .lock()
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
+        }
+
+        let exists = self
+            .datagen_registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "Datagen store '{}' does not exist",
+                name
+            )));
+        }
+
+        let uri = self.datagen_uri(name);
+        let opened = DatagenStore::open_existing_with_options(&uri, self.datagen_store_options())
+            .await
+            .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+        // Also observe registry removal by another server during the open.
+        let registry = &self.datagen_registry;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Err(AppError::NotFound(format!(
+                "Store '{name}' was deleted while opening"
+            )));
+        }
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
+        let mut cache = self.datagen_stores.lock().await;
+        cache.put(name.to_string(), opened.clone());
+        Ok(opened)
+    }
+
+    /// Physical URI of a generic store's dataset.
+    #[must_use]
+    pub fn generic_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.generic.lance", name))
+    }
+
+    fn generic_store_options(&self, seal_on_add: bool) -> GenericStoreOptions {
+        GenericStoreOptions {
+            storage_options: None,
+            shard_id: self.instance_id.clone(),
+            merge_after_generations: (self.rollout_merge_after_generations > 0)
+                .then_some(self.rollout_merge_after_generations),
+            merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            key_index_type: self.rollout_key_index_type,
+            pending_generations_warn: Some(self.rollout_wal_pending_warn_generations),
+            pending_generations_max: Some(self.rollout_wal_pending_max_generations),
+            merge_budget: self.merge_budget.clone(),
+            session: self.rollout_session.clone(),
+            seal_on_add,
+        }
+    }
+
+    /// Record that a generic store exists, in both the durable registry and the
+    /// in-memory LRU. The caller holds the name's handle lock throughout creation.
+    pub async fn register_generic(
+        &self,
+        name: &str,
+        uri: &str,
+        store: Arc<RwLock<GenericStore>>,
+        handle: &mut OwnedMutexGuard<Weak<RwLock<GenericStore>>>,
+    ) -> Result<(), AppError> {
+        Self::validate_name(name)?;
+        if handle.upgrade().is_some() {
+            return Err(AppError::AlreadyExists(format!(
+                "Store '{name}' already has a live handle"
+            )));
+        }
+        self.generic_registry
+            .upsert(name, uri)
+            .await
+            .map_err(AppError::from_lance)?;
+        **handle = Arc::downgrade(&store);
+        self.generic_stores
+            .lock()
+            .await
+            .put(name.to_string(), store);
+        Ok(())
+    }
+
+    /// Remove a generic store from the registry and evict any resident handle.
+    /// Returns whether the store existed.
+    pub async fn unregister_generic(&self, name: &str) -> Result<bool, AppError> {
+        Self::validate_name(name)?;
+        let mut handle = self.generic_handles.lock(name).await;
+        // Keep the registry entry and cached handle until physical deletion
+        // succeeds, so failures can be retried without losing the store's URI.
+        let registry = &self.generic_registry;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Ok(false);
+        }
+        let live = handle.upgrade();
+        if let Some(store) = live {
+            store
+                .write()
+                .await
+                .delete_data()
+                .await
+                .map_err(AppError::from_lance)?;
+        } else {
+            lance_context_core::remove_dataset(&self.generic_uri(name))
+                .await
+                .map_err(AppError::from_lance)?;
+        }
+        registry.remove(name).await.map_err(AppError::from_lance)?;
+        self.generic_stores.lock().await.pop(name);
+        *handle = Weak::new();
+        Ok(true)
+    }
+
+    /// Look up a generic store by name, lazily reopening it on a cache miss.
+    ///
+    /// The schema is not passed in: it is read back from the dataset, which is
+    /// where it durably lives. See [`Self::get_or_open_datagen_store`] for the
+    /// residency rationale.
+    pub async fn get_or_open_generic_store(
+        &self,
+        name: &str,
+    ) -> Result<Arc<RwLock<GenericStore>>, AppError> {
+        Self::validate_name(name)?;
+        if let Some(store) = self.generic_stores.lock().await.get(name) {
+            return Ok(store.clone());
+        }
+
+        let mut handle = self.generic_handles.lock(name).await;
+        if let Some(store) = handle.upgrade() {
+            self.generic_stores
+                .lock()
+                .await
+                .put(name.to_string(), store.clone());
+            return Ok(store);
+        }
+
+        let exists = self
+            .generic_registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?;
+        if !exists {
+            return Err(AppError::NotFound(format!(
+                "Generic store '{name}' does not exist"
+            )));
+        }
+
+        let uri = self.generic_uri(name);
+        // The seal mode is persisted in the dataset, so `open_existing` restores
+        // whatever the store was created with; the option passed here is only a
+        // fallback for datasets written before that was persisted.
+        let opened = GenericStore::open_existing(&uri, self.generic_store_options(false))
+            .await
+            .map_err(AppError::from_lance)?;
+        let opened = Arc::new(RwLock::new(opened));
+        // Also observe registry removal by another server during the open.
+        let registry = &self.generic_registry;
+        if !registry
+            .contains(name)
+            .await
+            .map_err(AppError::from_lance)?
+        {
+            return Err(AppError::NotFound(format!(
+                "Store '{name}' was deleted while opening"
+            )));
+        }
+        // The per-name lock excludes deletion and concurrent opens through
+        // publication in both the weak registry and the resident cache.
+        *handle = Arc::downgrade(&opened);
+        let mut cache = self.generic_stores.lock().await;
+        cache.put(name.to_string(), opened.clone());
+        Ok(opened)
+    }
+
+    /// Spawn the single, process-wide WAL-cleanup sweeper.
+    ///
+    /// This replaces the former one-timer-per-store model, which does not scale
+    /// to hundreds of thousands of per-experiment datasets. On each tick the
+    /// sweeper snapshots the *resident* stores of **every kind** (those in the
+    /// LRUs) and folds each one's flushed MemWAL generations into its base
+    /// table, guarding every pass with a timeout so a wedged store cannot stall
+    /// the sweeper.
+    ///
+    /// Covering all kinds is not cosmetic: it previously visited only rollout
+    /// stores, so a datagen store's generations accumulated forever and every
+    /// read unioned all of them.
+    ///
+    /// Cold stores (evicted from the LRU) are not swept: having no new writes,
+    /// they accumulate no new generations, and are swept again the moment a
+    /// request re-opens them. Returns `None` when the interval is `0`.
+    pub fn spawn_global_sweeper(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        let interval_secs = self.rollout_cleanup_interval_secs;
+        if interval_secs == 0 {
+            return None;
+        }
+        let interval = Duration::from_secs(interval_secs);
+        // Abandon any single pass that outruns five intervals (min 30s) so one
+        // stuck store cannot wedge cleanup for every other store.
+        let pass_timeout = interval.saturating_mul(5).max(Duration::from_secs(30));
+        let weak = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                // Every kind, not just rollout: generations accumulate in each
+                // one, and only the base table absorbs them. The kinds run
+                // concurrently: each pass is a serial walk with a per-store
+                // timeout of several minutes, so with hundreds of resident
+                // rollout stores a serial kind order let generic stores go
+                // unswept for hours while their generations piled into the
+                // tens of thousands and every read re-opened all of them.
+                tokio::join!(
+                    sweeper::merge_pass_coordinated(
+                        sweeper::resident(&state.rollout_stores).await,
+                        pass_timeout,
+                        Some(state.clone()),
+                    ),
+                    sweeper::merge_pass_coordinated(
+                        sweeper::resident(&state.datagen_stores).await,
+                        pass_timeout,
+                        Some(state.clone()),
+                    ),
+                    sweeper::merge_pass_coordinated(
+                        sweeper::resident(&state.generic_stores).await,
+                        pass_timeout,
+                        Some(state.clone()),
+                    ),
+                );
+            }
+        }))
+    }
+
+    /// Spawn the process-wide MemWAL flush sweeper.
+    ///
+    /// A deferred-seal append is durable on return (the WAL entry is persisted)
+    /// but not visible to reads until the active memtable is flushed into a
+    /// queryable generation. Rather than flush on every append — which would
+    /// serialize concurrent writes behind a per-append seal — this sweeper
+    /// flushes each resident store on a fixed interval, bounding
+    /// read-after-write latency while keeping the append path concurrent.
+    ///
+    /// Applies to every store kind. Rollout and generic stores default to a
+    /// deferred seal and genuinely depend on this; datagen seals on each append,
+    /// so its pass is a no-op in steady state and is kept only for symmetry.
+    ///
+    /// For rollout and generic it also runs the count-triggered merge
+    /// ([`sweeper::Sweepable::merge_if_due`]): the read-amplification bound
+    /// that formerly lived on the append path now rides this timer. The heavier
+    /// time-based cleanup/merge remains on [`Self::spawn_global_sweeper`].
+    ///
+    /// Returns `None` when the flush interval is `0`.
+    pub fn spawn_flush_sweeper(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        let interval_secs = self.rollout_flush_interval_secs;
+        if interval_secs == 0 {
+            return None;
+        }
+        let interval = Duration::from_secs(interval_secs);
+        // Abandon any single store's flush that outruns five intervals (min 30s)
+        // so one wedged store cannot stall flushing for the rest.
+        let pass_timeout = interval.saturating_mul(5).max(Duration::from_secs(30));
+        let weak = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                // Kinds run concurrently for the same reason the cleanup sweeper
+                // does: this pass now carries the count-triggered merge, so a
+                // slow walk over hundreds of rollout stores must not delay
+                // generic's tick. Datagen seals on every append, so its pass is
+                // a no-op in steady state; generic stores default to a deferred
+                // seal and genuinely depend on this.
+                tokio::join!(
+                    sweeper::flush_pass_coordinated(
+                        sweeper::resident(&state.rollout_stores).await,
+                        pass_timeout,
+                        state.merge_slots.clone(),
+                        Some(state.clone()),
+                    ),
+                    sweeper::flush_pass_coordinated(
+                        sweeper::resident(&state.datagen_stores).await,
+                        pass_timeout,
+                        state.merge_slots.clone(),
+                        Some(state.clone()),
+                    ),
+                    sweeper::flush_pass_coordinated(
+                        sweeper::resident(&state.generic_stores).await,
+                        pass_timeout,
+                        state.merge_slots.clone(),
+                        Some(state.clone()),
+                    ),
+                );
+            }
+        }))
+    }
+
+    ///
+    /// [`RolloutStore`]'s writer ([`ShardWriter`]) has no `Drop`, so its
+    /// background tasks are only reclaimed by an explicit `close().await`. On the
+    /// normal serving path an LRU eviction owning the last handle drops it, and
+    /// the `Drop` impl spawns a detached best-effort close — but at process
+    /// shutdown the runtime is about to stop, so a detached task may never run.
+    /// This walks the resident cache and awaits [`RolloutStore::close`] on each
+    /// handle so writer background tasks are drained deterministically before the
+    /// runtime tears down. Idempotent and safe to call once after the server
+    /// stops accepting connections.
+    pub async fn shutdown(&self) {
+        // Snapshot resident stores without holding the LRU lock across the awaits.
+        let resident: Vec<(String, Arc<RwLock<RolloutStore>>)> = {
+            let cache = self.rollout_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in resident {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close rollout writer during shutdown"
+                );
+            }
+        }
+
+        // Datagen and generic stores hold resident MemWAL writers too. Skipping
+        // them left an unsealed memtable to the best-effort detached close in
+        // `Drop`, so rows could stay durable-but-invisible until the next WAL
+        // replay. Closing here makes shutdown deterministic for every kind.
+        let datagen: Vec<(String, Arc<RwLock<DatagenStore>>)> = {
+            let cache = self.datagen_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in datagen {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close datagen writer during shutdown"
+                );
+            }
+        }
+
+        let generic: Vec<(String, Arc<RwLock<GenericStore>>)> = {
+            let cache = self.generic_stores.lock().await;
+            cache
+                .iter()
+                .map(|(name, store)| (name.clone(), store.clone()))
+                .collect()
+        };
+        for (name, store) in generic {
+            if let Err(e) = store.write().await.close().await {
+                tracing::warn!(
+                    store = %name,
+                    error = %e,
+                    "failed to close generic writer during shutdown"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn blob_budget_rejects_counter_overflow() {
+        let budget = BlobBudget::new(1024);
+        let oversized = budget.try_acquire(usize::MAX).unwrap();
+        assert!(budget.try_acquire(1).is_none());
+        assert!(budget.try_acquire_unknown().is_none());
+        drop(oversized);
+        assert!(budget.try_acquire_unknown().is_some());
+    }
+
+    #[test]
+    fn blob_budget_admits_until_full_then_releases_on_drop() {
+        let budget = BlobBudget::new(1000);
+        // Two reservations that together fit.
+        let a = budget.try_acquire(600).expect("first fits");
+        let b = budget.try_acquire(300).expect("second fits (900 <= 1000)");
+        // A third that would overflow is rejected while others are in flight.
+        assert!(
+            budget.try_acquire(200).is_none(),
+            "over-limit request rejected while budget is occupied"
+        );
+        // Dropping frees the bytes back.
+        drop(b);
+        let c = budget.try_acquire(200).expect("fits again after release");
+        drop(a);
+        drop(c);
+        // Fully drained: a request equal to the whole budget now fits.
+        assert!(budget.try_acquire(1000).is_some());
+    }
+
+    #[test]
+    fn blob_budget_admits_a_lone_oversized_request() {
+        // A single request larger than the entire budget is admitted when the
+        // instance is idle, so a lone big blob is never permanently rejected —
+        // the budget bounds concurrency, not maximum blob size.
+        let budget = BlobBudget::new(100);
+        let big = budget
+            .try_acquire(500)
+            .expect("lone oversized request admitted");
+        // But while it holds the (over-)reservation, nothing else gets in.
+        assert!(budget.try_acquire(1).is_none());
+        drop(big);
+        assert!(budget.try_acquire(50).is_some());
+    }
+
+    async fn state_with_interval(dir: &TempDir, secs: u64) -> Arc<AppState> {
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.rollout_cleanup_interval_secs = secs;
+        Arc::new(state)
+    }
+
+    /// The sweeper is a single detached task, gated on the cleanup interval:
+    /// spawned when non-zero, `None` when disabled. This is the whole-process
+    /// replacement for the former one-timer-per-store model.
+    #[tokio::test]
+    async fn global_sweeper_is_gated_on_interval() {
+        let dir = TempDir::new().unwrap();
+        let disabled = state_with_interval(&dir, 0).await;
+        assert!(disabled.spawn_global_sweeper().is_none());
+
+        let dir2 = TempDir::new().unwrap();
+        let enabled = state_with_interval(&dir2, 3600).await;
+        let handle = enabled
+            .spawn_global_sweeper()
+            .expect("sweeper spawns when interval > 0");
+        handle.abort();
+    }
+
+    /// One minimal, well-formed datagen event.
+    fn datagen_event() -> lance_context_core::DatagenEvent {
+        use lance_context_core::{
+            datagen_event_id, DatagenEvent, DatagenEventType, DatagenStepKind,
+            DATAGEN_SCHEMA_VERSION,
+        };
+        DatagenEvent {
+            event_id: datagen_event_id("item-1", "ckpt-1", 0),
+            item_id: "item-1".to_string(),
+            root_item_id: "item-1".to_string(),
+            parent_item_id: None,
+            item_seq: 1,
+            checkpoint_id: "ckpt-1".to_string(),
+            event_type: DatagenEventType::StepCompleted,
+            step_name: Some("grade".to_string()),
+            step_kind: Some(DatagenStepKind::Leaf),
+            step_index: Some(0),
+            enclosing_step: None,
+            selector_step: None,
+            attempt: 0,
+            run_id: "run-1".to_string(),
+            writer_epoch: "writer-1".to_string(),
+            field_name: None,
+            field_type: None,
+            codec_version: None,
+            value: None,
+            query_tags: None,
+            status: None,
+            error_type: None,
+            error_dump: None,
+            traceback: None,
+            event_ts: chrono::Utc::now(),
+            schema_version: DATAGEN_SCHEMA_VERSION,
+        }
+    }
+
+    /// The sweepers must visit **every** store kind, not just rollout. Before
+    /// this, a datagen store's flushed generations accumulated forever (nothing
+    /// merged them) and a generic store with the default deferred seal stayed
+    /// invisible until someone called `/flush` by hand.
+    ///
+    /// Drives one pass directly rather than waiting on the timer, so the test
+    /// asserts the traversal rather than the tick.
+    #[tokio::test]
+    async fn sweeper_passes_cover_datagen_and_generic_stores() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        use lance_context_core::{DatagenStore, GenericStore, GenericStoreOptions};
+        use std::time::Duration;
+
+        use crate::sweeper;
+
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+        let timeout = Duration::from_secs(30);
+
+        // --- generic: deferred seal, so the flush pass is what publishes it ---
+        let schema = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let generic_uri = state.generic_uri("g1");
+        let generic = GenericStore::open(
+            &generic_uri,
+            schema,
+            GenericStoreOptions {
+                seal_on_add: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut rows = serde_json::Map::new();
+        rows.insert("id".to_string(), serde_json::json!("r1"));
+        generic.add(&[rows]).await.unwrap();
+        assert_eq!(
+            generic.list(None, None).await.unwrap().len(),
+            0,
+            "precondition: a deferred-seal write is not yet visible"
+        );
+
+        let generic = Arc::new(RwLock::new(generic));
+        state
+            .register_generic(
+                "g1",
+                &generic_uri,
+                generic.clone(),
+                &mut state.generic_handles.lock("g1").await,
+            )
+            .await
+            .unwrap();
+
+        sweeper::flush_pass(
+            sweeper::resident(&state.generic_stores).await,
+            timeout,
+            state.merge_slots.clone(),
+        )
+        .await;
+        assert_eq!(
+            generic.read().await.list(None, None).await.unwrap().len(),
+            1,
+            "the flush pass must publish a generic store's buffered rows"
+        );
+
+        // --- datagen: seals on append, so the merge pass is what it needs ---
+        let datagen_uri = state.datagen_uri("d1");
+        let mut datagen = DatagenStore::open(&datagen_uri).await.unwrap();
+        datagen.append(&[datagen_event()]).await.unwrap();
+        assert!(
+            datagen.pending_wal_generations().await.unwrap() > 0,
+            "precondition: datagen seals on append, so a generation is pending"
+        );
+        let datagen = Arc::new(RwLock::new(datagen));
+        state
+            .register_datagen(
+                "d1",
+                &datagen_uri,
+                datagen.clone(),
+                &mut state.datagen_handles.lock("d1").await,
+            )
+            .await
+            .unwrap();
+
+        // Both kinds have pending generations now; the merge pass drains them.
+        sweeper::merge_pass(sweeper::resident(&state.generic_stores).await, timeout).await;
+        assert_eq!(
+            generic
+                .read()
+                .await
+                .pending_wal_generations()
+                .await
+                .unwrap(),
+            0,
+            "the merge pass must fold a generic store's generations into the base table"
+        );
+        // Rows survive the merge.
+        assert_eq!(
+            generic.read().await.list(None, None).await.unwrap().len(),
+            1
+        );
+
+        sweeper::merge_pass(sweeper::resident(&state.datagen_stores).await, timeout).await;
+        assert_eq!(
+            datagen
+                .read()
+                .await
+                .pending_wal_generations()
+                .await
+                .unwrap(),
+            0,
+            "the merge pass must reach datagen stores too"
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_datagen_and_generic_handles_are_fenced_by_delete() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+        let uri = state.datagen_uri("dg");
+        let datagen = Arc::new(RwLock::new(DatagenStore::open(&uri).await.unwrap()));
+        state
+            .register_datagen(
+                "dg",
+                &uri,
+                datagen.clone(),
+                &mut state.datagen_handles.lock("dg").await,
+            )
+            .await
+            .unwrap();
+        datagen
+            .write()
+            .await
+            .append(&[datagen_event()])
+            .await
+            .unwrap();
+        state.datagen_stores.lock().await.pop("dg");
+        assert!(Arc::ptr_eq(
+            &datagen,
+            &state.get_or_open_datagen_store("dg").await.unwrap()
+        ));
+        state.datagen_stores.lock().await.pop("dg");
+        assert!(state.unregister_datagen("dg").await.unwrap());
+        assert!(datagen
+            .write()
+            .await
+            .append(&[datagen_event()])
+            .await
+            .is_err());
+        assert!(state.get_or_open_datagen_store("dg").await.is_err());
+
+        let uri = state.generic_uri("g");
+        let schema = SchemaSpec::new(vec![(
+            ID_COLUMN.to_string(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let generic = Arc::new(RwLock::new(
+            GenericStore::open(&uri, schema, GenericStoreOptions::default())
+                .await
+                .unwrap(),
+        ));
+        state
+            .register_generic(
+                "g",
+                &uri,
+                generic.clone(),
+                &mut state.generic_handles.lock("g").await,
+            )
+            .await
+            .unwrap();
+        let row = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+            serde_json::json!({"id": "r1"}),
+        )
+        .unwrap();
+        generic
+            .read()
+            .await
+            .add(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        state.generic_stores.lock().await.pop("g");
+        assert!(Arc::ptr_eq(
+            &generic,
+            &state.get_or_open_generic_store("g").await.unwrap()
+        ));
+        state.generic_stores.lock().await.pop("g");
+        assert!(state.unregister_generic("g").await.unwrap());
+        assert!(generic.read().await.add(&[row]).await.is_err());
+        assert!(state.get_or_open_generic_store("g").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn weak_handles_release_stores_and_preserve_active_name_locks() {
+        let handles = StoreHandles::<()>::default();
+        let store = Arc::new(RwLock::new(()));
+        let weak = Arc::downgrade(&store);
+        *handles.lock("live").await = weak.clone();
+        let held = handles.lock("opening").await;
+        // Trigger collection repeatedly while a same-name open/delete is held.
+        for n in 0..200 {
+            drop(handles.lock(&format!("cold-{n}")).await);
+        }
+        assert!(handles.lock("live").await.upgrade().is_some());
+        let waiting = handles.lock("opening");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(held);
+        drop(waiting.await);
+        drop(store);
+        assert!(
+            weak.upgrade().is_none(),
+            "the registry must not retain datasets"
+        );
+        for n in 200..400 {
+            drop(handles.lock(&format!("cold-{n}")).await);
+        }
+        let slots = handles.slots.lock().unwrap();
+        assert!(
+            slots.by_name.len() < 64,
+            "dead names must not grow without bound"
+        );
+        assert!(!slots.by_name.contains_key("live"));
+    }
+
+    /// `shutdown` drains resident rollout writers by awaiting `close()` on each
+    /// (idempotent: `close` is a no-op when no writer is resident), so
+    /// `ShardWriter` background tasks are reclaimed deterministically instead of
+    /// relying on the detached best-effort `Drop`. It must also be a no-op when
+    /// the cache is empty.
+    #[tokio::test]
+    async fn shutdown_closes_resident_writers() {
+        use lance_context_core::RolloutStore;
+
+        let dir = TempDir::new().unwrap();
+        let state = state_with_interval(&dir, 0).await;
+
+        // Empty cache: shutdown is a no-op and returns promptly.
+        state.shutdown().await;
+
+        // Register a resident store, then shut down. The store's writer (if any)
+        // is closed under the write lock; the call must complete without error
+        // and leave the handle usable/droppable.
+        let uri = state.rollout_uri("exp");
+        let store = RolloutStore::open_with_options(&uri, state.rollout_store_options())
+            .await
+            .unwrap();
+        let store = Arc::new(RwLock::new(store));
+        state
+            .register_rollout(
+                "exp",
+                &uri,
+                store.clone(),
+                &mut state.rollout_handles.lock("exp").await,
+            )
+            .await
+            .unwrap();
+
+        state.shutdown().await;
+
+        // The handle survives shutdown (shutdown only drains the writer); a
+        // fresh close is still a no-op.
+        store.write().await.close().await.unwrap();
+    }
+}

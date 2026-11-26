@@ -1,0 +1,693 @@
+//! Shared master state: durable registry + stats table.
+
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use lance_context_core::etcd::open_registry;
+use lance_context_core::{
+    backfill_registry, join_uri, CompactionConfig, GenericStoreOptions, MirroredRegistry,
+    RolloutStore, RolloutStoreOptions, Session, StoreRegistry,
+};
+use lru::LruCache;
+use tokio::sync::{Mutex, RwLock, Semaphore};
+
+use crate::config::MasterConfig;
+use crate::discovery;
+use crate::stats_store::{StatRow, StatsStore};
+use crate::task_store::TaskStore;
+
+/// Bounded number of rollout handles retained by the master data browser.
+///
+/// Each handle reuses the process-wide Lance session whose fragment/file
+/// metadata caches are valuable across pagination requests. The bound prevents
+/// a master managing a very large registry from retaining one handle per
+/// experiment indefinitely.
+const RECORD_STORE_CACHE_CAPACITY: usize = 128;
+
+/// Build the process-wide rollout session from one total cache budget.
+///
+/// The 6:1 index:metadata split mirrors Lance's default cache ratio.
+fn build_rollout_session(cache_bytes: usize) -> Option<Arc<Session>> {
+    if cache_bytes == 0 {
+        return None;
+    }
+    let metadata_bytes = cache_bytes / 7;
+    let index_bytes = cache_bytes - metadata_bytes;
+    Some(RolloutStore::build_session(index_bytes, metadata_bytes))
+}
+
+fn build_compaction_config(config: &MasterConfig) -> CompactionConfig {
+    CompactionConfig {
+        enabled: true,
+        min_fragments: config.min_fragments,
+        target_rows_per_fragment: config.target_rows_per_fragment,
+        num_threads: Some(config.compaction_threads.max(1)),
+        max_bytes_per_file: (config.compaction_max_bytes_per_file > 0)
+            .then_some(config.compaction_max_bytes_per_file),
+        batch_size: Some(config.compaction_batch_size.max(1)),
+        max_source_fragments: (config.compaction_max_source_fragments > 0)
+            .then_some(config.compaction_max_source_fragments),
+        try_binary_copy: true,
+        ..Default::default()
+    }
+}
+
+/// Shared state for the master process.
+///
+/// The data-plane owns steady-state registry writes (store create/delete); the
+/// master only adds missing legacy rows during startup discovery, then reads it
+/// to enumerate experiments. Master replicas coordinate stats-table writes
+/// through the task store. The Lance handles are wrapped in locks because their
+/// mutating methods take `&mut self`.
+pub struct MasterState {
+    /// Durable directory of which rollout stores exist.
+    pub registry: Arc<dyn StoreRegistry>,
+    /// Durable directory of which generic stores exist. Same registry format
+    /// as rollout (the data plane writes `_registry.generic.lance` with the
+    /// same `RolloutRegistry` type); read here so the stats scan and the
+    /// WAL-merge sweep cover generic stores. Without this, generic stores'
+    /// MemWAL merges were left to each worker's own timer, so 20 shards raced
+    /// to commit into one base table and lost to `Too many concurrent writers`
+    /// while the master -- whose etcd-locked MergeWal task exists to serialize
+    /// exactly that -- never heard of them.
+    pub generic_registry: Arc<dyn StoreRegistry>,
+    /// Datagen participates in the same registry migration as the worker.
+    pub datagen_registry: Arc<dyn StoreRegistry>,
+    pub(crate) managed_registry: Option<Arc<dyn StoreRegistry>>,
+    /// Periodically-refreshed per-experiment metrics (master-owned).
+    pub stats: Mutex<StatsStore>,
+    /// Last snapshot written to the stats table, kept in memory so
+    /// `GET /experiments` can answer without touching `stats`.
+    ///
+    /// `stats` is an exclusive `Mutex` because every `StatsStore` read method
+    /// takes `&mut self`, so the read path has no way to run concurrently with
+    /// a scan round. When a round is slow, requests queued on that mutex with
+    /// no timeout and no fallback -- the handler simply hung, which is how a
+    /// wedged scan turned into a wedged UI.
+    ///
+    /// This cache is the fallback. The handler tries the lock, and on
+    /// contention serves the last snapshot and marks the response `stale`. A
+    /// slightly-old list beats an unbounded hang, and the staleness is visible
+    /// to the caller rather than silent.
+    pub stats_cache: RwLock<Arc<Vec<StatRow>>>,
+
+    /// Read handles used by the records browser, retained to reuse Lance
+    /// session and fragment metadata caches across requests.
+    record_stores: Mutex<LruCache<String, Arc<RwLock<RolloutStore>>>>,
+    /// Process-wide Lance cache session attached to every rollout store opened
+    /// by this master. `None` is only used when the configured budget is `0`.
+    pub(crate) rollout_session: Option<Arc<Session>>,
+    /// Shared data directory / object-store prefix.
+    pub base_uri: String,
+    /// Effective configuration.
+    pub config: MasterConfig,
+    /// Durable scheduler queue in etcd, providing shared CAS/lease semantics
+    /// for stateless HA master replicas.
+    pub task_store: TaskStore,
+    /// Local claim/scan admission, including in-flight ownership RPCs.
+    pub admission: Arc<crate::admission::Admission>,
+    /// Latest deduplicated catalog from the existing registry scan. The
+    /// retirement consumer keeps one traversal and at most one newer catalog.
+    pub(crate) retirement_catalog:
+        tokio::sync::watch::Sender<Option<Arc<Vec<crate::scanner::ScanEntry>>>>,
+    /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
+    pub http: reqwest::Client,
+    pub(crate) managed_workers: Option<crate::worker_discovery::KubernetesWorkers>,
+    pub(crate) legacy_response_waiters: Arc<Semaphore>,
+    /// Explicit resident-master staging shares one byte budget and cache session.
+    pub(crate) local_append: Option<crate::rollout_append::LocalStaging>,
+    /// Process-wide compaction permits shared by scheduler and retirement work.
+    pub(crate) compaction_permits: Arc<Semaphore>,
+    /// Consecutive `_stats` maintenance failures, for alerting.
+    ///
+    /// Failure was previously silent: the success counter simply stopped
+    /// incrementing, which is indistinguishable from "nothing to reclaim".
+    pub stats_maintenance_failures: std::sync::atomic::AtomicU64,
+    /// `_stats` version at the last successful maintenance pass.
+    ///
+    /// The gap between this and the current version is how many versions are
+    /// going unreclaimed -- the number worth alerting on. The raw version
+    /// number is not: it climbs by design and says nothing about disk usage.
+    pub stats_last_reclaimed_version: std::sync::atomic::AtomicU64,
+}
+
+// Internal worker endpoints are direct addresses. Never follow a merge POST
+// redirect: connect failures must mean the original worker never received it.
+pub(crate) fn worker_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .build()
+}
+
+impl MasterState {
+    /// Open the registry, stats dataset, and configured durable task store.
+    pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
+        Self::initialize(config, std::future::ready(())).await
+    }
+
+    async fn initialize(
+        mut config: MasterConfig,
+        before_init_release: impl std::future::Future<Output = ()>,
+    ) -> lance::Result<Arc<Self>> {
+        config.validate_registered_store()?;
+        let managed_workers =
+            crate::worker_discovery::KubernetesWorkers::in_cluster(&config.worker_discovery)
+                .map_err(lance::Error::invalid_input)?;
+        config.merge_rollout.validate().map_err(lance::Error::io)?;
+        config.catchup.validate().map_err(lance::Error::io)?;
+        config
+            .append
+            .validate_local(&config)
+            .map_err(lance::Error::io)?;
+        if config.maintenance.maintenance_timeout_secs == 0
+            || config.maintenance.maintenance_idle_timeout_secs == 0
+            || config.maintenance.maintenance_drain_timeout_secs == 0
+        {
+            return Err(lance::Error::invalid_input(
+                "maintenance deadlines must be positive",
+            ));
+        }
+        if config.legacy_merge_foreground_secs == 0 {
+            return Err(lance::Error::invalid_input(
+                "legacy foreground interval must be positive",
+            ));
+        }
+        let task_store = TaskStore::open_executor(&config).await?;
+        config.merge_rollout.fence_legacy = task_store
+            .merge_coordinator()
+            .legacy_fencing_mode(config.merge_rollout.fence_legacy)
+            .await
+            .map_err(lance::Error::io)?;
+        // Protocol activation covers every master maintenance writer as well
+        // as workers; a flag rollback must not restore unrecorded rewrites.
+        config.maintenance.fence_legacy_maintenance |= config.merge_rollout.fence_legacy;
+        config.validate_registered_store()?;
+        crate::local_merge::validate(&config).map_err(lance::Error::io)?;
+        // Serialize first-time registry/stats creation and legacy backfill in
+        // etcd mode. Followers wait briefly rather than racing Lance creates.
+        let dedicated = config.catchup.target.is_some();
+        let init_guard = if dedicated {
+            None
+        } else {
+            Some(loop {
+                if let Some(guard) = task_store.try_coordination_lock("state-init").await? {
+                    break guard;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            })
+        };
+        let base_uri = config.data_dir.clone();
+        let rollout_session = build_rollout_session(config.rollout_cache_bytes);
+        let compaction_concurrency = config.compaction_concurrency.max(1);
+        let registry_uri = join_uri(&base_uri, "_registry.rollout.lance");
+        let generic_registry_uri = join_uri(&base_uri, "_registry.generic.lance");
+        let stats_uri = join_uri(&base_uri, "_stats.rollout.lance");
+        let etcd = Some((task_store.etcd_client(), config.etcd.prefix()));
+        let registry = open_registry("rollout", &registry_uri, etcd, &config.registry).await?;
+        let generic_registry =
+            open_registry("generic", &generic_registry_uri, etcd, &config.registry).await?;
+        let datagen_registry = open_registry(
+            "datagen",
+            &join_uri(&base_uri, "_registry.datagen.lance"),
+            etcd,
+            &config.registry,
+        )
+        .await?;
+        let managed_registry = match &config.managed_store_kind {
+            Some(kind) => Some(
+                open_registry(
+                    kind,
+                    &join_uri(&base_uri, &format!("_registry.{kind}.lance")),
+                    etcd,
+                    &config.registry,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        // A dedicated one-table executor must not scan/backfill the whole
+        // registry or delay ordinary master startup behind its initialization.
+        if !dedicated {
+            let backfilled = discovery::backfill_registry(&config.data_dir, &*registry).await?;
+            if backfilled > 0 {
+                tracing::info!(
+                    experiments = backfilled,
+                    "backfilled rollout registry from data directory"
+                );
+            }
+            // With a mirror configured, seed it from the primary so a backend
+            // switch finds every store already there. Repeated on every
+            // maintenance round; this covers the very first start.
+            let mut initialized = std::collections::HashSet::new();
+            for (label, reg) in [
+                ("rollout", &registry),
+                ("generic", &generic_registry),
+                ("datagen", &datagen_registry),
+            ]
+            .into_iter()
+            .chain(
+                config
+                    .managed_store_kind
+                    .as_deref()
+                    .zip(managed_registry.as_ref()),
+            ) {
+                if !initialized.insert(label) {
+                    continue;
+                }
+                if let Some(m) = reg.as_any().downcast_ref::<MirroredRegistry>() {
+                    match backfill_registry(&*m.primary, &*m.mirror).await {
+                        Ok(copied) if copied > 0 => {
+                            tracing::info!(registry = label, copied, "seeded registry mirror")
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(registry = label, %error, "registry mirror seed failed")
+                        }
+                    }
+                }
+            }
+        }
+        let stats = StatsStore::open_or_create(&stats_uri, None).await?;
+        before_init_release.await;
+        if let Some(guard) = init_guard {
+            // Initialization has completed and performs no further protected
+            // writes. Release stops renewal before contacting etcd; if cleanup
+            // fails, the lease expires without replaying successful startup.
+            if let Err(error) = task_store.release_coordination_lock(guard).await {
+                metrics::counter!("master_state_init_cleanup_errors_total").increment(1);
+                tracing::warn!(%error, "master initialized; startup lock cleanup failed and lease will expire");
+            }
+        }
+        let local_append = crate::local_merge::enabled(&config).then(|| {
+            crate::rollout_append::LocalStaging::new(
+                config.append.rollout_append_local_memory_bytes,
+            )
+        });
+        let state = Arc::new(Self {
+            registry,
+            generic_registry,
+            datagen_registry,
+            managed_registry,
+            stats: Mutex::new(stats),
+            stats_cache: RwLock::new(Arc::new(Vec::new())),
+            record_stores: Mutex::new(LruCache::new(
+                NonZeroUsize::new(RECORD_STORE_CACHE_CAPACITY).unwrap(),
+            )),
+            rollout_session,
+            base_uri,
+            legacy_response_waiters: Arc::new(Semaphore::new(config.legacy_merge_wait_concurrency)),
+            config,
+            task_store,
+            admission: Arc::new(crate::admission::Admission::default()),
+            retirement_catalog: tokio::sync::watch::channel(None).0,
+            http: worker_http_client().map_err(|error| lance::Error::io(error.to_string()))?,
+            managed_workers,
+            local_append,
+            compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
+            stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
+            stats_last_reclaimed_version: std::sync::atomic::AtomicU64::new(0),
+        });
+        Ok(state)
+    }
+
+    /// Physical rollout dataset URI for `name`, matching the data-plane's
+    /// `rollout_uri` convention (`{name}.rollout.lance`).
+    pub fn rollout_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.rollout.lance", name))
+    }
+
+    /// Physical generic dataset URI for `name`, matching the data-plane's
+    /// `generic_uri` convention (`{name}.generic.lance`).
+    pub fn generic_uri(&self, name: &str) -> String {
+        join_uri(&self.base_uri, &format!("{}.generic.lance", name))
+    }
+
+    pub(crate) fn registered_target<'a>(&'a self, target: &'a str) -> Option<(&'a str, &'a str)> {
+        let kind = self.config.managed_store_kind.as_deref()?;
+        Some((kind, target.strip_prefix(kind)?.strip_prefix(':')?))
+    }
+
+    pub(crate) async fn managed_worker_endpoints(&self) -> Result<Vec<String>, String> {
+        match &self.managed_workers {
+            Some(workers) => Ok(workers.snapshot().await?.endpoints()),
+            None => Ok(self.config.worker_endpoints.clone()),
+        }
+    }
+
+    pub(crate) async fn target_uri(&self, target: &str) -> lance::Result<Option<String>> {
+        let (registry, name) = if let Some((_, name)) = self.registered_target(target) {
+            (
+                self.managed_registry.as_ref().expect("configured registry"),
+                name,
+            )
+        } else if let Some(name) = target.strip_prefix("generic:") {
+            (&self.generic_registry, name)
+        } else {
+            (&self.registry, target)
+        };
+        Ok(registry.get(name).await?.map(|entry| entry.uri))
+    }
+
+    /// Options for every generic store opened by the master (read-only
+    /// observation; the master never writes a generic store's WAL).
+    pub(crate) fn generic_store_options(&self) -> GenericStoreOptions {
+        GenericStoreOptions {
+            session: self.rollout_session.clone(),
+            key_index_type: self.config.key_index_type,
+            ..Default::default()
+        }
+    }
+
+    /// Options for every rollout store opened by the master.
+    pub(crate) fn rollout_store_options(&self) -> RolloutStoreOptions {
+        RolloutStoreOptions {
+            session: self.rollout_session.clone(),
+            key_index_type: self.config.key_index_type,
+            // The master observes and merges shards *because* they are behind;
+            // the worker-side read cap must never hide those from it.
+            pending_generations_max: Some(0),
+            ..Default::default()
+        }
+    }
+
+    /// Memory-bounded compaction settings for every master-initiated rewrite.
+    pub(crate) fn compaction_config(&self) -> CompactionConfig {
+        build_compaction_config(&self.config)
+    }
+
+    /// Return a cached rollout handle for the master records browser, opening
+    /// it without holding the cache lock on a miss.
+    pub async fn get_or_open_record_store(
+        &self,
+        name: &str,
+        uri: &str,
+    ) -> lance::Result<Arc<RwLock<RolloutStore>>> {
+        if let Some(store) = self.record_stores.lock().await.get(name) {
+            metrics::counter!("master_record_store_cache_hits_total").increment(1);
+            return Ok(store.clone());
+        }
+        metrics::counter!("master_record_store_cache_misses_total").increment(1);
+
+        let opened = Arc::new(RwLock::new(
+            RolloutStore::open_existing_with_options(uri, self.rollout_store_options()).await?,
+        ));
+
+        let mut cache = self.record_stores.lock().await;
+        if let Some(existing) = cache.get(name) {
+            return Ok(existing.clone());
+        }
+        cache.put(name.to_string(), opened.clone());
+        metrics::gauge!("master_record_stores_resident").set(cache.len() as f64);
+        Ok(opened)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_context_api::{TaskKind, TaskState};
+    use lance_context_core::{generate_id, RolloutStore};
+    use tempfile::TempDir;
+
+    fn test_config(dir: &TempDir) -> MasterConfig {
+        MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
+            append: Default::default(),
+            managed_store_kind: None,
+            catchup: Default::default(),
+            wal_tail: Default::default(),
+            planner: Default::default(),
+            maintenance: Default::default(),
+            merge_rollout: Default::default(),
+            data_dir: dir.path().to_string_lossy().to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            stats_scan_interval_secs: 0,
+            backlog_metrics_max_age_secs: 900,
+            scan_concurrency: 4,
+            rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
+            stats_maintenance_every_n_scans: 0,
+            stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
+            compaction_interval_secs: 0,
+            min_fragments: 16,
+            target_rows_per_fragment: 1_048_576,
+            compaction_concurrency: 1,
+            compaction_threads: 1,
+            compaction_batch_size: 8,
+            compaction_max_source_fragments: 32,
+            index_after_compaction: false,
+            index_interval_secs: 0,
+            key_index_type: Default::default(),
+            index_before_merge: false,
+            compaction_max_bytes_per_file: 1024 * 1024 * 1024,
+            merge_wal_interval_secs: 0,
+            merge_wal_min_generations: 8,
+            merge_wal_admission_targets: vec![],
+            worker_endpoints: vec![],
+            table_flush_timeout_secs: 20,
+            worker_discovery: Default::default(),
+            task_concurrency: 4,
+            merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
+                    .map(|value| value.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                etcd_prefix: format!("/lance-context/test/{}", generate_id()),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
+            etcd_lease_ttl_secs: 5,
+            task_history_limit: 1_000,
+            task_history_ttl_secs: 86_400,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
+            ui_dir: None,
+        }
+    }
+
+    #[test]
+    fn rollout_session_can_be_disabled() {
+        assert!(build_rollout_session(0).is_none());
+        assert!(build_rollout_session(7).is_some());
+    }
+
+    #[test]
+    fn compaction_config_maps_bounds_and_zero_disables_optional_limits() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.compaction_threads = 0;
+        config.compaction_batch_size = 0;
+        config.compaction_max_source_fragments = 0;
+        config.compaction_max_bytes_per_file = 0;
+
+        let compaction = build_compaction_config(&config);
+        assert_eq!(compaction.num_threads, Some(1));
+        assert_eq!(compaction.batch_size, Some(1));
+        assert_eq!(compaction.max_source_fragments, None);
+        assert_eq!(compaction.max_bytes_per_file, None);
+        assert!(compaction.try_binary_copy);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn startup_backfills_legacy_rollout_datasets() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("legacy.rollout.lance");
+        RolloutStore::open(uri.to_str().unwrap()).await.unwrap();
+
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let entries = state.registry.list().await.unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "legacy");
+        assert_eq!(entries[0].uri, uri.to_string_lossy().to_string());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn startup_and_migration_routes_include_datagen() {
+        use lance_context_core::{etcd::RegistryBackend, RolloutRegistry};
+        let dir = TempDir::new().unwrap();
+        for kind in ["rollout", "generic", "datagen"] {
+            let uri = dir.path().join(format!("_registry.{kind}.lance"));
+            let mut registry = RolloutRegistry::open_or_create(uri.to_str().unwrap(), None)
+                .await
+                .unwrap();
+            registry
+                .upsert("existing", &format!("/data/{kind}"))
+                .await
+                .unwrap();
+        }
+        let mut config = test_config(&dir);
+        config.registry.registry_mirror = Some(RegistryBackend::Etcd);
+        let state = MasterState::new(config).await.unwrap();
+        for kind in ["rollout", "generic", "datagen"] {
+            let axum::Json(diff) = crate::routes::registry_diff(
+                axum::extract::State(state.clone()),
+                axum::extract::Query(crate::routes::RegistryParams {
+                    kind: Some(kind.into()),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(diff["only_in_primary"], serde_json::json!([]));
+            assert_eq!(diff["only_in_mirror"], serde_json::json!([]));
+            assert_eq!(diff["mismatched"], serde_json::json!([]));
+        }
+        let m = state
+            .datagen_registry
+            .as_any()
+            .downcast_ref::<MirroredRegistry>()
+            .unwrap();
+        m.primary.remove("existing").await.unwrap();
+        let axum::Json(result) = crate::routes::registry_backfill(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::routes::RegistryParams {
+                kind: Some("datagen".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["copied"], 1);
+        assert!(m.mirror.get("existing").await.unwrap().is_none());
+    }
+
+    /// A master that dies mid-task leaves the record in `Running`. Once its
+    /// etcd lease expires the claim key vanishes, and the elected controller
+    /// must return the task to `Queued` — otherwise an
+    /// interrupted task is stranded in `Running` forever.
+    ///
+    /// The crash is simulated by revoking the claim's lease rather than just
+    /// dropping the claim: dropping stops lease *renewal*, but etcd holds the
+    /// claim key for the remainder of the TTL, during which the task is
+    /// legitimately still considered running. Revoking reaches the same key
+    /// state without sleeping out `etcd_lease_ttl_secs`.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn startup_requeues_interrupted_local_tasks() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let first = MasterState::new(config.clone()).await.unwrap();
+        let task = first
+            .task_store
+            .enqueue(TaskKind::Compact, "legacy", Vec::new())
+            .await
+            .unwrap();
+        let claim = first.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.state, TaskState::Running);
+        first
+            .task_store
+            .abandon_claim_for_test(claim)
+            .await
+            .unwrap();
+        drop(first);
+
+        let state = MasterState::new(config).await.unwrap();
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Running,
+            "opening an executor must not perform a global recovery scan"
+        );
+        let controller = crate::demand_controller::spawn(&state);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let recovered = state.task_store.get(&task.id).await.unwrap().unwrap();
+                if recovered.state == TaskState::Queued {
+                    assert_eq!(recovered.started_at, None);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        controller.abort();
+        assert!(controller.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn startup_survives_release_transport_failure_without_replaying_initialization() {
+        use crate::task_store::tests::LeaseTestProxy;
+        use std::time::Duration;
+        let dir = TempDir::new().unwrap();
+        let cfg = test_config(&dir);
+        let proxy = LeaseTestProxy::start(&cfg.etcd.etcd_endpoints[0]).await;
+        let mut proxied = cfg.clone();
+        proxied.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        let observer = cfg.etcd.connect().await.unwrap();
+        let hook_reached = std::sync::atomic::AtomicBool::new(false);
+        let state = tokio::time::timeout(
+            Duration::from_secs(20),
+            MasterState::initialize(proxied, async {
+                let keys = observer
+                    .clone()
+                    .get(
+                        format!("{}/coordination/", cfg.etcd.prefix()),
+                        Some(etcd_client::GetOptions::new().with_prefix()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    keys.kvs().len(),
+                    1,
+                    "initialization owns its guard before disconnect"
+                );
+                assert!(keys.kvs()[0].lease() > 0);
+                proxy.online.send(false).unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                hook_reached.store(true, std::sync::atomic::Ordering::Release);
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(hook_reached.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.admission.is_accepting());
+        assert!(dir.path().join("_stats.rollout.lance").exists());
+        proxy.online.send(true).unwrap();
+        let successor = TaskStore::open_executor(&cfg).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(guard) = successor.try_coordination_lock("state-init").await.unwrap() {
+                    successor.release_coordination_lock(guard).await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let task = state
+            .task_store
+            .enqueue(TaskKind::IndexId, "after-reconnect", vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn actual_initialization_failure_still_fails_before_cleanup_hook() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config(&dir);
+        let path = dir.path().join("not-a-directory");
+        std::fs::write(&path, b"file blocks dataset creation").unwrap();
+        cfg.data_dir = path.to_string_lossy().to_string();
+        let reached = std::sync::atomic::AtomicBool::new(false);
+        assert!(MasterState::initialize(cfg, async {
+            reached.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await
+        .is_err());
+        assert!(!reached.load(std::sync::atomic::Ordering::Acquire));
+    }
+}

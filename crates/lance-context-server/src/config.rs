@@ -1,0 +1,390 @@
+use clap::Parser;
+
+#[derive(Debug, Clone, Parser)]
+#[command(name = "lance-context-server")]
+#[command(about = "REST API server for lance-context")]
+pub struct ServerConfig {
+    #[command(flatten)]
+    pub merge_rollout: lance_context_merge::rollout::MergeRollout,
+
+    /// Maximum wait for the next requested upload body frame. Each frame resets
+    /// this idle timer; completed uploads and handler/merge execution are not timed.
+    #[arg(
+        long,
+        env = "REQUEST_BODY_IDLE_TIMEOUT_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub request_body_idle_timeout_secs: u64,
+
+    /// During graceful shutdown, retire response connections whose socket writes
+    /// are blocked for this long, after all admitted HTTP handlers have finished.
+    /// This does not impose a total deadline on queries, merges, or downloads.
+    #[arg(
+        long,
+        env = "HTTP_SHUTDOWN_RESPONSE_IDLE_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub http_shutdown_response_idle_secs: u64,
+
+    /// Stable worker URL reachable by the master for execution identity and
+    /// cancellation. Required when MERGE_FENCE_LEGACY is enabled.
+    #[arg(long, env = "MERGE_EXECUTOR_ENDPOINT")]
+    pub merge_executor_endpoint: Option<String>,
+
+    /// Persist fencing for only this stable INSTANCE_ID. Unlike
+    /// MERGE_FENCE_LEGACY this does not activate a cluster-wide protocol switch.
+    #[arg(long, env = "MERGE_FENCE_THIS_WORKER", default_value_t = false)]
+    pub merge_fence_this_worker: bool,
+
+    /// Legacy wire field; owned merges now use the real-progress idle timeout.
+    #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
+    pub merge_execution_timeout_secs: u64,
+
+    /// Maximum wait for a merge slot, separate from execution time.
+    #[arg(long, env = "MERGE_QUEUE_TIMEOUT_SECS", default_value_t = 600)]
+    pub merge_queue_timeout_secs: u64,
+
+    /// Maximum interval without an observed completed merge step.
+    #[arg(long, env = "MERGE_IDLE_TIMEOUT_SECS", default_value_t = 600)]
+    pub merge_idle_timeout_secs: u64,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: String,
+
+    #[arg(long, default_value = "3000")]
+    pub port: u16,
+
+    #[arg(long, default_value = "./lance-data")]
+    pub data_dir: String,
+
+    /// Stable identity of this server instance, used as the MemWAL shard key for
+    /// context, rollout, datagen, and generic writes. Each instance must present
+    /// a distinct, stable value so it owns exactly one shard per store and never
+    /// contends with peers (see
+    /// `docs/src/specs/rollout-deployment.md`). In Kubernetes, set this to the
+    /// StatefulSet pod ordinal hostname (e.g. `rollout-0`). Defaults to the
+    /// `INSTANCE_ID` env var, then the pod/host `HOSTNAME`; if neither is set,
+    /// writes fall back to a single shared `default` shard per store, which is
+    /// only safe for a single-instance deployment.
+    #[arg(long, env = "INSTANCE_ID")]
+    pub instance_id: Option<String>,
+
+    /// Count-triggered self-merge threshold for rollout MemWAL shards. When this
+    /// instance's shard has at least this many un-merged flushed generations, the
+    /// periodic sweeper folds them into the base table and drains the shard (see
+    /// `docs/src/specs/rollout-deployment.md`). This bounds read amplification. `0`
+    /// (the default) disables the count trigger — generations accumulate and are
+    /// unioned at read time (or reclaimed by the time-based cleanup below).
+    ///
+    /// Note: this merge runs on the periodic sweeper, not on the append path.
+    /// Appends are durable (WAL-persisted) but do not merge inline.
+    #[arg(long, env = "ROLLOUT_MERGE_AFTER_GENERATIONS", default_value = "0")]
+    pub rollout_merge_after_generations: usize,
+
+    /// Notify the master when this writer has at least this many pending WAL
+    /// generations, independently of worker self-merge. Uses the flush sweeper's
+    /// existing metadata observation and bounded, detached queue publication.
+    /// This never starts a local merge or changes execution ownership. `0`
+    /// disables the notification; ordinary master scans remain enabled.
+    #[arg(
+        long,
+        env = "ROLLOUT_MASTER_MERGE_AFTER_GENERATIONS",
+        default_value = "8"
+    )]
+    pub rollout_master_merge_after_generations: usize,
+
+    /// Maximum flushed MemWAL generations folded into the base table by one
+    /// merge pass. `0` disables this cap; the byte budget still applies.
+    /// Leftovers stay pending for the next pass. Both caps apply to count- and
+    /// time-triggered merges of rollout, datagen and generic stores.
+    #[arg(long, env = "ROLLOUT_MERGE_MAX_GENERATIONS", default_value = "8")]
+    pub rollout_merge_max_generations: usize,
+
+    /// Buffered Arrow array byte budget per merge pass; `0` disables this cap.
+    /// Checked after each whole generation, so one oversized generation
+    /// still makes progress. The generation-count cap applies independently.
+    #[arg(long, env = "ROLLOUT_MERGE_MAX_BYTES", default_value = "1073741824")]
+    pub rollout_merge_max_bytes: usize,
+
+    /// Base key index policy. Configure every master and worker consistently.
+    /// ZoneMap uses bounded key-only predicate deletes during WAL merge.
+    #[arg(
+        long,
+        env = "ROLLOUT_KEY_INDEX_TYPE",
+        value_enum,
+        default_value = "btree"
+    )]
+    pub rollout_key_index_type: lance_context_core::KeyIndexType,
+
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every LSM read of any store kind. Every
+    /// pending generation is a separate dataset a read must open, so this is
+    /// the read-amplification alarm; `0` disables the warn. The
+    /// `rollout_wal_pending_generations` histogram is emitted regardless.
+    #[arg(
+        long,
+        env = "ROLLOUT_WAL_PENDING_WARN_GENERATIONS",
+        default_value = "256"
+    )]
+    pub rollout_wal_pending_warn_generations: usize,
+
+    /// Refuse a read whose MemWAL shard has more than this many flushed
+    /// generations pending merge (HTTP 503) instead of
+    /// opening every one of them. A read over a 16k-generation shard held a
+    /// worker at its 32 GiB memory limit; the merge that fixes it is the same
+    /// merge the read was competing with. `0` disables the cap.
+    #[arg(
+        long,
+        env = "ROLLOUT_WAL_PENDING_MAX_GENERATIONS",
+        default_value = "4096"
+    )]
+    pub rollout_wal_pending_max_generations: usize,
+
+    /// Process-wide byte budget for MemWAL merges, shared by every merge
+    /// this worker runs regardless of what triggered it (its own sweepers, the
+    /// count trigger, the manual route, or the master's fan-out).
+    /// ROLLOUT_MERGE_MAX_BYTES bounds ONE merge; this bounds all of them
+    /// together, so the number of masters or concurrent tasks no longer
+    /// decides the worker's peak memory. A merge that cannot fit waits for
+    /// another to release instead of failing. Default 3 GiB; `0` disables.
+    #[arg(long, env = "ROLLOUT_MERGE_MEMORY_BYTES", default_value = "3221225472")]
+    pub rollout_merge_memory_bytes: usize,
+
+    /// Maximum merge-wal requests this worker runs at once; later ones wait
+    /// for a slot. The master's `MERGE_WAL_CONCURRENCY` bounds tasks *per
+    /// master*, and every task fans out to every worker, so six masters at 4
+    /// put 24 merges on each worker at the same time -- each with its own
+    /// `LANCE_MEM_POOL_SIZE x LANCE_CPU_THREADS` execution pool, which the
+    /// merge memory budget does not count. Default 4; `0` disables.
+    #[arg(long, env = "ROLLOUT_MERGE_CONCURRENCY", default_value_t = 4)]
+    pub rollout_merge_concurrency: usize,
+
+    /// Interval, in seconds, for the periodic per-shard WAL cleanup task. When
+    /// non-zero, the global sweeper folds this instance's flushed MemWAL
+    /// generations into the base table on a schedule — the *time* half of the
+    /// "time OR count" trigger, complementing `--rollout-merge-after-generations`.
+    /// Whichever fires first merges: the timer reclaims whatever is pending
+    /// regardless of count, so stale generations are folded in even on
+    /// low-traffic shards that never cross the count threshold. `0` (the default)
+    /// disables the timer.
+    ///
+    /// # Applies to every store kind, despite the name
+    ///
+    /// The sweeper visits rollout, datagen and generic stores alike — every
+    /// MemWAL-backed store accumulates generations, and only a merge reclaims
+    /// them. The `ROLLOUT_` prefix is historical: these variables predate the
+    /// other store kinds, and renaming them would silently break existing
+    /// deployment manifests for no functional gain.
+    #[arg(long, env = "ROLLOUT_CLEANUP_INTERVAL_SECS", default_value = "0")]
+    pub rollout_cleanup_interval_secs: u64,
+
+    /// Interval, in seconds, at which the sweeper flushes each resident store's
+    /// active MemWAL memtable into a queryable generation. A deferred-seal
+    /// append is durable on return (the WAL entry is persisted to object
+    /// storage) but is not visible to reads until the memtable is flushed, so
+    /// this interval bounds read-after-write latency. Decoupling flush from the
+    /// append path is what lets concurrent appends run without serializing
+    /// behind a per-append seal. Default `30`.
+    ///
+    /// Like the cleanup interval, this applies to **every** store kind despite
+    /// the `ROLLOUT_` prefix. Rollout and generic stores default to a deferred
+    /// seal and depend on it; datagen seals on each append, so its pass is a
+    /// no-op in steady state.
+    ///
+    /// `0` disables periodic flush, leaving the cleanup sweeper
+    /// (`ROLLOUT_CLEANUP_INTERVAL_SECS`) as the only thing that seals memtables
+    /// — it flushes before merging, so it is a sufficient fallback, but
+    /// read-after-write latency is then bounded by the *cleanup* interval
+    /// instead. Setting **both** to `0` means nothing ever seals: appends stay
+    /// durable but invisible until the process restarts and replays the WAL.
+    /// The server warns at startup in that configuration.
+    #[arg(long, env = "ROLLOUT_FLUSH_INTERVAL_SECS", default_value = "30")]
+    pub rollout_flush_interval_secs: u64,
+
+    /// Upper bound on the number of resident rollout-store handles kept in
+    /// memory (an LRU). With one physical dataset per experiment a deployment
+    /// may hold hundreds of thousands of stores; this bounds how many stay open
+    /// at once. Size it for peak *concurrent* experiments, not the total count.
+    /// Evicted stores are transparently reopened on the next request. `0` falls
+    /// back to the built-in default.
+    #[arg(long, env = "ROLLOUT_CACHE_CAPACITY", default_value = "2000")]
+    pub rollout_cache_capacity: usize,
+
+    /// Ceiling, in bytes, on the total artifact-blob payload held in memory
+    /// across all *concurrent* rollout uploads and downloads on this instance.
+    ///
+    /// Each blob request materializes its full payload as an in-memory buffer
+    /// (uploads buffer the request body; downloads materialize the row's
+    /// `binary_payload`). Without a global cap, N concurrent 1 GiB requests
+    /// would need N GiB and can OOM the process. This budget admits a request
+    /// only while enough of the budget is free — otherwise it is rejected with
+    /// `503 Service Unavailable` and a `Retry-After`, applying backpressure at
+    /// the edge instead of the allocator. A single request larger than the whole
+    /// budget is still admitted when the instance is otherwise idle (it reserves
+    /// the entire budget), so this bounds concurrency, not maximum blob size.
+    /// `0` (the default) disables the budget.
+    #[arg(long, env = "ROLLOUT_MAX_INFLIGHT_BLOB_BYTES", default_value = "0")]
+    pub rollout_max_inflight_blob_bytes: usize,
+
+    /// Size, in bytes, at or above which a single inline artifact blob is
+    /// logged at `WARN` with its experiment and record id.
+    ///
+    /// Blob size drives memory pressure on both the worker (WAL merge buffers
+    /// flushed generations, and every resident store keeps its manifest) and
+    /// the master (the compaction rewrite buffer). The `rollout_blob_bytes`
+    /// histogram shows the *distribution* but not which experiment produced an
+    /// outlier; thousands of experiments make a per-experiment histogram label
+    /// too high-cardinality to carry by default. This log closes that gap: the
+    /// histogram says a large blob was written, and the log says who wrote it.
+    ///
+    /// `0` disables the log; the histogram is always emitted.
+    #[arg(long, env = "ROLLOUT_LARGE_BLOB_LOG_BYTES", default_value = "16777216")]
+    pub rollout_large_blob_log_bytes: usize,
+
+    /// Total byte budget for the Lance metadata/index caches, shared across
+    /// **all** resident rollout stores on this instance.
+    ///
+    /// Every rollout store opens a Lance dataset; without an explicit session
+    /// Lance gives each store its own caches defaulting to **6 GiB index + 1 GiB
+    /// metadata**, keyed by dataset URI. Because each flushed MemWAL generation
+    /// is a distinct URI, a busy store's read path feeds an ever-growing key set
+    /// into that per-store cache until it approaches 6 GiB — worker RSS then
+    /// grows linearly with cumulative appends and never releases across
+    /// merge/compact cycles. Attaching one shared, capacity-bounded session caps
+    /// the process's *total* Lance cache at this budget instead of 6 GiB per
+    /// store. Split internally 6:1 (index:metadata), matching Lance's own
+    /// default ratio. `0` disables sharing and restores Lance's per-store
+    /// default session (the pre-fix, leak-prone behavior).
+    #[arg(long, env = "ROLLOUT_CACHE_BYTES", default_value = "2147483648")]
+    pub rollout_cache_bytes: usize,
+
+    /// Shared etcd settings for registries and lazily connected owned merges.
+    #[command(flatten)]
+    pub etcd: lance_context_core::etcd::EtcdConfig,
+
+    /// Which backend the store registries (rollout, generic, datagen) live in.
+    #[command(flatten)]
+    pub registry: lance_context_core::etcd::RegistryConfig,
+}
+
+impl ServerConfig {
+    /// Use the same namespace and credentials for lazily connected merge ownership.
+    pub(crate) fn merge_etcd_config(&self) -> lance_context_merge::EtcdConfig {
+        lance_context_merge::EtcdConfig {
+            etcd_endpoints: self.etcd.etcd_endpoints.clone(),
+            etcd_prefix: self.etcd.etcd_prefix.clone(),
+            etcd_username: self.etcd.etcd_username.clone(),
+            etcd_password: self.etcd.etcd_password.clone(),
+            etcd_ca_cert: self.etcd.etcd_ca_cert.clone(),
+            etcd_client_cert: self.etcd.etcd_client_cert.clone(),
+            etcd_client_key: self.etcd.etcd_client_key.clone(),
+        }
+    }
+
+    /// Resolve the instance id used for server-managed MemWAL sharding: the
+    /// explicit `--instance-id`/`INSTANCE_ID` if provided, otherwise the
+    /// `HOSTNAME` environment variable (stable per-pod under a StatefulSet).
+    #[must_use]
+    pub fn resolved_instance_id(&self) -> Option<String> {
+        self.instance_id
+            .clone()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn key_index_policy_is_explicit_and_validated() {
+        use clap::Parser;
+        use lance_context_core::KeyIndexType;
+        let config =
+            super::ServerConfig::try_parse_from(["server", "--rollout-key-index-type", "zonemap"])
+                .unwrap();
+        assert_eq!(config.rollout_key_index_type, KeyIndexType::Zonemap);
+        assert!(super::ServerConfig::try_parse_from([
+            "server",
+            "--rollout-key-index-type",
+            "unknown",
+        ])
+        .is_err());
+    }
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every tunable must stay an *optional flag* with a default.
+    ///
+    /// Regression guard: dropping a field's `#[arg(..)]` attribute silently
+    /// turns it into a required positional argument, so the binary still
+    /// compiles and every unit test still passes — it just refuses to start
+    /// with the documented flags. That is only caught by actually running the
+    /// server, which nothing in the Rust suite does.
+    #[test]
+    fn every_config_field_is_an_optional_flag() {
+        let command = ServerConfig::command();
+
+        let positionals: Vec<_> = command
+            .get_positionals()
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            positionals.is_empty(),
+            "config fields must be flags, not positional args; found {positionals:?} \
+             (a missing #[arg(..)] attribute does this)"
+        );
+
+        for arg in command.get_arguments() {
+            if arg.get_id() == "help" || arg.get_id() == "version" {
+                continue;
+            }
+            assert!(
+                arg.get_long().is_some(),
+                "'{}' has no long flag",
+                arg.get_id()
+            );
+            assert!(
+                arg.get_default_values().len() == 1 || !arg.is_required_set(),
+                "'{}' must have a default or be optional",
+                arg.get_id()
+            );
+        }
+    }
+
+    /// The server must start with no arguments beyond a data directory — the
+    /// documented defaults have to actually be defaults.
+    #[test]
+    fn parses_with_only_a_data_dir() {
+        let config = ServerConfig::try_parse_from(["lance-context-server", "--data-dir", "/tmp/x"])
+            .expect("the documented minimal invocation must parse");
+        assert_eq!(config.rollout_merge_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.rollout_wal_pending_warn_generations, 256);
+        assert_eq!(config.rollout_merge_memory_bytes, 3 * 1024 * 1024 * 1024);
+        assert_eq!(config.rollout_flush_interval_secs, 30);
+        assert_eq!(config.rollout_cleanup_interval_secs, 0);
+    }
+
+    #[test]
+    fn merge_byte_budget_flag_and_env_binding() {
+        let command = ServerConfig::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "rollout_merge_max_bytes")
+            .unwrap();
+        assert_eq!(arg.get_env().unwrap(), "ROLLOUT_MERGE_MAX_BYTES");
+        for (value, expected) in [("0", 0), ("1048576", 1048576)] {
+            let config = ServerConfig::try_parse_from([
+                "lance-context-server",
+                "--rollout-merge-max-bytes",
+                value,
+                "--rollout-merge-max-generations",
+                "3",
+            ])
+            .unwrap();
+            assert_eq!(config.rollout_merge_max_bytes, expected);
+            assert_eq!(config.rollout_merge_max_generations, 3);
+        }
+    }
+}

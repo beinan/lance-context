@@ -1,0 +1,2309 @@
+//! A store over a user-declared schema.
+//!
+//! [`GenericStore`] is the fourth store alongside the three fixed-schema ones,
+//! and the only one whose columns come from the caller rather than from a
+//! hard-coded `fn schema()`. It is deliberately thin: the schema comes from a
+//! [`SchemaSpec`], encode/decode from [`crate::generic_codec`], and *all*
+//! storage behavior from [`StorageBase`] — the same code path the built-in
+//! stores use.
+//!
+//! That last point is the design constraint, not an implementation detail.
+//! `add` and the WAL merge behave identically here to `RolloutStore`, because
+//! they are literally the same functions: the resident writer, the fence retry,
+//! the surgical generation drain, compaction with `defer_index_remap`, and the
+//! LSM read path are all inherited, not reimplemented.
+//!
+//! # The schema is persisted, not re-declared
+//!
+//! The spec is written into the dataset's schema metadata at creation and read
+//! back on open, so callers pass it once. Reopening with a *different* spec is
+//! an error rather than a silent reinterpretation of existing data.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow_array::{RecordBatch, StringArray};
+use arrow_schema::{ArrowError, Schema};
+use datafusion::prelude::{col, lit, Expr};
+use futures::{FutureExt, TryStreamExt};
+use lance::dataset::mem_wal::{scanner::ShardSnapshot, ShardManifestStore};
+use lance::dataset::optimize::CompactionMetrics;
+use lance::session::Session;
+use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::ShardManifest;
+
+use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
+use crate::merge_budget::MergeMemoryBudget;
+use crate::store::{CompactionConfig, CompactionStats};
+use crate::store_base::{
+    is_not_found_error, ListSource, PreparedMerge, StorageBase, StorageBaseOptions,
+};
+use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
+use lance_context_api::MAX_BATCH_GET_IDS;
+
+/// Schema-metadata key holding the serialized [`SchemaSpec`], so a store can be
+/// reopened without the caller re-declaring its columns.
+const SCHEMA_SPEC_KEY: &str = "lance-context:schema_spec";
+
+/// Schema-metadata key holding the store's seal-on-add mode.
+///
+/// Persisted for the same reason as the schema: it is a property *of the
+/// store*, chosen at creation, not of whoever happens to open it. Without this
+/// a store created with `seal_on_add: true` silently loses read-your-write the
+/// first time it is reopened (after an LRU eviction, or a process restart) —
+/// no error, no data loss, just "sometimes I can't read what I just wrote",
+/// which is close to undiagnosable in production.
+const SEAL_ON_ADD_KEY: &str = "lance-context:seal_on_add";
+
+/// Configuration for opening a [`GenericStore`].
+#[derive(Debug, Clone, Default)]
+pub struct GenericStoreOptions {
+    /// Object-store credentials/config, forwarded to Lance.
+    pub storage_options: Option<HashMap<String, String>>,
+    /// Stable identity of this writer instance, mapped to a MemWAL shard. Each
+    /// instance owns exactly one shard, so no two contend. `None` uses a single
+    /// `"default"` shard — correct for one writer, wrong for several.
+    pub shard_id: Option<String>,
+    /// Fold this instance's flushed generations into the base table once it has
+    /// accumulated this many. `None`/`0` disables the count trigger.
+    pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
+    pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every read. Every pending generation is a
+    /// separate dataset a read must open, so this is the read-amplification
+    /// alarm. `None` uses the crate default (256); `Some(0)` disables the warn.
+    /// The `rollout_wal_pending_generations` histogram is emitted regardless.
+    pub pending_generations_warn: Option<usize>,
+    /// See `StorageBaseOptions::pending_generations_max`.
+    pub pending_generations_max: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs; a
+    /// merge that cannot fit waits for another to release. `None` disables
+    /// the bound. See [`crate::merge_budget`] for the design.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Shared, capacity-bounded Lance session.
+    pub session: Option<Arc<Session>>,
+    /// Whether [`GenericStore::add`] seals before returning, making the rows it
+    /// wrote immediately readable.
+    ///
+    /// Defaults to `false` — [`crate::RolloutStore`]'s profile: `add` is a
+    /// durable WAL append, concurrent appends do not serialize behind a
+    /// per-append seal, and no flushed generation is emitted per call. There is
+    /// then **no read-your-write guarantee**; drive [`GenericStore::flush`]
+    /// periodically, or set this to `true` to seal on every `add`.
+    pub seal_on_add: bool,
+}
+
+/// A Lance-backed store over a user-declared schema.
+pub struct GenericStore {
+    base: StorageBase,
+    spec: SchemaSpec,
+    /// Arrow schema as it exists on disk. Encoding assembles against *this*,
+    /// not against `spec.to_arrow()`, so a dataset whose physical field order
+    /// differs still writes correctly.
+    schema: Arc<Schema>,
+    /// Whether `add` seals before returning. Resolved from the dataset on a
+    /// reopen, from the caller on a create.
+    seal_on_add: bool,
+    #[cfg(test)]
+    filtered_read_pause: std::sync::Mutex<Option<Arc<FilteredReadPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FilteredReadPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    before_stream: bool,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl GenericStore {
+    /// Create a store with `spec`, or open it if it already exists.
+    ///
+    /// # Errors
+    ///
+    /// - `spec` violates [`SchemaSpec::validate`] (no `id`, reserved names, …)
+    /// - the store exists and its persisted spec differs from `spec`
+    pub async fn open(
+        uri: &str,
+        spec: SchemaSpec,
+        options: GenericStoreOptions,
+    ) -> LanceResult<Self> {
+        Self::open_inner(uri, Some(spec), options, true).await
+    }
+
+    /// Open an existing store, reading its schema back from the dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanceError::DatasetNotFound`] when the store does not exist,
+    /// rather than creating an empty one — a mistyped name must not silently
+    /// materialize a new store.
+    pub async fn open_existing(uri: &str, options: GenericStoreOptions) -> LanceResult<Self> {
+        Self::open_inner(uri, None, options, false).await
+    }
+
+    async fn open_inner(
+        uri: &str,
+        spec: Option<SchemaSpec>,
+        options: GenericStoreOptions,
+        create_if_missing: bool,
+    ) -> LanceResult<Self> {
+        if let Some(spec) = &spec {
+            spec.validate()
+                .map_err(|error| LanceError::from(ArrowError::SchemaError(error)))?;
+        }
+
+        // Creating needs a schema up front; opening reads it back from the
+        // dataset. When no schema was supplied the store must already exist, so
+        // read its schema first and hand *that* to the base — it validates the
+        // key column against whatever it is given, and an empty placeholder
+        // would fail that check.
+        let create_schema = match &spec {
+            Some(spec) => Arc::new(schema_with_spec(spec, options.seal_on_add)?),
+            None if create_if_missing => {
+                return Err(ArrowError::SchemaError(
+                    "a schema is required to create a store".to_string(),
+                )
+                .into())
+            }
+            None => {
+                let existing = StorageBase::load_with_options(
+                    uri,
+                    options.storage_options.clone(),
+                    options.session.clone(),
+                )
+                .await?;
+                Arc::new(Schema::from(existing.schema()))
+            }
+        };
+
+        // A reopen honors the mode the store was *created* with; only a create
+        // takes it from the caller. Read it before opening, since the base
+        // needs it up front.
+        let seal_on_add = match &spec {
+            Some(_) => options.seal_on_add,
+            None => seal_on_add_from_schema(&create_schema).unwrap_or(options.seal_on_add),
+        };
+
+        let base = StorageBase::open(
+            uri,
+            StorageBaseOptions {
+                storage_options: options.storage_options,
+                shard_id: options.shard_id,
+                merge_after_generations: options.merge_after_generations,
+                merge_max_generations: options.merge_max_generations,
+                merge_max_bytes: options.merge_max_bytes,
+                key_index_type: options.key_index_type,
+                pending_generations_warn: options.pending_generations_warn,
+                pending_generations_max: options.pending_generations_max,
+                merge_budget: options.merge_budget.clone(),
+                session: options.session,
+                schema: create_schema,
+                // Always `id`: the LSM merge key, which `SchemaSpec::validate`
+                // guarantees exists as a non-nullable string.
+                key_column: ID_COLUMN.to_string(),
+                // User schemas are immutable in v1, so there is nothing to
+                // evolve an older base table to.
+                latest_schema: None,
+                seal_on_put: seal_on_add,
+            },
+            create_if_missing,
+        )
+        .await?;
+
+        let schema: Arc<Schema> = Arc::new(base.dataset.schema().into());
+        let persisted = spec_from_schema(&schema)?;
+
+        // Reopening with a different schema would reinterpret existing data.
+        if let Some(requested) = spec {
+            if requested != persisted {
+                return Err(ArrowError::SchemaError(format!(
+                    "store at '{uri}' was created with a different schema; \
+                     open it without a schema to use the persisted one"
+                ))
+                .into());
+            }
+        }
+
+        Ok(Self {
+            base,
+            spec: persisted,
+            schema,
+            seal_on_add,
+            #[cfg(test)]
+            filtered_read_pause: Default::default(),
+        })
+    }
+
+    /// The schema this store was created with.
+    #[must_use]
+    pub fn spec(&self) -> &SchemaSpec {
+        &self.spec
+    }
+
+    /// Whether `add` seals before returning, so its rows are immediately
+    /// readable. Persisted with the store, so a reopen preserves it.
+    #[must_use]
+    pub fn seal_on_add(&self) -> bool {
+        self.seal_on_add
+    }
+
+    /// URI of the underlying Lance dataset.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        self.base.uri()
+    }
+
+    /// Current base dataset version.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.base.version()
+    }
+
+    /// Whether this handle was explicitly checked out to a dataset version.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
+    /// Refresh this handle to the latest base-table manifest.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.base.refresh_latest().await
+    }
+
+    /// Append rows.
+    ///
+    /// Rows are matched to columns by name; an undeclared key is an error, and
+    /// an omitted nullable column is written as null. Visibility on return is
+    /// governed by [`GenericStoreOptions::seal_on_add`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates encoding failures (missing required column, type mismatch,
+    /// wrong vector length) before anything is written.
+    pub async fn add(&self, rows: &[Row]) -> LanceResult<u64> {
+        if rows.is_empty() {
+            return Ok(self.base.version());
+        }
+        let batch = rows_to_batch(&self.spec, self.schema.clone(), rows)?;
+        self.base.put(vec![batch]).await?;
+        Ok(self.base.version())
+    }
+
+    /// Read rows, newest-generation-wins by `id`.
+    ///
+    /// Blob columns are projected out (see [`SchemaSpec::scan_columns`]), so a
+    /// list never materializes large payloads. Use [`Self::get`] with explicit
+    /// columns to fetch them.
+    pub async fn list(&self, limit: Option<usize>, offset: Option<usize>) -> LanceResult<Vec<Row>> {
+        self.scan(None, limit, offset, &self.spec.scan_columns())
+            .await
+    }
+
+    /// [`Self::list`], filtered by a SQL predicate over the store's columns.
+    pub async fn list_filtered(
+        &self,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> LanceResult<Vec<Row>> {
+        self.scan(Some(filter), limit, offset, &self.spec.scan_columns())
+            .await
+    }
+
+    /// Fetch one row by `id`, or `None` if absent.
+    ///
+    /// `columns` selects what to read: `None` reads everything *except* blob
+    /// columns, matching [`Self::list`]. Pass an explicit list to fetch blobs —
+    /// this is the intended way to read a large payload, one row at a time.
+    pub async fn get(&self, id: &str, columns: Option<&[String]>) -> LanceResult<Option<Row>> {
+        let columns = columns.map_or_else(|| self.spec.scan_columns(), <[String]>::to_vec);
+        // Always read `id` so a match can be confirmed.
+        let mut columns = columns;
+        if !columns.iter().any(|column| column == ID_COLUMN) {
+            columns.push(ID_COLUMN.to_string());
+        }
+
+        let filter = format!("{ID_COLUMN} = '{}'", escape_sql_literal(id));
+        let rows = self.scan(Some(&filter), Some(1), None, &columns).await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Fetch a batch in first-requested order, omitting missing IDs and
+    /// returning duplicate IDs only once. At most [`MAX_BATCH_GET_IDS`] input
+    /// IDs are accepted, including duplicates; an empty batch returns empty.
+    ///
+    /// `None` excludes blobs. Explicit columns always include `id`; use
+    /// `Some(&["id".into()])` for existence checks without fetching payloads.
+    /// Like `get`, reads include flushed WAL; deferred appends need `flush`.
+    /// Reads retry a concurrent WAL merge, and fail rather than return partial
+    /// results if the view cannot be stabilized. Pinned reads stay pinned.
+    /// A known Lance 9 WAL index error retries native point lookups against
+    /// the same captured view; that compatibility path is slower.
+    pub async fn get_many(
+        &self,
+        ids: &[String],
+        columns: Option<&[String]>,
+    ) -> LanceResult<Vec<Row>> {
+        if ids.len() > MAX_BATCH_GET_IDS {
+            return Err(LanceError::invalid_input(format!(
+                "batch get accepts at most {MAX_BATCH_GET_IDS} IDs"
+            )));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let filter = col(ID_COLUMN).in_list(ids.iter().map(|id| lit(*id)).collect(), false);
+        let mut columns = columns.map_or_else(|| self.spec.scan_columns(), <[String]>::to_vec);
+        if !columns.iter().any(|column| column == ID_COLUMN) {
+            columns.push(ID_COLUMN.to_string());
+        }
+        let rows = self
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let filter = &filter;
+                let columns = &columns;
+                let ids = &ids;
+                async move {
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset,
+                        ID_COLUMN,
+                        ListSource::All,
+                        snapshots.clone(),
+                    );
+                    let scanner = batch_get_scanner(scanner, filter, columns)?;
+                    let read = async {
+                        let mut stream = scanner.try_into_stream().await?;
+                        let mut rows = Vec::new();
+                        while let Some(batch) = stream.try_next().await? {
+                            rows.extend(batch_to_rows(&self.spec, &batch)?);
+                        }
+                        Ok::<_, LanceError>(rows)
+                    }
+                    .await;
+                    match read {
+                        Err(error) if is_wal_pk_batch_error(&error) => {
+                            // Lance 9's batched WAL membership probe can reject
+                            // a PK sidecar that its point lookup can still read.
+                            // Discard partial results and retry all keys through
+                            // that native route against the SAME captured view.
+                            // Other errors propagate; no missing row is inferred
+                            // from a failed read. The outer consistency check
+                            // also covers this slower compatibility path.
+                            tracing::warn!(
+                                "batch get retrying native point lookups after a WAL PK index error"
+                            );
+                            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                            let mut rows = Vec::new();
+                            for id in ids {
+                                let scanner = StorageBase::lsm_scanner_for_dataset(
+                                    &dataset,
+                                    ID_COLUMN,
+                                    ListSource::All,
+                                    snapshots.clone(),
+                                )
+                                .project(&refs)?
+                                .filter_expr(col(ID_COLUMN).eq(lit(*id)));
+                                let mut stream = scanner.try_into_stream().await?;
+                                while let Some(batch) = stream.try_next().await? {
+                                    rows.extend(batch_to_rows(&self.spec, &batch)?);
+                                }
+                            }
+                            Ok(rows)
+                        }
+                        result => result,
+                    }
+                }
+            })
+            .await?;
+        let mut by_id = HashMap::with_capacity(rows.len());
+        for row in rows {
+            // The schema requires a non-null string ID and the projection includes it.
+            let id = row[ID_COLUMN]
+                .as_str()
+                .expect("required string id")
+                .to_string();
+            if by_id.insert(id, row).is_some() {
+                return Err(LanceError::io(
+                    "batch get received duplicate IDs from the LSM scan",
+                ));
+            }
+        }
+        Ok(ids.into_iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
+    async fn scan(
+        &self,
+        filter: Option<&str>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        if let Some(filter) = filter {
+            // Keep point/filtered reads on this handle's view. The server's
+            // refresh-on-miss path refreshes the cached handle itself; reading
+            // a newer clone on every lookup would bypass that cache update.
+            let operation = async {
+                let snapshots = self.base.wal_shard_snapshots().await?;
+                self.scan_filtered_snapshot(
+                    self.base.dataset.clone(),
+                    snapshots,
+                    filter,
+                    limit,
+                    offset,
+                    columns,
+                )
+                .await
+            };
+            let result = self.base.protect_wal_read(ListSource::All, operation).await;
+            if !self.base.is_version_pinned()
+                && matches!(&result, Err(error) if is_not_found_error(error)
+                    && !matches!(error, LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. }))
+            {
+                // GC can remove an opened generation during the scan. An
+                // error is not an absent row: retry a fresh consistent view.
+                // Successful reads and ordinary misses retain cache semantics.
+                return self
+                    .base
+                    .read_consistent(ListSource::All, |dataset, snapshots| {
+                        self.scan_filtered_snapshot(
+                            dataset, snapshots, filter, limit, offset, columns,
+                        )
+                    })
+                    .boxed()
+                    .await;
+            }
+            return result;
+        }
+
+        // Only unfiltered lists use this compatibility recovery. Keep retries
+        // on one captured base/WAL view, including the fallback.
+        self.base
+            .read_consistent(ListSource::All, |dataset, snapshots| async move {
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let mut scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset, ID_COLUMN, ListSource::All, snapshots.clone(),
+                ).project(&refs)?;
+                if limit.is_some() || offset.is_some() {
+                    scanner = scanner.limit(
+                        map_i64_bound("limit", limit)?, map_i64_bound("offset", offset)?,
+                    )?;
+                }
+                let read = async {
+                    let mut stream = scanner.try_into_stream().await?;
+                    let mut rows = Vec::new();
+                    while let Some(batch) = stream.try_next().await? {
+                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    }
+                    Ok::<_, LanceError>(rows)
+                }.await;
+                match read {
+                    Err(error) if is_wal_pk_batch_error(&error) => {
+                        tracing::warn!("unfiltered list retrying bounded native point lookups after a WAL PK index error");
+                        // Never turn an index failure into an unbounded ID cache
+                        // or a long-running scan of a production table.
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            self.scan_via_points(&dataset, &snapshots, limit, offset, columns),
+                        ).await.map_err(|_| LanceError::io(
+                            "WAL PK index fallback exceeded its 10 second budget"
+                        ))?
+                    }
+                    result => result,
+                }
+            })
+            // Erase this recovery future so callers do not inherit the full
+            // Lance scan + retry type (master tests otherwise exceed rustc
+            // layout query depth before they can run).
+            .boxed()
+            .await
+    }
+
+    async fn scan_filtered_snapshot(
+        &self,
+        dataset: lance::Dataset,
+        snapshots: Vec<ShardSnapshot>,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        #[cfg(test)]
+        let pause = self.filtered_read_pause.lock().unwrap().clone();
+        #[cfg(test)]
+        let pause_this_attempt = pause.as_ref().is_some_and(|pause| {
+            pause
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+        });
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut scanner =
+            StorageBase::lsm_scanner_for_dataset(&dataset, ID_COLUMN, ListSource::All, snapshots)
+                .project(&refs)?
+                .filter(filter)?;
+        if limit.is_some() || offset.is_some() {
+            scanner = scanner.limit(
+                map_i64_bound("limit", limit)?,
+                map_i64_bound("offset", offset)?,
+            )?;
+        }
+        #[cfg(test)]
+        if let Some(pause) = &pause {
+            if pause_this_attempt && pause.before_stream {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+        let mut stream = scanner.try_into_stream().await?;
+        #[cfg(test)]
+        if let Some(pause) = &pause {
+            if pause_this_attempt && !pause.before_stream {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            rows.extend(batch_to_rows(&self.spec, &batch)?);
+        }
+        Ok(rows)
+    }
+
+    /// Narrow compatibility path for Lance 9's broken batched PK sidecars.
+    /// Physical scans supply only candidate keys; the native point planner
+    /// still decides visibility/newest-wins, including replay and tombstones.
+    /// Filtering is deliberately not pushed into these older physical sources.
+    async fn scan_via_points(
+        &self,
+        dataset: &lance::Dataset,
+        snapshots: &[ShardSnapshot],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        let mut ids = BTreeSet::new();
+        let mut id_bytes = 0usize;
+        let mut scanned = 0usize;
+        // One dataset at a time; do not allocate a path list proportional to
+        // pending WAL generations before the key/work budgets can reject it.
+        collect_scan_keys(dataset, &mut ids, &mut id_bytes, &mut scanned).await?;
+        for snapshot in snapshots {
+            for generation in &snapshot.sstables {
+                let path = self
+                    .base
+                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                let source = StorageBase::load_with_options(
+                    &path,
+                    self.base.storage_options.clone(),
+                    Some(dataset.session()),
+                )
+                .await?;
+                collect_scan_keys(&source, &mut ids, &mut id_bytes, &mut scanned).await?;
+            }
+        }
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut rows = Vec::new();
+        let mut skip = offset.unwrap_or(0);
+        for id in ids {
+            if limit.is_some_and(|n| rows.len() >= n) {
+                break;
+            }
+            let scanner = StorageBase::lsm_scanner_for_dataset(
+                dataset,
+                ID_COLUMN,
+                ListSource::All,
+                snapshots.to_vec(),
+            )
+            .project(&refs)?
+            .filter_expr(col(ID_COLUMN).eq(lit(id)));
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                for row in batch_to_rows(&self.spec, &batch)? {
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Read rows from a chosen [`ListSource`] — base table, pending WAL
+    /// generations, or their union.
+    pub async fn list_from(&self, source: ListSource) -> LanceResult<Vec<Row>> {
+        // The All view must pair a current base with the WAL manifest captured
+        // for it. Fragments keeps the handle's base-only view; Wal keeps the
+        // captured pending-generation view, even if a merge drains it later.
+        if source == ListSource::All {
+            return self
+                .base
+                .read_consistent(source, |dataset, snapshots| async move {
+                    let columns = self.spec.scan_columns();
+                    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                    let scanner = StorageBase::lsm_scanner_for_dataset(
+                        &dataset, ID_COLUMN, source, snapshots,
+                    )
+                    .project(&refs)?;
+                    let mut stream = scanner.try_into_stream().await?;
+                    let mut rows = Vec::new();
+                    while let Some(batch) = stream.try_next().await? {
+                        rows.extend(batch_to_rows(&self.spec, &batch)?);
+                    }
+                    Ok(rows)
+                })
+                .await;
+        }
+        self.base
+            .protect_wal_read(source, async {
+                let snapshots = match source {
+                    ListSource::Fragments => Vec::new(),
+                    ListSource::Wal | ListSource::All => self.base.wal_shard_snapshots().await?,
+                };
+                let columns = self.spec.scan_columns();
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let scanner = self
+                    .base
+                    .lsm_scanner_for_source(source, snapshots)
+                    .project(&refs)?;
+
+                let mut stream = scanner.try_into_stream().await?;
+                let mut rows = Vec::new();
+                while let Some(batch) = stream.try_next().await? {
+                    rows.extend(batch_to_rows(&self.spec, &batch)?);
+                }
+                Ok(rows)
+            })
+            .await
+    }
+
+    /// Seal the active memtable so previously added rows become readable
+    /// everywhere. A no-op when `seal_on_add` is set, since `add` already seals.
+    pub async fn flush(&self) -> LanceResult<()> {
+        self.base.flush().await
+    }
+
+    /// Close the resident writer, draining its background tasks. Idempotent.
+    pub async fn close(&mut self) -> LanceResult<()> {
+        self.base.close().await
+    }
+
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
+    }
+
+    /// Merge flushed generations into the base table once the count trigger is
+    /// met. Returns how many were reclaimed.
+    pub async fn maybe_merge_wal(&mut self) -> LanceResult<usize> {
+        self.base.maybe_merge_own_shard().await
+    }
+
+    /// Seal, then merge **every** pending generation into the base table — the
+    /// time half of the "time OR count" trigger.
+    pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
+        self.base.cleanup_own_shard().await
+    }
+
+    /// Admission for a split merge on this resident store. Clone under a short
+    /// store read lock, release that lock, then await the gate; retain the guard
+    /// until commit finishes. Reads, ingestion and other tables do not take it.
+    #[must_use]
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.base.merge_preparation_gate()
+    }
+
+    /// The shared-lock half of [`Self::maybe_merge_wal`]: `None` unless the
+    /// count trigger is configured and met.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_count_merge().await
+    }
+
+    /// Check the configured count trigger using only this shard's manifest.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        self.base.count_merge_due().await
+    }
+
+    /// This writer's shard watermark from its own manifest. Metadata only.
+    pub async fn own_shard_watermark(
+        &self,
+    ) -> LanceResult<Option<crate::store_base::ShardWatermark>> {
+        self.base.own_shard_watermark().await
+    }
+
+    /// Every shard's watermark from its latest manifest. Metadata only.
+    pub async fn all_shard_watermarks(
+        &self,
+    ) -> LanceResult<Vec<crate::store_base::ShardWatermark>> {
+        self.base.all_shard_watermarks().await
+    }
+
+    /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
+    /// budgeted prefix of flushed generations into memory. Callers holding a
+    /// read lock run this while appends continue, then take the write lock
+    /// only for [`Self::commit_prepared_merge`].
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_cleanup_merge().await
+    }
+
+    /// Recover this instance's unsealed WAL, then prepare cleanup. The caller
+    /// must exclusively own the ingestion writer ID, as when appending. Never
+    /// use this to merge a live worker's shard from a maintenance master.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_recovered_cleanup_merge().await
+    }
+
+    /// Read sealed WAL using capacity admitted before opening payload readers.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_merge_reserved(reservation).await
+    }
+
+    /// Encode immutable replacement files without publishing rows or coverage.
+    /// Retains the prepared batches and reservation until ordered commit.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        self.base.stage_prepared_merge(prepared).await
+    }
+
+    /// Prepare this sealed shard for an opt-in bounded, ordered group.
+    pub async fn prepare_grouped_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<crate::PreparedShardMerge>> {
+        self.base.prepare_grouped_merge_reserved(reservation).await
+    }
+
+    /// Publish a group under the caller's existing table maintenance scope.
+    pub async fn commit_prepared_group(
+        &mut self,
+        shards: Vec<crate::PreparedShardMerge>,
+        max_bytes: usize,
+    ) -> LanceResult<usize> {
+        self.base.commit_prepared_group(shards, max_bytes).await
+    }
+
+    /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        self.base
+            .commit_prepared_merge(manifest_store, manifest, prepared)
+            .await
+    }
+
+    /// Generations pending merge across all shards. Read-only.
+    pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
+        self.base.pending_wal_generations().await
+    }
+
+    /// Admit durable WAL retirement discovery to the bounded background collector.
+    /// This may wait for capacity and must not run inside read/pending probes.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        self.base.discover_retired_wal().await
+    }
+
+    /// Total and largest per-shard pending counts from one manifest pass.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        self.base.pending_wal_generation_counts().await
+    }
+
+    /// Compact the base table's small fragments. Drive from a single external
+    /// trigger, not per worker — see [`StorageBase::compact`].
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
+        self.base.compact(options).await
+    }
+
+    /// Whether the base table is fragmented enough to be worth compacting.
+    #[must_use]
+    pub fn should_compact(&self, config: &CompactionConfig) -> bool {
+        self.base.should_compact(config)
+    }
+
+    /// Compaction statistics for the base table.
+    #[must_use]
+    pub fn compaction_stats(&self) -> CompactionStats {
+        self.base.compaction_stats()
+    }
+
+    /// Build a BTree scalar index on `id`. Idempotent.
+    pub async fn create_id_index(&mut self) -> LanceResult<()> {
+        self.base.create_key_btree_index().await
+    }
+
+    /// Row count of the base table. Excludes rows still in unmerged
+    /// generations or buffered in the writer.
+    pub async fn count_base_rows(&self) -> LanceResult<usize> {
+        self.base.dataset.count_rows(None).await
+    }
+}
+
+fn batch_get_scanner(
+    scanner: lance::dataset::mem_wal::scanner::LsmScanner,
+    filter: &Expr,
+    columns: &[String],
+) -> LanceResult<lance::dataset::mem_wal::scanner::LsmScanner> {
+    let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+    // Lance 9 routes a bare PK IN to lookup_many_via_per_key, which serializes
+    // disk reads. Explicit OFFSET 0 selects its general LSM scan: one indexed
+    // IN scan per source with Lance's native cross-generation suppression.
+    // This is a compatibility adapter using public APIs; the plan regression
+    // test guards it when Lance changes its routing. No LIMIT: source-local
+    // caps can underfill after newer generations suppress older matches.
+    scanner
+        .project(&refs)?
+        .filter_expr(filter.clone())
+        .limit(None, Some(0))
+}
+
+/// Attach the serialized spec and the seal mode to the Arrow schema, so both
+/// round-trip on open.
+fn schema_with_spec(spec: &SchemaSpec, seal_on_add: bool) -> Result<Schema, ArrowError> {
+    let schema = spec.to_arrow()?;
+    let encoded = serde_json::to_string(spec)
+        .map_err(|error| ArrowError::SchemaError(format!("could not serialize schema: {error}")))?;
+
+    let mut metadata = schema.metadata().clone();
+    metadata.insert(SCHEMA_SPEC_KEY.to_string(), encoded);
+    metadata.insert(SEAL_ON_ADD_KEY.to_string(), seal_on_add.to_string());
+    Ok(schema.with_metadata(metadata))
+}
+
+/// Read the persisted seal mode. `None` for a store written before this was
+/// persisted, which then falls back to the caller's option.
+fn seal_on_add_from_schema(schema: &Schema) -> Option<bool> {
+    schema
+        .metadata()
+        .get(SEAL_ON_ADD_KEY)
+        .and_then(|raw| raw.parse().ok())
+}
+
+/// Read the spec back out of a dataset's schema metadata.
+fn spec_from_schema(schema: &Schema) -> Result<SchemaSpec, ArrowError> {
+    let encoded = schema.metadata().get(SCHEMA_SPEC_KEY).ok_or_else(|| {
+        ArrowError::SchemaError(
+            "dataset has no stored schema spec: it was not created as a generic store".to_string(),
+        )
+    })?;
+    serde_json::from_str(encoded)
+        .map_err(|error| ArrowError::SchemaError(format!("stored schema spec is invalid: {error}")))
+}
+
+/// Escape single quotes for a SQL string literal.
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn map_i64_bound(name: &str, value: Option<usize>) -> LanceResult<Option<i64>> {
+    value
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| LanceError::invalid_input(format!("{name} exceeds i64::MAX")))
+}
+
+/// Row batches, for callers that already have Arrow data.
+impl GenericStore {
+    /// Append pre-built [`RecordBatch`]es, bypassing row encoding.
+    ///
+    /// For bulk ingest where the caller already holds Arrow data. Each batch
+    /// must match the store's schema exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a batch's schema differs from the store's.
+    pub async fn add_batches(&self, batches: Vec<RecordBatch>) -> LanceResult<u64> {
+        if batches.is_empty() {
+            return Ok(self.base.version());
+        }
+        for batch in &batches {
+            if batch.schema().fields() != self.schema.fields() {
+                return Err(ArrowError::SchemaError(
+                    "record batch schema does not match the store schema".to_string(),
+                )
+                .into());
+            }
+        }
+        self.base.put(batches).await?;
+        Ok(self.base.version())
+    }
+}
+
+/// Collect only candidate keys; native point reads resolve their visibility.
+async fn collect_scan_keys(
+    source: &lance::Dataset,
+    ids: &mut BTreeSet<String>,
+    id_bytes: &mut usize,
+    scanned: &mut usize,
+) -> LanceResult<()> {
+    let mut scanner = source.scan();
+    scanner.project(&[ID_COLUMN])?;
+    scanner.batch_size(256);
+    let mut stream = scanner.try_into_stream().await?;
+    while let Some(batch) = stream.try_next().await? {
+        *scanned += batch.num_rows();
+        if *scanned > 16 * MAX_BATCH_GET_IDS {
+            return Err(LanceError::io("WAL PK index fallback scan budget exceeded"));
+        }
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| LanceError::io("generic ID must be Utf8"))?;
+        for key in keys.iter().flatten() {
+            if !ids.contains(key) {
+                if ids.len() >= MAX_BATCH_GET_IDS
+                    || id_bytes.saturating_add(key.len()) > 1024 * 1024
+                {
+                    return Err(LanceError::io("WAL PK index fallback key budget exceeded"));
+                }
+                *id_bytes += key.len();
+                ids.insert(key.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_wal_pk_batch_error(error: &LanceError) -> bool {
+    error
+        .to_string()
+        .contains("RowAddrTreeMap::from_sorted_iter called with non-sorted input")
+}
+
+#[cfg(test)]
+// `GenericStore` owns a `Dataset` and is not `Debug`, so `expect_err` (which
+// formats the Ok value) is unavailable; `.err().expect(..)` is the alternative.
+#[allow(clippy::err_expect)]
+mod tests {
+
+    #[tokio::test]
+    async fn wal_lifetime_registration_failure_preserves_metadata_probes() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer.add(&[row(json!({"id":"protected"}))]).await.unwrap();
+        let reader = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        // A file in place of the registration directory deterministically
+        // rejects publication, while all real WAL and base data remain intact.
+        std::fs::write(dir.path().join("_wal_readers_v1"), b"unavailable").unwrap();
+        assert!(reader.list_from(ListSource::Wal).await.is_err());
+        assert!(reader.list_from(ListSource::All).await.is_err());
+        assert!(reader
+            .list_from(ListSource::Fragments)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(reader.base.pending_wal_generations().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_explicit_source_reads() {
+        for source in [ListSource::Wal, ListSource::All] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer
+                .add(&[row(json!({"id":"protected", "user_id":"payload"}))])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            let rows = crate::wal_read_lifetime::assert_read_survives_merge(
+                &reader.base,
+                &mut writer.base,
+                reader.list_from(source),
+            )
+            .await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], json!("protected"));
+            assert_eq!(rows[0]["user_id"], json!("payload"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_generic_all_reads() {
+        for source in [ListSource::All] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer
+                .add(&[row(json!({"id":"protected", "user_id":"payload"}))])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            let rows = crate::wal_read_lifetime::assert_read_after_merge(
+                &reader.base,
+                &mut writer.base,
+                reader.list_from(source),
+            )
+            .await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], json!("protected"));
+            assert_eq!(rows[0]["user_id"], json!("payload"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_reopen_lifecycle_discovers_retirement_with_zero_pending() {
+        use object_store::ObjectStoreExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut original = GenericStore::open(uri, spec(), Default::default())
+            .await
+            .unwrap();
+        let store = original.base.dataset.object_store(None).await.unwrap();
+        let root = original.base.dataset.branch_location().path.clone();
+        let shard = uuid::Uuid::new_v4();
+        let manifests =
+            lance::dataset::mem_wal::ShardManifestStore::new(store.clone(), &root, shard, 16);
+        manifests
+            .initialize_shard(0, Default::default())
+            .await
+            .unwrap();
+        manifests
+            .commit_update(0, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.current_generation = 2;
+                next
+            })
+            .await
+            .unwrap();
+        let keys = crate::wal_retirement::record(
+            store.clone(),
+            &root,
+            shard,
+            vec![crate::rollout_append::Generation {
+                number: 1,
+                path: "abcdef12_gen_1".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let payload = root
+            .clone()
+            .join("_mem_wal")
+            .join(shard.to_string())
+            .join("abcdef12_gen_1")
+            .join("data")
+            .join("payload");
+        store.put(&payload, b"retired").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+        let mut reopened = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+        assert!(store.inner.head(&keys[0]).await.is_ok());
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.discover_retired_wal().await.unwrap();
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+        reopened.discover_retired_wal().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match store.inner.head(&keys[0]).await {
+                    Err(object_store::Error::NotFound { .. }) => break,
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    Err(error) => panic!("retirement observation failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.inner.head(&payload).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        reopened.close().await.unwrap();
+    }
+    use super::*;
+    use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn filtered_reads_protect_the_initial_cached_wal_view() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        for (point, before_stream) in [(true, true), (true, false), (false, true), (false, false)] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            writer
+                .add(&[
+                    row(json!({"id":"wanted", "user_id":"original"})),
+                    row(json!({"id":"other", "user_id":"hidden"})),
+                ])
+                .await
+                .unwrap();
+            let reader = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            assert!(reader.base.wal_read_protection);
+            let pause = Arc::new(FilteredReadPause {
+                before_stream,
+                ..Default::default()
+            });
+            *reader.filtered_read_pause.lock().unwrap() = Some(pause.clone());
+            let reader = Arc::new(reader);
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    if point {
+                        reader
+                            .get("wanted", None)
+                            .await
+                            .map(|row| row.into_iter().collect::<Vec<_>>())
+                    } else {
+                        reader.list_filtered("id = 'wanted'", Some(1), None).await
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let mut paths = Vec::new();
+            for value in [None, Some("updated"), Some("latest")] {
+                if let Some(value) = value {
+                    writer
+                        .add(&[row(json!({"id":"wanted", "user_id":value}))])
+                        .await
+                        .unwrap();
+                }
+                for snapshot in writer.base.wal_shard_snapshots().await.unwrap() {
+                    for generation in snapshot.sstables {
+                        paths.push(
+                            writer
+                                .base
+                                .flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+                assert_eq!(writer.pending_wal_generation_counts().await.unwrap().0, 0);
+            }
+            assert_eq!(paths.len(), 3);
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let later = GenericStore::open_existing(uri, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                later.get("wanted", None).await.unwrap().unwrap()["user_id"],
+                "latest"
+            );
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                pause.calls.load(Ordering::SeqCst),
+                1,
+                "the first cached view must survive without retry"
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["id"], "wanted");
+            assert_eq!(rows[0]["user_id"], "original");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_point_snapshot_recovers_peer_gc_and_preserves_filter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+        writer
+            .add(&[
+                row(json!({"id":"wanted", "user_id":"value"})),
+                row(json!({"id":"other", "user_id":"hidden"})),
+            ])
+            .await
+            .unwrap();
+        let mut reader = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        reader.base.wal_read_protection = false; // Historical unregistered reader.
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let columns = vec!["id".to_string(), "user_id".to_string()];
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                let columns = &columns;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_wal().await.unwrap();
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .base
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::time::sleep(std::time::Duration::from_millis(10))
+                                            .await;
+                                    }
+                                })
+                                .await
+                                .unwrap();
+                            }
+                        }
+                    }
+                    reader
+                        .scan_filtered_snapshot(
+                            dataset,
+                            snapshots,
+                            "id = 'wanted'",
+                            Some(1),
+                            None,
+                            columns,
+                        )
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, vec![row(json!({"id":"wanted", "user_id":"value"}))]);
+    }
+
+    fn spec() -> SchemaSpec {
+        SchemaSpec::new(vec![
+            (
+                ID_COLUMN.to_string(),
+                ColumnSpec::required(ColumnType::String { large: false }),
+            ),
+            (
+                "user_id".to_string(),
+                ColumnSpec::new(ColumnType::String { large: false }),
+            ),
+            ("score".to_string(), ColumnSpec::new(ColumnType::Float32)),
+            (
+                "payload".to_string(),
+                ColumnSpec::new(ColumnType::Binary { blob: true }),
+            ),
+        ])
+    }
+
+    fn row(value: serde_json::Value) -> Row {
+        value.as_object().unwrap().clone()
+    }
+
+    fn sealing() -> GenericStoreOptions {
+        // Seal on add so each test reads its own writes without an explicit
+        // flush; the deferred default is exercised separately.
+        GenericStoreOptions {
+            seal_on_add: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn point_scan_fallback_preserves_newest_rows_projection_and_paging() {
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        store
+            .add(&[
+                row(json!({"id":"a", "score":1.0})),
+                row(json!({"id":"b", "score":2.0})),
+                row(json!({"id":"c", "score":3.0})),
+            ])
+            .await
+            .unwrap();
+        store.cleanup_wal().await.unwrap();
+        store
+            .add(&[row(json!({"id":"b", "score":20.0}))])
+            .await
+            .unwrap();
+        store
+            .add(&[
+                row(json!({"id":"b", "score":21.0})),
+                row(json!({"id":"d", "score":4.0})),
+            ])
+            .await
+            .unwrap();
+        let dataset = store.base.dataset.clone();
+        let snapshots = store.base.wal_shard_snapshots().await.unwrap();
+        let columns = vec!["id".to_string(), "score".to_string()];
+        let rows = store
+            .scan_via_points(&dataset, &snapshots, None, None, &columns)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(rows[1]["score"], json!(21.0));
+        assert!(rows.iter().all(|r| r.len() == 2));
+        let page = store
+            .scan_via_points(&dataset, &snapshots, Some(2), Some(1), &columns)
+            .await
+            .unwrap();
+        assert_eq!(page, rows[1..3]);
+        assert!(store
+            .scan_via_points(&dataset, &snapshots, Some(0), None, &columns)
+            .await
+            .unwrap()
+            .is_empty());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn point_scan_fallback_refuses_an_unbounded_key_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        let rows: Vec<_> = (0..=MAX_BATCH_GET_IDS)
+            .map(|i| row(json!({"id":format!("key-{i}"),"score":1.0})))
+            .collect();
+        store.add(&rows).await.unwrap();
+        let dataset = store.base.dataset.clone();
+        let snapshots = store.base.wal_shard_snapshots().await.unwrap();
+        let error = store
+            .scan_via_points(&dataset, &snapshots, Some(1), None, &["id".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("fallback key budget exceeded"),
+            "{error}"
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_get_matches_visible_rows_across_generations_and_merge() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let original: Vec<Row> = (0..64)
+            .map(|i| row(json!({"id": format!("r{i}"), "score": 1.0})))
+            .collect();
+        store.add(&original).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        let ids: Vec<String> = (0..64).rev().map(|i| format!("r{i}")).collect();
+        // Exercise both the unindexed base and BTree-covered base.
+        assert_eq!(store.get_many(&ids, None).await.unwrap().len(), 64);
+        store.create_id_index().await.unwrap();
+        for score in [2.0, 3.0] {
+            let replacements: Vec<Row> = (0..60)
+                .map(|i| row(json!({"id": format!("r{i}"), "score": score})))
+                .collect();
+            store.add(&replacements).await.unwrap();
+        }
+        store
+            .add(&[
+                row(json!({"id":"wal-only", "score":4.0})),
+                row(json!({"id":"wal-only", "score":5.0})),
+                row(json!({"id":"quote'雪", "score":6.0})),
+            ])
+            .await
+            .unwrap();
+        let mut requested = vec!["wal-only".into(), "missing".into(), "quote'雪".into()];
+        requested.extend(ids.clone());
+        requested.extend(["r0".into(), "wal-only".into()]);
+        let before = store.get_many(&requested, None).await.unwrap();
+        assert_eq!(before.len(), 66);
+        assert_eq!(before[0]["id"], "wal-only");
+        assert_eq!(before[0]["score"], 5.0);
+        assert_eq!(before[1]["id"], "quote'雪");
+        for (row, id) in before[2..].iter().zip(&ids) {
+            assert_eq!(row["id"], *id);
+            let i: usize = id[1..].parse().unwrap();
+            assert_eq!(row["score"], if i < 60 { 3.0 } else { 1.0 });
+        }
+        assert!(store.pending_wal_generations().await.unwrap() >= 3);
+        store.cleanup_wal().await.unwrap();
+        assert_eq!(store.get_many(&requested, None).await.unwrap(), before);
+        store.close().await.unwrap();
+        let reopened = GenericStore::open_existing(uri, GenericStoreOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.get_many(&requested, None).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn batch_get_reopened_writer_preserves_mutations_and_projection() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let original: Vec<Row> = (0..64)
+            .map(|i| row(json!({"id": format!("r{i:03}"), "score": 1.0})))
+            .collect();
+        store.add(&original).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.create_id_index().await.unwrap();
+        store.close().await.unwrap();
+        let mut store = GenericStore::open_existing(uri, sealing()).await.unwrap();
+        // Reuse the writer through merge cycles, with different key subsets
+        // and row positions. Base rows and newly sealed WAL rows must agree.
+        for cycle in 0..3 {
+            let score = (cycle + 2) as f64;
+            let changed: Vec<Row> = (0..64)
+                .rev()
+                .filter(|i| i % 3 == cycle)
+                .map(|i| row(json!({"id": format!("r{i:03}"), "score": score})))
+                .collect();
+            store.add(&changed).await.unwrap();
+            let mut ids: Vec<String> = original
+                .iter()
+                .rev()
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect();
+            ids.extend(["missing".into(), ids[0].clone()]);
+            let rows = store.get_many(&ids, Some(&["score".into()])).await.unwrap();
+            assert_eq!(rows.len(), 64);
+            for (r, id) in rows.iter().zip(&ids) {
+                assert_eq!(r["id"], *id);
+                assert_eq!(r.len(), 2);
+                let n: usize = id[1..].parse().unwrap();
+                let expected = if n % 3 <= cycle {
+                    (n % 3 + 2) as f64
+                } else {
+                    1.0
+                };
+                assert_eq!(r["score"], expected);
+            }
+            store.cleanup_wal().await.unwrap();
+        }
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_get_projection_bounds_and_deferred_visibility() {
+        let dir = TempDir::new().unwrap();
+        let store = GenericStore::open(
+            dir.path().to_str().unwrap(),
+            spec(),
+            GenericStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let ids = vec!["r1".into()];
+        store
+            .add(&[row(json!({"id":"r1", "user_id":"u1", "payload":[1,2,3]}))])
+            .await
+            .unwrap();
+        assert!(store.get_many(&ids, None).await.unwrap().is_empty());
+        store.flush().await.unwrap();
+        let default = store.get_many(&ids, None).await.unwrap();
+        assert!(!default[0].contains_key("payload"));
+        assert_eq!(
+            store.get_many(&ids, Some(&[])).await.unwrap(),
+            vec![row(json!({"id":"r1"}))]
+        );
+        assert_eq!(
+            store
+                .get_many(&ids, Some(&["payload".into()]))
+                .await
+                .unwrap(),
+            vec![row(json!({"id":"r1", "payload":"AQID"}))]
+        );
+        assert!(store.get_many(&[], None).await.unwrap().is_empty());
+        assert!(store
+            .get_many(&["missing".into()], None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_many(&ids, Some(&["unknown".into()]))
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .get_many(&vec!["r1".into(); MAX_BATCH_GET_IDS], None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            store
+                .get_many(&vec!["r1".into(); MAX_BATCH_GET_IDS + 1], None)
+                .await,
+            Err(LanceError::InvalidInput { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_get_refreshes_external_merges_and_respects_base_deletions() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let reader = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let mut writer = GenericStore::open_existing(
+            uri,
+            GenericStoreOptions {
+                shard_id: Some("external".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[
+                row(json!({"id":"r1", "score":1.0})),
+                row(json!({"id":"r2"})),
+            ])
+            .await
+            .unwrap();
+        writer.cleanup_wal().await.unwrap();
+        writer.create_id_index().await.unwrap();
+        let ids = vec!["r1".into(), "r2".into()];
+        assert_eq!(reader.get_many(&ids, None).await.unwrap().len(), 2);
+        let mut dataset = lance::Dataset::open(uri).await.unwrap();
+        dataset.delete("id = 'r2'").await.unwrap();
+        writer
+            .add(&[row(json!({"id":"r1", "score":2.0}))])
+            .await
+            .unwrap();
+        let rows = reader.get_many(&ids, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["score"], 2.0);
+        writer.refresh_latest().await.unwrap();
+        writer.cleanup_wal().await.unwrap();
+        assert_eq!(reader.get_many(&ids, None).await.unwrap(), rows);
+    }
+
+    #[tokio::test]
+    async fn batch_get_never_returns_partial_rows_during_external_merges() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        let rows: Vec<Row> = (0..32)
+            .map(|i| row(json!({"id":format!("r{i}"), "score":1.0})))
+            .collect();
+        writer.add(&rows).await.unwrap();
+        writer.cleanup_wal().await.unwrap();
+        writer.create_id_index().await.unwrap();
+        let reader = GenericStore::open_existing(
+            uri,
+            GenericStoreOptions {
+                shard_id: Some("reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let writer_barrier = barrier.clone();
+        let merges = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            for _ in 0..3 {
+                writer.add(&rows).await.unwrap();
+                writer.cleanup_wal().await.unwrap();
+            }
+            writer.close().await.unwrap();
+        });
+        barrier.wait().await;
+        for _ in 0..8 {
+            // A continuously changing view may report a retryable error, but
+            // may never claim that any of these durable IDs are missing.
+            match reader.get_many(&ids, Some(&[])).await {
+                Ok(found) => assert_eq!(
+                    found,
+                    ids.iter()
+                        .map(|id| row(json!({"id":id})))
+                        .collect::<Vec<_>>()
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("dataset changed during read")
+                            || message.to_lowercase().contains("not found"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        merges.await.unwrap();
+        assert_eq!(reader.get_many(&ids, None).await.unwrap().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn batch_get_plan_uses_one_indexed_scan_for_multiple_ids() {
+        use datafusion::physical_plan::displayable;
+        let dir = TempDir::new().unwrap();
+        let mut store = GenericStore::open(dir.path().to_str().unwrap(), spec(), sealing())
+            .await
+            .unwrap();
+        let rows: Vec<Row> = (0..2048)
+            .map(|i| row(json!({"id": format!("r{i}")})))
+            .collect();
+        store.add(&rows).await.unwrap();
+        store.cleanup_wal().await.unwrap();
+        store.create_id_index().await.unwrap();
+        let scanner = batch_get_scanner(
+            store.base.lsm_scanner().await.unwrap(),
+            &col(ID_COLUMN).in_list(vec![lit("r1"), lit("r2"), lit("r3")], false),
+            &["id".into()],
+        )
+        .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan = displayable(plan.as_ref()).indent(true).to_string();
+        // The old point route materializes lookups while planning and returns
+        // a OneShotExec. Require a single lazy scalar-index scan instead.
+        assert_eq!(plan.matches("ScalarIndexQuery").count(), 1, "{plan}");
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn user_schema_round_trips_add_and_read() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            store
+                .add(&[
+                    row(json!({"id": "r1", "user_id": "u1", "score": 0.5})),
+                    row(json!({"id": "r2", "user_id": "u2"})),
+                ])
+                .await
+                .unwrap();
+
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+
+            let found = store.get("r1", None).await.unwrap().unwrap();
+            assert_eq!(found["user_id"], json!("u1"));
+            assert!(store.get("missing", None).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn schema_is_persisted_and_reopens_without_being_redeclared() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            {
+                let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+                store.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            }
+
+            let reopened = GenericStore::open_existing(&uri, sealing()).await.unwrap();
+            assert_eq!(reopened.spec(), &spec());
+            assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[tokio::test]
+    async fn cold_maintenance_cleanup_does_not_claim_a_live_ingestion_epoch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = GenericStoreOptions {
+            shard_id: Some("live-ingestion-writer".into()),
+            ..Default::default()
+        };
+        let writer = GenericStore::open(uri, spec(), options.clone())
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":1.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let before = writer
+            .own_shard_watermark()
+            .await
+            .unwrap()
+            .unwrap()
+            .writer_epoch;
+        let mut maintenance = GenericStore::open_existing(uri, options).await.unwrap();
+        let (manifests, manifest, prepared) =
+            maintenance.prepare_cleanup_merge().await.unwrap().unwrap();
+        maintenance
+            .commit_prepared_merge(&manifests, &manifest, prepared)
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":2.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            writer
+                .own_shard_watermark()
+                .await
+                .unwrap()
+                .unwrap()
+                .writer_epoch,
+            before
+        );
+        assert_eq!(
+            writer.get("shared", None).await.unwrap().unwrap()["score"],
+            json!(2.0)
+        );
+    }
+
+    #[test]
+    fn cleanup_recovers_own_wal_updates_without_new_ingest_after_runtime_exit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let options = GenericStoreOptions {
+            shard_id: Some("restarted-generic-writer".into()),
+            ..Default::default()
+        };
+        let old_runtime = tokio::runtime::Runtime::new().unwrap();
+        let old = old_runtime.block_on(async {
+            let store = GenericStore::open(&uri, spec(), options.clone())
+                .await
+                .unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":1.0}))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":2.0}))])
+                .await
+                .unwrap();
+            store
+        });
+        drop(old_runtime);
+        drop(old);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut recovered = GenericStore::open_existing(&uri, options).await.unwrap();
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(1.0)
+            );
+            let (manifests, manifest, prepared) = recovered
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("own WAL must recover without a new append");
+            assert!(
+                recovered
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(2.0)
+            );
+            assert_eq!(recovered.list(None, None).await.unwrap().len(), 1);
+            assert_eq!(recovered.cleanup_wal().await.unwrap(), 0);
+            recovered.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn seal_mode_survives_a_reopen() {
+        // The mode is a property of the store, not of whoever opens it. Before
+        // it was persisted, a reopen silently reverted to the caller's default
+        // and the store lost read-your-write with no error.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            {
+                let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+                assert!(store.seal_on_add());
+            }
+
+            // Reopen with the *opposite* default: the persisted value wins.
+            let reopened = GenericStore::open_existing(&uri, GenericStoreOptions::default())
+                .await
+                .unwrap();
+            assert!(
+                reopened.seal_on_add(),
+                "a store created with seal_on_add must keep it across a reopen"
+            );
+
+            // And it is behavioral, not just a flag: the write is visible
+            // without an explicit flush.
+            reopened.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn deferred_seal_mode_also_survives_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            {
+                GenericStore::open(&uri, spec(), GenericStoreOptions::default())
+                    .await
+                    .unwrap();
+            }
+
+            // Reopen with the opposite default; the persisted `false` wins.
+            let reopened = GenericStore::open_existing(&uri, sealing()).await.unwrap();
+            assert!(!reopened.seal_on_add());
+
+            reopened.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            assert_eq!(
+                reopened.list(None, None).await.unwrap().len(),
+                0,
+                "a deferred-seal store must not start sealing after a reopen"
+            );
+            reopened.flush().await.unwrap();
+            assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn reopening_with_a_conflicting_schema_is_rejected() {
+        // Silently reinterpreting existing data under a new schema is the
+        // failure mode worth preventing here.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+
+            let mut other = spec();
+            other
+                .columns
+                .push(("extra".to_string(), ColumnSpec::new(ColumnType::Int64)));
+            let err = GenericStore::open(&uri, other, sealing())
+                .await
+                .err()
+                .expect("conflicting schema must be rejected");
+            assert!(err.to_string().contains("different schema"), "{err}");
+        });
+    }
+
+    #[test]
+    fn invalid_schema_is_rejected_before_anything_is_created() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // No `id` column.
+            let bad = SchemaSpec::new(vec![(
+                "name".to_string(),
+                ColumnSpec::new(ColumnType::String { large: false }),
+            )]);
+            let err = GenericStore::open(&uri, bad, sealing())
+                .await
+                .err()
+                .expect("invalid schema must be rejected");
+            assert!(err.to_string().contains("must declare an 'id'"), "{err}");
+        });
+    }
+
+    #[test]
+    fn blob_columns_are_excluded_from_list_but_fetchable_per_row() {
+        // The cost model for large payloads: bulk reads never materialize them,
+        // point reads can ask for them explicitly.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            store
+                .add(&[row(json!({"id": "r1", "payload": [1, 2, 3]}))])
+                .await
+                .unwrap();
+
+            let listed = store.list(None, None).await.unwrap();
+            assert!(
+                !listed[0].contains_key("payload"),
+                "list must not materialize blob columns"
+            );
+
+            let fetched = store
+                .get("r1", Some(&["payload".to_string()]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched["payload"], json!("AQID"));
+        });
+    }
+
+    #[test]
+    fn large_blob_round_trips_and_survives_wal_merge() {
+        // Multi-megabyte inline payloads are the point of this store, so pin
+        // that they survive both the write path and a WAL merge.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+            store
+                .add(&[row(json!({"id": "big", "payload": payload}))])
+                .await
+                .unwrap();
+
+            store.cleanup_wal().await.unwrap();
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
+
+            let fetched = store
+                .get("big", Some(&["payload".to_string()]))
+                .await
+                .unwrap()
+                .unwrap();
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(fetched["payload"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(decoded.len(), 4 * 1024 * 1024);
+        });
+    }
+
+    #[test]
+    fn deferred_seal_defers_visibility_like_the_rollout_store() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = GenericStore::open(&uri, spec(), GenericStoreOptions::default())
+                .await
+                .unwrap();
+            store.add(&[row(json!({"id": "r1"}))]).await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn cleanup_merge_refreshes_an_index_created_by_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let options = |shard: &str| GenericStoreOptions {
+                seal_on_add: true,
+                shard_id: Some(shard.to_string()),
+                ..Default::default()
+            };
+            let mut first = GenericStore::open(&uri, spec(), options("first"))
+                .await
+                .unwrap();
+            first
+                .add(&[row(json!({"id": "r1", "user_id": "old"}))])
+                .await
+                .unwrap();
+            assert_eq!(first.cleanup_wal().await.unwrap(), 1);
+
+            // A worker caches the unindexed base before another handle builds
+            // the index. Its next merge must observe that committed index.
+            let mut stale = GenericStore::open(&uri, spec(), options("second"))
+                .await
+                .unwrap();
+            first.create_id_index().await.unwrap();
+            assert!(first.version() > stale.version());
+            stale
+                .add(&[row(json!({"id": "r1", "user_id": "new"}))])
+                .await
+                .unwrap();
+            let (manifest_store, manifest, prepared) =
+                stale.prepare_cleanup_merge().await.unwrap().unwrap();
+            assert_eq!(
+                stale
+                    .commit_prepared_merge(&manifest_store, &manifest, prepared)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(stale.pending_wal_generations().await.unwrap(), 0);
+            let rows = stale.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["user_id"], json!("new"));
+        });
+    }
+
+    /// Two stores share one process-wide merge budget sized so that only one
+    /// merge's initial reservation fits. The second merge must wait until the
+    /// first commits and releases, then complete. This is the bound that was
+    /// missing when 17 of 20 production workers OOMKilled at once: each merge
+    /// was capped, their sum was not.
+    #[test]
+    fn concurrent_merges_queue_on_the_shared_memory_budget() {
+        use crate::merge_budget::MergeMemoryBudget;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        let dir = TempDir::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 1 MiB budget, and each merge asks for min(merge_max_bytes, budget)
+            // up front, so the budget admits exactly one merge at a time.
+            let budget = MergeMemoryBudget::new(1024 * 1024);
+            let opts = |shard: &str| GenericStoreOptions {
+                seal_on_add: true,
+                shard_id: Some(shard.to_string()),
+                merge_max_bytes: Some(1024 * 1024),
+                key_index_type: Default::default(),
+                merge_budget: Some(budget.clone()),
+                ..Default::default()
+            };
+            let uri_a = dir.path().join("a").to_string_lossy().to_string();
+            let uri_b = dir.path().join("b").to_string_lossy().to_string();
+            let a = GenericStore::open(&uri_a, spec(), opts("a")).await.unwrap();
+            let b = GenericStore::open(&uri_b, spec(), opts("b")).await.unwrap();
+            for i in 0..3 {
+                a.add(&[row(json!({"id": format!("a{i}")}))]).await.unwrap();
+                b.add(&[row(json!({"id": format!("b{i}")}))]).await.unwrap();
+            }
+
+            // Prepare A's merge: it takes the whole budget and holds it inside
+            // the PreparedMerge until we commit.
+            let prepared_a = a
+                .prepare_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("A has pending");
+            assert_eq!(budget.reserved(), 1024 * 1024);
+
+            // B's prepare must block on the budget.
+            let (started_tx, started_rx) = oneshot::channel();
+            let b_task = tokio::spawn(async move {
+                started_tx.send(()).unwrap();
+                let prepared = b
+                    .prepare_cleanup_merge()
+                    .await
+                    .unwrap()
+                    .expect("B has pending");
+                (b, prepared)
+            });
+            started_rx.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !b_task.is_finished(),
+                "B's merge must wait while A holds the whole budget"
+            );
+
+            // Commit A: consumes the batches and releases the reservation.
+            let mut a = a;
+            let (ms, m, p) = prepared_a;
+            a.commit_prepared_merge(&ms, &m, p).await.unwrap();
+            assert_eq!(a.pending_wal_generations().await.unwrap(), 0);
+
+            // B proceeds now.
+            let (mut b, (ms, m, p)) = tokio::time::timeout(Duration::from_secs(30), b_task)
+                .await
+                .expect("B must proceed once A releases its reservation")
+                .unwrap();
+            b.commit_prepared_merge(&ms, &m, p).await.unwrap();
+            assert_eq!(b.pending_wal_generations().await.unwrap(), 0);
+            assert_eq!(
+                budget.reserved(),
+                0,
+                "everything released after both commits"
+            );
+        });
+    }
+
+    #[test]
+    fn wal_generations_merge_into_the_base_table() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            for i in 0..3 {
+                store
+                    .add(&[row(json!({"id": format!("r{i}")}))])
+                    .await
+                    .unwrap();
+            }
+            assert!(store.pending_wal_generations().await.unwrap() > 0);
+
+            let reclaimed = store.cleanup_wal().await.unwrap();
+            assert!(reclaimed > 0);
+            assert_eq!(store.pending_wal_generations().await.unwrap(), 0);
+            assert_eq!(store.count_base_rows().await.unwrap(), 3);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+        });
+    }
+
+    /// Every LSM read samples each shard's pending-generation count. This is
+    /// the signal that would have caught a store at 12k pending generations
+    /// days before it OOMKilled its readers, so a read must emit it.
+    #[test]
+    fn reads_sample_pending_generations_per_shard() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+                // Three sealed adds leave three flushed generations pending on
+                // this instance's single shard.
+                for i in 0..3 {
+                    store
+                        .add(&[row(json!({"id": format!("r{i}")}))])
+                        .await
+                        .unwrap();
+                }
+                store.list(None, None).await.unwrap();
+            });
+        });
+
+        let samples: Vec<f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| {
+                key.kind() == MetricKind::Histogram
+                    && key.key().name() == crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS
+            })
+            .flat_map(|(_, _, _, value)| match value {
+                DebugValue::Histogram(v) => v.into_iter().map(|s| s.into_inner()).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(
+            samples.contains(&3.0),
+            "a read must sample the shard's 3 pending generations; got {samples:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_dedup_to_the_newest_write() {
+        // The LSM merge key is `id`, so a re-added id supersedes the old row.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            store
+                .add(&[row(json!({"id": "r1", "user_id": "first"}))])
+                .await
+                .unwrap();
+            store
+                .add(&[row(json!({"id": "r1", "user_id": "second"}))])
+                .await
+                .unwrap();
+
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1, "id is the merge key, so rows dedup");
+            assert_eq!(rows[0]["user_id"], json!("second"));
+
+            store.cleanup_wal().await.unwrap();
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 1, "cleanup must not duplicate the merge key");
+            assert_eq!(
+                rows[0]["user_id"],
+                json!("second"),
+                "cleanup must retain the newest WAL value"
+            );
+        });
+    }
+
+    #[test]
+    fn filters_and_paging_work_over_user_columns() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = GenericStore::open(&uri, spec(), sealing()).await.unwrap();
+            let rows: Vec<Row> = (0..6)
+                .map(|i| {
+                    row(json!({
+                        "id": format!("r{i}"),
+                        "user_id": if i % 2 == 0 { "even" } else { "odd" },
+                        "score": i as f32,
+                    }))
+                })
+                .collect();
+            store.add(&rows).await.unwrap();
+
+            let evens = store
+                .list_filtered("user_id = 'even'", None, None)
+                .await
+                .unwrap();
+            assert_eq!(evens.len(), 3);
+            assert!(evens.iter().all(|row| row["user_id"] == json!("even")));
+
+            let page = store.list(Some(2), Some(1)).await.unwrap();
+            assert_eq!(page.len(), 2);
+        });
+    }
+
+    #[test]
+    fn open_existing_does_not_create() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("absent").to_string_lossy().to_string();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let err = GenericStore::open_existing(&uri, sealing())
+                .await
+                .err()
+                .expect("open_existing must not create");
+            assert!(matches!(err, LanceError::DatasetNotFound { .. }), "{err}");
+        });
+    }
+}

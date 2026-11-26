@@ -1,0 +1,43 @@
+//! Control-plane (master) library surface.
+#![recursion_limit = "256"]
+
+pub mod admission;
+mod admission_telemetry;
+pub mod backlog_metrics;
+pub mod catchup;
+pub mod config;
+pub mod demand_publish;
+pub mod planner;
+pub use lance_context_merge::demand;
+pub mod discovery;
+pub mod eligibility;
+pub mod error;
+pub mod executors;
+mod index_coverage;
+mod index_snapshot;
+mod index_sweep;
+pub mod legacy_retirement;
+pub mod local_merge;
+mod maintenance_execution;
+mod merge_capacity;
+mod merge_execution;
+mod native_failure_recovery;
+mod periodic_sweep;
+mod publication;
+mod registered_store;
+mod resident_recovery;
+pub mod rollout_append;
+pub mod routes;
+pub mod scanner;
+pub mod scheduler;
+#[cfg(test)]
+mod scheduler_wakeup;
+pub mod scoring;
+pub mod state;
+pub mod stats_store;
+pub mod task_store;
+mod wal_sweep_refresh;
+pub mod wal_tail;
+mod worker_discovery;
+
+pub(crate) mod demand_controller;

@@ -1,0 +1,9986 @@
+//! Storage surface for the RL rollout schema.
+//!
+//! [`RolloutStore`] is a second, independent first-class store alongside
+//! [`crate::store::ContextStore`]. It owns its own Lance dataset and Arrow
+//! schema (see [`crate::rollout::RolloutRecord`] and spec §5) but reuses the
+//! schema-agnostic infrastructure: MemWAL ingest and the relationship graph.
+//!
+//! # Artifact bytes are stored inline, not blob-v2 offloaded
+//!
+//! `binary_payload` holds artifact bytes (spec §6) as a plain inline
+//! `LargeBinary` column, *not* a blob-v2 offloaded column. Rollout reads use
+//! MemWAL-aware paths with no blob-materialization step: a blob-v2
+//! (`lance-encoding:blob`) column reads back as `None` through them, so
+//! [`RolloutStore::get_blob`] could never return the bytes. Inline storage is
+//! therefore the only encoding that round-trips. To keep the "learner doesn't
+//! pay for artifacts" property (spec §2), list-style scans project the column
+//! out (see [`RolloutStore::list`]) rather than relying on physical offload.
+//!
+//! # Distributed writes: server-id sharding
+//!
+//! High fan-in rollout ingest (spec §2: thousands of workers) is served by
+//! writing through Lance's **MemWAL** rather than a plain [`Dataset::append`].
+//! Each REST server instance owns exactly one MemWAL shard, keyed by its
+//! server/instance id (see [`RolloutStoreOptions::shard_id`]). Because a shard
+//! has a single active writer per instance and no two instances share a shard,
+//! the MemWAL epoch-fencing invariant holds *by construction* — there is never
+//! a write war, no matter how a load balancer spreads worker requests across
+//! instances. See `docs/src/specs/rollout-deployment.md`.
+//!
+//! `MemWAL close-per-append` makes each write durable on object storage before
+//! `add` returns, and the read path rebuilds purely from object storage (base
+//! table ∪ every shard's flushed generations). So any instance reads every
+//! instance's writes — reads are not pinned to the writer node.
+//!
+//! # Reproducibility without `checkout`
+//!
+//! MemWAL writes land in a separate `_mem_wal/` manifest namespace and do not
+//! bump the base dataset version, so per-`add` [`RolloutStore::checkout`] no
+//! longer isolates a single append (it did under the old atomic-append path).
+//! This is intentional: rollout rows are **append-only and immutable**, so "the
+//! exact rollouts that trained checkpoint N" is a *filter over immutable rows*
+//! (e.g. by `policy_version`), not a table snapshot — reproducible because the
+//! rows never change. `checkout` remains available for base-table time-travel.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow_array::builder::{
+    BooleanBuilder, Float32Builder, Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder,
+    LargeStringBuilder, ListBuilder, StringBuilder, StringDictionaryBuilder,
+    TimestampMicrosecondBuilder,
+};
+use arrow_array::types::Int8Type;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Int32Array, Int64Array,
+    Int8Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt64Array,
+};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
+use datafusion::datasource::MemTable;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
+use lance::dataset::mem_wal::{ShardManifestStore, ShardSnapshot};
+use lance::dataset::optimize::CompactionMetrics;
+use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::Dataset;
+use lance::session::Session;
+use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::ShardManifest;
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::merge_budget::MergeMemoryBudget;
+use crate::rollout::RolloutRecord;
+use crate::store::{
+    column_as, column_as_optional, relationship_field, relationship_list_item_field,
+    relationship_struct_builder, relationships_from_list, timestamp_from_micros, CompactionConfig,
+    CompactionStats, RELATIONSHIPS_COLUMN,
+};
+use crate::store_base::{
+    align_batch_to_schema, is_not_found_error, StorageBase, StorageBaseOptions,
+    DEFAULT_OBSERVE_CONCURRENCY,
+};
+
+// `ListSource` and `PreparedMerge` are schema-agnostic and now live in
+// [`crate::store_base`]; re-exported here so the public rollout API is
+// unchanged.
+#[allow(unused_imports)]
+pub use crate::store_base::{derive_shard_id, ListSource, PreparedMerge};
+
+const CLAIM_CHECK_COLUMNS: [&str; 5] = [
+    "model_input_string",
+    "model_output_string",
+    "rationale",
+    "problem_text",
+    "user_metadata",
+];
+
+const PAGINATION_LATE_COLUMNS: [&str; 7] = [
+    "content",
+    "model_input_string",
+    "model_output_string",
+    "rationale",
+    "problem_text",
+    "user_metadata",
+    "metadata",
+];
+
+/// Read-only observability snapshot of a rollout store.
+///
+/// Produced by [`RolloutStore::observe`] from base-table and MemWAL metadata.
+/// Consumed by the control-plane stats scanner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutObservation {
+    /// Logical row count across the base table and every flushed MemWAL shard.
+    ///
+    /// **Excludes rows that are durable but not yet flushed.** An `add` returns
+    /// once the WAL entry is persisted; the row only reaches a flushed
+    /// generation when the memtable is sealed. In steady state this count
+    /// therefore lags recent writes by up to the flush interval. Use
+    /// [`Self::unflushed_rows`] to see the gap, or `row_count +
+    /// unflushed_rows` for every row this instance has durably accepted.
+    pub row_count: i64,
+    /// Number of fragments in the base table.
+    pub fragment_count: i64,
+    /// Current base dataset manifest version.
+    pub version: u64,
+    /// Manifest timestamp, Unix milliseconds — when the base table last changed.
+    pub last_updated: i64,
+    /// Flushed MemWAL generations pending merge across all shards.
+    pub pending_wal_generations: i64,
+    /// Largest pending count on any one shard in the same observation.
+    pub max_pending_wal_generations_per_shard: i64,
+    /// Rows durably accepted by *this instance's* resident writer but not yet
+    /// sealed into a flushed generation, and so not yet counted by
+    /// [`Self::row_count`] or visible to any reader.
+    ///
+    /// Instance-local by nature: it reads this process's in-memory writer, so
+    /// it cannot see another instance's unflushed memtable. `0` when no writer
+    /// is resident (nothing buffered) — which is also the steady state right
+    /// after a flush.
+    ///
+    /// A persistently non-zero value means the flush sweeper is not keeping up
+    /// (or is disabled); that is the signal that reads are lagging writes.
+    pub unflushed_rows: i64,
+}
+
+/// Exact-match filters for rollout record browsing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutFilters {
+    pub id: Option<String>,
+    pub rollout_id: Option<String>,
+    pub problem_id: Option<String>,
+    pub dataset: Option<String>,
+    pub role: Option<String>,
+    pub content_type: Option<String>,
+    pub policy_version: Option<String>,
+    pub artifact_type: Option<String>,
+    pub include_in_training: Option<bool>,
+}
+
+impl RolloutFilters {
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let Value::Object(object) = value else {
+            return Err("rollout filters must be a JSON object".to_string());
+        };
+
+        let mut filters = Self::default();
+        for (key, value) in object {
+            let string_value = || {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("rollout filter '{key}' must be a string"))
+            };
+            match key.as_str() {
+                "rollout_id" => filters.rollout_id = Some(string_value()?),
+                "problem_id" => filters.problem_id = Some(string_value()?),
+                "dataset" => filters.dataset = Some(string_value()?),
+                "policy_version" => filters.policy_version = Some(string_value()?),
+                "role" => filters.role = Some(string_value()?),
+                "content_type" => filters.content_type = Some(string_value()?),
+                "include_in_training" => {
+                    filters.include_in_training = Some(value.as_bool().ok_or_else(|| {
+                        "rollout filter 'include_in_training' must be a boolean".to_string()
+                    })?);
+                }
+                "artifact_type" => filters.artifact_type = Some(string_value()?),
+                _ => return Err(format!("unsupported rollout filter '{key}'")),
+            }
+        }
+        Ok(filters)
+    }
+
+    fn expression(&self) -> Option<String> {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("id", self.id.as_deref()),
+            ("rollout_id", self.rollout_id.as_deref()),
+            ("problem_id", self.problem_id.as_deref()),
+            ("dataset", self.dataset.as_deref()),
+            ("role", self.role.as_deref()),
+            ("content_type", self.content_type.as_deref()),
+            ("policy_version", self.policy_version.as_deref()),
+            ("artifact_type", self.artifact_type.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                clauses.push(format!("{column} = '{}'", value.replace('\'', "''")));
+            }
+        }
+        if let Some(value) = self.include_in_training {
+            clauses.push(format!("include_in_training = {value}"));
+        }
+        (!clauses.is_empty()).then(|| clauses.join(" AND "))
+    }
+
+    fn matches_record(&self, record: &RolloutRecord) -> bool {
+        fn matches_required(actual: &str, expected: Option<&str>) -> bool {
+            match expected {
+                Some(expected) if !expected.is_empty() => actual == expected,
+                _ => true,
+            }
+        }
+
+        fn matches_optional(actual: Option<&str>, expected: Option<&str>) -> bool {
+            match expected {
+                Some(expected) if !expected.is_empty() => actual == Some(expected),
+                _ => true,
+            }
+        }
+
+        matches_required(&record.id, self.id.as_deref())
+            && matches_required(&record.rollout_id, self.rollout_id.as_deref())
+            && matches_required(&record.problem_id, self.problem_id.as_deref())
+            && matches_optional(record.dataset.as_deref(), self.dataset.as_deref())
+            && matches_required(&record.role, self.role.as_deref())
+            && matches_required(&record.content_type, self.content_type.as_deref())
+            && matches_optional(
+                record.policy_version.as_deref(),
+                self.policy_version.as_deref(),
+            )
+            && matches_optional(
+                record.artifact_type.as_deref(),
+                self.artifact_type.as_deref(),
+            )
+            && self
+                .include_in_training
+                .is_none_or(|expected| record.include_in_training == Some(expected))
+    }
+}
+
+/// One server-side paginated rollout query result.
+#[derive(Debug, Clone)]
+pub struct RolloutPage {
+    pub records: Vec<RolloutRecord>,
+    pub has_more: bool,
+}
+
+/// Table name the ad-hoc SQL console binds an experiment's records to.
+pub const SQL_TABLE_NAME: &str = "records";
+
+/// Upper bound on rows materialized into the in-memory `records` table for an
+/// ad-hoc SQL query. Guards master memory against a huge experiment.
+pub const SQL_MAX_SCAN_ROWS: usize = 200_000;
+
+/// Upper bound on rows returned by an ad-hoc SQL query. Hitting it flags the
+/// result `truncated` rather than silently dropping rows.
+pub const SQL_MAX_RESULT_ROWS: usize = 10_000;
+
+/// Result of [`RolloutStore::query_sql`]: column names plus JSON-encoded rows.
+#[derive(Debug, Clone)]
+pub struct SqlQueryResult {
+    /// Output column names, in select order.
+    pub columns: Vec<String>,
+    /// Rows as JSON values (one inner vec per row, aligned to `columns`).
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// True when the result was capped at [`SQL_MAX_RESULT_ROWS`].
+    pub truncated: bool,
+}
+
+/// Reject anything that is not a single read-only `SELECT` (or CTE) statement.
+///
+/// Parsing with DataFusion's SQL parser is more robust than string matching:
+/// it rejects trailing/multiple statements, DML (`INSERT`/`UPDATE`/`DELETE`),
+/// DDL (`CREATE`/`DROP`/…), `COPY`, and `EXPLAIN ANALYZE` side effects. Because
+/// the console only registers one fixed in-memory table, there is no catalog
+/// surface to mutate even if a statement slipped through.
+fn ensure_select_only(sql: &str) -> LanceResult<()> {
+    let statements = DFParser::parse_sql(sql)
+        .map_err(|err| LanceError::invalid_input(format!("could not parse SQL: {err}")))?;
+    if statements.len() != 1 {
+        return Err(LanceError::invalid_input(
+            "exactly one SQL statement is allowed".to_string(),
+        ));
+    }
+    match &statements[0] {
+        DFStatement::Statement(stmt) if matches!(stmt.as_ref(), SqlStatement::Query(_)) => Ok(()),
+        _ => Err(LanceError::invalid_input(
+            "only read-only SELECT queries are allowed".to_string(),
+        )),
+    }
+}
+
+/// Convert DataFusion result batches into a JSON [`SqlQueryResult`], capping at
+/// [`SQL_MAX_RESULT_ROWS`] and flagging `truncated` when the cap is reached.
+/// `columns` is taken from the query plan schema so it is populated even for a
+/// zero-row result.
+fn sql_batches_to_result(
+    columns: Vec<String>,
+    batches: Vec<RecordBatch>,
+) -> LanceResult<SqlQueryResult> {
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut truncated = false;
+    'outer: for batch in &batches {
+        // arrow-json encodes each row as a JSON object keyed by column name;
+        // re-key to a positional array so duplicate/expression column names are
+        // preserved in select order.
+        let mut writer = arrow_json::ArrayWriter::new(Vec::<u8>::new());
+        writer.write(batch).map_err(LanceError::from)?;
+        writer.finish().map_err(LanceError::from)?;
+        let json_rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_slice(&writer.into_inner()).map_err(|err| {
+                LanceError::from(ArrowError::InvalidArgumentError(err.to_string()))
+            })?;
+        for obj in json_rows {
+            if rows.len() >= SQL_MAX_RESULT_ROWS {
+                truncated = true;
+                break 'outer;
+            }
+            let row = columns
+                .iter()
+                .map(|name| obj.get(name).cloned().unwrap_or(serde_json::Value::Null))
+                .collect();
+            rows.push(row);
+        }
+    }
+
+    Ok(SqlQueryResult {
+        columns,
+        rows,
+        truncated,
+    })
+}
+
+/// Configuration for opening a [`RolloutStore`].
+#[derive(Debug, Clone, Default)]
+pub struct RolloutStoreOptions {
+    /// Object-store credentials/config (e.g. S3), forwarded to Lance.
+    pub storage_options: Option<HashMap<String, String>>,
+    /// Stable identity of the writing server instance (e.g. a StatefulSet
+    /// ordinal hostname like `rollout-0`). Rollout writes go to the MemWAL
+    /// shard derived from this id, so each instance owns exactly one shard and
+    /// no two instances ever contend for the same shard. `None` falls back to a
+    /// single fixed shard (`"default"`), which is correct for single-instance
+    /// deployments but must be set per-instance when running multiple writers.
+    /// See `docs/src/specs/rollout-deployment.md`.
+    pub shard_id: Option<String>,
+    /// Count-triggered self-merge threshold. After an append flushes a new
+    /// generation, if this instance's own shard has accumulated at least this
+    /// many un-merged flushed generations, `add` synchronously merges them into
+    /// the base table and drains the shard's `flushed_generations` back to empty
+    /// (see [`RolloutStore::cleanup_own_shard`]). This bounds read amplification:
+    /// without it, `_mem_wal/{shard}/` generations accumulate forever and every
+    /// read unions all of them (spec §6).
+    ///
+    /// The merge runs on the instance that owns the shard, reusing its own
+    /// writer epoch, so it never fences a concurrent writer — each instance
+    /// merges only the shard it writes. It is synchronous, so the append that
+    /// crosses the threshold pays the merge latency (a periodic tail-latency
+    /// spike; see the deployment doc).
+    ///
+    /// `None` or `0` disables self-merge (the 0.6.0 behavior: generations
+    /// accumulate and are unioned at read time).
+    pub merge_after_generations: Option<usize>,
+    /// Maximum flushed generations folded into the base table by one merge
+    /// pass. `None` uses the crate default (8); `Some(0)` disables this cap.
+    /// The byte budget applies independently. Leftovers stay pending.
+    pub merge_max_generations: Option<usize>,
+    /// Buffered Arrow array byte budget per merge pass. `None` uses 1 GiB;
+    /// `Some(0)` disables only this cap. Stops after the generation that
+    /// reaches the budget, or the generation-count cap, whichever comes first.
+    /// A generation is indivisible, so even an oversized one is fully merged.
+    pub merge_max_bytes: Option<usize>,
+    /// Index used for base-table key lookup during WAL merge.
+    pub key_index_type: crate::KeyIndexType,
+    /// Warn when one MemWAL shard has at least this many flushed generations
+    /// pending merge, sampled on every read. `None` uses the crate default
+    /// (256); `Some(0)` disables the warn. The `rollout_wal_pending_generations`
+    /// histogram is emitted regardless.
+    pub pending_generations_warn: Option<usize>,
+    /// See `StorageBaseOptions::pending_generations_max`.
+    pub pending_generations_max: Option<usize>,
+    /// Process-wide byte budget shared by every merge this process runs; a
+    /// merge that cannot fit waits for another to release. `None` disables
+    /// the bound. See [`crate::merge_budget`] for the design.
+    pub merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Shared Lance [`Session`] used to open this store's base dataset (and,
+    /// transitively, every flushed MemWAL generation it reads — those inherit
+    /// the base dataset's session).
+    ///
+    /// When `None`, Lance builds a *fresh* per-store session whose index and
+    /// metadata caches default to **6 GiB / 1 GiB** and are keyed by dataset
+    /// URI. Each flushed generation is a distinct URI, so a busy store's read
+    /// path (`observe`, list, stats) feeds an ever-growing set of keys into that
+    /// cache until it approaches the 6 GiB cap — worker RSS then grows linearly
+    /// with cumulative appends and is never released across merge/compact cycles
+    /// (the session outlives the merged generations). Passing a single shared,
+    /// capacity-bounded session across all resident stores bounds this: the
+    /// deployment's total Lance cache is the session's capacity, shared, rather
+    /// than 6 GiB *per store*. Build one with [`RolloutStore::build_session`].
+    pub session: Option<Arc<Session>>,
+}
+
+/// A Lance-backed store for RL rollout trajectories.
+///
+/// All storage mechanics — dataset handle, the resident MemWAL writer, the
+/// durable append, flush, WAL merge, compaction, indexing and the LSM read
+/// scanner — live in the crate-internal `StorageBase`. What remains here is the rollout
+/// *schema*: [`rollout_schema`], record encoding/decoding, filters, and the
+/// typed read APIs built on top of the base's scanners.
+pub struct RolloutStore {
+    base: StorageBase,
+    #[cfg(test)]
+    blob_read_pause: std::sync::Mutex<Option<Arc<BlobReadPause>>>,
+    #[cfg(test)]
+    point_read_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
+    #[cfg(test)]
+    observation_pause: std::sync::Mutex<Option<Arc<PointReadPause>>>,
+    #[cfg(test)]
+    selected_list_pause: std::sync::Mutex<Option<Arc<SelectedListPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SelectedListPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    before_materialization: bool,
+    pause_attempts: usize,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PointReadPause {
+    checked_base: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BlobReadPause {
+    opened: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    before_wal_snapshot: bool,
+}
+
+impl RolloutStore {
+    /// Build a shared, capacity-bounded Lance [`Session`] for opening rollout
+    /// stores.
+    ///
+    /// Split the total cache budget across Lance's two caches: `index_cache_bytes`
+    /// bounds opened-index data and `metadata_cache_bytes` bounds file/dataset
+    /// metadata. Both are byte-weighted LRUs keyed by dataset URI, so a single
+    /// session shared across every resident [`RolloutStore`] caps the process's
+    /// *total* Lance cache at this budget — instead of Lance's default of a fresh
+    /// 6 GiB + 1 GiB session per store (the source of the per-append RSS growth;
+    /// see [`RolloutStoreOptions::session`]).
+    #[must_use]
+    pub fn build_session(index_cache_bytes: usize, metadata_cache_bytes: usize) -> Arc<Session> {
+        StorageBase::build_session(index_cache_bytes, metadata_cache_bytes)
+    }
+
+    /// Open an existing rollout dataset or create a new one with default
+    /// options (`binary_payload` stored inline; see [`RolloutStoreOptions`]).
+    ///
+    /// Uses the fallback single-shard identity; for a multi-instance deployment
+    /// open with [`RolloutStoreOptions::shard_id`] set per instance.
+    pub async fn open(uri: &str) -> LanceResult<Self> {
+        Self::open_with_options(uri, RolloutStoreOptions::default()).await
+    }
+
+    /// Open a rollout dataset with explicit storage and shard configuration.
+    /// Creates the dataset if it does not exist.
+    pub async fn open_with_options(uri: &str, options: RolloutStoreOptions) -> LanceResult<Self> {
+        Self::open_inner(uri, options, true).await
+    }
+
+    /// Open an **existing** rollout dataset. Unlike [`Self::open_with_options`],
+    /// this does **not** create the dataset when it is absent — it returns the
+    /// underlying [`LanceError::DatasetNotFound`] instead.
+    ///
+    /// This is the read/write path used by the server's lazy cache-fill: a
+    /// cache miss must load a store that genuinely exists on object storage
+    /// (create-on-absence would silently materialize an empty table for a
+    /// mistyped name, masking the 404). Store creation goes exclusively through
+    /// [`Self::open_with_options`] on the explicit `create` route.
+    pub async fn open_existing_with_options(
+        uri: &str,
+        options: RolloutStoreOptions,
+    ) -> LanceResult<Self> {
+        Self::open_inner(uri, options, false).await
+    }
+
+    async fn open_inner(
+        uri: &str,
+        options: RolloutStoreOptions,
+        create_if_missing: bool,
+    ) -> LanceResult<Self> {
+        let RolloutStoreOptions {
+            storage_options,
+            shard_id,
+            merge_after_generations,
+            merge_max_generations,
+            merge_max_bytes,
+            key_index_type,
+            pending_generations_warn,
+            pending_generations_max,
+            merge_budget,
+            session,
+        } = options;
+        let mut base = StorageBase::open(
+            uri,
+            StorageBaseOptions {
+                storage_options,
+                shard_id,
+                merge_after_generations,
+                merge_max_generations,
+                merge_max_bytes,
+                key_index_type,
+                pending_generations_warn,
+                pending_generations_max,
+                merge_budget,
+                session,
+                schema: Arc::new(rollout_schema()),
+                key_column: "id".to_string(),
+                // Rollout's schema is additive across releases (e.g. the
+                // claim-check columns), so a WAL merge first evolves an older
+                // base table to the current schema before appending.
+                latest_schema: Some(Arc::new(rollout_schema())),
+                // Rollout defers the seal: high fan-in appends must not
+                // serialize behind a per-append seal, and rollout rows are
+                // immutable so nothing reads back before writing. The server's
+                // flush sweeper (and `?flush=true`) provide visibility.
+                seal_on_put: false,
+            },
+            create_if_missing,
+        )
+        .await?;
+        // Encoding follows the base schema. Evolve before accepting writes,
+        // otherwise values for newly supported fields are silently discarded.
+        base.ensure_latest_schema().await?;
+        Ok(Self {
+            base,
+            #[cfg(test)]
+            blob_read_pause: Default::default(),
+            #[cfg(test)]
+            point_read_pause: Default::default(),
+            #[cfg(test)]
+            observation_pause: Default::default(),
+            #[cfg(test)]
+            selected_list_pause: Default::default(),
+        })
+    }
+    /// URI of the underlying Lance dataset.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        self.base.uri()
+    }
+
+    /// Current dataset version.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.base.version()
+    }
+
+    /// Check out an immutable base-table version. Live WAL generations are
+    /// excluded; unmerged appends are not part of a base version. Writes are
+    /// rejected until `refresh_latest` is called.
+    pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
+        self.base.checkout(version_id).await
+    }
+
+    /// Whether this handle was explicitly checked out to a dataset version.
+    ///
+    /// Serving layers use this to preserve time-travel reads instead of
+    /// automatically advancing a pinned handle when a point lookup misses.
+    #[must_use]
+    pub fn is_version_pinned(&self) -> bool {
+        self.base.is_version_pinned()
+    }
+
+    /// Refresh this handle to the latest base-table manifest while retaining
+    /// its session and metadata caches.
+    ///
+    /// Long-lived read handles call this before a new request so compaction or
+    /// WAL merges committed by another process become visible without paying
+    /// the cost of reopening the dataset and rebuilding all session caches.
+    pub async fn refresh_latest(&mut self) -> LanceResult<()> {
+        self.base.refresh_latest().await
+    }
+
+    /// Append rollout rows through this instance's MemWAL shard; returns the
+    /// current base dataset version.
+    ///
+    /// The write is routed to the shard derived from the configured
+    /// `shard_id`, so concurrent appends from other server instances (each
+    /// owning a distinct shard) never contend.
+    ///
+    /// # Durable on return, *not* visible on return
+    ///
+    /// The only per-append work is `put`, which returns once the WAL entry has
+    /// been PUT to object storage. The rows are then **durable** — they survive
+    /// a crash and are replayed on reopen — but they are **not yet readable**,
+    /// by this instance or any other. A row becomes visible only after its
+    /// memtable is sealed into a flushed generation and committed to the shard
+    /// manifest, which happens in [`Self::flush`] (also performed by
+    /// [`Self::close`], and by the merge path via its internal close).
+    ///
+    /// Callers therefore get **no read-your-write guarantee**. In the server the
+    /// gap is bounded by the periodic flush sweeper's interval
+    /// (`ROLLOUT_FLUSH_INTERVAL_SECS`, default 30s); a caller that needs the row
+    /// readable immediately must `add(..).await` then `flush().await`.
+    ///
+    /// This decoupling is deliberate: sealing on the append path serialized
+    /// concurrent appends behind one seal+drain. Keeping only the durable `put`
+    /// here lets appends run concurrently, and reuses a single resident
+    /// `ShardWriter` (see `StorageBase::resident_writer`) so the shard epoch is
+    /// claimed once and the object-store connection is pooled, rather than
+    /// paying a cold DNS resolution + TCP/TLS handshake + epoch claim per
+    /// append.
+    ///
+    /// Note that because visibility is asynchronous,
+    /// [`RolloutObservation::row_count`] does not count rows that are durable
+    /// but not yet flushed.
+    ///
+    /// # The return value carries no information about this append
+    ///
+    /// It is the base dataset version, which MemWAL appends do **not** advance,
+    /// so it is a constant unrelated to the rows just written — the same value
+    /// before and after. It does not identify a snapshot containing them, and
+    /// (since the seal moved off this path) it does not indicate they are
+    /// visible either. Do not treat it as a write handle or use it to poll for
+    /// visibility; call [`Self::flush`] instead. Retained only for API
+    /// compatibility — see the module docs on reproducibility.
+    pub async fn add(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
+        self.base.ensure_writable()?;
+        if records.is_empty() {
+            return Ok(self.base.version());
+        }
+        // Encoding is schema-specific and stays here; everything after it —
+        // the resident writer, the fence retry, and the latency/error metrics —
+        // is `StorageBase::put`.
+        let batch = self.records_to_batch(records)?;
+        self.base.put(vec![batch]).await?;
+        Ok(self.base.version())
+    }
+
+    /// Materialize the active memtable into a flushed, queryable generation, so
+    /// previously added rows become readable on every instance. A no-op when no
+    /// writer is resident. See `StorageBase::flush`.
+    pub async fn flush(&self) -> LanceResult<()> {
+        self.base.flush().await
+    }
+
+    /// Gracefully close the resident writer, draining its background tasks.
+    /// Idempotent. See `StorageBase::close`.
+    pub async fn close(&mut self) -> LanceResult<()> {
+        self.base.close().await
+    }
+
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
+    }
+
+    /// Merge this instance's flushed generations into the base table **if** the
+    /// shard has accumulated at least `merge_after_generations` of them (the
+    /// count trigger; `0` disables it). No-op otherwise.
+    pub async fn maybe_merge_own_shard(&mut self) -> LanceResult<usize> {
+        self.base.maybe_merge_own_shard().await
+    }
+
+    /// The shared-lock half of a merge; see `StorageBase::prepare_merge_if_ready`
+    /// for the intended read-lock/write-lock split.
+    pub async fn prepare_merge_if_ready(
+        &self,
+        threshold: usize,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_merge_if_ready(threshold).await
+    }
+
+    /// Admission for a split merge on this resident store. Clone under a short
+    /// store read lock, release that lock, then await the gate; retain the guard
+    /// until commit finishes. Reads, ingestion and other tables do not take it.
+    #[must_use]
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.base.merge_preparation_gate()
+    }
+
+    /// The shared-lock half of [`Self::maybe_merge_own_shard`]: `None` unless
+    /// the count trigger is configured and met.
+    pub async fn prepare_count_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_count_merge().await
+    }
+
+    /// Check the configured count trigger using only this shard's manifest.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        self.base.count_merge_due().await
+    }
+
+    /// This writer's shard watermark from its own manifest. Metadata only.
+    pub async fn own_shard_watermark(
+        &self,
+    ) -> LanceResult<Option<crate::store_base::ShardWatermark>> {
+        self.base.own_shard_watermark().await
+    }
+
+    /// Every shard's watermark from its latest manifest. Metadata only.
+    pub async fn all_shard_watermarks(
+        &self,
+    ) -> LanceResult<Vec<crate::store_base::ShardWatermark>> {
+        self.base.all_shard_watermarks().await
+    }
+
+    /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
+    /// the time-triggered behavior of [`Self::cleanup_own_shard`].
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_cleanup_merge().await
+    }
+
+    /// Recover this instance's unsealed WAL, then prepare cleanup. The caller
+    /// must exclusively own the ingestion writer ID, as when appending. Never
+    /// use this to merge a live worker's shard from a maintenance master.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_recovered_cleanup_merge().await
+    }
+
+    /// Read sealed WAL using capacity admitted before opening payload readers.
+    pub async fn prepare_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_merge_reserved(reservation).await
+    }
+
+    /// Encode immutable replacement files without publishing rows or coverage.
+    /// Retains the prepared batches and reservation until ordered commit.
+    pub async fn stage_prepared_merge(&self, prepared: &mut PreparedMerge) -> LanceResult<()> {
+        self.base.stage_prepared_merge(prepared).await
+    }
+
+    /// Prepare this sealed shard for an opt-in bounded, ordered group.
+    pub async fn prepare_grouped_merge_reserved(
+        &self,
+        reservation: crate::MergeReservation,
+    ) -> LanceResult<Option<crate::PreparedShardMerge>> {
+        self.base.prepare_grouped_merge_reserved(reservation).await
+    }
+
+    /// Publish a group under the caller's existing table maintenance scope.
+    pub async fn commit_prepared_group(
+        &mut self,
+        shards: Vec<crate::PreparedShardMerge>,
+        max_bytes: usize,
+    ) -> LanceResult<usize> {
+        self.base.commit_prepared_group(shards, max_bytes).await
+    }
+
+    /// Stage a budgeted worker merge under its existing durable owner. Call
+    /// under the shared store guard; publication still needs the exclusive guard.
+    /// Unowned legacy operations keep their original serial behavior.
+    pub async fn stage_owned_prepared_merge(
+        &self,
+        input: Option<crate::store_base::PreparedMergeInput>,
+    ) -> LanceResult<Option<crate::store_base::PreparedMergeInput>> {
+        self.base.stage_owned_prepared_merge(input).await
+    }
+
+    /// Commit a merge prepared by [`Self::prepare_merge_if_ready`].
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        self.base
+            .commit_prepared_merge(manifest_store, manifest, prepared)
+            .await
+    }
+
+    /// Run one periodic WAL-cleanup pass over this instance's own shard: seal,
+    /// then fold **every** pending flushed generation into the base table. This
+    /// is the *time* half of the "time OR count" trigger and is deliberately not
+    /// gated by the count threshold. See `StorageBase::cleanup_own_shard`.
+    pub async fn cleanup_own_shard(&mut self) -> LanceResult<usize> {
+        self.base.cleanup_own_shard().await
+    }
+
+    /// Compact the base table's small fragments into larger ones.
+    ///
+    /// Must be driven by a *single* external trigger, not a per-worker timer:
+    /// compaction rewrites the shared base table and two concurrent `Rewrite`
+    /// commits conflict. See `StorageBase::compact`.
+    pub async fn compact(
+        &mut self,
+        options: Option<CompactionConfig>,
+    ) -> LanceResult<CompactionMetrics> {
+        self.base.compact(options).await
+    }
+
+    /// Prepare immutable compaction output without a base-table commit.
+    pub async fn prepare_compaction(
+        &self,
+        options: CompactionConfig,
+    ) -> LanceResult<crate::PreparedCompaction> {
+        self.base.prepare_compaction(options).await
+    }
+
+    /// Publish prepared output using this freshly opened, fenced handle.
+    pub async fn commit_prepared_compaction(
+        &mut self,
+        prepared: crate::PreparedCompaction,
+    ) -> LanceResult<CompactionMetrics> {
+        self.base.commit_prepared_compaction(prepared).await
+    }
+
+    /// See `StorageBase::base_data_files`.
+    pub fn base_data_files(&self) -> Vec<String> {
+        self.base.base_data_files()
+    }
+
+    /// Validate current data/deletion references without modifying storage.
+    pub async fn validate_fragment_references(
+        &mut self,
+    ) -> LanceResult<crate::ReferenceValidation> {
+        self.base.validate_fragment_references().await
+    }
+
+    /// See `StorageBase::repair_missing_fragments`.
+    pub async fn repair_missing_fragments(&mut self) -> LanceResult<crate::RepairReport> {
+        self.base.repair_missing_fragments().await
+    }
+
+    /// Build the configured key index on the base table's `id` column.
+    pub async fn create_id_key_index(&mut self) -> LanceResult<()> {
+        self.base.create_configured_key_index().await
+    }
+
+    /// Build immutable key-index files without publishing a table version.
+    pub async fn prepare_id_key_index(&self) -> LanceResult<crate::PreparedKeyIndex> {
+        self.base.prepare_key_index().await
+    }
+
+    /// Publish prepared key-index files under fresh table write ownership.
+    pub async fn commit_prepared_id_key_index(
+        &mut self,
+        prepared: crate::PreparedKeyIndex,
+    ) -> LanceResult<()> {
+        self.base.commit_prepared_key_index(prepared).await
+    }
+
+    /// Explicitly create a BTree, independent of the configured merge policy.
+    pub async fn create_id_btree_index(&mut self) -> LanceResult<()> {
+        self.base.create_key_btree_index().await
+    }
+
+    /// See `StorageBase::extend_key_btree_index`.
+    pub async fn extend_id_btree_index(&mut self) -> LanceResult<usize> {
+        self.base.extend_key_btree_index().await
+    }
+
+    /// See `StorageBase::has_key_btree_index`.
+    pub async fn has_id_btree_index(&self) -> LanceResult<bool> {
+        self.base.has_key_btree_index().await
+    }
+
+    /// Whether the base table has accumulated at least `min_fragments`
+    /// fragments (and is thus worth compacting), honoring quiet hours.
+    #[must_use]
+    pub fn should_compact(&self, config: &CompactionConfig) -> bool {
+        self.base.should_compact(config)
+    }
+
+    /// Number of flushed MemWAL generations pending merge into the base table
+    /// across all shards. Read-only; never merges.
+    pub async fn pending_wal_generations(&self) -> LanceResult<usize> {
+        self.base.pending_wal_generations().await
+    }
+
+    /// Admit durable WAL retirement discovery to the bounded background collector.
+    /// This may wait for capacity and must not run inside read/pending probes.
+    pub async fn discover_retired_wal(&self) -> LanceResult<()> {
+        self.base.discover_retired_wal().await
+    }
+
+    /// Total and largest per-shard pending counts from one manifest pass.
+    pub async fn pending_wal_generation_counts(&self) -> LanceResult<(usize, usize)> {
+        self.base.pending_wal_generation_counts().await
+    }
+
+    /// Snapshot read-only observability metrics for the rollout store.
+    ///
+    /// `row_count` combines base-table fragment metadata with row counts from
+    /// every flushed generation in every MemWAL shard. Generation datasets are
+    /// opened concurrently and counted from their fragment metadata; rollout
+    /// IDs are append-only, so summing those immutable generations preserves the
+    /// store's logical row count without scanning payload columns.
+    ///
+    /// `fragment_count` intentionally remains the base-table fragment count:
+    /// master-driven compaction only rewrites the shared base table, while each
+    /// writer owns and merges its own WAL shard.
+    pub async fn observe(&self) -> LanceResult<RolloutObservation> {
+        // Match ordinary reads: bracket WAL capture with fresh base metadata
+        // and retry if a peer merge reclaims a generation before its count is
+        // read. All persisted fields must come from this same accepted view.
+        self.base
+            .read_consistent(ListSource::All, |dataset, shard_snapshots| async move {
+                #[cfg(test)]
+                {
+                    let pause = self.observation_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.checked_base.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
+                let base_rows = dataset.count_rows(None).await? as u64;
+                let pending_rows = self.base.pending_wal_rows(&shard_snapshots).await?;
+                let row_count = (base_rows + pending_rows) as i64;
+                let fragment_count = dataset.count_fragments() as i64;
+                let version = dataset.manifest.version;
+                let last_updated = dataset.manifest.timestamp().timestamp_millis();
+                let pending_wal_generations = shard_snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.sstables.len() as i64)
+                    .sum();
+                Ok(RolloutObservation {
+                    row_count,
+                    fragment_count,
+                    version,
+                    last_updated,
+                    pending_wal_generations,
+                    max_pending_wal_generations_per_shard: shard_snapshots
+                        .iter()
+                        .map(|s| s.sstables.len() as i64)
+                        .max()
+                        .unwrap_or(0),
+                    unflushed_rows: self.unflushed_rows().await,
+                })
+            })
+            .await
+    }
+
+    /// Rows buffered in this instance's resident writer that have not yet been
+    /// sealed into a flushed generation. See `StorageBase::unflushed_rows`.
+    async fn unflushed_rows(&self) -> i64 {
+        self.base.unflushed_rows().await
+    }
+
+    /// Current compaction statistics for the base table.
+    #[must_use]
+    pub fn compaction_stats(&self) -> CompactionStats {
+        self.base.compaction_stats()
+    }
+
+    /// List rollout rows (base table ∪ every instance's flushed MemWAL rows).
+    ///
+    /// `binary_payload` is projected out so artifact bytes are never
+    /// materialized on a list scan (spec §2); fetch them on demand via
+    /// [`Self::get_blob`]. Ordering is not guaranteed to match append order
+    /// because the LSM read path dedups by `id` across generations.
+    pub async fn list(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        self.list_with_filters(limit, offset, None).await
+    }
+
+    /// List rollout rows matching exact field filters.
+    ///
+    /// Select rows using narrow columns before materializing a page's payload.
+    /// Preserve first-seen ordering and last-seen values across base and WAL;
+    /// apply filters to the winning row before pagination.
+    ///
+    /// Selection still scans every source and retains one position per distinct
+    /// id; this bounds payload decoding to the selected rows, not total key I/O.
+    /// Unfiltered, unbounded calls retain the complete-list behavior.
+    pub async fn list_with_filters(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RolloutFilters>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if limit.is_some() || filters.is_some() {
+            return self
+                .base
+                .read_consistent(ListSource::All, |dataset, snapshots| {
+                    self.list_selected_snapshot(dataset, snapshots, limit, offset, filters)
+                })
+                .await;
+        }
+        Ok(self
+            .list_all_non_blob_records()
+            .await?
+            .into_iter()
+            .skip(offset.unwrap_or(0))
+            .collect())
+    }
+
+    async fn list_selected_snapshot(
+        &self,
+        dataset: Dataset,
+        snapshots: Vec<ShardSnapshot>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        filters: Option<&RolloutFilters>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        #[cfg(test)]
+        let selected_pause = self.selected_list_pause.lock().unwrap().clone();
+        #[cfg(test)]
+        let pause_this_attempt = selected_pause.as_ref().is_some_and(|pause| {
+            pause
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                < pause.pause_attempts.max(1)
+        });
+        // Required decoder fields plus the exact-match filter columns. Text,
+        // token arrays, JSON metadata and artifact bytes never enter this scan.
+        let selection_columns = Arc::new(
+            [
+                "id",
+                "rollout_id",
+                "problem_id",
+                "sequence_order",
+                "role",
+                "created_at",
+                "content_type",
+                "dataset",
+                "policy_version",
+                "artifact_type",
+                "include_in_training",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .filter(|column| filters.is_some() || column == "id")
+            .filter(|column| dataset.schema().field(column).is_some())
+            .collect::<Vec<_>>(),
+        );
+        let selection_schema = Arc::new(projected_arrow_schema(&dataset, &selection_columns)?);
+        let columns = Self::non_blob_columns_for(&dataset);
+        let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
+        // Identify the captured WAL generation without logging filters, row
+        // values, object paths, or changing the consistent-read retry policy.
+        let base_version = dataset.manifest.version;
+        let report_source_failure = |phase: &'static str,
+                                     source_kind: &'static str,
+                                     wal_source: Option<(Uuid, u64)>,
+                                     error: &LanceError| {
+            tracing::warn!(uri = %self.base.dataset.uri(), phase, source_kind,
+                base_version,
+                wal_shard = ?wal_source.map(|(shard, _)| shard),
+                wal_generation = ?wal_source.map(|(_, generation)| generation),
+                missing_file = crate::store_base::is_not_found_error(error),
+                "rollout selected read source failed");
+        };
+        let mut sources = vec![dataset];
+        let mut wal_sources = vec![None];
+        for snapshot in snapshots {
+            for generation in snapshot.sstables {
+                let wal_source = Some((snapshot.shard_id, generation.generation));
+                let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                sources.push(self.open_flushed_dataset(&uri).await.inspect_err(|error| {
+                    report_source_failure("open", "wal", wal_source, error);
+                })?);
+                wal_sources.push(wal_source);
+            }
+        }
+
+        #[cfg(test)]
+        if let Some(pause) = selected_pause
+            .as_ref()
+            .filter(|pause| pause_this_attempt && !pause.before_materialization)
+        {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+
+        let mut positions = HashMap::new();
+        let mut selections = Vec::new();
+        for (source_index, dataset) in sources.iter().enumerate() {
+            let source_kind = if source_index == 0 { "base" } else { "wal" };
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&projected_column_refs(dataset, &selection_columns))?
+                .with_row_id();
+            let mut stream = scanner.try_into_stream().await.inspect_err(|error| {
+                report_source_failure(
+                    "selection_plan",
+                    source_kind,
+                    wal_sources[source_index],
+                    error,
+                );
+            })?;
+            while let Some(batch) = stream.try_next().await.inspect_err(|error| {
+                report_source_failure(
+                    "selection_stream",
+                    source_kind,
+                    wal_sources[source_index],
+                    error,
+                );
+            })? {
+                let row_ids = column_as::<UInt64Array>(&batch, "_rowid")?.clone();
+                let selection_indices = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, field)| (field.name() != "_rowid").then_some(index))
+                    .collect::<Vec<_>>();
+                let aligned = align_batch_to_schema(
+                    batch.project(&selection_indices)?,
+                    selection_schema.clone(),
+                )?;
+                let matches = filters
+                    .map(|filters| {
+                        batch_to_rollout_records(&aligned).map(|records| {
+                            records
+                                .into_iter()
+                                .map(|record| filters.matches_record(&record))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .transpose()?;
+                let ids = column_as::<StringArray>(&aligned, "id")?;
+                for row in 0..aligned.num_rows() {
+                    let selection = (
+                        source_index,
+                        row_ids.value(row),
+                        matches.as_ref().is_none_or(|matches| matches[row]),
+                    );
+                    if let Some(index) = positions.get(ids.value(row)).copied() {
+                        selections[index] = selection;
+                    } else {
+                        positions.insert(ids.value(row).to_string(), selections.len());
+                        selections.push(selection);
+                    }
+                }
+            }
+        }
+        // The winning row may fail the filter even if an older row passed it.
+        // Do not filter sources independently or fetch rows by id again.
+        drop(positions);
+        let selected = selections
+            .into_iter()
+            .filter(|(_, _, matches)| *matches)
+            .skip(offset.unwrap_or(0))
+            .take(limit.unwrap_or(usize::MAX));
+        let mut per_source = vec![Vec::new(); sources.len()];
+        let mut count = 0;
+        for (position, (source, row_id, _)) in selected.enumerate() {
+            per_source[source].push((position, row_id));
+            count += 1;
+        }
+        let mut results = vec![None; count];
+        #[cfg(test)]
+        if let Some(pause) = selected_pause
+            .as_ref()
+            .filter(|pause| pause_this_attempt && pause.before_materialization)
+        {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+        for (source_index, (dataset, rows)) in sources.iter().zip(per_source).enumerate() {
+            let source_kind = if source_index == 0 { "base" } else { "wal" };
+            // Bound individual wide-row takes, including unbounded filtered
+            // callers. Allocate from observed rows, never from a client limit.
+            for chunk in rows.chunks(256) {
+                let row_ids = chunk.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+                let projection = projected_dataset_schema(dataset, &columns)?;
+                let batch = dataset
+                    .take_rows(&row_ids, projection)
+                    .await
+                    .inspect_err(|error| {
+                        report_source_failure(
+                            "materialize",
+                            source_kind,
+                            wal_sources[source_index],
+                            error,
+                        );
+                    })?;
+                let aligned = align_batch_to_schema(batch, target_schema.clone())?;
+                let records = batch_to_rollout_records(&aligned)?;
+                if records.len() != chunk.len() {
+                    return Err(LanceError::io(
+                        "rollout rows disappeared during page materialization",
+                    ));
+                }
+                for ((position, _), record) in chunk.iter().zip(records) {
+                    results[*position] = Some(record);
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|record| {
+                record.ok_or_else(|| LanceError::io("rollout page row was not materialized"))
+            })
+            .collect()
+    }
+
+    /// Return one complete trajectory in deterministic message order.
+    pub async fn get_trajectory(&self, rollout_id: &str) -> LanceResult<Vec<RolloutRecord>> {
+        if rollout_id.is_empty() {
+            return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                "rollout_id must not be empty".to_string(),
+            )));
+        }
+
+        let filters = RolloutFilters {
+            rollout_id: Some(rollout_id.to_string()),
+            ..Default::default()
+        };
+        let mut records = self.list_with_filters(None, None, Some(&filters)).await?;
+        records.sort_by(|left, right| {
+            left.sequence_order
+                .cmp(&right.sequence_order)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(records)
+    }
+
+    /// Filter and page rollout rows over the full base ∪ WAL union.
+    ///
+    /// Thin wrapper over [`Self::list_filtered_source`] with [`ListSource::All`],
+    /// preserving the historical union semantics for existing callers.
+    pub async fn list_filtered(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+    ) -> LanceResult<RolloutPage> {
+        self.list_filtered_source(filters, limit, offset, ListSource::All)
+            .await
+    }
+
+    /// Filter and page rollout rows from a chosen [`ListSource`].
+    ///
+    /// Reads one row beyond the requested page to report `has_more`, avoiding
+    /// an unbounded full-table count on every UI request. Each source is read in
+    /// one projected, filtered, bounded scan. Fragments use the base [`Dataset`]
+    /// scanner directly so Lance can push limit/offset into the scan. WAL-backed
+    /// reads page through a narrow, deterministic `id`-only top-K sort, then
+    /// take the selected rows directly from their physical datasets so wide
+    /// text columns never participate in the full LSM sort.
+    ///
+    /// [`ListSource::Fragments`] skips MemWAL manifest discovery entirely, so its
+    /// latency is independent of how far the merge backlog has grown.
+    pub async fn list_filtered_source(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+        source: ListSource,
+    ) -> LanceResult<RolloutPage> {
+        self.base
+            .read_consistent(source, |dataset, snapshots| {
+                self.list_filtered_snapshot(filters, limit, offset, source, dataset, snapshots)
+            })
+            .await
+    }
+
+    async fn list_filtered_snapshot(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+        source: ListSource,
+        dataset: Dataset,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<RolloutPage> {
+        let filter = filters.expression();
+        let columns = Self::non_blob_columns_for(&dataset);
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let page_limit = limit.saturating_add(1);
+
+        if matches!(source, ListSource::Wal | ListSource::All) {
+            let mut scanner = StorageBase::lsm_scanner_for_dataset(
+                &dataset,
+                "id",
+                source,
+                shard_snapshots.clone(),
+            )
+            .project(&["id"])?;
+            if let Some(filter) = &filter {
+                scanner = scanner.filter(filter)?;
+            }
+
+            // Lance 9's block-list LSM plan is intentionally unordered. Page
+            // boundaries must not inherit that internal union order: otherwise
+            // repeated offset requests can skip or repeat records. Sort only
+            // the narrow key plan and retain at most the requested prefix.
+            let plan = scanner.create_plan().await?;
+            let id_index = plan.schema().index_of("id")?;
+            let fetch = offset.saturating_add(page_limit);
+            let sorted = SortExec::new(
+                [PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "id", id_index,
+                )))]
+                .into(),
+                plan,
+            )
+            .with_fetch(Some(fetch));
+            let page_plan = Arc::new(GlobalLimitExec::new(
+                Arc::new(sorted),
+                offset,
+                Some(page_limit),
+            ));
+            let ctx = SessionContext::new();
+
+            let mut page_ids = Vec::with_capacity(page_limit);
+            let mut stream = page_plan
+                .execute(0, ctx.task_ctx())
+                .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
+            while let Some(batch) = stream.try_next().await? {
+                let ids = column_as::<StringArray>(&batch, "id")?;
+                page_ids.extend((0..ids.len()).map(|row| ids.value(row).to_string()));
+            }
+
+            let has_more = page_ids.len() > limit;
+            page_ids.truncate(limit);
+            let records = self
+                .take_lsm_page_rows(&dataset, source, shard_snapshots, page_ids)
+                .await?;
+            return Ok(RolloutPage { records, has_more });
+        }
+
+        let mut stream: datafusion::physical_plan::SendableRecordBatchStream = match source {
+            ListSource::Fragments => {
+                let scan_limit = i64::try_from(page_limit).map_err(|_| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "pagination limit exceeds i64::MAX".to_string(),
+                    ))
+                })?;
+                let scan_offset = i64::try_from(offset).map_err(|_| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "pagination offset exceeds i64::MAX".to_string(),
+                    ))
+                })?;
+                let mut scanner = dataset.scan();
+                scanner.project(&refs)?;
+                // Lance 7's late take path can panic on nested list columns.
+                // Keep those early while deferring only potentially large text.
+                scanner.materialization_style(MaterializationStyle::all_early_except(
+                    &PAGINATION_LATE_COLUMNS,
+                    dataset.schema(),
+                )?);
+                if let Some(filter) = &filter {
+                    scanner.filter(filter)?;
+                }
+                scanner.limit(Some(scan_limit), Some(scan_offset))?;
+                scanner.try_into_stream().await?.into()
+            }
+            ListSource::Wal | ListSource::All => unreachable!("handled above"),
+        };
+
+        let mut records = Vec::with_capacity(page_limit);
+        while let Some(batch) = stream.try_next().await? {
+            records.extend(batch_to_rollout_records(&batch)?);
+        }
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        Ok(RolloutPage { records, has_more })
+    }
+
+    async fn list_all_non_blob_records(&self) -> LanceResult<Vec<RolloutRecord>> {
+        self.base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                self.list_non_blob_snapshot(dataset, snapshots)
+            })
+            .await
+    }
+
+    async fn list_non_blob_snapshot(
+        &self,
+        dataset: Dataset,
+        snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        let columns = Arc::new(Self::non_blob_columns_for(&dataset));
+        let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
+        let mut records_by_id = HashMap::new();
+        let mut records = Vec::new();
+
+        Self::append_non_blob_records_from_dataset(
+            dataset,
+            columns.clone(),
+            target_schema.clone(),
+            &mut records_by_id,
+            &mut records,
+        )
+        .await?;
+
+        for snapshot in snapshots {
+            for generation in snapshot.sstables {
+                let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                let dataset = self.open_flushed_dataset(&uri).await?;
+                Self::append_non_blob_records_from_dataset(
+                    dataset,
+                    columns.clone(),
+                    target_schema.clone(),
+                    &mut records_by_id,
+                    &mut records,
+                )
+                .await?;
+            }
+        }
+
+        Ok(records)
+    }
+
+    async fn append_non_blob_records_from_dataset(
+        dataset: Dataset,
+        columns: Arc<Vec<String>>,
+        target_schema: Arc<Schema>,
+        records_by_id: &mut HashMap<String, usize>,
+        records: &mut Vec<RolloutRecord>,
+    ) -> LanceResult<()> {
+        let refs = projected_column_refs(&dataset, &columns);
+        let mut scanner = dataset.scan();
+        scanner.project(&refs)?;
+
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let aligned = align_batch_to_schema(batch, target_schema.clone())?;
+            for record in batch_to_rollout_records(&aligned)? {
+                if let Some(index) = records_by_id.get(&record.id).copied() {
+                    records[index] = record;
+                } else {
+                    records_by_id.insert(record.id.clone(), records.len());
+                    records.push(record);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve an LSM page's ids against the physical base/WAL datasets and
+    /// take only those rows' non-blob columns.
+    async fn take_lsm_page_rows(
+        &self,
+        dataset: &Dataset,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+        page_ids: Vec<String>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns = Arc::new(Self::non_blob_columns_for(dataset));
+        let target_schema = Arc::new(projected_arrow_schema(dataset, &columns)?);
+        let id_filter = Arc::new(format!("id IN ({})", sql_quoted_list(&page_ids)));
+        let wanted: HashSet<String> = page_ids.iter().cloned().collect();
+
+        let mut records_by_id = HashMap::with_capacity(page_ids.len());
+        if source == ListSource::All {
+            for record in Self::take_page_rows_from_dataset(
+                dataset.clone(),
+                id_filter.clone(),
+                columns.clone(),
+                target_schema.clone(),
+            )
+            .await?
+            {
+                records_by_id.insert(record.id.clone(), record);
+            }
+        }
+
+        let mut generation_uris = Vec::new();
+        for snapshot in shard_snapshots {
+            for generation in snapshot.sstables {
+                generation_uris
+                    .push(self.flushed_generation_uri(snapshot.shard_id, &generation.path));
+            }
+        }
+        let mut generation_rows = stream::iter(generation_uris)
+            .map(|uri| {
+                let columns = columns.clone();
+                let target_schema = target_schema.clone();
+                let id_filter = id_filter.clone();
+                async move {
+                    let dataset = self.open_flushed_dataset(&uri).await?;
+                    Self::take_page_rows_from_dataset(dataset, id_filter, columns, target_schema)
+                        .await
+                }
+            })
+            .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
+
+        while let Some(rows) = generation_rows.try_next().await? {
+            for record in rows {
+                if wanted.contains(&record.id) {
+                    records_by_id.entry(record.id.clone()).or_insert(record);
+                }
+            }
+        }
+
+        page_ids
+            .iter()
+            .map(|id| {
+                records_by_id.remove(id).ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "rollout row '{id}' disappeared while reading its page"
+                    )))
+                })
+            })
+            .collect()
+    }
+
+    async fn take_page_rows_from_dataset(
+        dataset: Dataset,
+        id_filter: Arc<String>,
+        columns: Arc<Vec<String>>,
+        target_schema: Arc<Schema>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])?
+            .filter(id_filter.as_str())?
+            .with_row_id();
+
+        let mut row_ids = Vec::new();
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let ids = column_as::<StringArray>(&batch, "id")?;
+            let row_id_array = column_as::<UInt64Array>(&batch, "_rowid")?;
+            row_ids.extend(
+                (0..batch.num_rows())
+                    .filter(|row| !ids.is_null(*row))
+                    .map(|row| row_id_array.value(row)),
+            );
+        }
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let projection = projected_dataset_schema(&dataset, &columns)?;
+        let batch = dataset.take_rows(&row_ids, projection).await?;
+        let aligned = align_batch_to_schema(batch, target_schema)?;
+        batch_to_rollout_records(&aligned)
+    }
+
+    /// Run a read-only `SELECT` against this experiment's rollout records.
+    ///
+    /// The merged view ([`ListSource::All`]: base table ∪ pending MemWAL
+    /// generations) is materialized into an in-memory table named `records`,
+    /// then queried with DataFusion. Only a single `SELECT`/CTE statement is
+    /// accepted — any DML/DDL/multi-statement input is rejected before
+    /// execution (see [`ensure_select_only`]). The `binary_payload` column is
+    /// excluded (blob bytes are fetched via [`Self::get_blob`]).
+    ///
+    /// Two bounds keep a query from exhausting master memory:
+    /// - [`SQL_MAX_SCAN_ROWS`] caps how many rows are materialized into the
+    ///   `records` table; exceeding it is a hard error asking the user to work
+    ///   on a smaller experiment.
+    /// - [`SQL_MAX_RESULT_ROWS`] caps returned rows; hitting it sets
+    ///   `truncated = true` rather than silently dropping rows.
+    ///
+    /// A syntactically invalid or non-`SELECT` query returns
+    /// [`LanceError::InvalidInput`] so callers can surface it as a 400.
+    pub async fn query_sql(&self, sql: &str) -> LanceResult<SqlQueryResult> {
+        ensure_select_only(sql)?;
+
+        let (batches, table_schema) = self
+            .base
+            .read_consistent(ListSource::All, |dataset, shard_snapshots| async move {
+                // Materialize the merged (base ∪ WAL) non-blob rows, bounded.
+                let columns = self.non_blob_columns();
+                let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+                let scanner = StorageBase::lsm_scanner_for_dataset(
+                    &dataset,
+                    "id",
+                    ListSource::All,
+                    shard_snapshots,
+                )
+                .project(&refs)?;
+                let mut stream = scanner.try_into_stream().await?;
+
+                let mut batches: Vec<RecordBatch> = Vec::new();
+                let mut scanned_rows = 0usize;
+                let mut table_schema: Option<Arc<Schema>> = None;
+                while let Some(batch) = stream.try_next().await? {
+                    if table_schema.is_none() {
+                        table_schema = Some(batch.schema());
+                    }
+                    scanned_rows += batch.num_rows();
+                    if scanned_rows > SQL_MAX_SCAN_ROWS {
+                        return Err(LanceError::invalid_input(format!(
+                    "experiment has more than {SQL_MAX_SCAN_ROWS} rows, which is too large \
+                     for ad-hoc SQL; use the record browser filters instead"
+                )));
+                    }
+                    batches.push(batch);
+                }
+                Ok((batches, table_schema))
+            })
+            .await?;
+
+        // Empty experiment: fall back to the projected dataset schema so
+        // `SELECT`s still resolve column names against an empty `records` table.
+        let schema = match table_schema {
+            Some(schema) => schema,
+            None => {
+                let full: Schema = self.base.dataset.schema().into();
+                let projected: Vec<FieldRef> = full
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != "binary_payload")
+                    .cloned()
+                    .collect();
+                Arc::new(Schema::new(projected))
+            }
+        };
+
+        let ctx = SessionContext::new();
+        let provider = MemTable::try_new(schema, vec![batches])
+            .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
+        ctx.register_table(SQL_TABLE_NAME, Arc::new(provider))
+            .map_err(|err| LanceError::from(ArrowError::from_external_error(Box::new(err))))?;
+
+        // DataFusion planning/exec errors (unknown column, bad function, …) are
+        // user errors → InvalidInput so the API returns 400, not 500.
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+        let df = df
+            .limit(0, Some(SQL_MAX_RESULT_ROWS + 1))
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+        // Capture the output columns from the plan schema so they are known even
+        // when the query returns zero rows.
+        let columns: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let result_batches = df
+            .collect()
+            .await
+            .map_err(|err| LanceError::invalid_input(err.to_string()))?;
+
+        sql_batches_to_result(columns, result_batches)
+    }
+
+    /// Retrieve a single rollout row by its unique id, including any freshly
+    /// appended (MemWAL-flushed) row on any instance. `binary_payload` is
+    /// projected out (fetch bytes via [`Self::get_blob`]).
+    ///
+    /// # Base-table-first
+    ///
+    /// This queries the immutable base table first and returns immediately on a
+    /// hit, opening **zero** MemWAL generations for the common case of an
+    /// already-merged record. Only a base miss falls back to the flushed-WAL
+    /// union, so latency is decoupled from the pending-generation backlog
+    /// (which can run into the hundreds/thousands on a high-write experiment)
+    /// instead of paying one object-store open per pending generation.
+    ///
+    /// This is a pure optimization, not a semantic change: rollout rows are
+    /// immutable and an `id` is never re-appended, so a row present in the base
+    /// table is identical to any (necessarily absent) WAL copy, and a row that
+    /// is *only* in the WAL is still found by the fallback. The fetchability
+    /// invariant holds — any row visible in a `wal`/`all` list is returned here.
+    pub async fn get_by_id(&self, id: &str) -> LanceResult<Option<RolloutRecord>> {
+        self.get_by_id_source(id, ListSource::All).await
+    }
+
+    /// [`Self::get_by_id`] with an explicit [`ListSource`]:
+    /// - `Fragments`: base table only — never opens a WAL generation (fastest,
+    ///   but misses un-merged rows);
+    /// - `Wal`: flushed MemWAL generations only (excludes the base table);
+    /// - `All`: base-table-first with a WAL fallback — the fetch-anything
+    ///   default, fast whenever the row is already merged.
+    pub async fn get_by_id_source(
+        &self,
+        id: &str,
+        source: ListSource,
+    ) -> LanceResult<Option<RolloutRecord>> {
+        match source {
+            ListSource::Fragments => self.scan_one_by_id(id, ListSource::Fragments).await,
+            ListSource::Wal => self.scan_one_by_id(id, ListSource::Wal).await,
+            ListSource::All => {
+                let cached = self.scan_one_by_id(id, ListSource::Fragments).await?;
+                if cached.is_some() || self.base.is_version_pinned() {
+                    return Ok(cached);
+                }
+
+                // Another executor may have merged this row since the resident
+                // handle opened. Check a fresh clone before discovering unrelated
+                // WAL generations or enforcing their pending-generation cap.
+                // The resident handle stays unchanged, so callers need no write lock.
+                let mut latest = self.base.dataset.clone();
+                latest.checkout_latest().await?;
+                if latest.manifest.version != self.base.dataset.manifest.version {
+                    if let Some(record) = self
+                        .scan_one_by_id_snapshot(id, ListSource::Fragments, latest, Vec::new())
+                        .await?
+                    {
+                        return Ok(Some(record));
+                    }
+                }
+
+                // Include the captured base as well as WAL: a merge can commit
+                // and drain this row between the fast base check and discovery.
+                // Existing consistent-read retries handle missing-file races;
+                // persistent errors and the WAL admission cap still propagate.
+                #[cfg(test)]
+                {
+                    let pause = self.point_read_pause.lock().unwrap().take();
+                    if let Some(pause) = pause {
+                        pause.checked_base.notify_one();
+                        pause.resume.notified().await;
+                    }
+                }
+                self.scan_one_by_id(id, ListSource::All).await
+            }
+        }
+    }
+
+    /// Fetch a row *together with* its `binary_payload` in a single base-first
+    /// scan, returning `(record, payload)`.
+    ///
+    /// Callers that need both the row metadata (e.g. `content_type` for a
+    /// download's `Content-Type`/filename) and the artifact bytes would
+    /// otherwise call [`Self::get_by_id`] then [`Self::get_blob`] — two
+    /// independent point scans over the same shard. This folds them into one
+    /// scan: the row is located once and `binary_payload` is materialized for
+    /// only that row (via a projected `take`), so it never reads back an entire
+    /// fragment's payloads. `payload` is `None` when the row carries no blob.
+    ///
+    /// Base-table-first with the same immutable-row reasoning as
+    /// [`Self::get_by_id`]: a hit in the base table returns immediately with no
+    /// MemWAL generation opened; only a base miss falls back to the flushed WAL.
+    pub async fn get_record_with_blob(
+        &self,
+        id: &str,
+    ) -> LanceResult<Option<(RolloutRecord, Option<Vec<u8>>)>> {
+        // Base table first — no manifest reads, no per-generation opens.
+        if let Some(record) = self.scan_one_by_id(id, ListSource::Fragments).await? {
+            let payload = Self::get_blob_from_dataset(&self.base.dataset, id)
+                .await?
+                .flatten();
+            return Ok(Some((record, payload)));
+        }
+
+        // Base miss: locate the row in the flushed generations. Reuse the
+        // NotFound-tolerant, bounded-parallel blob fallback and pair it with the
+        // WAL-sourced metadata scan.
+        let Some(record) = self.scan_one_by_id(id, ListSource::Wal).await? else {
+            return Ok(None);
+        };
+        let payload = self.get_blob(id).await?;
+        Ok(Some((record, payload)))
+    }
+
+    /// Run an id-equality point scan against a single [`ListSource`] and return
+    /// the first matching record. `Fragments` passes an empty snapshot set so it
+    /// performs no MemWAL manifest discovery; `Wal`/`All` discover flushed
+    /// generations first.
+    async fn scan_one_by_id(
+        &self,
+        id: &str,
+        source: ListSource,
+    ) -> LanceResult<Option<RolloutRecord>> {
+        if source == ListSource::Fragments {
+            // Explicit fragment reads retain the resident snapshot. All-source
+            // point reads refresh clones around this fast path instead.
+            return self
+                .scan_one_by_id_snapshot(id, source, self.base.dataset.clone(), Vec::new())
+                .await;
+        }
+        self.base
+            .read_consistent(source, |dataset, snapshots| {
+                self.scan_one_by_id_snapshot(id, source, dataset, snapshots)
+            })
+            .boxed()
+            .await
+    }
+
+    async fn scan_one_by_id_snapshot(
+        &self,
+        id: &str,
+        source: ListSource,
+        dataset: Dataset,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<Option<RolloutRecord>> {
+        let escaped_id = id.replace('\'', "''");
+        let columns = Self::non_blob_columns_for(&dataset)
+            .into_iter()
+            .filter(|column| {
+                source == ListSource::Fragments || !CLAIM_CHECK_COLUMNS.contains(&column.as_str())
+            })
+            .collect::<Vec<_>>();
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let scanner = StorageBase::lsm_scanner_for_dataset(&dataset, "id", source, shard_snapshots)
+            .project(&refs)?
+            .filter(&format!("id = '{}'", escaped_id))?;
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            for record in batch_to_rollout_records(&batch)? {
+                if record.id == id {
+                    return Ok(Some(record));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetch a single artifact row's `binary_payload` bytes on demand.
+    ///
+    /// `list`/`get_by_id` project `binary_payload` out, so it reads back as
+    /// `None` there. This method first locates the row using only `id`, then
+    /// takes `binary_payload` for that exact row id. Keeping the large inline
+    /// column out of the filtered scan prevents a point lookup from
+    /// materializing an entire fragment's payloads. Returns `None` if the row
+    /// or its payload is absent.
+    ///
+    /// # Base-table-first, then bounded-parallel WAL fallback
+    ///
+    /// The immutable base table is queried first and, on a hit, returned
+    /// immediately without opening any MemWAL generation — the common
+    /// already-merged case pays zero per-generation opens. Only a base miss
+    /// falls back to the flushed generations, which are then opened
+    /// **concurrently** (bounded by [`DEFAULT_OBSERVE_CONCURRENCY`]) with the
+    /// first match winning, rather than one-at-a-time newest-first.
+    ///
+    /// Because rollout rows are immutable and an `id` is never re-appended,
+    /// any WAL copy still visible after a merge commits is identical to the
+    /// base row. Base-first cannot shadow a newer value, and the parallel
+    /// fallback needs no ordering.
+    ///
+    /// A concurrent merge can delete a generation after its dataset is open,
+    /// while its IDs or payload are being read. Missing-file errors trigger at
+    /// most two retries from a refreshed base snapshot. Persistent failures
+    /// remain errors, and explicitly pinned reads never advance versions.
+    /// After a WAL miss, check the latest base once more to cover a generation
+    /// drained between the earlier base check and WAL discovery. All refreshes
+    /// use clones, so even misses can complete under a shared store guard.
+    pub async fn get_blob(&self, id: &str) -> LanceResult<Option<Vec<u8>>> {
+        let mut base = self.base.dataset.clone();
+        let mut retries = 0;
+        loop {
+            match self.get_blob_from_snapshot(&base, id).await {
+                Err(error)
+                    if is_not_found_error(&error)
+                        && !self.base.is_version_pinned()
+                        && retries < 2 =>
+                {
+                    // Merge can delete a generation after its manifest was
+                    // opened, during the ID scan or payload take. Re-read from
+                    // the committed base instead of turning that race into a
+                    // 500. Persistent missing files still fail after 3 tries.
+                    retries += 1;
+                    base.checkout_latest().await?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn get_blob_from_snapshot(
+        &self,
+        base: &Dataset,
+        id: &str,
+    ) -> LanceResult<Option<Vec<u8>>> {
+        // Base-table-first: an already-merged row is found here with no MemWAL
+        // manifest reads and no per-generation opens.
+        if let Some(payload) = Self::get_blob_from_dataset(base, id).await? {
+            return Ok(payload);
+        }
+
+        // Another executor may have merged this row since the resident store
+        // opened. Check that newer base before paying for unrelated WAL reads
+        // (or refusing the request because those generations exceed the cap).
+        // Refresh a clone so shared-lock readers never mutate the resident
+        // dataset, and explicitly pinned historical reads remain historical.
+        let mut latest = base.clone();
+        if !self.base.is_version_pinned() {
+            latest.checkout_latest().await?;
+            if latest.manifest.version != base.manifest.version {
+                if let Some(payload) = Self::get_blob_from_dataset(&latest, id).await? {
+                    return Ok(payload);
+                }
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let pause = {
+                let mut guard = self.blob_read_pause.lock().unwrap();
+                if guard
+                    .as_ref()
+                    .is_some_and(|pause| pause.before_wal_snapshot)
+                {
+                    guard.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pause) = pause {
+                pause.opened.notify_one();
+                pause.resume.notified().await;
+            }
+        }
+
+        self.base
+            .protect_wal_read(ListSource::All, async {
+                // Base miss: fall back to the flushed generations. Open them with
+                // bounded concurrency and take the first hit; tolerate a generation that
+                // was concurrently merged away (NotFound) instead of failing the request.
+                let snapshots = self.wal_shard_snapshots().await?;
+                let uris: Vec<String> = snapshots
+                    .iter()
+                    .flat_map(|snapshot| {
+                        snapshot.sstables.iter().map(|generation| {
+                            self.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                        })
+                    })
+                    .collect();
+
+                let mut hits = stream::iter(uris)
+                    .map(|uri| async move {
+                        match self.open_flushed_dataset(&uri).await {
+                            Ok(dataset) => {
+                                #[cfg(test)]
+                                {
+                                    let pause = self.blob_read_pause.lock().unwrap().take();
+                                    if let Some(pause) = pause {
+                                        pause.opened.notify_one();
+                                        pause.resume.notified().await;
+                                    }
+                                }
+                                Self::get_blob_from_dataset(&dataset, id).await
+                            }
+                            // A generation drained + deleted by a concurrent merge
+                            // between snapshot and open: its rows are in a committed
+                            // base version, covered by the final base check below.
+                            Err(err) if is_not_found_error(&err) => Ok(None),
+                            Err(err) => Err(err),
+                        }
+                    })
+                    .buffer_unordered(DEFAULT_OBSERVE_CONCURRENCY);
+
+                while let Some(result) = hits.next().await {
+                    if let Some(payload) = result? {
+                        // Outer Some = row found in this generation; inner is
+                        // payload-or-null. Return the inner value directly.
+                        return Ok(payload);
+                    }
+                }
+
+                if !self.base.is_version_pinned() {
+                    let checked_version = latest.manifest.version;
+                    latest.checkout_latest().await?;
+                    if latest.manifest.version != checked_version {
+                        // Any generation already drained during the completed WAL
+                        // scan was committed before this checkout. A final base check
+                        // therefore covers it without an exclusive resident refresh or
+                        // waiting for merging to stop. Concurrent newer appends need
+                        // not be part of this read's captured view.
+                        return Self::get_blob_from_dataset(&latest, id)
+                            .await
+                            .map(Option::flatten);
+                    }
+                }
+                Ok(None)
+            })
+            .await
+    }
+
+    /// Locate `id` without projecting payload bytes, then take only the
+    /// matching row's payload. The outer option distinguishes a missing row
+    /// from a present row whose payload is null, which matters when a newer WAL
+    /// row shadows a base-table row.
+    async fn get_blob_from_dataset(
+        dataset: &Dataset,
+        id: &str,
+    ) -> LanceResult<Option<Option<Vec<u8>>>> {
+        let escaped_id = id.replace('\'', "''");
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])?
+            .filter(&format!("id = '{}'", escaped_id))?
+            .with_row_id()
+            .limit(Some(1), None)?;
+
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let id_array = column_as::<StringArray>(&batch, "id")?;
+            let row_id_array = column_as::<UInt64Array>(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                if id_array.value(row) != id {
+                    continue;
+                }
+
+                let projection = dataset.schema().project(&["binary_payload"])?;
+                let payload_batch = dataset
+                    .take_rows(&[row_id_array.value(row)], projection)
+                    .await?;
+                let binary_array =
+                    column_as_optional::<LargeBinaryArray>(&payload_batch, "binary_payload");
+                return Ok(Some(match binary_array {
+                    Some(arr) if !arr.is_null(0) => Some(arr.value(0).to_vec()),
+                    _ => None,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn flushed_generation_uri(&self, shard_id: Uuid, path: &str) -> String {
+        self.base.flushed_generation_uri(shard_id, path)
+    }
+
+    async fn open_flushed_dataset(&self, uri: &str) -> LanceResult<Dataset> {
+        self.base.open_flushed_dataset(uri).await
+    }
+
+    /// Top-level column names excluding `binary_payload`, so list-style scans
+    /// never materialize artifact bytes.
+    fn non_blob_columns(&self) -> Vec<String> {
+        Self::non_blob_columns_for(&self.base.dataset)
+    }
+
+    fn non_blob_columns_for(dataset: &Dataset) -> Vec<String> {
+        dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .filter(|name| name != "binary_payload")
+            .collect()
+    }
+
+    /// Read the latest manifest for every MemWAL shard.
+    async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
+        self.base.wal_shard_snapshots().await
+    }
+
+    fn records_to_batch(&self, records: &[RolloutRecord]) -> LanceResult<RecordBatch> {
+        let field_paths = self.base.dataset.schema().field_paths();
+        let has = |name: &str| field_paths.iter().any(|path| path == name);
+        let include_relationships = has(RELATIONSHIPS_COLUMN);
+        let include_metadata = has("metadata");
+
+        if !include_relationships && records.iter().any(|r| !r.relationships.is_empty()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "relationships require a rollout dataset created with relationships support"
+                    .to_string(),
+            )
+            .into());
+        }
+        if !include_metadata && records.iter().any(|r| r.metadata.is_some()) {
+            return Err(ArrowError::InvalidArgumentError(
+                "metadata requires a rollout dataset created with metadata support".to_string(),
+            )
+            .into());
+        }
+
+        let mut id_builder = StringBuilder::new();
+        let mut rollout_id_builder = StringBuilder::new();
+        let mut problem_id_builder = StringBuilder::new();
+        let mut dataset_builder = StringBuilder::new();
+        let mut sequence_order_builder = Int32Builder::new();
+        let mut role_builder = StringDictionaryBuilder::<Int8Type>::new();
+        let mut created_at_builder = TimestampMicrosecondBuilder::with_capacity(records.len());
+        let mut content_builder = LargeStringBuilder::new();
+        let mut content_type_builder = StringBuilder::new();
+        let mut model_input_string_builder = LargeStringBuilder::new();
+        let mut model_output_string_builder = LargeStringBuilder::new();
+        let mut rationale_builder = LargeStringBuilder::new();
+        let mut problem_text_builder = LargeStringBuilder::new();
+        let mut user_metadata_builder = LargeStringBuilder::new();
+        let mut input_tokens_builder = ListBuilder::new(Int32Builder::new());
+        let mut output_tokens_builder = ListBuilder::new(Int32Builder::new());
+        let mut num_input_tokens_builder = Int32Builder::new();
+        let mut num_output_tokens_builder = Int32Builder::new();
+        let mut output_logprobs_builder = ListBuilder::new(Float32Builder::new());
+        let mut input_logprobs_builder = ListBuilder::new(Float32Builder::new());
+        let mut ref_logprobs_builder = ListBuilder::new(Float32Builder::new());
+        let mut loss_mask_builder = ListBuilder::new(Int8Builder::new());
+        let mut advantage_builder = Float32Builder::new();
+        let mut reward_builder = Float32Builder::new();
+        let mut raw_reward_builder = Float32Builder::new();
+        let mut grader_id_builder = StringBuilder::new();
+        let mut score_builder = Float32Builder::new();
+        let mut include_in_training_builder = BooleanBuilder::new();
+        let mut exclude_reason_builder = StringBuilder::new();
+        let mut policy_version_builder = StringBuilder::new();
+        let mut relationships_builder = ListBuilder::new(relationship_struct_builder())
+            .with_field(relationship_list_item_field());
+        let mut binary_payload_builder = LargeBinaryBuilder::new();
+        let mut payload_size_builder = Int64Builder::new();
+        let mut payload_checksum_builder = StringBuilder::new();
+        let mut artifact_type_builder = StringBuilder::new();
+        let mut metadata_builder = LargeStringBuilder::new();
+
+        for record in records {
+            id_builder.append_value(&record.id);
+            rollout_id_builder.append_value(&record.rollout_id);
+            problem_id_builder.append_value(&record.problem_id);
+            dataset_builder.append_option(record.dataset.as_deref());
+            sequence_order_builder.append_value(record.sequence_order);
+            role_builder.append(&record.role)?;
+            created_at_builder.append_value(record.created_at.timestamp_micros());
+            content_builder.append_option(record.content.as_deref());
+            content_type_builder.append_value(&record.content_type);
+            model_input_string_builder.append_option(record.model_input_string.as_deref());
+            model_output_string_builder.append_option(record.model_output_string.as_deref());
+            rationale_builder.append_option(record.rationale.as_deref());
+            problem_text_builder.append_option(record.problem_text.as_deref());
+            user_metadata_builder.append_option(record.user_metadata.as_deref());
+            append_i32_list(&mut input_tokens_builder, record.input_tokens.as_deref());
+            append_i32_list(&mut output_tokens_builder, record.output_tokens.as_deref());
+            num_input_tokens_builder.append_option(record.num_input_tokens);
+            num_output_tokens_builder.append_option(record.num_output_tokens);
+            append_f32_list(
+                &mut output_logprobs_builder,
+                record.output_logprobs.as_deref(),
+            );
+            append_f32_list(
+                &mut input_logprobs_builder,
+                record.input_logprobs.as_deref(),
+            );
+            append_f32_list(&mut ref_logprobs_builder, record.ref_logprobs.as_deref());
+            append_i8_list(&mut loss_mask_builder, record.loss_mask.as_deref());
+            advantage_builder.append_option(record.advantage);
+            reward_builder.append_option(record.reward);
+            raw_reward_builder.append_option(record.raw_reward);
+            grader_id_builder.append_option(record.grader_id.as_deref());
+            score_builder.append_option(record.score);
+            include_in_training_builder.append_option(record.include_in_training);
+            exclude_reason_builder.append_option(record.exclude_reason.as_deref());
+            policy_version_builder.append_option(record.policy_version.as_deref());
+
+            for relationship in &record.relationships {
+                let values_builder = relationships_builder.values();
+                values_builder
+                    .field_builder::<StringBuilder>(0)
+                    .unwrap()
+                    .append_value(&relationship.target_id);
+                values_builder
+                    .field_builder::<StringBuilder>(1)
+                    .unwrap()
+                    .append_value(&relationship.relation);
+                values_builder
+                    .field_builder::<Float32Builder>(2)
+                    .unwrap()
+                    .append_option(relationship.weight);
+                values_builder.append(true);
+            }
+            relationships_builder.append(true);
+
+            match &record.binary_payload {
+                Some(bytes) => binary_payload_builder.append_value(bytes),
+                None => binary_payload_builder.append_null(),
+            }
+            payload_size_builder.append_option(record.payload_size);
+            payload_checksum_builder.append_option(record.payload_checksum.as_deref());
+            artifact_type_builder.append_option(record.artifact_type.as_deref());
+            match &record.metadata {
+                Some(metadata) => metadata_builder.append_value(metadata.to_string()),
+                None => metadata_builder.append_null(),
+            }
+        }
+
+        let mut arrays_by_name: HashMap<String, ArrayRef> = HashMap::new();
+        arrays_by_name.insert("id".to_string(), Arc::new(id_builder.finish()));
+        arrays_by_name.insert(
+            "rollout_id".to_string(),
+            Arc::new(rollout_id_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "problem_id".to_string(),
+            Arc::new(problem_id_builder.finish()),
+        );
+        arrays_by_name.insert("dataset".to_string(), Arc::new(dataset_builder.finish()));
+        arrays_by_name.insert(
+            "sequence_order".to_string(),
+            Arc::new(sequence_order_builder.finish()),
+        );
+        arrays_by_name.insert("role".to_string(), Arc::new(role_builder.finish()));
+        arrays_by_name.insert(
+            "created_at".to_string(),
+            Arc::new(created_at_builder.finish()),
+        );
+        arrays_by_name.insert("content".to_string(), Arc::new(content_builder.finish()));
+        arrays_by_name.insert(
+            "content_type".to_string(),
+            Arc::new(content_type_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "model_input_string".to_string(),
+            Arc::new(model_input_string_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "model_output_string".to_string(),
+            Arc::new(model_output_string_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "rationale".to_string(),
+            Arc::new(rationale_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "problem_text".to_string(),
+            Arc::new(problem_text_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "user_metadata".to_string(),
+            Arc::new(user_metadata_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "input_tokens".to_string(),
+            Arc::new(input_tokens_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "output_tokens".to_string(),
+            Arc::new(output_tokens_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "num_input_tokens".to_string(),
+            Arc::new(num_input_tokens_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "num_output_tokens".to_string(),
+            Arc::new(num_output_tokens_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "output_logprobs".to_string(),
+            Arc::new(output_logprobs_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "input_logprobs".to_string(),
+            Arc::new(input_logprobs_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "ref_logprobs".to_string(),
+            Arc::new(ref_logprobs_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "loss_mask".to_string(),
+            Arc::new(loss_mask_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "advantage".to_string(),
+            Arc::new(advantage_builder.finish()),
+        );
+        arrays_by_name.insert("reward".to_string(), Arc::new(reward_builder.finish()));
+        arrays_by_name.insert(
+            "raw_reward".to_string(),
+            Arc::new(raw_reward_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "grader_id".to_string(),
+            Arc::new(grader_id_builder.finish()),
+        );
+        arrays_by_name.insert("score".to_string(), Arc::new(score_builder.finish()));
+        arrays_by_name.insert(
+            "include_in_training".to_string(),
+            Arc::new(include_in_training_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "exclude_reason".to_string(),
+            Arc::new(exclude_reason_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "policy_version".to_string(),
+            Arc::new(policy_version_builder.finish()),
+        );
+        if include_relationships {
+            arrays_by_name.insert(
+                RELATIONSHIPS_COLUMN.to_string(),
+                Arc::new(relationships_builder.finish()),
+            );
+        }
+        arrays_by_name.insert(
+            "binary_payload".to_string(),
+            Arc::new(binary_payload_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "payload_size".to_string(),
+            Arc::new(payload_size_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "payload_checksum".to_string(),
+            Arc::new(payload_checksum_builder.finish()),
+        );
+        arrays_by_name.insert(
+            "artifact_type".to_string(),
+            Arc::new(artifact_type_builder.finish()),
+        );
+        if include_metadata {
+            arrays_by_name.insert("metadata".to_string(), Arc::new(metadata_builder.finish()));
+        }
+
+        let schema: Arc<Schema> = Arc::new(self.base.dataset.schema().into());
+        let arrays = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                arrays_by_name.remove(field.name().as_str()).ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "unsupported rollout dataset column '{}'",
+                        field.name()
+                    )))
+                })
+            })
+            .collect::<LanceResult<Vec<_>>>()?;
+
+        Ok(RecordBatch::try_new(schema, arrays)?)
+    }
+}
+
+/// Arrow schema for a rollout dataset (spec §5). `binary_payload` is a plain
+/// inline `LargeBinary` column: rollout reads go through the MemWAL LSM scanner,
+/// which has no blob-materialization step, so a blob-v2 offloaded column would
+/// read back as `None`. List-style scans project the column out instead (see
+/// [`RolloutStore::list`]).
+#[must_use]
+pub fn rollout_schema() -> Schema {
+    let mut id_metadata = HashMap::new();
+    id_metadata.insert(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    );
+
+    let binary_field = Field::new("binary_payload", DataType::LargeBinary, true);
+
+    let fields = vec![
+        // Identity & grouping.
+        Field::new("id", DataType::Utf8, false).with_metadata(id_metadata),
+        Field::new("rollout_id", DataType::Utf8, false),
+        Field::new("problem_id", DataType::Utf8, false),
+        Field::new("dataset", DataType::Utf8, true),
+        Field::new("sequence_order", DataType::Int32, false),
+        Field::new(
+            "role",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        // Message content.
+        Field::new("content", DataType::LargeUtf8, true),
+        Field::new("content_type", DataType::Utf8, false),
+        // Claim-check offloaded message fields.
+        Field::new("model_input_string", DataType::LargeUtf8, true),
+        Field::new("model_output_string", DataType::LargeUtf8, true),
+        Field::new("rationale", DataType::LargeUtf8, true),
+        Field::new("problem_text", DataType::LargeUtf8, true),
+        Field::new("user_metadata", DataType::LargeUtf8, true),
+        // Tokens.
+        list_field("input_tokens", DataType::Int32),
+        list_field("output_tokens", DataType::Int32),
+        Field::new("num_input_tokens", DataType::Int32, true),
+        Field::new("num_output_tokens", DataType::Int32, true),
+        // Training signals.
+        list_field("output_logprobs", DataType::Float32),
+        list_field("input_logprobs", DataType::Float32),
+        list_field("ref_logprobs", DataType::Float32),
+        list_field("loss_mask", DataType::Int8),
+        Field::new("advantage", DataType::Float32, true),
+        // Reward.
+        Field::new("reward", DataType::Float32, true),
+        Field::new("raw_reward", DataType::Float32, true),
+        Field::new("grader_id", DataType::Utf8, true),
+        Field::new("score", DataType::Float32, true),
+        // Training control & provenance.
+        Field::new("include_in_training", DataType::Boolean, true),
+        Field::new("exclude_reason", DataType::Utf8, true),
+        Field::new("policy_version", DataType::Utf8, true),
+        // Graph, artifacts, escape hatch.
+        relationship_field(),
+        binary_field,
+        Field::new("payload_size", DataType::Int64, true),
+        Field::new("payload_checksum", DataType::Utf8, true),
+        Field::new("artifact_type", DataType::Utf8, true),
+        Field::new("metadata", DataType::LargeUtf8, true),
+    ];
+
+    Schema::new(fields)
+}
+
+/// A nullable `List<item>` field carrying a nullable primitive child.
+fn list_field(name: &str, item_type: DataType) -> Field {
+    Field::new(
+        name,
+        DataType::List(Arc::new(Field::new("item", item_type, true))),
+        true,
+    )
+}
+
+fn append_i32_list(builder: &mut ListBuilder<Int32Builder>, values: Option<&[i32]>) {
+    match values {
+        Some(values) => {
+            let child = builder.values();
+            for value in values {
+                child.append_value(*value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
+fn append_f32_list(builder: &mut ListBuilder<Float32Builder>, values: Option<&[f32]>) {
+    match values {
+        Some(values) => {
+            let child = builder.values();
+            for value in values {
+                child.append_value(*value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
+fn append_i8_list(builder: &mut ListBuilder<Int8Builder>, values: Option<&[i8]>) {
+    match values {
+        Some(values) => {
+            let child = builder.values();
+            for value in values {
+                child.append_value(*value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
+fn projected_column_refs<'a>(dataset: &Dataset, columns: &'a [String]) -> Vec<&'a str> {
+    let field_paths = dataset.schema().field_paths();
+    columns
+        .iter()
+        .map(String::as_str)
+        .filter(|column| field_paths.iter().any(|path| path == column))
+        .collect()
+}
+
+fn projected_dataset_schema(
+    dataset: &Dataset,
+    columns: &[String],
+) -> LanceResult<lance::datatypes::Schema> {
+    let available_columns = projected_column_refs(dataset, columns);
+    dataset.schema().project(&available_columns)
+}
+
+fn projected_arrow_schema(dataset: &Dataset, columns: &[String]) -> LanceResult<Schema> {
+    let projection = projected_dataset_schema(dataset, columns)?;
+    Ok((&projection).into())
+}
+
+fn sql_quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn batch_to_rollout_records(batch: &RecordBatch) -> LanceResult<Vec<RolloutRecord>> {
+    let id_array = column_as::<StringArray>(batch, "id")?;
+    let rollout_id_array = column_as::<StringArray>(batch, "rollout_id")?;
+    let problem_id_array = column_as::<StringArray>(batch, "problem_id")?;
+    let dataset_array = column_as_optional::<StringArray>(batch, "dataset");
+    let sequence_order_array = column_as::<Int32Array>(batch, "sequence_order")?;
+    let role_array = column_as::<DictionaryArray<Int8Type>>(batch, "role")?;
+    let created_at_array = column_as::<TimestampMicrosecondArray>(batch, "created_at")?;
+    let content_array = column_as_optional::<LargeStringArray>(batch, "content");
+    let content_type_array = column_as::<StringArray>(batch, "content_type")?;
+    let model_input_string_array =
+        column_as_optional::<LargeStringArray>(batch, "model_input_string");
+    let model_output_string_array =
+        column_as_optional::<LargeStringArray>(batch, "model_output_string");
+    let rationale_array = column_as_optional::<LargeStringArray>(batch, "rationale");
+    let problem_text_array = column_as_optional::<LargeStringArray>(batch, "problem_text");
+    let user_metadata_array = column_as_optional::<LargeStringArray>(batch, "user_metadata");
+    let input_tokens_array = column_as_optional::<ListArray>(batch, "input_tokens");
+    let output_tokens_array = column_as_optional::<ListArray>(batch, "output_tokens");
+    let num_input_tokens_array = column_as_optional::<Int32Array>(batch, "num_input_tokens");
+    let num_output_tokens_array = column_as_optional::<Int32Array>(batch, "num_output_tokens");
+    let output_logprobs_array = column_as_optional::<ListArray>(batch, "output_logprobs");
+    let input_logprobs_array = column_as_optional::<ListArray>(batch, "input_logprobs");
+    let ref_logprobs_array = column_as_optional::<ListArray>(batch, "ref_logprobs");
+    let loss_mask_array = column_as_optional::<ListArray>(batch, "loss_mask");
+    let advantage_array = column_as_optional::<Float32Array>(batch, "advantage");
+    let reward_array = column_as_optional::<Float32Array>(batch, "reward");
+    let raw_reward_array = column_as_optional::<Float32Array>(batch, "raw_reward");
+    let grader_id_array = column_as_optional::<StringArray>(batch, "grader_id");
+    let score_array = column_as_optional::<Float32Array>(batch, "score");
+    let include_in_training_array =
+        column_as_optional::<BooleanArray>(batch, "include_in_training");
+    let exclude_reason_array = column_as_optional::<StringArray>(batch, "exclude_reason");
+    let policy_version_array = column_as_optional::<StringArray>(batch, "policy_version");
+    let relationships_array = column_as_optional::<ListArray>(batch, RELATIONSHIPS_COLUMN);
+    let binary_payload_array = column_as_optional::<LargeBinaryArray>(batch, "binary_payload");
+    let payload_size_array = column_as_optional::<Int64Array>(batch, "payload_size");
+    let payload_checksum_array = column_as_optional::<StringArray>(batch, "payload_checksum");
+    let artifact_type_array = column_as_optional::<StringArray>(batch, "artifact_type");
+    let metadata_array = column_as_optional::<LargeStringArray>(batch, "metadata");
+
+    let mut results = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let created_at = timestamp_from_micros(created_at_array.value(row), "created_at")?;
+
+        let role = {
+            let values = role_array
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "role dictionary values are not strings".to_string(),
+                    ))
+                })?;
+            if role_array.is_null(row) {
+                return Err(LanceError::from(ArrowError::InvalidArgumentError(
+                    "role column contains null values".to_string(),
+                )));
+            }
+            values
+                .value(role_array.keys().value(row) as usize)
+                .to_string()
+        };
+
+        let metadata = match metadata_array {
+            Some(arr) if !arr.is_null(row) => {
+                Some(serde_json::from_str(arr.value(row)).map_err(|err| {
+                    LanceError::from(ArrowError::InvalidArgumentError(format!(
+                        "invalid metadata JSON for rollout row {}: {}",
+                        id_array.value(row),
+                        err
+                    )))
+                })?)
+            }
+            _ => None,
+        };
+        let relationships = match relationships_array {
+            Some(arr) if !arr.is_null(row) => relationships_from_list(arr, row)?,
+            _ => Vec::new(),
+        };
+
+        results.push(RolloutRecord {
+            id: id_array.value(row).to_string(),
+            rollout_id: rollout_id_array.value(row).to_string(),
+            problem_id: problem_id_array.value(row).to_string(),
+            dataset: optional_string(dataset_array, row),
+            sequence_order: sequence_order_array.value(row),
+            role,
+            created_at,
+            content: optional_large_string(content_array, row),
+            content_type: content_type_array.value(row).to_string(),
+            model_input_string: optional_large_string(model_input_string_array, row),
+            model_output_string: optional_large_string(model_output_string_array, row),
+            rationale: optional_large_string(rationale_array, row),
+            problem_text: optional_large_string(problem_text_array, row),
+            user_metadata: optional_large_string(user_metadata_array, row),
+            input_tokens: optional_i32_list(input_tokens_array, row)?,
+            output_tokens: optional_i32_list(output_tokens_array, row)?,
+            num_input_tokens: optional_i32(num_input_tokens_array, row),
+            num_output_tokens: optional_i32(num_output_tokens_array, row),
+            output_logprobs: optional_f32_list(output_logprobs_array, row)?,
+            input_logprobs: optional_f32_list(input_logprobs_array, row)?,
+            ref_logprobs: optional_f32_list(ref_logprobs_array, row)?,
+            loss_mask: optional_i8_list(loss_mask_array, row)?,
+            advantage: optional_f32(advantage_array, row),
+            reward: optional_f32(reward_array, row),
+            raw_reward: optional_f32(raw_reward_array, row),
+            grader_id: optional_string(grader_id_array, row),
+            score: optional_f32(score_array, row),
+            include_in_training: include_in_training_array.and_then(|arr| {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(arr.value(row))
+                }
+            }),
+            exclude_reason: optional_string(exclude_reason_array, row),
+            policy_version: optional_string(policy_version_array, row),
+            relationships,
+            binary_payload: match binary_payload_array {
+                Some(arr) if !arr.is_null(row) => Some(arr.value(row).to_vec()),
+                _ => None,
+            },
+            payload_size: payload_size_array.and_then(|arr| {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    Some(arr.value(row))
+                }
+            }),
+            payload_checksum: optional_string(payload_checksum_array, row),
+            artifact_type: optional_string(artifact_type_array, row),
+            metadata,
+        });
+    }
+
+    Ok(results)
+}
+
+fn optional_string(array: Option<&StringArray>, row: usize) -> Option<String> {
+    array.and_then(|arr| {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row).to_string())
+        }
+    })
+}
+
+fn optional_large_string(array: Option<&LargeStringArray>, row: usize) -> Option<String> {
+    array.and_then(|arr| {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row).to_string())
+        }
+    })
+}
+
+fn optional_i32(array: Option<&Int32Array>, row: usize) -> Option<i32> {
+    array.and_then(|arr| {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        }
+    })
+}
+
+fn optional_f32(array: Option<&Float32Array>, row: usize) -> Option<f32> {
+    array.and_then(|arr| {
+        if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        }
+    })
+}
+
+fn optional_i32_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option<Vec<i32>>> {
+    match array {
+        Some(arr) if !arr.is_null(row) => {
+            let values = arr.value(row);
+            let typed = values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "token list column does not contain int32 values".to_string(),
+                    ))
+                })?;
+            Ok(Some((0..typed.len()).map(|i| typed.value(i)).collect()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn optional_f32_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option<Vec<f32>>> {
+    match array {
+        Some(arr) if !arr.is_null(row) => {
+            let values = arr.value(row);
+            let typed = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    LanceError::from(ArrowError::InvalidArgumentError(
+                        "logprob list column does not contain float32 values".to_string(),
+                    ))
+                })?;
+            Ok(Some((0..typed.len()).map(|i| typed.value(i)).collect()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn optional_i8_list(array: Option<&ListArray>, row: usize) -> LanceResult<Option<Vec<i8>>> {
+    match array {
+        Some(arr) if !arr.is_null(row) => {
+            let values = arr.value(row);
+            let typed = values.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                LanceError::from(ArrowError::InvalidArgumentError(
+                    "loss_mask list column does not contain int8 values".to_string(),
+                ))
+            })?;
+            Ok(Some((0..typed.len()).map(|i| typed.value(i)).collect()))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn wal_lifetime_registration_failure_is_not_an_absent_blob() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[artifact_record("protected", b"protected-payload")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        std::fs::write(dir.path().join("_wal_readers_v1"), b"unavailable").unwrap();
+        assert!(reader.get_blob("protected").await.is_err());
+        assert!(reader.query_sql("SELECT id FROM records").await.is_err());
+        assert!(matches!(
+            reader.query_sql("DELETE FROM records").await,
+            Err(LanceError::InvalidInput { .. })
+        ));
+        assert_eq!(reader.pending_wal_generations().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wal_lifetime_covers_sql_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer
+                .add(&[artifact_record("protected", b"protected-payload")])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let result = reader.query_sql("SELECT id FROM records").await?;
+                    Ok(result.rows == vec![vec![serde_json::json!("protected")]])
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_survives_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_snapshot_after_drain_sql_and_blob_reads() {
+        for blob in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer
+                .add(&[artifact_record("protected", b"protected-payload")])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let read = async {
+                if blob {
+                    Ok(reader.get_blob("protected").await?.as_deref()
+                        == Some(b"protected-payload".as_slice()))
+                } else {
+                    let result = reader.query_sql("SELECT id FROM records").await?;
+                    Ok(result.rows == vec![vec![serde_json::json!("protected")]])
+                }
+            };
+            assert!(
+                crate::wal_read_lifetime::assert_read_after_merge(
+                    &reader.base,
+                    &mut writer.base,
+                    read,
+                )
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_reopen_lifecycle_discovers_retirement_with_zero_pending() {
+        use object_store::ObjectStoreExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut original = RolloutStore::open(uri).await.unwrap();
+        let store = original.base.dataset.object_store(None).await.unwrap();
+        let root = original.base.dataset.branch_location().path.clone();
+        let shard = uuid::Uuid::new_v4();
+        let manifests =
+            lance::dataset::mem_wal::ShardManifestStore::new(store.clone(), &root, shard, 16);
+        manifests
+            .initialize_shard(0, Default::default())
+            .await
+            .unwrap();
+        manifests
+            .commit_update(0, |current| {
+                let mut next = current.clone();
+                next.version += 1;
+                next.current_generation = 2;
+                next
+            })
+            .await
+            .unwrap();
+        let keys = crate::wal_retirement::record(
+            store.clone(),
+            &root,
+            shard,
+            vec![crate::rollout_append::Generation {
+                number: 1,
+                path: "abcdef12_gen_1".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let payload = root
+            .clone()
+            .join("_mem_wal")
+            .join(shard.to_string())
+            .join("abcdef12_gen_1")
+            .join("data")
+            .join("payload");
+        store.put(&payload, b"retired").await.unwrap();
+        original.close().await.unwrap();
+        drop(original);
+        let mut reopened = RolloutStore::open_existing_with_options(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+        assert!(store.inner.head(&keys[0]).await.is_ok());
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.discover_retired_wal().await.unwrap();
+        assert!(store.inner.head(&payload).await.is_ok());
+        reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+        reopened.discover_retired_wal().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match store.inner.head(&keys[0]).await {
+                    Err(object_store::Error::NotFound { .. }) => break,
+                    Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    Err(error) => panic!("retirement observation failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.inner.head(&payload).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        reopened.close().await.unwrap();
+    }
+    use super::*;
+
+    // Current mergers retain retired WAL until reader-safe collection. During a
+    // rolling upgrade, an old peer can still delete it immediately after its
+    // successful merge. Keep testing that compatibility race with real missing
+    // files, independently of the new collector's retention policy.
+    fn simulate_legacy_peer_gc(reader: &RolloutStore, snapshots: &[ShardSnapshot]) {
+        assert!(snapshots
+            .iter()
+            .any(|snapshot| !snapshot.sstables.is_empty()));
+        for snapshot in snapshots {
+            for generation in &snapshot.sstables {
+                let path = reader.flushed_generation_uri(snapshot.shard_id, &generation.path);
+                std::fs::remove_dir_all(&path).unwrap();
+                assert!(!std::path::Path::new(&path).exists());
+            }
+        }
+    }
+
+    use std::collections::HashSet;
+
+    use arrow_array::RecordBatchIterator;
+    use lance::dataset::NewColumnTransform;
+    use lance::index::DatasetIndexExt;
+
+    use crate::record::Relationship;
+    use crate::rollout::{ROLE_ARTIFACT, ROLE_ASSISTANT};
+    use crate::store_base::{
+        DEFAULT_MANIFEST_SCAN_BATCH_SIZE, ID_INDEX_NAME as ROLLOUT_ID_INDEX_NAME,
+    };
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn productive_merges_do_not_require_a_quiet_window_for_complete_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("base-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+
+        let result = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    writer
+                        .add(&[assistant_record(&format!("concurrent-row-{epoch}"))])
+                        .await?;
+                    writer.flush().await?;
+                    // A real commit and WAL drain invalidate every lower-bound
+                    // capture. A read must recover while productive merges
+                    // continue, rather than depending on the writer stopping.
+                    writer.cleanup_own_shard().await?;
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await;
+        writer.lock().await.close().await.unwrap();
+        let rows = result.expect("productive merges must permit a complete read");
+        let ids: HashSet<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert!(ids.contains("base-row"));
+        assert!(ids.contains("wal-row"));
+        assert_eq!(ids.len(), rows.len(), "merged WAL must not duplicate rows");
+        assert!(captures.load(Ordering::SeqCst) > 0);
+        assert!(decodes.load(Ordering::SeqCst) > 0);
+    }
+
+    #[tokio::test]
+    async fn rebased_read_keeps_new_values_blobs_and_unmerged_shards() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("merging".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[artifact_record("updated", &[1; 1024])])
+            .await
+            .unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let mut middle = artifact_record("updated", &[2; 1024]);
+        middle.content_type = "application/middle".into();
+        writer.add(&[middle]).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut tail = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("unmerged".into()),
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tail.add(&[artifact_record("wal-only", &[9; 1024])])
+            .await
+            .unwrap();
+        tail.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let (rows, updated_blob, wal_blob) = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    let mut newest = artifact_record("updated", &[3; 1024]);
+                    newest.content_type = "application/newest".into();
+                    writer.add(&[newest]).await?;
+                    writer.flush().await?;
+                    writer.cleanup_own_shard().await?;
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    let reader = &reader;
+                    async move {
+                        // The captured older WAL must not shadow the newly committed
+                        // value. The other shard remains WAL-only and must survive.
+                        assert!(snapshots
+                            .iter()
+                            .any(|s| s.shard_id == derive_shard_id(Some("unmerged"))
+                                && !s.sstables.is_empty()));
+                        let rows = reader
+                            .list_non_blob_snapshot(dataset.clone(), snapshots)
+                            .await?;
+                        let updated = reader.get_blob_from_snapshot(&dataset, "updated").await?;
+                        let tail = reader.get_blob_from_snapshot(&dataset, "wal-only").await?;
+                        Ok((rows, updated, tail))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.id == "updated")
+                .unwrap()
+                .content_type
+                .as_str(),
+            "application/newest"
+        );
+        assert!(rows.iter().any(|r| r.id == "wal-only"));
+        assert_eq!(updated_blob, Some(vec![3; 1024]));
+        assert_eq!(wal_blob, Some(vec![9; 1024]));
+        writer.lock().await.close().await.unwrap();
+        tail.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebased_read_accepts_compaction_between_capture_and_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        for id in ["base-a", "base-b", "base-c"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let mut writer = writer.lock().await;
+                        let compacted = writer
+                            .compact(Some(CompactionConfig {
+                                min_fragments: 2,
+                                num_threads: Some(1),
+                                ..Default::default()
+                            }))
+                            .await?;
+                        assert!(compacted.fragments_removed >= 3);
+                        assert_eq!(writer.cleanup_own_shard().await?, 1);
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| reader.list_non_blob_snapshot(dataset, snapshots),
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["base-a", "base-b", "base-c", "wal-row"])
+        );
+        assert_eq!(rows.len(), 4);
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_merge_history_requires_a_fresh_capture() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("before-capture")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let mut writer = writer.lock().await;
+                        writer.cleanup_own_shard().await?;
+                        let middle = writer.base.dataset.manifest_location().path.clone();
+                        writer.add(&[assistant_record("during-capture")]).await?;
+                        writer.cleanup_own_shard().await?;
+                        // Keep the current base intact but remove a historical
+                        // manifest, as version cleanup can do during a long read.
+                        writer
+                            .base
+                            .dataset
+                            .object_store(None)
+                            .await?
+                            .delete(&middle)
+                            .await?;
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            2,
+            "missing history must never be certified from watermarks alone"
+        );
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["before-capture", "during-capture"])
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_only_publications_do_not_starve_wal_snapshot_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for index_kind in [
+            None,
+            Some(crate::KeyIndexType::Btree),
+            Some(crate::KeyIndexType::Zonemap),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    key_index_type: index_kind.unwrap_or_default(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.add(&[assistant_record("base-row")]).await.unwrap();
+            writer.flush().await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+            writer.add(&[assistant_record("wal-row")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let writer = tokio::sync::Mutex::new(writer);
+            let captures = AtomicUsize::new(0);
+            let decodes = AtomicUsize::new(0);
+            let rows = reader
+                .base
+                .read_consistent_with_snapshots(
+                    ListSource::All,
+                    || async {
+                        let snapshots = reader.base.wal_shard_snapshots().await?;
+                        let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                        let mut writer = writer.lock().await;
+                        if index_kind.is_some() {
+                            writer.base.create_configured_key_index().await?;
+                        } else {
+                            writer
+                                .base
+                                .dataset
+                                .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                                .await?;
+                        }
+                        Ok(snapshots)
+                    },
+                    |dataset, snapshots| {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        reader.list_non_blob_snapshot(dataset, snapshots)
+                    },
+                )
+                .await
+                .expect("metadata/index publication must not invalidate unchanged base data");
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+            assert_eq!(decodes.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["base-row", "wal-row"])
+            );
+            writer.lock().await.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_read_retries_a_concurrent_base_deletion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("deleted"), assistant_record("kept")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        writer.add(&[assistant_record("wal-row")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer
+                            .lock()
+                            .await
+                            .base
+                            .dataset
+                            .delete("id = 'deleted'")
+                            .await?;
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(captures.load(Ordering::SeqCst), 2);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["kept", "wal-row"])
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_publication_does_not_reset_missing_payload_retry_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = tokio::sync::Mutex::new(RolloutStore::open(uri).await.unwrap());
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let decodes = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |_, _| async {
+                let epoch = decodes.fetch_add(1, Ordering::SeqCst);
+                writer
+                    .lock()
+                    .await
+                    .base
+                    .dataset
+                    .update_metadata([("capture-epoch".to_owned(), epoch.to_string())])
+                    .await?;
+                Err::<(), _>(LanceError::io(
+                    "Not found: _mem_wal/missing/data/file.lance",
+                ))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            3,
+            "metadata churn is not data progress"
+        );
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_payload_read_retries_a_generation_reclaimed_by_peer_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("survives-slow-read")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A valid capture can lose a generation while the initial
+                        // payload read is slow. Commit the merge and simulate an
+                        // old peer deleting files, rather than a synthetic error.
+                        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        assert_eq!(writer.lock().await.cleanup_own_shard().await.unwrap(), 1);
+                        simulate_legacy_peer_gc(reader, &snapshots);
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .expect("a slow first payload attempt must still recover reclaimed WAL");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "survives-slow-read");
+    }
+
+    #[tokio::test]
+    async fn slow_payload_recovery_stays_bounded_while_versions_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("row-0")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(if attempt == 0 {
+                        2100
+                    } else {
+                        1100
+                    }))
+                    .await;
+                    let mut writer = writer.lock().await;
+                    assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                    simulate_legacy_peer_gc(reader, &snapshots);
+                    // Every retry sees a different real base version and WAL file.
+                    // That must not reset the payload recovery window indefinitely.
+                    writer
+                        .add(&[assistant_record(&format!("row-{}", attempt + 1))])
+                        .await
+                        .unwrap();
+                    writer.flush().await.unwrap();
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await;
+        assert!(result.is_err());
+        let count = attempts.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&count), "payload attempts={count}");
+        writer.lock().await.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_metadata_capture_still_gets_a_fresh_snapshot_after_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open(uri).await.unwrap();
+        writer
+            .add(&[assistant_record("survives-merge")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let captures = AtomicUsize::new(0);
+        let decodes = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || async {
+                    let snapshots = reader.base.wal_shard_snapshots().await?;
+                    if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Azure metadata IO can consume the entire retry budget
+                        // before any payload is decoded. An actual peer merge
+                        // must be reconciled from atomic coverage.
+                        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                    }
+                    Ok(snapshots)
+                },
+                |dataset, snapshots| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    reader.list_non_blob_snapshot(dataset, snapshots)
+                },
+            )
+            .await
+            .expect("slow metadata capture must rebase onto the committed rows");
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "survives-merge");
+    }
+
+    #[tokio::test]
+    async fn changing_data_captures_remain_bounded_without_payload_decoding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Exercise both the attempt cap and expiry of the metadata retry
+        // window. Unwatermarked external writes cannot certify WAL coverage.
+        for slow in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let writer = tokio::sync::Mutex::new(RolloutStore::open(uri).await.unwrap());
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let captures = AtomicUsize::new(0);
+            let decodes = AtomicUsize::new(0);
+            let result = reader
+                .base
+                .read_consistent_with_snapshots(
+                    ListSource::All,
+                    || async {
+                        let snapshots = reader.base.wal_shard_snapshots().await?;
+                        let epoch = captures.fetch_add(1, Ordering::SeqCst);
+                        if slow {
+                            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        }
+                        let mut writer = writer.lock().await;
+                        let batch = writer.records_to_batch(&[assistant_record(&format!(
+                            "external-row-{epoch}"
+                        ))])?;
+                        let input =
+                            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+                        writer.base.dataset.append(input, None).await?;
+                        Ok(snapshots)
+                    },
+                    |_, _| {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        async { Ok(()) }
+                    },
+                )
+                .await;
+            assert!(result.unwrap_err().to_string().contains("dataset changed"));
+            assert_eq!(decodes.load(Ordering::SeqCst), 0);
+            let observed = captures.load(Ordering::SeqCst);
+            assert!((2..=16).contains(&observed), "captures={observed}");
+            if slow {
+                assert_eq!(observed, 2, "a new version must not reset the retry window");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_retries_wrapped_missing_generation_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        // Same nested error surface observed in Azure while
+                        // GC removed a generation's data file during a take.
+                        Err(LanceError::io(
+                            "Wrapped error: Not found: _mem_wal/shard/gen_9/data/file.lance",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn point_snapshot_recovers_peer_gc_without_changing_wal_only_semantics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for source in [ListSource::All, ListSource::Wal] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let writer = RolloutStore::open(uri).await.unwrap();
+            writer.add(&[assistant_record("point")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            let writer = tokio::sync::Mutex::new(writer);
+            let attempts = AtomicUsize::new(0);
+            let record = reader
+                .base
+                .read_consistent(source, |dataset, snapshots| {
+                    let reader = &reader;
+                    let writer = &writer;
+                    let attempts = &attempts;
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            writer.lock().await.cleanup_own_shard().await.unwrap();
+                            simulate_legacy_peer_gc(reader, &snapshots);
+                        }
+                        reader
+                            .scan_one_by_id_snapshot("point", source, dataset, snapshots)
+                            .await
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            if source == ListSource::All {
+                assert_eq!(record.unwrap().id, "point");
+            } else {
+                assert!(
+                    record.is_none(),
+                    "WAL-only must not return the merged base row"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_list_snapshot_survives_later_merge_commits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("initial")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    let rows = reader.list_non_blob_snapshot(dataset, snapshots).await?;
+                    // Publish a later write only after this read has collected
+                    // its complete snapshot. It must not invalidate those rows.
+                    let sequence = attempts.fetch_add(1, Ordering::SeqCst);
+                    let mut writer = writer.lock().await;
+                    writer
+                        .add(&[assistant_record(&format!("later-{sequence}"))])
+                        .await
+                        .unwrap();
+                    writer.flush().await.unwrap();
+                    writer.cleanup_own_shard().await.unwrap();
+                    Ok(rows)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "initial");
+    }
+
+    #[tokio::test]
+    async fn list_retries_when_a_generation_is_deleted_during_the_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("merge-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("read-worker".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[assistant_record("merged-during-read")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let writer = &writer;
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                        simulate_legacy_peer_gc(reader, &snapshots);
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "merged-during-read");
+    }
+
+    #[tokio::test]
+    async fn review_list_retries_when_merge_committed_before_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        let record = assistant_record("already-committed");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+        // Pause a merge after its base commit, before manifest drain and GC.
+        let batch = writer.records_to_batch(&[record]).unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        writer.base.dataset.append(batches, None).await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let snapshot = &snapshots[0];
+                        let store = dataset.object_store(None).await.unwrap();
+                        let path = dataset.branch_location().path.clone();
+                        let manifests = ShardManifestStore::new(
+                            store.clone(),
+                            &path,
+                            snapshot.shard_id,
+                            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                        );
+                        let current = manifests.refresh_latest().await.unwrap().unwrap();
+                        manifests
+                            .commit_update(current.writer_epoch, |m| ShardManifest {
+                                version: m.version + 1,
+                                sstables: vec![],
+                                ..m.clone()
+                            })
+                            .await
+                            .unwrap();
+                        for generation in &snapshot.sstables {
+                            store
+                                .remove_dir_all(
+                                    path.clone()
+                                        .join("_mem_wal")
+                                        .join(snapshot.shard_id.to_string().as_str())
+                                        .join(generation.path.as_str()),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "read failed instead of retrying: {result:?}; attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn list_survives_several_progressing_peer_merges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("continuous-merge-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("row-0")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let writer = &writer;
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 4 {
+                        // Each failed snapshot loses a DIFFERENT generation to
+                        // a real successful merge. This is useful progress, not
+                        // a permanently missing file to retry indefinitely.
+                        let mut writer = writer.lock().await;
+                        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                        simulate_legacy_peer_gc(reader, &snapshots);
+                        writer
+                            .add(&[assistant_record(&format!("row-{}", attempt + 1))])
+                            .await
+                            .unwrap();
+                        writer.flush().await.unwrap();
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .expect("healthy merge progress must not exhaust a three-attempt read limit");
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        let ids: HashSet<_> = rows.into_iter().map(|row| row.id).collect();
+        assert_eq!(ids, (0..5).map(|i| format!("row-{i}")).collect());
+    }
+
+    #[tokio::test]
+    async fn consistent_read_retries_wrapped_missing_payload_but_propagates_capture_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let missing =
+            || LanceError::io_source(Box::new(LanceError::not_found("synthetic-generation")));
+        assert!(is_not_found_error(&missing()));
+        let attempts = AtomicUsize::new(0);
+        let rows = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        Err(missing())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        // A metadata-capture error currently exits before the payload retry
+        // loop. The new diagnostics must identify this without changing it.
+        let captures = AtomicUsize::new(0);
+        attempts.store(0, Ordering::SeqCst);
+        let result = store
+            .base
+            .read_consistent_with_snapshots(
+                ListSource::All,
+                || {
+                    captures.fetch_add(1, Ordering::SeqCst);
+                    async { Err(missing()) }
+                },
+                |_, _| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async { Ok::<_, LanceError>(42) }
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(LanceError::IO { .. })));
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consistent_read_bounds_missing_generation_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let missing = |_, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(LanceError::dataset_not_found(
+                    "missing-generation",
+                    "missing".into(),
+                ))
+            }
+        };
+        let err = store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LanceError::DatasetNotFound { .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        store.checkout(store.version()).await.unwrap();
+        assert!(store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "pinned reads must not retry against newer snapshots"
+        );
+
+        store.refresh_latest().await.unwrap();
+        attempts.store(0, Ordering::SeqCst);
+        let result = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(LanceError::invalid_input("bad filter")) }
+            })
+            .await;
+        assert!(matches!(result, Err(LanceError::InvalidInput { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_store_commit_guard_survives_transfer_to_a_child_task() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct Deny;
+        impl CommitAuthorizer for Deny {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(lance::Error::io("old execution fenced")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let version = store.version();
+        let scope = MergeWriteScope::with_pinned_authorizer(Arc::new(Deny));
+        let mut dataset = scope
+            .run(StorageBase::load_with_options(uri, None, None))
+            .await
+            .unwrap();
+        let error =
+            tokio::spawn(async move { dataset.update_metadata([("attempt", "late-child")]).await })
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(error.to_string().contains("old execution fenced"));
+        scope.drain().await;
+        assert_eq!(
+            RolloutStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap()
+                .version(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_store_commit_guard_uses_each_new_execution() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct Deny;
+        impl CommitAuthorizer for Deny {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(lance::Error::io("current execution fenced")) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        RolloutStore::open(uri).await.unwrap();
+        let old = MergeWriteScope::with_authorizer(Arc::new(Deny));
+        let mut dataset = old
+            .run(StorageBase::load_with_options(uri, None, None))
+            .await
+            .unwrap();
+        old.drain().await;
+        // A cached handle must not retain the old, now closed execution.
+        let next = MergeWriteScope::new();
+        next.run(async {
+            dataset
+                .update_metadata([("attempt", "next-execution")])
+                .await
+        })
+        .await
+        .unwrap();
+        next.drain().await;
+        // The same handle must still enforce a later execution's authorization.
+        let denied = MergeWriteScope::with_authorizer(Arc::new(Deny));
+        let error = denied
+            .run(async {
+                dataset
+                    .update_metadata([("attempt", "denied-execution")])
+                    .await
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("current execution fenced"));
+        denied.drain().await;
+    }
+
+    #[test]
+    fn rollout_filters_parse_supported_fields() {
+        let filters = RolloutFilters::from_json_value(json!({
+            "rollout_id": "traj-1",
+            "problem_id": "problem-7",
+            "dataset": "gsm8k",
+            "policy_version": "ckpt-42",
+            "role": "assistant",
+            "content_type": "text/plain",
+            "include_in_training": false,
+            "artifact_type": "screenshot"
+        }))
+        .unwrap();
+
+        assert_eq!(filters.rollout_id.as_deref(), Some("traj-1"));
+        assert_eq!(filters.problem_id.as_deref(), Some("problem-7"));
+        assert_eq!(filters.dataset.as_deref(), Some("gsm8k"));
+        assert_eq!(filters.policy_version.as_deref(), Some("ckpt-42"));
+        assert_eq!(filters.role.as_deref(), Some("assistant"));
+        assert_eq!(filters.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(filters.include_in_training, Some(false));
+        assert_eq!(filters.artifact_type.as_deref(), Some("screenshot"));
+    }
+
+    #[test]
+    fn rollout_filters_reject_unknown_and_wrong_types() {
+        assert!(RolloutFilters::from_json_value(json!({"reward": 1.0})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"dataset": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"content_type": false})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"policy_version": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"include_in_training": "yes"})).is_err());
+        assert!(RolloutFilters::from_json_value(json!([])).is_err());
+    }
+
+    #[test]
+    fn rollout_filter_expression_escapes_strings_and_fields() {
+        let filters = RolloutFilters {
+            policy_version: Some("worker's-ckpt".to_string()),
+            role: Some("assistant".to_string()),
+            include_in_training: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.expression().as_deref(),
+            Some(
+                "role = 'assistant' AND policy_version = 'worker''s-ckpt' AND include_in_training = true"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
+        cancellation_recovery_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_allows_retry_before_late_old_append_returns() {
+        cancellation_recovery_case(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_retirement_barrier_rejects_delayed_unfenced_base_commit() {
+        cancellation_recovery_case(true, true).await;
+    }
+
+    async fn cancellation_recovery_case(fence_old: bool, retired_legacy: bool) {
+        use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
+        use lance_table::format::{IndexMetadata, Manifest, Transaction};
+        use lance_table::io::commit::{
+            CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        #[derive(Debug, Default)]
+        struct Gate {
+            closed: AtomicBool,
+            high: AtomicU64,
+        }
+        impl crate::merge_write_scope::CommitAuthorizer for Gate {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(lance::Error::io("execution fenced"));
+                    }
+                    assert_eq!(resource, "base");
+                    self.high.fetch_max(version, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct PausedCommit {
+            inner: Arc<dyn CommitHandler>,
+            once: AtomicBool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        #[allow(clippy::too_many_arguments)]
+        impl CommitHandler for PausedCommit {
+            async fn commit(
+                &self,
+                manifest: &mut Manifest,
+                indices: Option<Vec<IndexMetadata>>,
+                path: &object_store::path::Path,
+                store: &lance_io::object_store::ObjectStore,
+                writer: ManifestWriter,
+                naming: ManifestNamingScheme,
+                transaction: Option<Transaction>,
+            ) -> std::result::Result<ManifestLocation, CommitError> {
+                let appending = transaction.as_ref().is_some_and(|tx| {
+                    matches!(
+                        tx.as_pb().operation,
+                        Some(
+                            lance_table::format::pb::transaction::Operation::Append(_)
+                                | lance_table::format::pb::transaction::Operation::Update(_)
+                        )
+                    )
+                });
+                if appending && !self.once.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner
+                    .commit(manifest, indices, path, store, writer, naming, transaction)
+                    .await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        let bytes = vec![73u8; 2 * 1024 * 1024];
+        store
+            .add(&[artifact_record("large", &bytes)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GuardedCommit::new(Arc::new(PausedCommit {
+            inner: lance_table::io::commit::commit_handler_from_url(uri, &None)
+                .await
+                .unwrap(),
+            once: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+        })));
+        store.base.dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_commit_handler(handler)
+            .load()
+            .await
+            .unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let gate = Arc::new(Gate::default());
+        // A retired legacy process never recorded commit permits in etcd. Its
+        // application future is gone, but an already issued immutable storage
+        // leaf may still complete. There is no authorizer in this variant.
+        let scope = if retired_legacy {
+            MergeWriteScope::new()
+        } else {
+            MergeWriteScope::with_authorizer(gate.clone())
+        };
+        let worker_scope = scope.clone();
+        let writer = store.clone();
+        let merge = tokio::spawn(async move {
+            worker_scope
+                .run(async { writer.lock().await.cleanup_own_shard().await })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+            .await
+            .unwrap();
+        merge.abort();
+        assert!(merge.await.unwrap_err().is_cancelled());
+        let drain_scope = scope.clone();
+        let drain = tokio::spawn(async move { drain_scope.drain().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        // Writes arriving after cancellation must survive the eventual retry.
+        {
+            let store = store.lock().await;
+            store
+                .add(&[assistant_record("arrived-during-recovery")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        if fence_old {
+            gate.closed.store(true, Ordering::SeqCst);
+            let plan = if retired_legacy {
+                assert_eq!(
+                    gate.high.load(Ordering::SeqCst),
+                    0,
+                    "legacy writer has no commit permits"
+                );
+                crate::legacy_retirement::snapshot_retired_writer(uri, None, "default")
+                    .await
+                    .unwrap()
+            } else {
+                let high = gate.high.load(Ordering::SeqCst);
+                assert!(high > 0);
+                std::collections::BTreeMap::from([("base".to_string(), high)])
+            };
+            crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+                .await
+                .unwrap();
+            // Recovery must progress while the old storage call is still alive.
+            assert!(!drain.is_finished());
+            let mut next = store.lock().await;
+            next.base.refresh_latest().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 0);
+            next.cleanup_own_shard().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&next).await, 0);
+        }
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut store = store.lock().await;
+        if !fence_old {
+            assert!(flushed_generation_count(&store).await > 0);
+        }
+        store.base.refresh_latest().await.unwrap();
+        assert_eq!(
+            store.base.dataset.count_rows(None).await.unwrap(),
+            if fence_old { 2 } else { 1 },
+            "late old append must be rejected after a storage barrier"
+        );
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(store.get_blob("large").await.unwrap().unwrap(), bytes);
+        assert!(store
+            .get_by_id("arrived-during-recovery")
+            .await
+            .unwrap()
+            .is_some());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_manifest_barrier_rejects_a_late_drain_and_preserves_new_wal() {
+        use lance::dataset::mem_wal::ShardManifestStore;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        store.add(&[assistant_record("before")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.add(&[assistant_record("during")]).await.unwrap();
+        store.flush().await.unwrap();
+        let manifests = ShardManifestStore::new(
+            store.base.dataset.object_store(None).await.unwrap(),
+            &store.base.dataset.branch_location().path,
+            store.base.write_shard,
+            16,
+        );
+        let before = manifests.refresh_latest().await.unwrap().unwrap();
+        let mut late_drain = before.clone();
+        late_drain.version += 1;
+        late_drain.sstables.clear();
+        let plan = std::collections::BTreeMap::from([(
+            format!("shard:{}", store.base.write_shard),
+            late_drain.version,
+        )]);
+        crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+            .await
+            .unwrap();
+        assert!(matches!(
+            crate::merge_write_scope::commit_exact_shard(&manifests, &late_drain).await,
+            Err(lance::Error::RetryableCommitConflict { .. })
+        ));
+        let after = manifests.refresh_latest().await.unwrap().unwrap();
+        assert!(after.version > late_drain.version);
+        assert_eq!(
+            after.writer_epoch, before.writer_epoch,
+            "recovery must not fence live ingest"
+        );
+        assert_eq!(after.sstables, before.sstables);
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_drain_reauthorizes_after_a_concurrent_manifest_commit() {
+        use crate::merge_write_scope::{drain_generations, CommitAuthorizer, MergeWriteScope};
+        use lance::dataset::mem_wal::ShardManifestStore;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Debug)]
+        struct RaceThenRevoke {
+            peer: ShardManifestStore,
+            epoch: u64,
+            admitted: AtomicU64,
+            refused: AtomicU64,
+        }
+        impl CommitAuthorizer for RaceThenRevoke {
+            fn authorize<'a>(
+                &'a self,
+                _resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if self.admitted.swap(version, Ordering::SeqCst) != 0 {
+                        self.refused.store(version, Ordering::SeqCst);
+                        return Err(lance::Error::io("execution revoked"));
+                    }
+                    // A different handle wins the admitted immutable version
+                    // before this drain writes. Lance may internally retry,
+                    // but it must not drain at the next, unadmitted version.
+                    let won = self
+                        .peer
+                        .commit_update(self.epoch, |current| {
+                            let mut next = current.clone();
+                            next.version += 1;
+                            next
+                        })
+                        .await?;
+                    assert_eq!(won.version, version);
+                    Ok(())
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        store.add(&[assistant_record("pending")]).await.unwrap();
+        store.flush().await.unwrap();
+        let object_store = store.base.dataset.object_store(None).await.unwrap();
+        let path = &store.base.dataset.branch_location().path;
+        let shard = store.base.write_shard;
+        let manifests = ShardManifestStore::new(object_store.clone(), path, shard, 16);
+        let before = manifests.refresh_latest().await.unwrap().unwrap();
+        let gate = Arc::new(RaceThenRevoke {
+            peer: ShardManifestStore::new(object_store, path, shard, 16),
+            epoch: before.writer_epoch,
+            admitted: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+        });
+        let scope = MergeWriteScope::with_authorizer(gate.clone());
+        let result = scope
+            .run(drain_generations(
+                manifests,
+                before.writer_epoch,
+                before.sstables.iter().map(|s| s.generation).collect(),
+            ))
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("execution revoked"));
+        scope.drain().await;
+        assert_eq!(gate.refused.load(Ordering::SeqCst), before.version + 2);
+        let after = gate.peer.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(after.version, before.version + 1);
+        assert_eq!(after.sstables, before.sstables);
+        assert_eq!(scope.completed_steps(), 0);
+        assert_eq!(scope.work().generations_reclaimed, 0);
+        assert!(!scope.has_uncertain_commit());
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 1);
+        store.close().await.unwrap();
+    }
+
+    pub(super) fn assistant_record(id: &str) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "rollout-1".to_string(),
+            problem_id: "problem-1".to_string(),
+            dataset: Some("gsm8k".to_string()),
+            sequence_order: 0,
+            role: ROLE_ASSISTANT.to_string(),
+            created_at: Utc.timestamp_micros(1_700_000_000_000_000).unwrap(),
+            content: Some("the answer is 42".to_string()),
+            content_type: "text/plain".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: Some(vec![10, 11, 12]),
+            output_tokens: Some(vec![20, 21]),
+            num_input_tokens: Some(3),
+            num_output_tokens: Some(2),
+            output_logprobs: Some(vec![-0.5, -1.25]),
+            input_logprobs: None,
+            ref_logprobs: Some(vec![-0.4, -1.1]),
+            loss_mask: Some(vec![1, 0]),
+            advantage: Some(0.75),
+            reward: Some(1.0),
+            raw_reward: Some(0.9),
+            grader_id: Some("grader-a".to_string()),
+            score: Some(0.95),
+            include_in_training: Some(true),
+            exclude_reason: None,
+            policy_version: Some("ckpt-42".to_string()),
+            relationships: vec![Relationship {
+                target_id: "problem-1".to_string(),
+                relation: "derived_from".to_string(),
+                weight: Some(1.0),
+            }],
+            binary_payload: None,
+            payload_size: None,
+            payload_checksum: None,
+            artifact_type: None,
+            metadata: Some(json!({"harness": "verifiers"})),
+        }
+    }
+
+    pub(super) fn artifact_record(id: &str, bytes: &[u8]) -> RolloutRecord {
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "rollout-1".to_string(),
+            problem_id: "problem-1".to_string(),
+            dataset: None,
+            sequence_order: 1,
+            role: ROLE_ARTIFACT.to_string(),
+            created_at: Utc.timestamp_micros(1_700_000_000_500_000).unwrap(),
+            content: None,
+            content_type: "application/octet-stream".to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: None,
+            num_input_tokens: None,
+            num_output_tokens: None,
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: None,
+            raw_reward: None,
+            grader_id: None,
+            score: None,
+            include_in_training: None,
+            exclude_reason: None,
+            policy_version: None,
+            relationships: Vec::new(),
+            binary_payload: Some(bytes.to_vec()),
+            payload_size: Some(bytes.len() as i64),
+            payload_checksum: Some("sha256:cafef00d".to_string()),
+            artifact_type: Some("excel_grade_screenshot".to_string()),
+            metadata: Some(json!({"filename": "trace.bin"})),
+        }
+    }
+
+    fn pre_claim_check_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(
+            rollout_schema()
+                .fields()
+                .iter()
+                .filter(|field| !CLAIM_CHECK_COLUMNS.contains(&field.name().as_str()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    async fn create_empty_dataset(uri: &str, schema: Arc<Schema>) {
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let batches = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(empty_batch)].into_iter(),
+            schema,
+        );
+        Dataset::write(batches, uri, None).await.unwrap();
+    }
+
+    async fn store_with_legacy_base_and_wal(evolve_base: bool) -> (TempDir, RolloutStore) {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let legacy_schema = pre_claim_check_schema();
+        create_empty_dataset(&uri, legacy_schema.clone()).await;
+
+        // Model a writer from the old release without running today's open-
+        // time migration, so the fixtures really contain the legacy schema.
+        let mut store = RolloutStore {
+            blob_read_pause: Default::default(),
+            point_read_pause: Default::default(),
+            #[cfg(test)]
+            observation_pause: Default::default(),
+            #[cfg(test)]
+            selected_list_pause: Default::default(),
+            base: StorageBase::open(
+                &uri,
+                StorageBaseOptions {
+                    storage_options: None,
+                    shard_id: Some("pre-claim-check".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                    session: None,
+                    schema: legacy_schema.clone(),
+                    key_column: "id".to_string(),
+                    latest_schema: Some(Arc::new(rollout_schema())),
+                    seal_on_put: false,
+                },
+                false,
+            )
+            .await
+            .unwrap(),
+        };
+
+        let base_batch = store
+            .records_to_batch(&[assistant_record("legacy-base")])
+            .unwrap();
+        let base_schema = base_batch.schema();
+        let base_reader = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, ArrowError>(base_batch)].into_iter(),
+            base_schema,
+        );
+        store.base.dataset.append(base_reader, None).await.unwrap();
+
+        store.add(&[assistant_record("legacy-wal")]).await.unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        store.close().await.unwrap();
+
+        if evolve_base {
+            let claim_check_fields = rollout_schema()
+                .fields()
+                .iter()
+                .filter(|field| legacy_schema.field_with_name(field.name()).is_err())
+                .cloned()
+                .collect::<Vec<_>>();
+            store
+                .base
+                .dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(Schema::new(claim_check_fields))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        (dir, store)
+    }
+
+    fn assert_records_eq(actual: &RolloutRecord, expected: &RolloutRecord) {
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.rollout_id, expected.rollout_id);
+        assert_eq!(actual.problem_id, expected.problem_id);
+        assert_eq!(actual.dataset, expected.dataset);
+        assert_eq!(actual.sequence_order, expected.sequence_order);
+        assert_eq!(actual.role, expected.role);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(actual.content, expected.content);
+        assert_eq!(actual.content_type, expected.content_type);
+        assert_eq!(actual.model_input_string, expected.model_input_string);
+        assert_eq!(actual.model_output_string, expected.model_output_string);
+        assert_eq!(actual.rationale, expected.rationale);
+        assert_eq!(actual.problem_text, expected.problem_text);
+        assert_eq!(actual.user_metadata, expected.user_metadata);
+        assert_eq!(actual.input_tokens, expected.input_tokens);
+        assert_eq!(actual.output_tokens, expected.output_tokens);
+        assert_eq!(actual.num_input_tokens, expected.num_input_tokens);
+        assert_eq!(actual.num_output_tokens, expected.num_output_tokens);
+        assert_eq!(actual.output_logprobs, expected.output_logprobs);
+        assert_eq!(actual.input_logprobs, expected.input_logprobs);
+        assert_eq!(actual.ref_logprobs, expected.ref_logprobs);
+        assert_eq!(actual.loss_mask, expected.loss_mask);
+        assert_eq!(actual.advantage, expected.advantage);
+        assert_eq!(actual.reward, expected.reward);
+        assert_eq!(actual.raw_reward, expected.raw_reward);
+        assert_eq!(actual.grader_id, expected.grader_id);
+        assert_eq!(actual.score, expected.score);
+        assert_eq!(actual.include_in_training, expected.include_in_training);
+        assert_eq!(actual.exclude_reason, expected.exclude_reason);
+        assert_eq!(actual.policy_version, expected.policy_version);
+        assert_eq!(actual.relationships.len(), expected.relationships.len());
+        for (a, e) in actual.relationships.iter().zip(&expected.relationships) {
+            assert_eq!(a.target_id, e.target_id);
+            assert_eq!(a.relation, e.relation);
+            assert_eq!(a.weight, e.weight);
+        }
+        // `binary_payload` is projected out of `list`/`get_by_id` scans, so
+        // they read it back as `None` (byte materialization is verified
+        // separately through `get_blob`). The inline sidecar columns still
+        // round-trip.
+        assert_eq!(actual.payload_size, expected.payload_size);
+        assert_eq!(actual.payload_checksum, expected.payload_checksum);
+        assert_eq!(actual.artifact_type, expected.artifact_type);
+        assert_eq!(actual.metadata, expected.metadata);
+    }
+
+    #[test]
+    fn append_list_and_fetch_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let assistant = assistant_record("row-0");
+        let artifact_bytes = b"\x00\x01\x02trace-bytes";
+        let artifact = artifact_record("row-1", artifact_bytes);
+        let quoted_artifact_bytes = b"quoted-id-bytes";
+        let quoted_artifact = artifact_record("row-'quoted'", quoted_artifact_bytes);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            // MemWAL appends land in the `_mem_wal` namespace and do not advance
+            // the base dataset version; `add` returns it unchanged.
+            store
+                .add(&[assistant.clone(), artifact.clone(), quoted_artifact.clone()])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+
+            // The LSM read path dedups by `id` across generations and does not
+            // guarantee append order, so look rows up by id rather than by
+            // position.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 3);
+            let listed_assistant = listed.iter().find(|r| r.id == "row-0").unwrap();
+            let listed_artifact = listed.iter().find(|r| r.id == "row-1").unwrap();
+            assert_records_eq(listed_assistant, &assistant);
+            assert_records_eq(listed_artifact, &artifact);
+            // Offloaded blob column is projected out of a list scan.
+            assert_eq!(listed_artifact.binary_payload, None);
+
+            let fetched = store.get_by_id("row-1").await.unwrap().unwrap();
+            assert_records_eq(&fetched, &artifact);
+            assert!(fetched.is_artifact());
+
+            // The bytes are recoverable on demand from the sidecar file.
+            let blob = store.get_blob("row-1").await.unwrap();
+            assert_eq!(blob.as_deref(), Some(&artifact_bytes[..]));
+            let quoted_blob = store.get_blob("row-'quoted'").await.unwrap();
+            assert_eq!(quoted_blob.as_deref(), Some(&quoted_artifact_bytes[..]));
+            // The assistant row carries no payload.
+            assert_eq!(store.get_blob("row-0").await.unwrap(), None);
+
+            assert!(store.get_by_id("missing").await.unwrap().is_none());
+            assert_eq!(store.get_blob("missing").await.unwrap(), None);
+        });
+    }
+
+    #[tokio::test]
+    async fn missing_base_index_metadata_does_not_publish_zero_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        store.add(&[assistant_record("first")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.close().await.unwrap();
+        // Disable metadata caching so a real missing index object cannot be
+        // masked by the metadata loaded while opening the dataset.
+        let dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_read_params(lance::dataset::ReadParams {
+                index_cache_size_bytes: 0,
+                metadata_cache_size_bytes: 0,
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_some());
+        let manifest_path =
+            std::path::Path::new("/").join(dataset.manifest_location().path.as_ref());
+        assert!(manifest_path.starts_with(dir.path()));
+        std::fs::remove_file(manifest_path).unwrap();
+        assert!(crate::wal_watermarks::from_dataset(&dataset).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn demand_watermarks_preserve_flush_between_prepare_and_commit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer.add(&[assistant_record("first")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let (manifests, manifest, prepared) =
+            writer.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        writer.add(&[assistant_record("second")]).await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            writer
+                .commit_prepared_merge(&manifests, &manifest, prepared)
+                .await
+                .unwrap(),
+            1
+        );
+        let marks = crate::read_demand_watermarks(uri).await.unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].merged_through, Some(1));
+        assert_eq!(marks[0].pending_generations, 1);
+        for id in ["first", "second"] {
+            assert_eq!(writer.get_by_id(id).await.unwrap().unwrap().id, id);
+        }
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_watermarks_reconcile_upsert_merges_without_append_cutover() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = RolloutStoreOptions {
+            shard_id: Some("watermark-writer".into()),
+            merge_after_generations: Some(0),
+            merge_max_generations: Some(1),
+            ..Default::default()
+        };
+        let mut writer = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        for id in ["first", "second"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        let reader = RolloutStore::open_existing_with_options(uri, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(
+            crate::rollout_append::merged_watermarks(uri)
+                .await
+                .unwrap()
+                .get(&derive_shard_id(Some("watermark-writer"))),
+            Some(&1)
+        );
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].pending_generations, 1);
+        assert_eq!(marks[0].merged_through, Some(1));
+        assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
+
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(marks[0].sealed_through, 2);
+        assert_eq!(marks[0].pending_generations, 0);
+        assert_eq!(marks[0].merged_through, Some(2));
+        assert_eq!(crate::read_demand_watermarks(uri).await.unwrap(), marks);
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
+        let epoch = marks[0].writer_epoch;
+        writer.close().await.unwrap();
+        let mut writer = RolloutStore::open_with_options(uri, options).await.unwrap();
+        writer.add(&[assistant_record("third")]).await.unwrap();
+        let unsealed = reader.all_shard_watermarks().await.unwrap();
+        assert_eq!(unsealed[0].sealed_through, 2);
+        assert_eq!(unsealed[0].merged_through, Some(2));
+        writer.flush().await.unwrap();
+        let marks = reader.all_shard_watermarks().await.unwrap();
+        assert!(marks[0].writer_epoch > epoch);
+        assert_eq!(marks[0].sealed_through, 3);
+        assert_eq!(marks[0].pending_generations, 1);
+        assert_eq!(marks[0].merged_through, Some(2));
+        assert_eq!(writer.own_shard_watermark().await.unwrap(), Some(marks[0]));
+        for id in ["first", "second", "third"] {
+            assert_eq!(reader.get_by_id(id).await.unwrap().unwrap().id, id);
+        }
+        let mut pinned = reader;
+        pinned.checkout(pinned.version()).await.unwrap();
+        assert!(pinned.all_shard_watermarks().await.unwrap().is_empty());
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_refreshes_base_after_peer_merge_and_honors_pinning() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("first")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let mut reader = RolloutStore::open(uri).await.unwrap();
+        let pinned_version = reader.version();
+        writer.add(&[assistant_record("second")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let latest = Dataset::open(uri).await.unwrap();
+        let observed = reader.observe().await.unwrap();
+        assert_eq!(
+            observed.row_count, 2,
+            "merged WAL must not disappear from a cached observer"
+        );
+        assert_eq!(observed.version, latest.manifest.version);
+        assert_eq!(observed.fragment_count, latest.count_fragments() as i64);
+        assert_eq!(
+            observed.last_updated,
+            latest.manifest.timestamp().timestamp_millis()
+        );
+        assert_eq!(observed.pending_wal_generations, 0);
+        reader.checkout(pinned_version).await.unwrap();
+        writer.add(&[assistant_record("unmerged")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let pinned = reader.observe().await.unwrap();
+        assert_eq!(pinned.version, pinned_version);
+        assert_eq!(pinned.row_count, 1);
+        assert_eq!(pinned.pending_wal_generations, 0);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_retries_wal_reclaimed_after_capture() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("survives")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+        let captured = reader.wal_shard_snapshots().await.unwrap();
+        let pause = Arc::new(PointReadPause::default());
+        *reader.observation_pause.lock().unwrap() = Some(pause.clone());
+        let read = {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.observe().await })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pause.checked_base.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        simulate_legacy_peer_gc(&reader, &captured);
+        pause.resume.notify_one();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("observation must refresh after concurrent WAL reclamation");
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(observed.row_count, 1);
+        assert_eq!(observed.version, latest.manifest.version);
+        assert_eq!(observed.pending_wal_generations, 0);
+        assert_eq!(observed.max_pending_wal_generations_per_shard, 0);
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_hide_a_missing_unmerged_generation() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        writer.add(&[assistant_record("missing")]).await.unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let snapshots = reader.wal_shard_snapshots().await.unwrap();
+        assert_eq!(snapshots.iter().map(|s| s.sstables.len()).sum::<usize>(), 1);
+        for snapshot in snapshots {
+            for generation in snapshot.sstables {
+                std::fs::remove_dir_all(
+                    reader.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                )
+                .unwrap();
+            }
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), reader.observe())
+            .await
+            .expect("a missing generation must not cause an unbounded retry");
+        assert!(
+            result.is_err(),
+            "unmerged data loss cannot become a successful zero observation"
+        );
+        writer.close().await.unwrap();
+    }
+
+    #[test]
+    fn observe_reports_cheap_metrics() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            // Empty store: no rows, no pending generations.
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 0);
+            assert_eq!(obs.pending_wal_generations, 0);
+
+            store
+                .add(&[assistant_record("a"), assistant_record("b")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+
+            // Two MemWAL-appended rows are visible via the LSM read path; the
+            // base table itself has not been merged, so they surface as a
+            // pending flushed generation rather than base rows.
+            let obs = store.observe().await.unwrap();
+            assert!(obs.fragment_count >= 0);
+            assert!(obs.pending_wal_generations >= 1);
+            assert_eq!(obs.row_count, 2);
+            assert!(obs.last_updated > 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn selected_list_retries_after_wal_reclamation() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        writer.add(&[assistant_record("reclaimed")]).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+        let mut reader = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        reader.base.wal_read_protection = false; // Historical unregistered reader.
+        let writer = tokio::sync::Mutex::new(&mut writer);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        let paths: Vec<_> = snapshots
+                            .iter()
+                            .flat_map(|snapshot| {
+                                snapshot.sstables.iter().map(|generation| {
+                                    reader
+                                        .flushed_generation_uri(snapshot.shard_id, &generation.path)
+                                })
+                            })
+                            .collect();
+                        assert_eq!(paths.len(), 1);
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                        // Merge completion publishes the base and drains the
+                        // manifest; durable physical reclamation runs later.
+                        // Force the stale-snapshot read after that deletion so
+                        // this regression actually exercises the retry path.
+                        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                            while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    reader
+                        .list_selected_snapshot(dataset, snapshots, Some(1), None, None)
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "reclaimed");
+    }
+
+    #[tokio::test]
+    async fn selected_list_upgrade_retains_old_reader_then_collects_after_cold_reopen() {
+        for grouped in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some("upgrade-reader".into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(writer.base.wal_collection, crate::wal_gc::Mode::Retain);
+            writer.add(&[assistant_record("old-reader")]).await.unwrap();
+            writer.flush().await.unwrap();
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            // Model a still-running old binary. Retain must not depend on a
+            // registration from this reader, or on its request duration.
+            reader.base.wal_read_protection = false;
+            let reader = Arc::new(reader);
+            let pause = Arc::new(SelectedListPause {
+                before_materialization: true,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    reader
+                        .list_with_filters(
+                            Some(4),
+                            None,
+                            Some(&RolloutFilters {
+                                role: Some(ROLE_ASSISTANT.into()),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let paths: Vec<_> = writer
+                .wal_shard_snapshots()
+                .await
+                .unwrap()
+                .into_iter()
+                .flat_map(|snapshot| {
+                    snapshot
+                        .sstables
+                        .into_iter()
+                        .map(move |generation| (snapshot.shard_id, generation.path))
+                })
+                .map(|(shard, path)| writer.flushed_generation_uri(shard, &path))
+                .collect();
+            assert_eq!(paths.len(), 1);
+            if grouped {
+                let mut coordinator = crate::rollout_append::AppendCoordinator::open(uri, None)
+                    .await
+                    .unwrap();
+                assert_eq!(coordinator.wal_collection, crate::wal_gc::Mode::Retain);
+                let (plans, _) = coordinator
+                    .plan(&["upgrade-reader".into()], 64, 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(plans.len(), 1);
+                let staged = crate::rollout_append::stage(
+                    uri,
+                    plans.into_iter().next().unwrap(),
+                    crate::MergeMemoryBudget::new(32 * 1024 * 1024),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(coordinator.commit(vec![staged]).await.unwrap(), 1);
+            } else {
+                assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            }
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            writer.discover_retired_wal().await.unwrap();
+            writer.close().await.unwrap();
+            drop(writer);
+            let mut reopened = RolloutStore::open_existing_with_options(uri, Default::default())
+                .await
+                .unwrap();
+            reopened.discover_retired_wal().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "old-reader");
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(reader);
+            // The test has now joined every old reader. Production must prove
+            // that barrier for the whole fleet before configuring Collect.
+            reopened.base.wal_collection = crate::wal_gc::Mode::Collect;
+            reopened.discover_retired_wal().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reopened.pending_wal_generations().await.unwrap(), 0);
+            let rows = reopened
+                .list_with_filters(
+                    Some(4),
+                    None,
+                    Some(&RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "old-reader");
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_protection_keeps_captured_files_while_merges_continue() {
+        for (grouped, before_materialization) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some("read-lifetime".into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            for record in &mut records {
+                record.content = Some("protected-page-payload".repeat(16_384));
+            }
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let reader = RolloutStore::open(uri).await.unwrap();
+            assert!(reader.base.wal_read_protection);
+            let reader = Arc::new(reader);
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(4), None, Some(&filters))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let mut paths = Vec::new();
+            // Three actual merge/drain cycles must finish while the old read
+            // retains its original WAL snapshot. Only physical GC waits.
+            for next_id in [None, Some("d"), Some("e")] {
+                if let Some(id) = next_id {
+                    writer.add(&[assistant_record(id)]).await.unwrap();
+                    writer.flush().await.unwrap();
+                }
+                for snapshot in writer.wal_shard_snapshots().await.unwrap() {
+                    for generation in snapshot.sstables {
+                        paths.push(
+                            writer.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                if grouped {
+                    let mut coordinator = crate::rollout_append::AppendCoordinator::open(uri, None)
+                        .await
+                        .unwrap();
+                    coordinator.wal_collection = crate::wal_gc::Mode::Collect;
+                    let (plans, _) = coordinator
+                        .plan(&["read-lifetime".into()], 64, 8 * 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(plans.len(), 1);
+                    let prepared = crate::rollout_append::stage(
+                        uri,
+                        plans.into_iter().next().unwrap(),
+                        crate::MergeMemoryBudget::new(32 * 1024 * 1024),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(coordinator.commit(vec![prepared]).await.unwrap(), 1);
+                } else {
+                    assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                }
+                assert_eq!(flushed_generation_count(&writer).await, 0);
+            }
+            assert_eq!(paths.len(), 3);
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let later_reader = RolloutStore::open(uri).await.unwrap();
+            assert!(later_reader.base.wal_read_protection);
+            let filters = RolloutFilters {
+                role: Some(ROLE_ASSISTANT.into()),
+                ..Default::default()
+            };
+            let later = later_reader
+                .list_with_filters(Some(5), None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(later.len(), 5);
+            assert!(!reading.is_finished());
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(rows.len(), 3);
+            for record in &records {
+                assert_records_eq(rows.iter().find(|row| row.id == record.id).unwrap(), record);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            writer.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_repeated_reclamation_exhausts_retry_window() {
+        for before_materialization in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            for record in &mut records {
+                record.content = Some("first-page-payload".repeat(16_384));
+            }
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            reader.base.wal_read_protection = false; // Reproduce the old reader.
+            let reader = Arc::new(reader);
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                pause_attempts: 2,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(4), None, Some(&filters))
+                        .await
+                })
+            };
+            for attempt in 0..2 {
+                tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                    .await
+                    .unwrap();
+                assert!(!reading.is_finished());
+                let snapshots = writer.wal_shard_snapshots().await.unwrap();
+                let mut paths = Vec::new();
+                for snapshot in &snapshots {
+                    for generation in &snapshot.sstables {
+                        paths.push(
+                            writer.flushed_generation_uri(snapshot.shard_id, &generation.path),
+                        );
+                    }
+                }
+                assert_eq!(paths.len(), 1);
+                assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if attempt == 0 {
+                    let mut record = assistant_record("d");
+                    record.content = Some("second-page-payload".repeat(16_384));
+                    writer.add(std::slice::from_ref(&record)).await.unwrap();
+                    writer.flush().await.unwrap();
+                    records.push(record);
+                } else {
+                    // This is elapsed time inside the second real read, after
+                    // its WAL was opened/selected and then physically reclaimed.
+                    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                }
+                pause.resume.notify_one();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!(
+                "repeated reclamation before_materialization={before_materialization} attempts={} error={:?}",
+                pause.calls.load(std::sync::atomic::Ordering::SeqCst),
+                result.as_ref().err()
+            );
+            // Characterize the production baseline: committed data remains
+            // readable, but the original request fails after two reclamations.
+            assert!(
+                result.is_err(),
+                "baseline unexpectedly recovered: {result:?}"
+            );
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let recovered = RolloutStore::open(uri).await.unwrap();
+            let filters = RolloutFilters {
+                role: Some(ROLE_ASSISTANT.into()),
+                ..Default::default()
+            };
+            let rows = recovered
+                .list_with_filters(Some(4), None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), records.len());
+            for record in &records {
+                assert_records_eq(rows.iter().find(|row| row.id == record.id).unwrap(), record);
+            }
+            writer.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_survives_reclamation_after_open_and_selection() {
+        for before_materialization in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut writer = RolloutStore::open(uri).await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let mut records = vec![
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+            ];
+            // This column is excluded from selection and fetched for the page.
+            records[1].content = Some("page-payload".repeat(16_384));
+            writer.add(&records).await.unwrap();
+            writer.flush().await.unwrap();
+            let mut reader = RolloutStore::open(uri).await.unwrap();
+            reader.base.wal_read_protection = false; // Historical unregistered reader.
+            let reader = Arc::new(reader);
+            let original_version = reader.version();
+            let snapshots = reader.wal_shard_snapshots().await.unwrap();
+            let mut paths = Vec::new();
+            for snapshot in &snapshots {
+                for generation in &snapshot.sstables {
+                    paths.push(reader.flushed_generation_uri(snapshot.shard_id, &generation.path));
+                }
+            }
+            assert_eq!(paths.len(), 1);
+            assert!(paths.iter().all(|path| std::path::Path::new(path).exists()));
+            let pause = Arc::new(SelectedListPause {
+                before_materialization,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    let filters = RolloutFilters {
+                        role: Some(ROLE_ASSISTANT.into()),
+                        ..Default::default()
+                    };
+                    reader
+                        .list_with_filters(Some(1), Some(1), Some(&filters))
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            assert!(!reading.is_finished());
+            assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            pause.resume.notify_one();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!(
+                "before_materialization={before_materialization} attempts={} error={:?}",
+                pause.calls.load(std::sync::atomic::Ordering::SeqCst),
+                result.as_ref().err()
+            );
+            let rows = result.expect("a committed row must survive concurrent WAL reclamation");
+            assert_eq!(pause.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(rows.len(), 1);
+            assert_records_eq(&rows[0], &records[1]);
+            assert_eq!(reader.version(), original_version);
+            writer.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_supports_legacy_wal_and_evolved_base() {
+        for evolved in [false, true] {
+            let (_dir, store) = store_with_legacy_base_and_wal(evolved).await;
+            let expected = store.list_all_non_blob_records().await.unwrap();
+            for filters in [
+                None,
+                Some(RolloutFilters {
+                    role: Some(ROLE_ASSISTANT.into()),
+                    ..Default::default()
+                }),
+            ] {
+                let rows = store
+                    .list_with_filters(Some(10), None, filters.as_ref())
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), expected.len());
+                for (actual, expected) in rows.iter().zip(&expected) {
+                    assert_records_eq(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_list_skips_unselected_payload_decoding() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let batch = store
+            .records_to_batch(&[assistant_record("selected"), assistant_record("unselected")])
+            .unwrap();
+        let mut columns = batch.columns().to_vec();
+        columns[batch.schema().index_of("metadata").unwrap()] =
+            Arc::new(LargeStringArray::from(vec![Some("{}"), Some("{")]));
+        let batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+        let schema = batch.schema();
+        store
+            .base
+            .dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(store.list_all_non_blob_records().await.is_err());
+        let page = store.list(Some(1), None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "selected");
+        let filters = RolloutFilters {
+            id: Some("selected".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.list(Some(0), None).await.unwrap().is_empty());
+        assert!(store
+            .list(Some(usize::MAX), Some(usize::MAX))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_list_preserves_base_wal_winners_order_and_filters() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let batch = store
+            .records_to_batch(&[assistant_record("z-first"), assistant_record("a-second")])
+            .unwrap();
+        let schema = batch.schema();
+        store
+            .base
+            .dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                None,
+            )
+            .await
+            .unwrap();
+        for version in ["old", "new"] {
+            let mut updated = assistant_record("z-first");
+            updated.content = Some(version.into());
+            updated.policy_version = Some(version.into());
+            store
+                .add(&[updated, assistant_record(&format!("wal-{version}"))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        let expected = store.list_all_non_blob_records().await.unwrap();
+        assert_eq!(expected[0].content.as_deref(), Some("new"));
+        for limit in [1, 2, usize::MAX] {
+            for offset in [0, 1, 3, usize::MAX] {
+                let actual = store.list(Some(limit), Some(offset)).await.unwrap();
+                let expected = expected.iter().skip(offset).take(limit).collect::<Vec<_>>();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_records_eq(actual, expected);
+                }
+            }
+        }
+        for version in ["old", "new"] {
+            let filters = RolloutFilters {
+                policy_version: Some(version.into()),
+                ..Default::default()
+            };
+            let actual = store
+                .list_with_filters(Some(2), None, Some(&filters))
+                .await
+                .unwrap();
+            let expected = expected
+                .iter()
+                .filter(|row| filters.matches_record(row))
+                .collect::<Vec<_>>();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_records_eq(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_list_matches_fields_before_pagination() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+
+            let mut first = assistant_record("row-a");
+            first.rollout_id = "traj-a".to_string();
+            first.problem_id = "problem-a".to_string();
+            first.policy_version = Some("ckpt-1".to_string());
+            first.include_in_training = Some(true);
+
+            let mut second = assistant_record("row-b");
+            second.rollout_id = "traj-b".to_string();
+            second.problem_id = "problem-b".to_string();
+            second.policy_version = Some("ckpt-2".to_string());
+            second.include_in_training = Some(false);
+
+            let mut artifact = artifact_record("row-c", b"bytes");
+            artifact.rollout_id = "traj-b".to_string();
+            artifact.problem_id = "problem-b".to_string();
+            artifact.policy_version = Some("ckpt-2".to_string());
+            artifact.include_in_training = Some(false);
+
+            store.add(&[first, second, artifact]).await.unwrap();
+            store.flush().await.unwrap();
+
+            let filters = RolloutFilters {
+                policy_version: Some("ckpt-2".to_string()),
+                include_in_training: Some(false),
+                ..Default::default()
+            };
+            let all = store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all
+                .iter()
+                .all(|row| row.policy_version.as_deref() == Some("ckpt-2")));
+            assert!(all.iter().all(|row| row.include_in_training == Some(false)));
+
+            let page = store
+                .list_with_filters(Some(1), Some(1), Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].policy_version.as_deref(), Some("ckpt-2"));
+        });
+    }
+
+    #[test]
+    fn filtered_list_supports_dictionary_and_nullable_string_columns() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            store
+                .add(&[
+                    assistant_record("assistant"),
+                    artifact_record("artifact", b"bytes"),
+                ])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+
+            let filters = RolloutFilters {
+                role: Some(ROLE_ARTIFACT.to_string()),
+                artifact_type: Some("excel_grade_screenshot".to_string()),
+                ..Default::default()
+            };
+            let rows = store
+                .list_with_filters(None, None, Some(&filters))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, "artifact");
+            assert!(rows[0].binary_payload.is_none());
+        });
+    }
+
+    #[test]
+    fn appends_accumulate_and_are_immutable() {
+        // MemWAL appends are append-only: successive `add`s accumulate, and a
+        // row is never mutated. Reproducing "the rollouts that trained
+        // checkpoint N" is therefore a filter over immutable rows (here, by id),
+        // not a per-append table snapshot — so this replaces the old
+        // `checkout_recovers_earlier_version` test, whose per-add snapshot
+        // semantics MemWAL intentionally drops.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let artifact_bytes = b"\x00\x01\x02checkpoint-trace";
+        let artifact = artifact_record("row-0", artifact_bytes);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+
+            // A second append accumulates rather than replacing the first.
+            store.add(&[assistant_record("row-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+
+            // The first-appended row is still present and unchanged after the
+            // later append (immutability), and its inline artifact bytes remain
+            // materializable.
+            let recovered = store.get_by_id("row-0").await.unwrap().unwrap();
+            assert_records_eq(&recovered, &artifact);
+            let blob = store.get_blob("row-0").await.unwrap();
+            assert_eq!(blob.as_deref(), Some(&artifact_bytes[..]));
+        });
+    }
+
+    #[test]
+    fn cleanup_own_shard_seals_before_merging() {
+        // Regression guard for the `ROLLOUT_FLUSH_INTERVAL_SECS=0` trap: with no
+        // periodic flush, nothing seals the active memtable, so
+        // `flushed_generations` stays empty and the threshold check in
+        // `merge_own_shard_if_ready` used to return 0 without ever merging —
+        // leaving rows durable but permanently invisible.
+        //
+        // `cleanup_own_shard` now flushes first, making it a genuine standalone
+        // fallback, which is what the config docs already claimed.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("cleanup-seal-0".to_string()),
+                    // Count trigger disabled: cleanup is the only path that can
+                    // make this row visible, exactly as with flush interval 0.
+                    merge_after_generations: Some(0),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("c-0")]).await.unwrap();
+
+            // Nothing sealed yet: invisible, and no generation pending.
+            assert!(store.list(None, None).await.unwrap().is_empty());
+            assert_eq!(
+                store.observe().await.unwrap().pending_wal_generations,
+                0,
+                "precondition: the memtable is unsealed, so no generation exists"
+            );
+
+            // A single cleanup pass must seal, merge, and expose the row.
+            let reclaimed = store.cleanup_own_shard().await.unwrap();
+            assert_eq!(reclaimed, 1, "cleanup must seal then merge the generation");
+
+            let seen = store.list(None, None).await.unwrap();
+            assert_eq!(seen.len(), 1, "row must be visible after cleanup alone");
+            assert_eq!(seen[0].id, "c-0");
+        });
+    }
+
+    #[test]
+    fn dropping_a_store_seals_its_unflushed_rows() {
+        // The server's flush sweeper only visits LRU-resident stores, so a store
+        // evicted while holding an unsealed memtable depends entirely on `Drop`
+        // to seal it. `Drop` spawns a detached `ShardWriter::close`, which does
+        // seal — this asserts that end to end, so the eviction path cannot
+        // silently regress into stranding rows.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = || RolloutStoreOptions {
+                storage_options: None,
+                session: None,
+                shard_id: Some("evicted-0".to_string()),
+                merge_after_generations: None,
+                merge_max_generations: None,
+                merge_max_bytes: None,
+                key_index_type: Default::default(),
+                pending_generations_warn: None,
+                pending_generations_max: None,
+                merge_budget: None,
+            };
+
+            {
+                let store = RolloutStore::open_with_options(&uri, options())
+                    .await
+                    .unwrap();
+                store.add(&[assistant_record("e-0")]).await.unwrap();
+                // Deliberately no flush() and no close(): this models an LRU
+                // eviction dropping the last handle.
+                assert!(store.list(None, None).await.unwrap().is_empty());
+            }
+
+            // The detached close is spawned, not awaited, so poll for the row
+            // rather than assuming it has landed by now.
+            let mut seen = 0;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let reader = RolloutStore::open_with_options(&uri, options())
+                    .await
+                    .unwrap();
+                seen = reader.list(None, None).await.unwrap().len();
+                if seen > 0 {
+                    break;
+                }
+            }
+            assert_eq!(seen, 1, "Drop must seal the memtable of an evicted store");
+        });
+    }
+
+    #[test]
+    fn observe_reports_unflushed_rows_excluded_from_row_count() {
+        // `row_count` counts base ∪ flushed generations, so durable-but-unsealed
+        // rows are invisible to it. That undercount is inherent to the async
+        // flush design; `unflushed_rows` is what makes it observable, and
+        // `row_count + unflushed_rows` is every row durably accepted.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("observe-0".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // No writer resident yet: nothing buffered.
+            assert_eq!(store.observe().await.unwrap().unflushed_rows, 0);
+
+            store
+                .add(&[assistant_record("o-0"), assistant_record("o-1")])
+                .await
+                .unwrap();
+
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 0, "row_count must not count unsealed rows");
+            assert_eq!(
+                obs.unflushed_rows, 2,
+                "the durable-but-invisible rows must be observable"
+            );
+
+            store.flush().await.unwrap();
+
+            let obs = store.observe().await.unwrap();
+            assert_eq!(obs.row_count, 2, "flushed rows join row_count");
+            assert_eq!(
+                obs.unflushed_rows, 0,
+                "nothing remains buffered after a flush"
+            );
+        });
+    }
+
+    #[test]
+    fn distinct_shards_share_one_dataset() {
+        // Two instances writing distinct shards of the same dataset both
+        // contribute to reads, and neither fences the other. This models the
+        // server-id sharding deployment: a load balancer may route appends to
+        // either instance, and every reader sees the union.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let shard_a_blob = b"shard-a-blob";
+            let shard_b_blob = b"shard-b-blob";
+            let options = |shard: &str| RolloutStoreOptions {
+                storage_options: None,
+                session: None,
+                shard_id: Some(shard.to_string()),
+                merge_after_generations: None,
+                merge_max_generations: None,
+                merge_max_bytes: None,
+                key_index_type: Default::default(),
+                pending_generations_warn: None,
+                pending_generations_max: None,
+                merge_budget: None,
+            };
+
+            let instance_a = RolloutStore::open_with_options(&uri, options("rollout-0"))
+                .await
+                .unwrap();
+            instance_a
+                .add(&[artifact_record("a-0", shard_a_blob)])
+                .await
+                .unwrap();
+            instance_a.flush().await.unwrap();
+
+            let instance_b = RolloutStore::open_with_options(&uri, options("rollout-1"))
+                .await
+                .unwrap();
+            instance_b
+                .add(&[artifact_record("b-0", shard_b_blob)])
+                .await
+                .unwrap();
+            instance_b.flush().await.unwrap();
+
+            // Distinct instance ids derive distinct shards.
+            assert_ne!(
+                derive_shard_id(Some("rollout-0")),
+                derive_shard_id(Some("rollout-1"))
+            );
+
+            // Either instance's reader sees both shards' rows.
+            let seen = instance_b.list(None, None).await.unwrap();
+            assert_eq!(seen.len(), 2);
+            assert!(seen.iter().any(|r| r.id == "a-0"));
+            assert!(seen.iter().any(|r| r.id == "b-0"));
+            assert_eq!(
+                instance_b.get_blob("a-0").await.unwrap().as_deref(),
+                Some(&shard_a_blob[..])
+            );
+            assert_eq!(
+                instance_a.get_blob("b-0").await.unwrap().as_deref(),
+                Some(&shard_b_blob[..])
+            );
+
+            // Observability is independent of the reader's own write shard:
+            // both shards contribute rows and pending generations.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let obs = reader.observe().await.unwrap();
+            assert_eq!(obs.row_count, 2);
+            assert_eq!(obs.pending_wal_generations, 2);
+            assert_eq!(obs.fragment_count, 0);
+        });
+    }
+
+    #[test]
+    fn filtered_listing_pages_across_shards_and_escapes_values() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let options = |shard: &str| RolloutStoreOptions {
+                shard_id: Some(shard.to_string()),
+                ..Default::default()
+            };
+            let instance_a = RolloutStore::open_with_options(&uri, options("filter-a"))
+                .await
+                .unwrap();
+            let mut quoted = assistant_record("row-'quoted");
+            quoted.rollout_id = "rollout-alpha".to_string();
+            quoted.policy_version = Some("policy-a".to_string());
+            instance_a
+                .add(&[quoted, assistant_record("row-a")])
+                .await
+                .unwrap();
+            instance_a.flush().await.unwrap();
+
+            let instance_b = RolloutStore::open_with_options(&uri, options("filter-b"))
+                .await
+                .unwrap();
+            let artifact = artifact_record("row-b", b"blob");
+            instance_b.add(&[artifact]).await.unwrap();
+            instance_b.flush().await.unwrap();
+
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let quoted_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        id: Some("row-'quoted".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!quoted_page.has_more);
+            assert_eq!(quoted_page.records[0].id, "row-'quoted");
+            assert_eq!(quoted_page.records[0].input_tokens, Some(vec![10, 11, 12]));
+            assert_eq!(
+                quoted_page.records[0].output_logprobs,
+                Some(vec![-0.5, -1.25])
+            );
+            assert_eq!(
+                quoted_page.records[0].metadata,
+                Some(json!({"harness": "verifiers"}))
+            );
+
+            let policy_page = reader
+                .list_filtered(
+                    &RolloutFilters {
+                        rollout_id: Some("rollout-alpha".to_string()),
+                        role: Some(ROLE_ASSISTANT.to_string()),
+                        policy_version: Some("policy-a".to_string()),
+                        ..Default::default()
+                    },
+                    25,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(!policy_page.has_more);
+            assert_eq!(policy_page.records[0].id, "row-'quoted");
+
+            let page = reader
+                .list_filtered(&RolloutFilters::default(), 1, 1)
+                .await
+                .unwrap();
+            assert!(page.has_more);
+            assert_eq!(page.records.len(), 1);
+        });
+    }
+
+    #[test]
+    fn fragments_listing_filters_and_pages_wide_rows() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("fragment-pagination".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let wide_text = "x".repeat(64 * 1024);
+            let records: Vec<_> = (0..6)
+                .map(|index| {
+                    let mut record = assistant_record(&format!("row-{index}"));
+                    record.policy_version = Some(if index == 3 {
+                        "excluded".to_string()
+                    } else {
+                        "page-test".to_string()
+                    });
+                    record.rationale = Some(wide_text.clone());
+                    record
+                })
+                .collect();
+            store.add(&records[..3]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            store.add(&records[3..]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(store.observe().await.unwrap().fragment_count, 2);
+
+            let filters = RolloutFilters {
+                policy_version: Some("page-test".to_string()),
+                ..Default::default()
+            };
+            let all = store
+                .list_filtered_source(&filters, 10, 0, ListSource::Fragments)
+                .await
+                .unwrap();
+            assert_eq!(all.records.len(), 5);
+            assert!(!all.has_more);
+
+            let middle = store
+                .list_filtered_source(&filters, 2, 2, ListSource::Fragments)
+                .await
+                .unwrap();
+            assert_eq!(middle.records.len(), 2);
+            assert!(middle.has_more);
+            assert_eq!(
+                middle
+                    .records
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                all.records[2..4]
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(middle
+                .records
+                .iter()
+                .all(|record| record.rationale.as_deref() == Some(wide_text.as_str())));
+
+            let tail = store
+                .list_filtered_source(&filters, 2, 4, ListSource::Fragments)
+                .await
+                .unwrap();
+            assert_eq!(tail.records.len(), 1);
+            assert!(!tail.has_more);
+            assert_eq!(tail.records[0].id, all.records[4].id);
+        });
+    }
+
+    #[test]
+    fn refresh_latest_keeps_cached_reader_current() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("refresh-writer".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            writer.add(&[assistant_record("row-0")]).await.unwrap();
+            writer.flush().await.unwrap();
+
+            let mut cached_reader =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            assert_eq!(cached_reader.list(None, None).await.unwrap().len(), 1);
+
+            writer.add(&[assistant_record("row-1")]).await.unwrap();
+            writer.flush().await.unwrap();
+            cached_reader.refresh_latest().await.unwrap();
+
+            let ids: HashSet<_> = cached_reader
+                .list(None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect();
+            assert_eq!(
+                ids,
+                HashSet::from(["row-0".to_string(), "row-1".to_string()])
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_checkout_pins_until_latest_refresh() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            assert!(!store.is_version_pinned());
+
+            store.checkout(store.version()).await.unwrap();
+            assert!(store.is_version_pinned());
+
+            store.refresh_latest().await.unwrap();
+            assert!(!store.is_version_pinned());
+        });
+    }
+
+    #[test]
+    fn trajectory_rows_are_filtered_and_sorted_across_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("trajectory-test".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let mut later = assistant_record("row-a");
+            later.rollout_id = "target".to_string();
+            later.sequence_order = 2;
+            let mut unrelated = assistant_record("other");
+            unrelated.rollout_id = "other".to_string();
+            store.add(&[later, unrelated]).await.unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
+
+            let mut earlier = assistant_record("row-b");
+            earlier.rollout_id = "target".to_string();
+            earlier.sequence_order = 0;
+            store.add(&[earlier]).await.unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
+
+            assert_eq!(store.observe().await.unwrap().fragment_count, 2);
+            let rows = store.get_trajectory("target").await.unwrap();
+            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, vec!["row-b", "row-a"]);
+        });
+    }
+
+    #[test]
+    fn trajectory_read_rejects_an_empty_rollout_id() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            let err = store.get_trajectory("").await.unwrap_err();
+            assert!(err.to_string().contains("rollout_id must not be empty"));
+        });
+    }
+
+    /// Read the number of un-merged flushed generations recorded for a store's
+    /// own write shard. Used by merge tests to assert the manifest drains.
+    async fn flushed_generation_count(store: &RolloutStore) -> usize {
+        let object_store = store.base.dataset.object_store(None).await.unwrap();
+        let branch_location = store.base.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            store.base.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .map(|m| m.sstables.len())
+            .unwrap_or(0)
+    }
+
+    /// Read the current writer epoch recorded for a store's own write shard.
+    /// Used to assert the resident writer claims the epoch once instead of
+    /// bumping it on every append.
+    async fn shard_writer_epoch(store: &RolloutStore) -> u64 {
+        let object_store = store.base.dataset.object_store(None).await.unwrap();
+        let branch_location = store.base.dataset.branch_location();
+        let manifest_store = ShardManifestStore::new(
+            object_store,
+            &branch_location.path,
+            store.base.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        manifest_store
+            .refresh_latest()
+            .await
+            .unwrap()
+            .map(|m| m.writer_epoch)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn add_reuses_resident_writer_epoch_stable() {
+        // The resident writer must claim the shard epoch exactly once at open
+        // and reuse it across appends (that reuse is what pools the object-store
+        // connection instead of cold-rebuilding it per append). Every append is
+        // still immediately visible cross-instance because it commits a flushed
+        // generation to the manifest before returning.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // no merge → epoch never reclaimed
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            let epoch_after_first = shard_writer_epoch(&store).await;
+
+            // Read-after-write: the first append is visible right away.
+            assert!(store.get_by_id("a-0").await.unwrap().is_some());
+
+            for i in 1..5 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                // Each append is immediately visible.
+                assert!(
+                    store.get_by_id(&format!("a-{i}")).await.unwrap().is_some(),
+                    "append a-{i} should be visible immediately"
+                );
+            }
+
+            // The epoch did NOT advance per append: the writer was opened once.
+            assert_eq!(
+                shard_writer_epoch(&store).await,
+                epoch_after_first,
+                "resident writer should claim the epoch once, not per append"
+            );
+
+            // Every append landed as its own flushed generation.
+            assert_eq!(flushed_generation_count(&store).await, 5);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 5);
+        });
+    }
+
+    #[test]
+    fn merge_reopens_writer_after_epoch_claim() {
+        // A merge claims the shard epoch, which fences the resident writer. The
+        // next append must transparently reopen the writer against the fresh
+        // epoch rather than failing with a fence error.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    // Merge on every append → epoch is reclaimed each time, so
+                    // the following append always hits the reopen path.
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..4 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap_or_else(|e| panic!("append a-{i} after merge must not be fenced: {e}"));
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
+                assert!(store.get_by_id(&format!("a-{i}")).await.unwrap().is_some());
+            }
+
+            // Merges folded the generations into the base table.
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 4);
+        });
+    }
+
+    #[test]
+    fn close_drains_resident_writer_and_add_reopens() {
+        // close() must gracefully drop the resident writer, and a subsequent
+        // add() must reopen one and keep working.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+
+            // Idempotent close drops the resident writer.
+            store.close().await.unwrap();
+            store.close().await.unwrap(); // second close is a no-op
+
+            // add() after close reopens the writer and stays visible.
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn add_is_durable_but_not_visible_until_flush() {
+        // Core semantic of the concurrent-write design: `add` returns once the
+        // record is durable (WAL-persisted), but the row is NOT visible to reads
+        // until `flush` seals the memtable into a queryable generation. This is
+        // the accepted read-after-write asynchrony that lets appends run without
+        // a per-append seal.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            // Durable, but not yet flushed: the read path (base ∪ flushed
+            // generations) does not see it.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+            assert!(store.get_by_id("a-0").await.unwrap().is_none());
+
+            // After a flush the row is visible, and nothing was lost.
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+            assert!(store.get_by_id("a-0").await.unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn concurrent_adds_share_one_store_and_none_are_lost() {
+        // `add` is `&self`, so many appends can run concurrently against one
+        // shared store handle (no RwLock, no per-append serialization). All must
+        // succeed and every record must survive to be readable after a flush.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(RolloutStore::open(&uri).await.unwrap());
+
+            const N: usize = 50;
+            let mut handles = Vec::with_capacity(N);
+            for i in 0..N {
+                let store = store.clone();
+                handles.push(tokio::spawn(async move {
+                    store
+                        .add(&[assistant_record(&format!("row-{i}"))])
+                        .await
+                        .unwrap();
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+
+            store.flush().await.unwrap();
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), N, "every concurrent append must be readable");
+            for i in 0..N {
+                assert!(
+                    store
+                        .get_by_id(&format!("row-{i}"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "row-{i} was lost"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn bulk_key_delete_merge_preserves_upserts_blobs_and_later_wal() {
+        for (parallel, staged) in [(false, false), (true, false), (false, true)] {
+            for index in [
+                None,
+                Some(crate::KeyIndexType::Btree),
+                Some(crate::KeyIndexType::Zonemap),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_string_lossy().to_string();
+                let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+                let options = RolloutStoreOptions {
+                    shard_id: Some("bulk-writer".into()),
+                    merge_after_generations: Some(0),
+                    merge_max_generations: Some(64),
+                    merge_max_bytes: Some(1024 * 1024),
+                    merge_budget: Some(budget.clone()),
+                    key_index_type: index.unwrap_or(crate::KeyIndexType::Zonemap),
+                    ..Default::default()
+                };
+                let mut store = RolloutStore::open_with_options(&uri, options)
+                    .await
+                    .unwrap();
+                let old_blob = vec![19; 64 * 1024];
+                let new_blob = vec![41; 64 * 1024];
+                for group in 0..2 {
+                    let rows: Vec<_> = (group * 8..(group + 1) * 8)
+                        .map(|i| artifact_record(&format!("row-{i}"), &old_blob))
+                        .collect();
+                    store.add(&rows).await.unwrap();
+                    store.cleanup_own_shard().await.unwrap();
+                    if group == 0 && index.is_some() {
+                        store.base.create_configured_key_index().await.unwrap();
+                    }
+                }
+                // Existing keys in both indexed and uncovered fragments, plus an
+                // absent key. Two source generations update the same key as well.
+                store
+                    .add(&[
+                        artifact_record("row-0", &old_blob),
+                        artifact_record("row-9", &new_blob),
+                        artifact_record("new-key", &new_blob),
+                    ])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                store
+                    .add(&[artifact_record("row-0", &new_blob)])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                let (manifests, manifest, mut prepared) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                let (_, _, mut stale) = store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                prepared.use_bulk_key_delete();
+                if parallel {
+                    prepared.use_parallel_upsert_io();
+                }
+                stale.use_bulk_key_delete();
+                if parallel {
+                    stale.use_parallel_upsert_io();
+                }
+                if staged {
+                    let before_stage = store.base.dataset.version().version;
+                    store.stage_prepared_merge(&mut prepared).await.unwrap();
+                    store.stage_prepared_merge(&mut stale).await.unwrap();
+                    // Encoding has no visible rows, deletions, or WAL coverage.
+                    store.base.refresh_latest().await.unwrap();
+                    assert_eq!(store.base.dataset.version().version, before_stage);
+                    assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 16);
+                    assert_eq!(flushed_generation_count(&store).await, 2);
+                }
+                assert!(budget.reserved() > 0);
+                let before = store.base.dataset.version().version;
+                store
+                    .add(&[artifact_record("later-wal", &new_blob)])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                assert_eq!(
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, prepared)
+                        .await
+                        .unwrap(),
+                    2
+                );
+                assert!(store.base.dataset.version().version > before);
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 17);
+                assert_eq!(
+                    flushed_generation_count(&store).await,
+                    1,
+                    "later flush must survive the older prepared merge"
+                );
+                assert_eq!(
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, stale)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(budget.reserved(), 0);
+                for id in ["row-0", "row-9", "new-key", "later-wal"] {
+                    assert_eq!(
+                        store.get_blob(id).await.unwrap().as_deref(),
+                        Some(new_blob.as_slice()),
+                        "{id}"
+                    );
+                }
+                assert_eq!(
+                    store.get_blob("row-15").await.unwrap().as_deref(),
+                    Some(old_blob.as_slice())
+                );
+                let (manifests, manifest, mut next) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                next.use_bulk_key_delete();
+                if parallel {
+                    next.use_parallel_upsert_io();
+                }
+                if staged {
+                    store.stage_prepared_merge(&mut next).await.unwrap();
+                }
+                assert_eq!(
+                    store
+                        .commit_prepared_merge(&manifests, &manifest, next)
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 18);
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(budget.reserved(), 0);
+                store.close().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_wal_shards_delete_against_latest_ordered_commit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let budget = crate::MergeMemoryBudget::new(4 * 1024 * 1024);
+        let options = |shard: &str| RolloutStoreOptions {
+            shard_id: Some(shard.to_owned()),
+            merge_after_generations: Some(0),
+            merge_max_bytes: Some(1024 * 1024),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut a = RolloutStore::open_with_options(uri, options("staged-a"))
+            .await
+            .unwrap();
+        let original = vec![1; 64 * 1024];
+        let next_a = vec![2; 64 * 1024];
+        let next_b = vec![3; 64 * 1024];
+        a.add(&[
+            artifact_record("shared", &original),
+            artifact_record("untouched", &original),
+        ])
+        .await
+        .unwrap();
+        a.cleanup_own_shard().await.unwrap();
+        let mut b = RolloutStore::open_with_options(uri, options("staged-b"))
+            .await
+            .unwrap();
+        a.add(&[
+            artifact_record("shared", &next_a),
+            artifact_record("a-only", &next_a),
+        ])
+        .await
+        .unwrap();
+        b.add(&[
+            artifact_record("shared", &next_b),
+            artifact_record("b-only", &next_b),
+        ])
+        .await
+        .unwrap();
+        a.flush().await.unwrap();
+        b.flush().await.unwrap();
+        let ra = budget.reserve(1024 * 1024).await;
+        let rb = budget.try_reserve(1024 * 1024).unwrap();
+        let (ma, sa, mut pa) = a.prepare_merge_reserved(ra).await.unwrap().unwrap();
+        let (mb, sb, mut pb) = b.prepare_merge_reserved(rb).await.unwrap().unwrap();
+        let version = a.base.dataset.version().version;
+        let (ea, eb) = tokio::join!(
+            a.stage_prepared_merge(&mut pa),
+            b.stage_prepared_merge(&mut pb)
+        );
+        ea.unwrap();
+        eb.unwrap();
+        a.base.refresh_latest().await.unwrap();
+        assert_eq!(a.base.dataset.version().version, version);
+        assert_eq!(a.base.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(a.commit_prepared_merge(&ma, &sa, pa).await.unwrap(), 1);
+        assert_eq!(b.commit_prepared_merge(&mb, &sb, pb).await.unwrap(), 1);
+        assert_eq!(budget.reserved(), 0);
+        b.base.refresh_latest().await.unwrap();
+        assert_eq!(b.base.dataset.count_rows(None).await.unwrap(), 4);
+        for (id, blob) in [
+            ("shared", &next_b),
+            ("a-only", &next_a),
+            ("b-only", &next_b),
+            ("untouched", &original),
+        ] {
+            assert_eq!(b.get_blob(id).await.unwrap().as_ref(), Some(blob));
+        }
+        assert_eq!(flushed_generation_count(&a).await, 0);
+        assert_eq!(flushed_generation_count(&b).await, 0);
+        a.close().await.unwrap();
+        b.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_wal_rejects_schema_change_without_draining() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open_with_options(
+            dir.path().to_str().unwrap(),
+            RolloutStoreOptions {
+                merge_after_generations: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let blob = vec![9; 64 * 1024];
+        store
+            .add(&[artifact_record("pending", &blob)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        store.stage_prepared_merge(&mut prepared).await.unwrap();
+        store
+            .base
+            .dataset
+            .add_columns(
+                lance::dataset::NewColumnTransform::AllNulls(Arc::new(arrow_schema::Schema::new(
+                    vec![arrow_schema::Field::new(
+                        "added_after_staging",
+                        arrow_schema::DataType::Int64,
+                        true,
+                    )],
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let version = store.base.dataset.version().version;
+        let err = store
+            .commit_prepared_merge(&manifests, &manifest, prepared)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed after WAL encoding"),
+            "{err}"
+        );
+        store.base.refresh_latest().await.unwrap();
+        assert_eq!(store.base.dataset.version().version, version);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 0);
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn atomic_upsert_conflict_never_replays_over_newer_same_shard_values() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+
+        struct AdvanceOnce(tokio::sync::Mutex<Option<RolloutStore>>);
+        impl std::fmt::Debug for AdvanceOnce {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("AdvanceOnce")
+            }
+        }
+        impl CommitAuthorizer for AdvanceOnce {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" {
+                        let peer = self.0.lock().await.take();
+                        if let Some(mut peer) = peer {
+                            // The old deletion masks/files are already prepared.
+                            // Publish a newer value before its conditional commit.
+                            peer.cleanup_own_shard().await?;
+                            peer.close().await?;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = RolloutStoreOptions {
+            shard_id: Some("same-shard".into()),
+            merge_after_generations: Some(0),
+            ..Default::default()
+        };
+        let mut old = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        old.add(&[artifact_record("updated", &[1; 1024])])
+            .await
+            .unwrap();
+        old.flush().await.unwrap();
+        let (manifests, manifest, prepared) = old.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        let peer = RolloutStore::open_with_options(uri, options).await.unwrap();
+        peer.add(&[artifact_record("updated", &[2; 1024])])
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        let scope = MergeWriteScope::with_authorizer(Arc::new(AdvanceOnce(
+            tokio::sync::Mutex::new(Some(peer)),
+        )));
+        let error = scope
+            .run(old.commit_prepared_merge(&manifests, &manifest, prepared))
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        assert!(
+            error
+                .to_string()
+                .contains("shard coverage changed during atomic upsert; reprepare"),
+            "{error}"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.count_rows(None).await.unwrap(), 1);
+        assert!(
+            RolloutStore::get_blob_from_dataset(&latest, "updated")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(&[2; 1024])
+        );
+        assert_eq!(flushed_generation_count(&old).await, 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_timeout_before_storage_preserves_definite_failure() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct Unavailable;
+        impl CommitAuthorizer for Unavailable {
+            fn authorize<'a>(
+                &'a self,
+                _: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async { Err(LanceError::io("etcdserver: request timed out")) })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let mut dataset = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        let before = dataset.version().version;
+        let scope = MergeWriteScope::with_authorizer(Arc::new(Unavailable));
+        let error = scope
+            .run(async {
+                dataset
+                    .update_metadata([("denied", "must-not-publish")])
+                    .await
+            })
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        let message = error.to_string();
+        assert!(
+            message.contains("etcdserver: request timed out"),
+            "{message}"
+        );
+        assert!(!message.contains("Commit result"), "{message}");
+        assert!(
+            !scope.has_uncertain_commit(),
+            "no storage write was admitted"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.version().version, before);
+        assert!(!latest.metadata().contains_key("denied"));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn guarded_prepublication_conflict_is_definitive_for_local_storage() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let store = RolloutStore::open(uri).await.unwrap();
+        let mut stale = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        let attempted = stale.version().version + 1;
+        let mut peer = StorageBase::load_with_options(uri, None, None)
+            .await
+            .unwrap();
+        peer.update_metadata([("peer", "committed")]).await.unwrap();
+        let error = crate::merge_write_scope::at_base_version(attempted, async {
+            stale.update_metadata([("stale", "must-not-publish")]).await
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LanceError::CommitConflict { .. }),
+            "{error}"
+        );
+        let latest = Dataset::open(uri).await.unwrap();
+        assert_eq!(latest.version().version, attempted);
+        assert_eq!(
+            latest.metadata().get("peer").map(String::as_str),
+            Some("committed")
+        );
+        assert!(!latest.metadata().contains_key("stale"));
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn atomic_upsert_keeps_base_intact_when_publication_is_fenced() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        #[derive(Debug)]
+        struct DenyPublication(u64);
+        impl CommitAuthorizer for DenyPublication {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" && version > self.0 {
+                        return Err(lance::Error::io("atomic upsert fenced"));
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+        let options = RolloutStoreOptions {
+            shard_id: Some("bulk-replay".into()),
+            merge_after_generations: Some(0),
+            merge_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        let mut store = RolloutStore::open_with_options(uri, options.clone())
+            .await
+            .unwrap();
+        let old = vec![19; 64 * 1024];
+        let new = vec![41; 64 * 1024];
+        store
+            .add(&[
+                artifact_record("replace", &old),
+                artifact_record("untouched", &old),
+            ])
+            .await
+            .unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        store
+            .add(&[
+                artifact_record("replace", &new),
+                artifact_record("new", &new),
+            ])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        prepared.use_bulk_key_delete();
+        prepared.use_parallel_upsert_io();
+        let before = store.base.dataset.version().version;
+        let scope = MergeWriteScope::with_authorizer(Arc::new(DenyPublication(before)));
+        let error = scope
+            .run(store.commit_prepared_merge(&manifests, &manifest, prepared))
+            .await
+            .unwrap_err();
+        scope.drain().await;
+        assert!(
+            error.to_string().contains("atomic upsert fenced"),
+            "{error}"
+        );
+        let base = lance::Dataset::open(uri).await.unwrap();
+        assert_eq!(base.version().version, before);
+        assert_eq!(
+            base.count_rows(None).await.unwrap(),
+            2,
+            "fenced publication must not delete original base rows"
+        );
+        assert_eq!(flushed_generation_count(&store).await, 1);
+        assert_eq!(budget.reserved(), 0);
+        // Verify both immutable views explicitly. Rollout's ordinary blob API
+        // is base-first for append-only IDs; this recovery test deliberately
+        // exercises an upsert of an existing ID.
+        assert!(
+            RolloutStore::get_blob_from_dataset(&base, "replace")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(old.as_slice())
+        );
+        let snapshots = store.wal_shard_snapshots().await.unwrap();
+        let generation = &snapshots[0].sstables[0];
+        let wal =
+            Dataset::open(&store.flushed_generation_uri(snapshots[0].shard_id, &generation.path))
+                .await
+                .unwrap();
+        assert!(
+            RolloutStore::get_blob_from_dataset(&wal, "replace")
+                .await
+                .unwrap()
+                .flatten()
+                .as_deref()
+                == Some(new.as_slice())
+        );
+        store.close().await.unwrap();
+        drop(store);
+
+        let mut successor = RolloutStore::open_with_options(uri, options).await.unwrap();
+        let (manifests, manifest, mut prepared) =
+            successor.prepare_merge_if_ready(1).await.unwrap().unwrap();
+        prepared.use_bulk_key_delete();
+        prepared.use_parallel_upsert_io();
+        assert_eq!(
+            successor
+                .commit_prepared_merge(&manifests, &manifest, prepared)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(successor.base.dataset.count_rows(None).await.unwrap(), 3);
+        assert_eq!(flushed_generation_count(&successor).await, 0);
+        for id in ["replace", "new"] {
+            assert_eq!(successor.get_blob(id).await.unwrap(), Some(new.clone()));
+        }
+        assert_eq!(successor.get_blob("untouched").await.unwrap(), Some(old));
+        assert_eq!(budget.reserved(), 0);
+        successor.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_upsert_encodes_while_delete_waits_and_joins_on_error() {
+        use crate::merge_write_scope::{CommitAuthorizer, MergeWriteScope};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        #[derive(Debug)]
+        struct Gate {
+            first: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+            reject: bool,
+        }
+        impl CommitAuthorizer for Gate {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                _: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if resource == "base" && !self.first.swap(true, Ordering::SeqCst) {
+                        self.entered.notify_one();
+                        let permit = self.release.acquire().await.unwrap();
+                        drop(permit);
+                        if self.reject {
+                            return Err(lance::Error::io("delete denied by test fence"));
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+        for bulk in [false, true] {
+            for reject in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_str().unwrap();
+                let budget = crate::MergeMemoryBudget::new(32 * 1024 * 1024);
+                let mut store = RolloutStore::open_with_options(
+                    uri,
+                    RolloutStoreOptions {
+                        merge_after_generations: Some(0),
+                        merge_budget: Some(budget.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                store
+                    .add(&[artifact_record("replace", &[19; 4096])])
+                    .await
+                    .unwrap();
+                store.cleanup_own_shard().await.unwrap();
+                let payload = vec![41; 2 * 1024 * 1024];
+                store
+                    .add(&[artifact_record("replace", &payload)])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                let (manifests, manifest, mut prepared) =
+                    store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                prepared.use_parallel_upsert_io();
+                if bulk {
+                    prepared.use_bulk_key_delete();
+                }
+                let before = store.base.dataset.version().version;
+                let gate = Arc::new(Gate {
+                    first: AtomicBool::new(false),
+                    entered: tokio::sync::Notify::new(),
+                    // Error case rejects immediately, proving join does not
+                    // abandon the concurrently admitted encoding operation.
+                    release: tokio::sync::Semaphore::new(usize::from(reject)),
+                    reject,
+                });
+                let scope = MergeWriteScope::with_authorizer(gate.clone());
+                let runner_scope = scope.clone();
+                let runner = tokio::spawn(async move {
+                    runner_scope
+                        .run(async move {
+                            let result = store
+                                .commit_prepared_merge(&manifests, &manifest, prepared)
+                                .await;
+                            (store, result)
+                        })
+                        .await
+                });
+                if !reject {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        gate.entered.notified(),
+                    )
+                    .await
+                    .unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                        while scope.work().encoded_files == 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("encoding must finish while deletion is blocked");
+                    assert!(!runner.is_finished());
+                    assert!(budget.reserved() > 0);
+                    assert_eq!(
+                        lance::Dataset::open(uri).await.unwrap().version().version,
+                        before
+                    );
+                    gate.release.add_permits(1);
+                }
+                let (mut store, result) = runner.await.unwrap();
+                scope.drain().await;
+                assert!(scope.work().encoded_files > 0);
+                assert_eq!(budget.reserved(), 0);
+                if reject {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("delete denied by test fence"));
+                    assert_eq!(
+                        lance::Dataset::open(uri).await.unwrap().version().version,
+                        before
+                    );
+                    assert_eq!(flushed_generation_count(&store).await, 1);
+                    let (manifests, manifest, mut prepared) =
+                        store.prepare_merge_if_ready(1).await.unwrap().unwrap();
+                    prepared.use_parallel_upsert_io();
+                    if bulk {
+                        prepared.use_bulk_key_delete();
+                    }
+                    assert_eq!(
+                        store
+                            .commit_prepared_merge(&manifests, &manifest, prepared)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), 1);
+                }
+                assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 1);
+                assert_eq!(store.get_blob("replace").await.unwrap(), Some(payload));
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                store.close().await.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_recovers_own_wal_without_new_ingest_after_runtime_exit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let options = RolloutStoreOptions {
+            shard_id: Some("restarted-writer".into()),
+            ..Default::default()
+        };
+        let payload = vec![37; 64 * 1024];
+        let old_runtime = tokio::runtime::Runtime::new().unwrap();
+        let old = old_runtime.block_on(async {
+            let store = RolloutStore::open_with_options(&uri, options.clone())
+                .await
+                .unwrap();
+            store
+                .add(&[artifact_record("durable-before-exit", &payload)])
+                .await
+                .unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            store
+        });
+        // Stop every old background task before dropping the store outside a
+        // runtime. Do not run its graceful close (which would hide this bug).
+        drop(old_runtime);
+        drop(old);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let other = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("different-live-writer".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(other
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .is_none());
+            assert!(other.own_shard_watermark().await.unwrap().is_none());
+            assert!(other
+                .get_by_id("durable-before-exit")
+                .await
+                .unwrap()
+                .is_none());
+
+            let mut recovered = RolloutStore::open_with_options(&uri, options)
+                .await
+                .unwrap();
+            recovered.flush().await.unwrap();
+            assert!(recovered
+                .get_by_id("durable-before-exit")
+                .await
+                .unwrap()
+                .is_none());
+            // Exercise the split-lock route used by the actual HTTP merge.
+            let (manifests, manifest, prepared) = recovered
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("cleanup must replay acknowledged but unsealed WAL");
+            assert!(
+                recovered
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                recovered.get_blob("durable-before-exit").await.unwrap(),
+                Some(payload)
+            );
+            assert_eq!(recovered.cleanup_own_shard().await.unwrap(), 0);
+            let epoch = shard_writer_epoch(&recovered).await;
+            recovered
+                .add(&[assistant_record("after-recovery")])
+                .await
+                .unwrap();
+            recovered.cleanup_own_shard().await.unwrap();
+            assert_eq!(
+                shard_writer_epoch(&recovered).await,
+                epoch,
+                "live writer must be reused"
+            );
+            assert_eq!(recovered.list(None, None).await.unwrap().len(), 2);
+            recovered.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn flush_is_noop_without_writes() {
+        // flush() with no resident writer / nothing buffered must be a harmless
+        // no-op (the periodic sweeper calls it on every resident store each tick).
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            // No writer opened yet, nothing buffered.
+            store.flush().await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 0);
+
+            // A flush after an add makes the row visible; a second flush is a
+            // no-op (memtable already drained).
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[tokio::test]
+    async fn reference_validation_preserves_healthy_and_missing_data() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        for id in ["a", "b", "c"] {
+            store.add(&[assistant_record(id)]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+        }
+        let version = store.version();
+        let files = store.base_data_files();
+        assert_eq!(files.len(), 3);
+        let scope = crate::merge_write_scope::MergeWriteScope::new();
+        let report = scope
+            .run(store.validate_fragment_references())
+            .await
+            .unwrap();
+        assert_eq!(report.read_version, version);
+        assert_eq!(report.references_checked, 3);
+        assert_eq!(scope.completed_steps(), 3);
+        assert_eq!(scope.work().references_validated, 3);
+        assert_eq!(store.version(), version);
+        assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+
+        let path = dir.path().join("data").join(&files[1]);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = store
+            .validate_fragment_references()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing data reference"), "{error}");
+        assert_eq!(store.version(), version);
+        assert_eq!(store.base_data_files(), files);
+        // Restoring the reference restores all original rows; validation never
+        // made the absence permanent by deleting a fragment from the manifest.
+        std::fs::write(path, original).unwrap();
+        store.validate_fragment_references().await.unwrap();
+        assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn reference_validation_preserves_missing_deletion_reference() {
+        let dir = TempDir::new().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        store
+            .add(&[assistant_record("a"), assistant_record("b")])
+            .await
+            .unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        store.base.dataset.delete("id = 'a'").await.unwrap();
+        store.base.reload().await.unwrap();
+        let fragment = &store.base.dataset.fragments()[0];
+        let deletion = fragment
+            .deletion_file
+            .as_ref()
+            .expect("partial deletion file");
+        let name = format!(
+            "{}-{}-{}.{}",
+            fragment.id,
+            deletion.read_version,
+            deletion.id,
+            deletion.file_type.suffix()
+        );
+        let path = dir.path().join("_deletions").join(name);
+        let original = std::fs::read(&path).unwrap();
+        let version = store.version();
+        let scope = crate::merge_write_scope::MergeWriteScope::new();
+        let report = scope
+            .run(store.validate_fragment_references())
+            .await
+            .unwrap();
+        assert_eq!(report.references_checked, 2);
+        assert_eq!(scope.completed_steps(), 2);
+        std::fs::remove_file(&path).unwrap();
+        let error = store
+            .validate_fragment_references()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing deletion reference"), "{error}");
+        assert_eq!(store.version(), version);
+        assert!(store.base.dataset.fragments()[0].deletion_file.is_some());
+        std::fs::write(path, original).unwrap();
+        store.validate_fragment_references().await.unwrap();
+        assert_eq!(store.list(None, None).await.unwrap().len(), 1);
+    }
+
+    /// A manifest that names a data file storage no longer has makes every
+    /// scan, merge and compaction fail with `Not found`, and no retry fixes
+    /// it. `repair_missing_fragments` drops exactly those fragments and
+    /// commits, after which the table works again minus the rows that were
+    /// already gone.
+    #[test]
+    fn repair_drops_fragments_whose_files_are_missing() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            // Three fragments of one row each.
+            for i in 0..3 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
+            }
+            assert_eq!(store.base.dataset.count_fragments(), 3);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+
+            // Nothing missing: no commit.
+            let v = store.version();
+            let report = store.repair_missing_fragments().await.unwrap();
+            assert!(report.dropped.is_empty());
+            assert_eq!(report.committed_version, None);
+            assert_eq!(store.version(), v);
+
+            // Lose the second fragment's data file behind Lance's back.
+            let victim = store.base.dataset.fragments()[1].clone();
+            let victim_id = victim.id;
+            let victim_path = victim.files[0].path.clone();
+            std::fs::remove_file(dir.path().join("data").join(&victim_path)).unwrap();
+
+            // The table is now broken the way production stores were.
+            let mut broken =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            let err = broken
+                .compact(Some(CompactionConfig {
+                    min_fragments: 1,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Not found"), "{err}");
+
+            let report = store.repair_missing_fragments().await.unwrap();
+            assert_eq!(report.dropped.len(), 1);
+            assert_eq!(report.dropped[0].id, victim_id);
+            assert_eq!(report.dropped[0].physical_rows, Some(1));
+            assert_eq!(report.dropped[0].missing_files, vec![victim_path]);
+            assert!(report.committed_version.unwrap() > report.read_version);
+
+            // Two rows remain and the table compacts again.
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            store
+                .compact(Some(CompactionConfig {
+                    min_fragments: 1,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn compact_reduces_fragments_and_preserves_reads() {
+        // Each WAL merge appends a fragment to the base table, so several merges
+        // leave many small fragments. compact() folds them into fewer fragments
+        // while every row stays readable exactly once and inline artifact bytes
+        // remain fetchable.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let artifact_bytes = b"\x00\x01\x02compacted";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    // Merge every append into base so each forms its own fragment.
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..6 {
+                store
+                    .add(&[assistant_record(&format!("a-{i}"))])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
+            }
+            store
+                .add(&[artifact_record("a-6", artifact_bytes)])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
+
+            let before = store.base.dataset.count_fragments();
+            assert!(before > 1, "expected several fragments, got {before}");
+            assert!(store.should_compact(&CompactionConfig {
+                min_fragments: 2,
+                ..CompactionConfig::default()
+            }));
+
+            let metrics = store
+                .compact(Some(CompactionConfig {
+                    min_fragments: 2,
+                    num_threads: Some(1),
+                    max_bytes_per_file: Some(1024 * 1024),
+                    batch_size: Some(1),
+                    max_source_fragments: Some(4),
+                    try_binary_copy: true,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            assert!(
+                metrics.fragments_removed <= 4,
+                "one incremental pass must honor max_source_fragments"
+            );
+
+            let after = store.base.dataset.count_fragments();
+            assert!(
+                after < before,
+                "compaction should reduce fragments: {before} -> {after}"
+            );
+
+            // All rows conserved, each exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 7);
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["a-0", "a-1", "a-2", "a-3", "a-4", "a-5", "a-6"]);
+            // Inline artifact bytes survive compaction.
+            assert_eq!(
+                store.get_blob("a-6").await.unwrap().as_deref(),
+                Some(&artifact_bytes[..])
+            );
+
+            // Stats reflect the successful compaction.
+            let stats = store.compaction_stats();
+            assert_eq!(stats.total_compactions, 1);
+            assert!(stats.last_compaction.is_some());
+            assert!(stats.last_error.is_none());
+        });
+    }
+
+    async fn compact_after_peer_rewrite(incremental: bool, prepared: bool) {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..3 {
+            writer
+                .add(&[assistant_record(&format!("row-{i}"))])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let mut cached =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        let cached_version = cached.version();
+        assert_eq!(cached.base.dataset.count_fragments(), 3);
+        assert!(writer.compact(None).await.unwrap().fragments_removed > 0);
+        // A later append must also survive the next compactor's stale handle.
+        writer
+            .add(&[artifact_record("row-3", b"peer-blob")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        let latest_version = writer.version();
+        assert!(latest_version > cached_version);
+        assert_eq!(cached.version(), cached_version);
+        let mut pinned =
+            RolloutStore::open_existing_with_options(uri, RolloutStoreOptions::default())
+                .await
+                .unwrap();
+        pinned.checkout(cached_version).await.unwrap();
+        assert!(pinned
+            .compact(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+        assert!(pinned
+            .prepare_compaction(CompactionConfig::default())
+            .await
+            .expect_err("historical handles must not prepare writes")
+            .to_string()
+            .contains("read-only"));
+        assert_eq!(pinned.version(), cached_version);
+        let config = CompactionConfig {
+            max_source_fragments: incremental.then_some(128),
+            ..Default::default()
+        };
+        let metrics = if prepared {
+            let work = cached.prepare_compaction(config).await.unwrap();
+            assert_eq!(work.read_version(), latest_version);
+            // Preparing a fresh immutable snapshot does not change the cached handle.
+            assert_eq!(cached.version(), cached_version);
+            cached.commit_prepared_compaction(work).await.unwrap()
+        } else {
+            cached.compact(Some(config)).await.unwrap()
+        };
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(cached.base.dataset.count_fragments(), 1);
+        let mut ids: Vec<_> = cached
+            .list(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["row-0", "row-1", "row-2", "row-3"]);
+        assert_eq!(
+            cached.get_blob("row-3").await.unwrap().as_deref(),
+            Some(b"peer-blob".as_slice())
+        );
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_refreshes_after_peer_rewrite() {
+        for incremental in [false, true] {
+            compact_after_peer_rewrite(incremental, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_compact_refreshes_after_peer_rewrite() {
+        compact_after_peer_rewrite(true, true).await;
+    }
+
+    #[test]
+    fn should_compact_respects_min_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+
+            let frags = store.base.dataset.count_fragments();
+            // A threshold above the current fragment count says "don't compact".
+            assert!(!store.should_compact(&CompactionConfig {
+                min_fragments: frags + 1,
+                ..CompactionConfig::default()
+            }));
+            // At/below it says "compact".
+            assert!(store.should_compact(&CompactionConfig {
+                min_fragments: frags,
+                ..CompactionConfig::default()
+            }));
+        });
+    }
+
+    #[test]
+    fn compact_composes_with_concurrent_wal_merge() {
+        // Append and Rewrite compose, but preparing the WAL merge can also
+        // CreateIndex. Lance may ask that transaction to retry after Rewrite.
+        // One explicit retry once compaction completes must retain every row.
+        // Instance A compacts while
+        // instance B (a different shard) merges its own generations into the
+        // same base table.
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Seed the base table via A with several fragments to compact.
+            let mut a = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..5 {
+                a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+                a.flush().await.unwrap();
+                a.maybe_merge_own_shard().await.unwrap();
+            }
+
+            // B accumulates its own shard's generations (not yet merged).
+            let b = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+                b.flush().await.unwrap();
+            }
+
+            let a = Arc::new(RwLock::new(a));
+            let b = Arc::new(RwLock::new(b));
+
+            // A compacts the base table; B merges its shard into it — concurrently.
+            let (ca, mb) = tokio::join!(
+                async {
+                    let mut g = a.write().await;
+                    g.compact(None).await
+                },
+                async {
+                    let mut g = b.write().await;
+                    g.cleanup_own_shard().await
+                },
+            );
+            ca.expect("compaction should not fail against a concurrent append");
+            let mb = match mb {
+                Err(LanceError::RetryableCommitConflict { .. }) => {
+                    // The concurrent compactor has completed above. Retry only
+                    // this typed conflict, never arbitrary storage/data errors.
+                    b.write().await.cleanup_own_shard().await
+                }
+                result => result,
+            };
+            assert_eq!(mb.expect("wal merge should not fail"), 3);
+
+            // A fresh reader sees all 8 rows exactly once.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 8);
+            assert_eq!(reader.base.dataset.count_rows(None).await.unwrap(), 8);
+            let ids: std::collections::HashSet<_> = listed.iter().map(|r| r.id.clone()).collect();
+            let expected = (0..5)
+                .map(|i| format!("a-{i}"))
+                .chain((0..3).map(|i| format!("b-{i}")))
+                .collect();
+            assert_eq!(ids, expected);
+        });
+    }
+
+    #[test]
+    fn below_threshold_no_merge() {
+        // With a threshold of 3, two appends must NOT trigger a merge: the
+        // flushed generations stay in `_mem_wal/` and the base table version
+        // does not advance from appends.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(3),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+
+            // Two generations accumulated, threshold (3) not reached: no merge.
+            assert_eq!(flushed_generation_count(&store).await, 2);
+            // All rows still readable via the LSM union.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn merge_at_threshold_drains_shard_and_preserves_reads() {
+        // At the threshold, `add` folds the shard's flushed generations into
+        // the base table and drains `flushed_generations` to empty. Reads still
+        // return every row exactly once (base ∪ empty shard, dedup by id), and
+        // inline artifact bytes remain fetchable after the merge.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let artifact_bytes = b"\x00\x01\x02merged-trace";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(3),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            // The third append reaches the threshold and triggers the merge.
+            store
+                .add(&[artifact_record("a-2", artifact_bytes)])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.maybe_merge_own_shard().await.unwrap();
+
+            // Shard drained: no un-merged generations remain.
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Every row is still present exactly once (no duplication despite
+            // the base table now holding what the shard used to).
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 3);
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["a-0", "a-1", "a-2"]);
+
+            // Point lookup and inline artifact bytes survive the merge into base.
+            let fetched = store.get_by_id("a-2").await.unwrap().unwrap();
+            assert!(fetched.is_artifact());
+            assert_eq!(
+                store.get_blob("a-2").await.unwrap().as_deref(),
+                Some(&artifact_bytes[..])
+            );
+        });
+    }
+
+    #[test]
+    fn merge_is_visible_to_a_fresh_reader_instance() {
+        // After a merge folds rows into the base table and drains the shard, a
+        // freshly opened store (new process / reader) that re-reads manifests
+        // from object storage sees exactly the merged rows — proving the data
+        // truly landed in the base table, not just this handle's memory.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            {
+                let mut store = RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        storage_options: None,
+                        session: None,
+                        shard_id: Some("rollout-0".to_string()),
+                        merge_after_generations: Some(2),
+                        merge_max_generations: None,
+                        merge_max_bytes: None,
+                        key_index_type: Default::default(),
+                        pending_generations_warn: None,
+                        pending_generations_max: None,
+                        merge_budget: None,
+                    },
+                )
+                .await
+                .unwrap();
+                store.add(&[assistant_record("a-0")]).await.unwrap();
+                store.flush().await.unwrap();
+                store.add(&[assistant_record("a-1")]).await.unwrap();
+                store.flush().await.unwrap();
+                store.maybe_merge_own_shard().await.unwrap();
+                assert_eq!(flushed_generation_count(&store).await, 0);
+            }
+
+            // A brand-new reader opens the same dataset.
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().any(|r| r.id == "a-0"));
+            assert!(listed.iter().any(|r| r.id == "a-1"));
+        });
+    }
+
+    /// Merging does not publish table-wide indexes, even on a populated base.
+    /// Predicate deletion scans keys only when no index is available.
+    #[test]
+    fn merge_does_not_build_an_id_index_on_the_write_path() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.base.dataset.count_fragments(), 1);
+            assert!(
+                !store.has_id_btree_index().await.unwrap(),
+                "empty base: nothing to index"
+            );
+
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert!(
+                !store.has_id_btree_index().await.unwrap(),
+                "merge must not race other shards to create a table-wide index"
+            );
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    /// Partial index coverage remains correct without extending the index in
+    /// each shard's write path. Explicit maintenance still extends coverage.
+    #[test]
+    fn merge_uses_partial_btree_without_publishing_index_updates() {
+        use lance::index::DatasetIndexInternalExt as _;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            store.create_id_btree_index().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            let original = indices
+                .iter()
+                .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                .unwrap()
+                .uuid;
+            // Three more merges append fragments outside existing coverage.
+            for id in ["a-1", "a-2", "a-3"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let unindexed = store
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .len();
+            assert_eq!(unindexed, 3);
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            assert_eq!(
+                indices
+                    .iter()
+                    .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                    .unwrap()
+                    .uuid,
+                original
+            );
+            store.extend_id_btree_index().await.unwrap();
+            assert!(store
+                .base
+                .dataset
+                .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(store.list(None, None).await.unwrap().len(), 4);
+        });
+    }
+
+    #[test]
+    fn merge_deletes_old_rows_and_appends_instead_of_rewriting_fragments() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Two keys in one fragment, so deleting one leaves the fragment
+            // (a fully-deleted fragment is dropped outright).
+            store
+                .add(&[assistant_record("k"), assistant_record("other")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            let fragments = store.base.dataset.get_fragments();
+            assert_eq!(fragments.len(), 1);
+            let first_id = fragments[0].id();
+            assert!(fragments[0].metadata().deletion_file.is_none());
+
+            let mut newer = assistant_record("k");
+            newer.content = Some("second write wins".to_string());
+            store.add(&[newer]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let fragments = store.base.dataset.get_fragments();
+            assert_eq!(fragments.len(), 2, "old fragment kept, new one appended");
+            let old = fragments.iter().find(|f| f.id() == first_id).unwrap();
+            assert!(
+                old.metadata().deletion_file.is_some(),
+                "old row is masked by a deletion vector, not rewritten"
+            );
+            let rows = store.list(None, None).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            let k = rows.iter().find(|r| r.id == "k").unwrap();
+            assert_eq!(k.content.as_deref(), Some("second write wins"));
+        });
+    }
+
+    #[test]
+    fn cleanup_own_shard_merges_whatever_is_pending() {
+        // The periodic-cleanup entry point (`cleanup_own_shard`) is the time
+        // trigger's per-pass body. Time and count are a strict OR, so the time
+        // trigger is NOT gated by any generation count: with count self-merge
+        // disabled, a single pending generation is merged the moment the pass
+        // runs. A pass with nothing pending is a no-op.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // count trigger off
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            // One generation pending: the time trigger merges it immediately —
+            // it does not wait for a count threshold.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            // Next generation is likewise merged on the following pass.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Rows survive the merge, readable exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            assert_eq!(listed.len(), 2);
+
+            // Nothing pending: a further pass reclaims nothing.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn cleanup_merges_pre_claim_check_generations_after_schema_evolution() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (_dir, mut store) = store_with_legacy_base_and_wal(false).await;
+
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            let field_paths = store.base.dataset.schema().field_paths();
+            for column in CLAIM_CHECK_COLUMNS {
+                assert!(field_paths.iter().any(|path| path == column));
+            }
+
+            let mut rows = store.list(None, None).await.unwrap();
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].id, "legacy-base");
+            assert_eq!(rows[1].id, "legacy-wal");
+            for row in rows {
+                assert!(row.model_input_string.is_none());
+                assert!(row.model_output_string.is_none());
+                assert!(row.rationale.is_none());
+                assert!(row.problem_text.is_none());
+                assert!(row.user_metadata.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn latest_schema_alignment_preserves_claim_check_values() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let legacy_dir = TempDir::new().unwrap();
+            let legacy_uri = legacy_dir.path().to_string_lossy().to_string();
+            create_empty_dataset(&legacy_uri, pre_claim_check_schema()).await;
+            let mut legacy_store = RolloutStore::open(&legacy_uri).await.unwrap();
+
+            let current_dir = TempDir::new().unwrap();
+            let current_uri = current_dir.path().to_string_lossy().to_string();
+            let current_store = RolloutStore::open(&current_uri).await.unwrap();
+            let mut record = assistant_record("current-generation");
+            record.model_input_string = Some("input".to_string());
+            record.model_output_string = Some("output".to_string());
+            record.rationale = Some("reason".to_string());
+            record.problem_text = Some("problem".to_string());
+            record.user_metadata = Some(r#"{"source":"worker"}"#.to_string());
+            let generation_batch = current_store.records_to_batch(&[record]).unwrap();
+
+            legacy_store.base.ensure_latest_schema().await.unwrap();
+            let merge_schema: Arc<Schema> = Arc::new(legacy_store.base.dataset.schema().into());
+            let aligned = align_batch_to_schema(generation_batch, merge_schema.clone()).unwrap();
+            let reader = RecordBatchIterator::new(
+                vec![Ok::<RecordBatch, ArrowError>(aligned)].into_iter(),
+                merge_schema,
+            );
+            legacy_store
+                .base
+                .dataset
+                .append(reader, None)
+                .await
+                .unwrap();
+
+            let merged = legacy_store
+                .get_by_id_source("current-generation", ListSource::Fragments)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(merged.model_input_string.as_deref(), Some("input"));
+            assert_eq!(merged.model_output_string.as_deref(), Some("output"));
+            assert_eq!(merged.rationale.as_deref(), Some("reason"));
+            assert_eq!(merged.problem_text.as_deref(), Some("problem"));
+            assert_eq!(
+                merged.user_metadata.as_deref(),
+                Some(r#"{"source":"worker"}"#)
+            );
+        });
+    }
+
+    #[test]
+    fn get_by_id_reads_pre_claim_check_base_and_wal_after_schema_evolution() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (_dir, store) = store_with_legacy_base_and_wal(true).await;
+
+            let mut base = store.get_by_id("legacy-base").await.unwrap().unwrap();
+            let wal = store.get_by_id("legacy-wal").await.unwrap().unwrap();
+
+            assert!(store
+                .get_by_id_source("legacy-base", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .get_by_id_source("legacy-wal", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_some());
+
+            for row in [&base, &wal] {
+                assert!(row.model_input_string.is_none());
+                assert!(row.model_output_string.is_none());
+                assert!(row.rationale.is_none());
+                assert!(row.problem_text.is_none());
+                assert!(row.user_metadata.is_none());
+            }
+
+            base.id.clone_from(&wal.id);
+            assert_records_eq(&base, &wal);
+            assert_eq!(base.binary_payload, wal.binary_payload);
+        });
+    }
+
+    /// ZoneMap merges use key predicates rather than the full-target merge
+    /// join. Exercise multiple bounded delete chunks and unusual literal IDs.
+    #[test]
+    fn zonemap_merge_preserves_updates_across_delete_chunks_and_retries() {
+        use crate::KeyIndexType;
+        use lance::index::DatasetIndexExt;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    key_index_type: KeyIndexType::Zonemap,
+                    merge_max_generations: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut ids: Vec<_> = (0..2050).map(|i| format!("key-{i}")).collect();
+            ids.push("quote' AND false -- \\ unicode-你好".to_string());
+            for payload in [1u8, 2, 2] {
+                let records: Vec<_> = ids
+                    .iter()
+                    .map(|id| artifact_record(id, &[payload; 1024]))
+                    .collect();
+                store.add(&records).await.unwrap();
+                store.flush().await.unwrap();
+                assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(
+                    store.base.dataset.count_rows(None).await.unwrap(),
+                    ids.len()
+                );
+                let actual = store.list(None, None).await.unwrap();
+                assert_eq!(actual.len(), ids.len());
+                let mut scanner = store.base.dataset.scan();
+                scanner.project(&["binary_payload"]).unwrap();
+                let mut stream = scanner.try_into_stream().await.unwrap();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    let blobs = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::LargeBinaryArray>()
+                        .unwrap();
+                    for row in 0..batch.num_rows() {
+                        assert_eq!(blobs.value(row), &[payload; 1024]);
+                    }
+                }
+            }
+            assert!(!store.has_id_btree_index().await.unwrap());
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            assert!(!indices.iter().any(|i| i.name == ROLLOUT_ID_INDEX_NAME));
+            store.create_id_key_index().await.unwrap();
+            let indices = store.base.dataset.load_indices().await.unwrap();
+            assert!(indices.iter().any(|i| i.name == ROLLOUT_ID_INDEX_NAME
+                && i.index_details
+                    .as_ref()
+                    .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))));
+
+            // A configured maintenance rebuild must preserve the selected type.
+            store.create_id_key_index().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            // Changing the policy takes effect on maintenance, not on opening.
+            drop(store);
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            store
+                .add(&[artifact_record(&ids[0], &[3; 1024])])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            assert_eq!(store.list(None, None).await.unwrap().len(), ids.len());
+            store.create_id_key_index().await.unwrap();
+            assert!(store.has_id_btree_index().await.unwrap());
+        });
+    }
+
+    #[test]
+    fn parallel_shard_merges_preserve_partial_indexes_and_full_payloads() {
+        use crate::KeyIndexType;
+        use lance::index::DatasetIndexExt;
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for kind in [KeyIndexType::Btree, KeyIndexType::Zonemap] {
+                    let dir = TempDir::new().unwrap();
+                    let uri = dir.path().to_string_lossy().to_string();
+                    let mut seed = RolloutStore::open_with_options(
+                        &uri,
+                        RolloutStoreOptions {
+                            shard_id: Some("seed".into()),
+                            key_index_type: kind,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let records: Vec<_> = (0..8)
+                        .map(|i| artifact_record(&format!("old-{i}"), &[1; 65536]))
+                        .collect();
+                    seed.add(&records).await.unwrap();
+                    seed.flush().await.unwrap();
+                    seed.cleanup_own_shard().await.unwrap();
+                    seed.create_id_key_index().await.unwrap();
+                    let indices = seed.base.dataset.load_indices().await.unwrap();
+                    let index = indices
+                        .iter()
+                        .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                        .unwrap()
+                        .uuid;
+                    // Half the existing rows are outside index coverage. The
+                    // concurrent updates must delete those rows too, using key
+                    // scans without extending the shared index.
+                    let uncovered: Vec<_> = (8..16)
+                        .map(|i| artifact_record(&format!("old-{i}"), &[1; 65536]))
+                        .collect();
+                    seed.add(&uncovered).await.unwrap();
+                    seed.flush().await.unwrap();
+                    seed.cleanup_own_shard().await.unwrap();
+                    let mut shards = Vec::new();
+                    for shard in 0..4 {
+                        let writer = RolloutStore::open_with_options(
+                            &uri,
+                            RolloutStoreOptions {
+                                shard_id: Some(format!("shard-{shard}")),
+                                key_index_type: kind,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let records: Vec<_> = (shard * 4..shard * 4 + 4)
+                            .flat_map(|i| {
+                                [
+                                    artifact_record(&format!("old-{i}"), &[2; 65536]),
+                                    artifact_record(&format!("new-{i}"), &[2; 65536]),
+                                ]
+                            })
+                            .collect();
+                        writer.add(&records).await.unwrap();
+                        writer.flush().await.unwrap();
+                        shards.push(writer);
+                    }
+                    let results = futures::future::join_all(
+                        shards
+                            .iter_mut()
+                            .map(|writer| async move { writer.cleanup_own_shard().await }),
+                    )
+                    .await;
+                    for result in results {
+                        assert_eq!(result.unwrap(), 1);
+                    }
+                    // Replay is empty and cannot duplicate data or mutate the index.
+                    for writer in &mut shards {
+                        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 0);
+                    }
+                    let fresh = RolloutStore::open(&uri).await.unwrap();
+                    assert_eq!(fresh.base.dataset.count_rows(None).await.unwrap(), 32);
+                    let rows = fresh.list(None, None).await.unwrap();
+                    assert_eq!(rows.len(), 32);
+                    for prefix in ["old", "new"] {
+                        for i in 0..16 {
+                            let id = format!("{prefix}-{i}");
+                            assert!(rows.iter().any(|row| row.id == id));
+                            assert_eq!(fresh.get_blob(&id).await.unwrap().unwrap(), vec![2; 65536]);
+                        }
+                    }
+                    let indices = fresh.base.dataset.load_indices().await.unwrap();
+                    assert_eq!(
+                        indices
+                            .iter()
+                            .find(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                            .unwrap()
+                            .uuid,
+                        index
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn merge_insert_probes_the_id_btree_instead_of_scanning() {
+        use lance::dataset::MergeInsertBuilder;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let plan_for = |s: &RolloutStore| {
+                let dataset = Arc::new(s.base.dataset.clone());
+                async move {
+                    let mut b =
+                        MergeInsertBuilder::try_new(dataset, vec!["id".to_string()]).unwrap();
+                    b.when_matched(lance::dataset::WhenMatched::UpdateAll);
+                    b.try_build().unwrap().explain_plan(None, false).await
+                }
+            };
+
+            // No index: full-table join.
+            let plan = plan_for(&store).await.expect("full-scan plan renders");
+            assert!(plan.contains("HashJoin"), "{plan}");
+
+            // ZoneMap: still a full-table join (not an exact-answer index).
+            store
+                .base
+                .dataset
+                .create_index_builder(
+                    &["id"],
+                    lance_index::IndexType::ZoneMap,
+                    &lance_index::scalar::ScalarIndexParams::default(),
+                )
+                .name(ROLLOUT_ID_INDEX_NAME.to_string())
+                .replace(true)
+                .await
+                .unwrap();
+            store.base.reload().await.unwrap();
+            assert!(!store.has_id_btree_index().await.unwrap());
+            let plan = plan_for(&store)
+                .await
+                .expect("ZoneMap does not change the plan");
+            assert!(plan.contains("HashJoin"), "{plan}");
+
+            // BTree: indexed path, which explain_plan cannot render.
+            store.create_id_btree_index().await.unwrap();
+            assert!(store.has_id_btree_index().await.unwrap());
+            let err = plan_for(&store).await.expect_err("indexed path");
+            assert!(
+                err.to_string().contains("scalar-index"),
+                "expected the scalar-index refusal, got: {err}"
+            );
+
+            // And a real merge through the index still works.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    /// Every merge appends fragments the id BTree does not cover, and
+    /// `merge_insert` full-scans exactly those. `extend_id_btree_index`
+    /// appends an index delta over them; a fully covered table is a no-op
+    /// and a table without the BTree is left alone.
+    #[test]
+    fn extend_id_btree_index_covers_fragments_added_since_build() {
+        use lance::index::DatasetIndexInternalExt as _;
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            // No BTree yet: nothing to extend.
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            store.create_id_btree_index().await.unwrap();
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            // Both merged fragments remain uncovered until explicit maintenance.
+            for id in ["a-1", "a-2"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let unindexed = |s: &RolloutStore| {
+                let dataset = s.base.dataset.clone();
+                async move {
+                    dataset
+                        .unindexed_fragments(ROLLOUT_ID_INDEX_NAME)
+                        .await
+                        .unwrap()
+                        .len()
+                }
+            };
+            assert_eq!(unindexed(&store).await, 2);
+
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 2);
+            assert_eq!(unindexed(&store).await, 0);
+            assert!(store.has_id_btree_index().await.unwrap());
+            assert_eq!(store.extend_id_btree_index().await.unwrap(), 0);
+
+            // Rows are still merged correctly through the extended index.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+        });
+    }
+
+    /// Reads open every flushed generation pending merge. Past the cap the
+    /// read is refused with a recognizable error (the server maps it to 503)
+    /// instead of holding a worker's memory hostage; at the cap it passes.
+    /// The cap holds for the store as a whole: two writer shards each under
+    /// it still add up to a read that opens every generation of both.
+    #[test]
+    fn pending_generation_cap_counts_every_shard() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let open = |shard: &str| {
+                RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        storage_options: None,
+                        session: None,
+                        shard_id: Some(shard.to_string()),
+                        merge_after_generations: None,
+                        merge_max_generations: None,
+                        merge_max_bytes: None,
+                        key_index_type: Default::default(),
+                        pending_generations_warn: None,
+                        pending_generations_max: Some(3),
+                        merge_budget: None,
+                    },
+                )
+            };
+            let mut a = open("rollout-a").await.unwrap();
+            let b = open("rollout-b").await.unwrap();
+            for id in ["a-0", "a-1"] {
+                a.add(&[assistant_record(id)]).await.unwrap();
+                a.flush().await.unwrap();
+            }
+            b.add(&[assistant_record("b-0")]).await.unwrap();
+            b.flush().await.unwrap();
+            // 2 + 1 = 3: at the cap, every shard well under it.
+            assert_eq!(a.list(None, None).await.unwrap().len(), 3);
+
+            b.add(&[assistant_record("b-1")]).await.unwrap();
+            b.flush().await.unwrap();
+            // 2 + 2 = 4: no shard exceeds the cap, the store does.
+            let err = a.list(None, None).await.expect_err("over the cap in total");
+            assert!(
+                crate::store_base::is_pending_generations_exceeded(&err),
+                "{err}"
+            );
+            assert!(err.to_string().contains("across 2 shards"), "{err}");
+
+            // Merging one shard brings the total back under.
+            assert_eq!(a.cleanup_own_shard().await.unwrap(), 2);
+            assert_eq!(b.list(None, None).await.unwrap().len(), 4);
+        });
+    }
+
+    #[test]
+    fn reads_are_refused_past_the_pending_generation_cap() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: Some(2),
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            for id in ["a-0", "a-1"] {
+                store.add(&[assistant_record(id)]).await.unwrap();
+                store.flush().await.unwrap();
+            }
+            // At the cap: still readable.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+
+            store.add(&[assistant_record("a-2")]).await.unwrap();
+            store.flush().await.unwrap();
+            let err = store.list(None, None).await.expect_err("over the cap");
+            assert!(
+                crate::store_base::is_pending_generations_exceeded(&err),
+                "{err}"
+            );
+            assert!(err.to_string().contains("3 flushed generations"), "{err}");
+
+            // The merge drains the backlog and reads resume.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 3);
+            assert_eq!(store.list(None, None).await.unwrap().len(), 3);
+        });
+    }
+
+    #[test]
+    fn create_id_btree_index_builds_and_is_idempotent() {
+        // Building the BTree index on `id` must succeed even though the
+        // rollout table also carries a (fieldless) MemWAL index, and calling it
+        // twice must not error (replace(true) rebuilds in place).
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open(&uri).await.unwrap();
+            // Add rows and fold them into the base table so there is data (and a
+            // MemWAL index) present when we build the scalar index.
+            store.add(&[assistant_record("a-0")]).await.unwrap();
+            store.add(&[assistant_record("a-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            assert!(!store.has_id_btree_index().await.unwrap());
+            store.create_id_btree_index().await.unwrap();
+            assert!(
+                store.has_id_btree_index().await.unwrap(),
+                "the id index must be a BTree: merge_insert only probes an exact-answer index"
+            );
+            let has_id_index = |s: &RolloutStore| {
+                let dataset = s.base.dataset.clone();
+                async move {
+                    dataset
+                        .load_indices()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|i| i.name == ROLLOUT_ID_INDEX_NAME)
+                }
+            };
+            assert!(has_id_index(&store).await, "id index should exist");
+
+            // Idempotent: a second build replaces in place without erroring.
+            store.create_id_btree_index().await.unwrap();
+            assert!(has_id_index(&store).await, "id index should still exist");
+
+            // Rows remain readable exactly once after indexing.
+            assert_eq!(store.list(None, None).await.unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn concurrent_merges_from_two_shards_into_one_base_table() {
+        // Case 2 of the concurrency hardening: two instances (distinct shards)
+        // fold their flushed generations into the SAME base table at the same
+        // time. Lance's optimistic concurrency retries the second append on the
+        // latest version (Append vs Append is non-conflicting), so no commit is
+        // lost. Each instance drains only its own shard manifest. Afterwards
+        // every row is present exactly once and both shards are empty.
+        use tokio::sync::RwLock;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let make = |shard: &str| {
+                let uri = uri.clone();
+                let shard = shard.to_string();
+                async move {
+                    RolloutStore::open_with_options(
+                        &uri,
+                        RolloutStoreOptions {
+                            storage_options: None,
+                            session: None,
+                            shard_id: Some(shard),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+
+            // Two instances, each accumulates a few generations on its own shard.
+            let a = make("rollout-0").await;
+            let b = make("rollout-1").await;
+            for i in 0..4 {
+                a.add(&[assistant_record(&format!("a-{i}"))]).await.unwrap();
+                a.flush().await.unwrap();
+                b.add(&[assistant_record(&format!("b-{i}"))]).await.unwrap();
+                b.flush().await.unwrap();
+            }
+            assert_eq!(flushed_generation_count(&a).await, 4);
+            assert_eq!(flushed_generation_count(&b).await, 4);
+
+            let a = Arc::new(RwLock::new(a));
+            let b = Arc::new(RwLock::new(b));
+
+            // Both merge into the shared base table concurrently.
+            let (ra, rb) = tokio::join!(
+                async {
+                    let mut g = a.write().await;
+                    g.cleanup_own_shard().await
+                },
+                async {
+                    let mut g = b.write().await;
+                    g.cleanup_own_shard().await
+                },
+            );
+            assert_eq!(ra.unwrap(), 4);
+            assert_eq!(rb.unwrap(), 4);
+
+            // Both shards drained; a fresh reader sees all 8 rows exactly once.
+            assert_eq!(flushed_generation_count(&*a.read().await).await, 0);
+            assert_eq!(flushed_generation_count(&*b.read().await).await, 0);
+
+            let reader = RolloutStore::open(&uri).await.unwrap();
+            let listed = reader.list(None, None).await.unwrap();
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            let expected: Vec<String> = (0..4)
+                .flat_map(|i| [format!("a-{i}"), format!("b-{i}")])
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            assert_eq!(ids, expected);
+            assert_eq!(listed.len(), 8);
+        });
+    }
+
+    #[test]
+    fn merge_drains_only_merged_generations() {
+        // Regression guard for the surgical drain: the manifest commit removes
+        // exactly the generations that were merged, so if a generation were to
+        // appear that wasn't part of this merge it would be retained, not
+        // silently discarded. We assert the row count is conserved end to end:
+        // every appended row is readable exactly once after a merge, proving no
+        // generation was dropped without being folded into the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            for i in 0..3 {
+                store
+                    .add(&[assistant_record(&format!("g-{i}"))])
+                    .await
+                    .unwrap();
+                store.flush().await.unwrap();
+            }
+            assert_eq!(flushed_generation_count(&store).await, 3);
+
+            // Merge all three. Surgical drain removes exactly generations {merged}.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 3);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Append a fourth AFTER the drain: it forms a new generation that the
+            // prior merge must not have wiped. A second merge folds just that one.
+            store.add(&[assistant_record("g-3")]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 1);
+
+            // All four rows conserved, each exactly once.
+            let listed = store.list(None, None).await.unwrap();
+            let mut ids: Vec<_> = listed.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            assert_eq!(ids, vec!["g-0", "g-1", "g-2", "g-3"]);
+        });
+    }
+
+    #[test]
+    fn merge_budget_contention_preserves_complete_generations_and_payloads() {
+        const MIB: usize = 1024 * 1024;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // The first case fits a complete generation before growth fails;
+            // the other cases cannot fit even the first complete generation,
+            // including one larger than the entire budget.
+            for payload_len in [700 * 1024, 1400 * 1024, 3 * MIB] {
+                let dir = TempDir::new().unwrap();
+                let uri = dir.path().to_string_lossy().to_string();
+                let budget = MergeMemoryBudget::new(2 * MIB);
+                let held = budget.reserve(MIB).await;
+                let mut store = RolloutStore::open_with_options(
+                    &uri,
+                    RolloutStoreOptions {
+                        shard_id: Some("budget-contention".to_string()),
+                        merge_max_generations: Some(0),
+                        merge_max_bytes: Some(MIB),
+                        key_index_type: Default::default(),
+                        merge_budget: Some(budget.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let payload = vec![42; payload_len];
+                for i in 0..3 {
+                    store
+                        .add(&[artifact_record(&format!("g-{i}"), &payload)])
+                        .await
+                        .unwrap();
+                    store.flush().await.unwrap();
+                }
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    store.cleanup_own_shard(),
+                )
+                .await
+                .expect("memory growth contention must not hang");
+                let remaining = if payload_len < MIB {
+                    assert_eq!(outcome.unwrap(), 1);
+                    2
+                } else {
+                    assert!(outcome
+                        .unwrap_err()
+                        .to_string()
+                        .contains("merge memory budget busy"));
+                    3
+                };
+                assert_eq!(flushed_generation_count(&store).await, remaining);
+                assert_eq!(budget.reserved(), MIB);
+                drop(held);
+                for _ in 0..3 {
+                    let reclaimed = store.cleanup_own_shard().await.unwrap();
+                    if reclaimed == 0 {
+                        break;
+                    }
+                }
+                assert_eq!(flushed_generation_count(&store).await, 0);
+                assert_eq!(budget.reserved(), 0);
+                let mut ids: Vec<_> = store
+                    .list(None, None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.id)
+                    .collect();
+                ids.sort();
+                assert_eq!(ids, ["g-0", "g-1", "g-2"]);
+                for id in ids {
+                    assert_eq!(store.get_blob(&id).await.unwrap().unwrap(), payload);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn list_source_splits_base_and_wal() {
+        // Rows appended but not yet merged live only in the WAL, not the base
+        // table. `Fragments` must omit them; `Wal` must show exactly them; `All`
+        // is the union. After a merge the rows move to the base table and the WAL
+        // empties, flipping which source sees them.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            async fn list_ids(store: &RolloutStore, source: ListSource) -> Vec<String> {
+                let page = store
+                    .list_filtered_source(&RolloutFilters::default(), 25, 0, source)
+                    .await
+                    .unwrap();
+                let mut ids: Vec<_> = page.records.iter().map(|r| r.id.clone()).collect();
+                ids.sort();
+                ids
+            }
+
+            // Two un-merged rows sit in the WAL only.
+            store.add(&[assistant_record("g-0")]).await.unwrap();
+            store.flush().await.unwrap();
+            store.add(&[assistant_record("g-1")]).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 2);
+
+            assert!(
+                list_ids(&store, ListSource::Fragments).await.is_empty(),
+                "fragments must not see un-merged WAL rows"
+            );
+            assert_eq!(list_ids(&store, ListSource::Wal).await, vec!["g-0", "g-1"]);
+            assert_eq!(list_ids(&store, ListSource::All).await, vec!["g-0", "g-1"]);
+            // The default wrapper preserves the historical union semantics.
+            let default_page = store
+                .list_filtered(&RolloutFilters::default(), 25, 0)
+                .await
+                .unwrap();
+            let mut default_ids: Vec<_> =
+                default_page.records.iter().map(|r| r.id.clone()).collect();
+            default_ids.sort();
+            assert_eq!(default_ids, vec!["g-0", "g-1"]);
+
+            // Merge folds the WAL into the base table and drains it.
+            assert_eq!(store.cleanup_own_shard().await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            assert_eq!(
+                list_ids(&store, ListSource::Fragments).await,
+                vec!["g-0", "g-1"]
+            );
+            assert!(
+                list_ids(&store, ListSource::Wal).await.is_empty(),
+                "wal must be empty after a merge"
+            );
+            assert_eq!(list_ids(&store, ListSource::All).await, vec!["g-0", "g-1"]);
+        });
+    }
+
+    #[test]
+    fn wal_and_all_pagination_take_only_page_rows() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("rollout-pagination".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let make_record = |id: &str| {
+                let mut record = assistant_record(id);
+                record.rationale = Some(format!("wide-rationale-{id}-{}", "x".repeat(64 * 1024)));
+                record
+            };
+
+            let mut base_rows = ["row-000", "row-002", "row-004"].map(make_record).to_vec();
+            base_rows[1].policy_version = Some("other-policy".to_string());
+            store.add(&base_rows).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+
+            let mut wal_rows = ["row-001", "row-003", "row-005"].map(make_record).to_vec();
+            wal_rows[1].policy_version = Some("other-policy".to_string());
+            store.add(&wal_rows).await.unwrap();
+            store.flush().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 1);
+
+            let all_page = store
+                .list_filtered_source(&RolloutFilters::default(), 2, 1, ListSource::All)
+                .await
+                .unwrap();
+            assert!(all_page.has_more);
+            assert_eq!(
+                all_page
+                    .records
+                    .iter()
+                    .map(|record| record.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["row-001", "row-002"]
+            );
+            assert!(all_page.records.iter().all(|record| {
+                record
+                    .rationale
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("wide-rationale-"))
+            }));
+
+            let wal_page = store
+                .list_filtered_source(&RolloutFilters::default(), 1, 1, ListSource::Wal)
+                .await
+                .unwrap();
+            assert!(wal_page.has_more);
+            assert_eq!(wal_page.records[0].id, "row-003");
+            assert!(wal_page.records[0]
+                .rationale
+                .as_deref()
+                .is_some_and(|value| value.starts_with("wide-rationale-row-003")));
+
+            let filtered_page = store
+                .list_filtered_source(
+                    &RolloutFilters {
+                        policy_version: Some("other-policy".to_string()),
+                        ..Default::default()
+                    },
+                    1,
+                    0,
+                    ListSource::All,
+                )
+                .await
+                .unwrap();
+            assert!(filtered_page.has_more);
+            assert_eq!(filtered_page.records[0].id, "row-002");
+
+            let final_page = store
+                .list_filtered_source(&RolloutFilters::default(), 2, 5, ListSource::All)
+                .await
+                .unwrap();
+            assert!(!final_page.has_more);
+            assert_eq!(final_page.records[0].id, "row-005");
+        });
+    }
+
+    /// Reproduces the master's direct fragment pagination workload at the
+    /// reported row and fragment scale, including a deep offset.
+    ///
+    /// Run explicitly with:
+    /// `cargo test -p lance-context-core bench_master_pagination_90k_52_fragments -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark; creates 90k rows across 52 fragments"]
+    fn bench_master_pagination_90k_52_fragments() {
+        use std::time::Instant;
+
+        const ROWS: usize = 90_000;
+        const FRAGMENTS: usize = 52;
+        const PAGE_SIZE: usize = 25;
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some("pagination-benchmark".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            let rows_per_fragment = ROWS.div_ceil(FRAGMENTS);
+            let write_start = Instant::now();
+            for fragment in 0..FRAGMENTS {
+                let start = fragment * rows_per_fragment;
+                let end = ((fragment + 1) * rows_per_fragment).min(ROWS);
+                if start >= end {
+                    break;
+                }
+                let records: Vec<_> = (start..end)
+                    .map(|row| assistant_record(&format!("row-{row:06}")))
+                    .collect();
+                writer.add(&records).await.unwrap();
+            }
+            writer.close().await.unwrap();
+
+            let observation = writer.observe().await.unwrap();
+            assert_eq!(observation.row_count, ROWS as i64);
+            assert_eq!(observation.fragment_count, FRAGMENTS as i64);
+
+            let reader =
+                RolloutStore::open_existing_with_options(&uri, RolloutStoreOptions::default())
+                    .await
+                    .unwrap();
+            let first_start = Instant::now();
+            let first_page = reader
+                .list_filtered_source(
+                    &RolloutFilters::default(),
+                    PAGE_SIZE,
+                    0,
+                    ListSource::Fragments,
+                )
+                .await
+                .unwrap();
+            let first_elapsed = first_start.elapsed();
+            assert_eq!(first_page.records.len(), PAGE_SIZE);
+            assert!(first_page.has_more);
+
+            let deep_start = Instant::now();
+            let deep_page = reader
+                .list_filtered_source(
+                    &RolloutFilters::default(),
+                    PAGE_SIZE,
+                    80_000,
+                    ListSource::Fragments,
+                )
+                .await
+                .unwrap();
+            let deep_elapsed = deep_start.elapsed();
+            assert_eq!(deep_page.records.len(), PAGE_SIZE);
+            assert!(deep_page.has_more);
+
+            println!("\n=== master pagination benchmark ===");
+            println!(
+                "  dataset                              : {ROWS} rows / {FRAGMENTS} fragments"
+            );
+            println!(
+                "  dataset construction                 : {:?}",
+                write_start.elapsed()
+            );
+            println!("  direct fragment page at offset 0     : {first_elapsed:?}");
+            println!("  direct fragment page at offset 80k   : {deep_elapsed:?}");
+        });
+    }
+
+    /// Micro-benchmark (run with `cargo test -- --ignored --nocapture
+    /// bench_merge_read_amplification`): quantifies the read-amplification that
+    /// self-merge removes. Appends N generations, times a `list` scan over the
+    /// accumulated `_mem_wal/` generations, then merges them into the base
+    /// table and times an equivalent scan. Also reports the tail latency of the
+    /// single append that triggers the merge.
+    #[test]
+    #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+    fn bench_merge_read_amplification() {
+        use std::time::Instant;
+
+        const N: usize = 200;
+        const READ_ITERS: usize = 20;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // --- Un-merged: accumulate N generations, never merge. ---
+            let dir_no_merge = TempDir::new().unwrap();
+            let uri = dir_no_merge.path().to_string_lossy().to_string();
+            let store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: None, // disabled
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..N {
+                store
+                    .add(&[assistant_record(&format!("row-{i}"))])
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(flushed_generation_count(&store).await, N);
+
+            let start = Instant::now();
+            for _ in 0..READ_ITERS {
+                let rows = store.list(None, None).await.unwrap();
+                assert_eq!(rows.len(), N);
+            }
+            let unmerged_read = start.elapsed() / READ_ITERS as u32;
+
+            // --- Merged: same N rows, but self-merge folds each batch into
+            // base as soon as it lands (threshold 1). ---
+            let dir_merge = TempDir::new().unwrap();
+            let uri_m = dir_merge.path().to_string_lossy().to_string();
+            let merge_store = RolloutStore::open_with_options(
+                &uri_m,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    merge_after_generations: Some(1),
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    key_index_type: Default::default(),
+                    pending_generations_warn: None,
+                    pending_generations_max: None,
+                    merge_budget: None,
+                },
+            )
+            .await
+            .unwrap();
+            let mut max_add = std::time::Duration::ZERO;
+            for i in 0..N {
+                let t = Instant::now();
+                merge_store
+                    .add(&[assistant_record(&format!("row-{i}"))])
+                    .await
+                    .unwrap();
+                max_add = max_add.max(t.elapsed());
+            }
+            assert_eq!(flushed_generation_count(&merge_store).await, 0);
+
+            let start = Instant::now();
+            for _ in 0..READ_ITERS {
+                let rows = merge_store.list(None, None).await.unwrap();
+                assert_eq!(rows.len(), N);
+            }
+            let merged_read = start.elapsed() / READ_ITERS as u32;
+
+            println!("\n=== merge read-amplification benchmark (N={N} generations) ===");
+            println!("  list scan, {N} un-merged generations : {unmerged_read:?}");
+            println!("  list scan, merged into base table     : {merged_read:?}");
+            println!(
+                "  read speedup from merge               : {:.1}x",
+                unmerged_read.as_secs_f64() / merged_read.as_secs_f64().max(1e-9)
+            );
+            println!("  slowest single add() (merge on every append) : {max_add:?}");
+        });
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_recovers_when_open_wal_is_deleted() {
+        for requested_id in ["target", "mid-absent"] {
+            let dir = TempDir::new().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let open = |shard: &str| {
+                RolloutStore::open_with_options(
+                    uri,
+                    RolloutStoreOptions {
+                        shard_id: Some(shard.to_owned()),
+                        ..Default::default()
+                    },
+                )
+            };
+            let mut writer = open("race-writer").await.unwrap();
+            let mut reader = open("race-reader").await.unwrap();
+            reader.base.wal_read_protection = false; // Historical unregistered reader.
+            let original_version = reader.version();
+            let bytes = b"blob-moved-after-generation-open";
+            writer
+                .add(&[
+                    assistant_record("a"),
+                    artifact_record("target", bytes),
+                    assistant_record("z"),
+                ])
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+            writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+            let snapshots = writer.wal_shard_snapshots().await.unwrap();
+            let paths: Vec<_> = snapshots
+                .iter()
+                .flat_map(|snapshot| {
+                    snapshot.sstables.iter().map(|generation| {
+                        writer.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                    })
+                })
+                .collect();
+            assert!(!paths.is_empty());
+            let pause = Arc::new(BlobReadPause::default());
+            *reader.blob_read_pause.lock().unwrap() = Some(pause.clone());
+            let reading = tokio::spawn(async move {
+                let result = reader.get_blob(requested_id).await;
+                (result, reader.version())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.opened.notified())
+                .await
+                .unwrap();
+            // The generation dataset is already open, but its payload has not
+            // been read. Commit it to the base and delete its source files.
+            assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+            assert_eq!(flushed_generation_count(&writer).await, 0);
+            // Prove physical reclamation happened, rather than only logical drain.
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            pause.resume.notify_one();
+            let (result, version) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                result.unwrap().as_deref(),
+                (requested_id == "target").then_some(bytes.as_slice()),
+            );
+            assert_eq!(version, original_version);
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_recovers_when_wal_drains_before_discovery() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-writer".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("snapshot-reader".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let original_version = reader.version();
+        let bytes = b"present-before-read-starts";
+        writer
+            .add(&[artifact_record("target", bytes)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.base.wal_collection = crate::wal_gc::Mode::Collect;
+        let snapshots = writer.wal_shard_snapshots().await.unwrap();
+        let paths: Vec<_> = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot.sstables.iter().map(|generation| {
+                    writer.flushed_generation_uri(snapshot.shard_id, &generation.path)
+                })
+            })
+            .collect();
+        assert!(!paths.is_empty());
+        let pause = Arc::new(BlobReadPause {
+            before_wal_snapshot: true,
+            ..Default::default()
+        });
+        *reader.blob_read_pause.lock().unwrap() = Some(pause.clone());
+        let reading = tokio::spawn(async move {
+            let result = reader.get_blob("target").await;
+            (result, reader.version())
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.opened.notified())
+            .await
+            .unwrap();
+        // The row existed before the read. Move it after the base check but
+        // before WAL discovery, so opening the WAL returns no generations.
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(flushed_generation_count(&writer).await, 0);
+        // Prove physical reclamation happened, rather than only logical drain.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while paths.iter().any(|path| std::path::Path::new(path).exists()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        pause.resume.notify_one();
+        let (result, version) = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap().as_deref(), Some(bytes.as_slice()));
+        assert_eq!(version, original_version);
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_does_not_hide_persistent_missing_data() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("missing-writer".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[artifact_record("target", b"not-merged")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("missing-reader".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let snapshots = writer.wal_shard_snapshots().await.unwrap();
+        let generation_uri =
+            writer.flushed_generation_uri(snapshots[0].shard_id, &snapshots[0].sstables[0].path);
+        // Retain the generation manifest. Unlike a completed merge, no base
+        // commit can recover this row: bounded retries must preserve the error.
+        let path = generation_uri
+            .strip_prefix("file://")
+            .unwrap_or(&generation_uri);
+        std::fs::remove_dir_all(std::path::Path::new(path).join("data")).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.get_blob("target"),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(is_not_found_error(&error), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn point_lookup_finds_row_merged_after_fresh_base_miss() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("point-race-writer").await.unwrap();
+        let reader = open("point-race-reader").await.unwrap();
+        let original_version = reader.version();
+        let record = assistant_record("target");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        let pause = Arc::new(PointReadPause::default());
+        *reader.point_read_pause.lock().unwrap() = Some(pause.clone());
+        let reading = tokio::spawn(async move {
+            let result = reader.get_by_id("target").await;
+            (result, reader.version())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            pause.checked_base.notified(),
+        )
+        .await
+        .unwrap();
+        // The fresh base lacked this row, but the WAL capture has not started.
+        // A WAL-only fallback would now incorrectly return a missing record.
+        assert_eq!(writer.cleanup_own_shard().await.unwrap(), 1);
+        assert_eq!(flushed_generation_count(&writer).await, 0);
+        pause.resume.notify_one();
+        let (result, version) = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_records_eq(&result.unwrap().unwrap(), &record);
+        assert_eq!(version, original_version);
+    }
+
+    #[tokio::test]
+    async fn point_lookup_refreshes_base_before_opening_unrelated_wal() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    pending_generations_max: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("point-writer").await.unwrap();
+        let reader = open("point-reader").await.unwrap();
+        let mut pinned = open("point-pinned").await.unwrap();
+        let original_version = reader.version();
+        pinned.checkout(pinned.version()).await.unwrap();
+        let record = assistant_record("new-base-row");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        assert!(writer.version() > original_version);
+        for id in ["unrelated-1", "unrelated-2"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        assert!(reader.wal_shard_snapshots().await.is_err());
+        let found = reader.get_by_id(&record.id).await.unwrap().unwrap();
+        assert_records_eq(&found, &record);
+        assert_eq!(reader.version(), original_version);
+        // Explicit source/version choices remain unchanged; a true WAL lookup
+        // still respects the cap, whereas a historical read stays historical.
+        assert!(reader
+            .get_by_id_source(&record.id, ListSource::Fragments)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reader
+            .get_by_id_source(&record.id, ListSource::Wal)
+            .await
+            .is_err());
+        assert!(reader.get_by_id("unrelated-1").await.is_err());
+        assert!(pinned.get_by_id(&record.id).await.unwrap().is_none());
+        assert_eq!(pinned.version(), original_version);
+    }
+
+    #[tokio::test]
+    async fn blob_lookup_refreshes_base_before_opening_unrelated_wal() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let open = |shard: &str| {
+            RolloutStore::open_with_options(
+                uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.to_owned()),
+                    pending_generations_max: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut writer = open("blob-writer").await.unwrap();
+        let reader = open("blob-reader").await.unwrap();
+        let mut pinned = open("blob-pinned").await.unwrap();
+        let original_version = reader.version();
+        pinned.checkout(pinned.version()).await.unwrap();
+        let bytes = b"merged-after-reader-open";
+        writer
+            .add(&[
+                artifact_record("new-base-blob", bytes),
+                assistant_record("new-base-null"),
+            ])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.cleanup_own_shard().await.unwrap();
+        assert!(writer.version() > original_version);
+        for id in ["unrelated-1", "unrelated-2"] {
+            writer.add(&[assistant_record(id)]).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+        // A WAL fallback would be refused here; neither merged row needs it.
+        assert!(reader.wal_shard_snapshots().await.is_err());
+        assert_eq!(
+            reader.get_blob("new-base-blob").await.unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
+        assert!(reader.get_blob("new-base-null").await.unwrap().is_none());
+        assert_eq!(reader.version(), original_version);
+        // A point miss still observes the existing WAL safety cap.
+        assert!(reader.get_blob("unrelated-1").await.is_err());
+        // Explicit historical reads never switch to the latest manifest.
+        assert!(pinned.get_blob("new-base-blob").await.unwrap().is_none());
+        assert_eq!(pinned.version(), original_version);
+    }
+
+    #[test]
+    fn point_lookup_base_first_finds_unmerged_and_merged_rows() {
+        // get_by_id / get_blob default to base-table-first with a WAL fallback.
+        // The fallback must still find a row that is only in the (un-merged)
+        // WAL, and after a merge the same row must be found via the base table.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"\x00\x01payload-x";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // merge_after_generations = None: appended rows stay in the WAL,
+            // un-merged, so this exercises the base-miss -> WAL-fallback path.
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let artifact = artifact_record("row-x", bytes);
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+            store.flush().await.unwrap();
+
+            // Row is only in the WAL (nothing merged): base-first misses, the
+            // fallback finds it.
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            let got = store.get_by_id("row-x").await.unwrap().unwrap();
+            assert_records_eq(&got, &artifact);
+            assert_eq!(
+                store.get_blob("row-x").await.unwrap().as_deref(),
+                Some(&bytes[..]),
+                "get_blob must find an un-merged WAL row via the fallback"
+            );
+
+            // Fragments source (base only) must NOT see the un-merged row;
+            // Wal source must.
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_some());
+
+            // Merge folds the row into the base table and drains the WAL.
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Now base-first hits the base table with zero generations open.
+            let got = store.get_by_id("row-x").await.unwrap().unwrap();
+            assert_records_eq(&got, &artifact);
+            assert_eq!(
+                store.get_blob("row-x").await.unwrap().as_deref(),
+                Some(&bytes[..])
+            );
+            // After merge the row is in the base table (Fragments sees it) and
+            // no longer in the WAL.
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Fragments)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .get_by_id_source("row-x", ListSource::Wal)
+                .await
+                .unwrap()
+                .is_none());
+
+            // A miss returns None on every source (no panic, no error).
+            assert!(store.get_by_id("nope").await.unwrap().is_none());
+            assert!(store.get_blob("nope").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn point_lookup_immutability_contract_returns_base_version() {
+        // Contract guard: rollout ids are immutable and never re-appended, so a
+        // row present in the base table is authoritative. This pins that
+        // base-first returns the base row and does not require scanning the WAL
+        // to be correct — if someone later violates the no-overwrite contract by
+        // re-appending the same id, this test documents that base-first would
+        // return the base (merged) version, surfacing the contract break here
+        // rather than as silent stale reads in production.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"base-version-bytes";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let base = artifact_record("dup", bytes);
+            store.add(std::slice::from_ref(&base)).await.unwrap();
+            store.flush().await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+
+            // Base table holds the authoritative row; base-first returns it
+            // without opening any WAL generation.
+            let got = store.get_by_id("dup").await.unwrap().unwrap();
+            assert_records_eq(&got, &base);
+            assert_eq!(
+                store.get_blob("dup").await.unwrap().as_deref(),
+                Some(&bytes[..])
+            );
+        });
+    }
+
+    #[test]
+    fn get_record_with_blob_returns_row_and_payload_in_one_scan() {
+        // get_record_with_blob folds the metadata point lookup and the payload
+        // fetch into a single base-first scan. It must return both the row and
+        // its bytes for an un-merged WAL row (base-miss -> fallback) and for a
+        // merged base row, and None for a missing id.
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let bytes = b"\x00\x01record-with-blob";
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut store = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    storage_options: None,
+                    session: None,
+                    shard_id: Some("rollout-0".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let artifact = artifact_record("row-rw", bytes);
+            store.add(std::slice::from_ref(&artifact)).await.unwrap();
+            store.flush().await.unwrap();
+
+            // Un-merged: found via the WAL fallback, row + payload paired.
+            assert_eq!(flushed_generation_count(&store).await, 1);
+            let (record, payload) = store
+                .get_record_with_blob("row-rw")
+                .await
+                .unwrap()
+                .expect("row present in WAL");
+            assert_records_eq(&record, &artifact);
+            assert_eq!(payload.as_deref(), Some(&bytes[..]));
+
+            // After merge: found via the base table, still paired.
+            store.cleanup_own_shard().await.unwrap();
+            assert_eq!(flushed_generation_count(&store).await, 0);
+            let (record, payload) = store
+                .get_record_with_blob("row-rw")
+                .await
+                .unwrap()
+                .expect("row present in base");
+            assert_records_eq(&record, &artifact);
+            assert_eq!(payload.as_deref(), Some(&bytes[..]));
+
+            // Missing id: None, not an error.
+            assert!(store.get_record_with_blob("nope").await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn ensure_select_only_accepts_select_and_cte() {
+        assert!(ensure_select_only("SELECT * FROM records").is_ok());
+        assert!(ensure_select_only("  select id from records where reward > 0 ").is_ok());
+        assert!(ensure_select_only("WITH t AS (SELECT id FROM records) SELECT * FROM t").is_ok());
+    }
+
+    #[test]
+    fn ensure_select_only_rejects_mutations_and_multi_statements() {
+        for sql in [
+            "DELETE FROM records",
+            "UPDATE records SET reward = 1",
+            "INSERT INTO records (id) VALUES ('x')",
+            "DROP TABLE records",
+            "CREATE TABLE t (a INT)",
+            "SELECT 1; SELECT 2",
+            "not sql at all",
+        ] {
+            assert!(
+                ensure_select_only(sql).is_err(),
+                "expected rejection for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_sql_runs_select_over_merged_records() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            store
+                .add(&[
+                    assistant_record("a-0"),
+                    assistant_record("a-1"),
+                    assistant_record("a-2"),
+                ])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+
+            // Aggregate over the merged (base + pending WAL) view.
+            let result = store
+                .query_sql("SELECT count(*) AS n FROM records")
+                .await
+                .unwrap();
+            assert_eq!(result.columns, vec!["n".to_string()]);
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0], serde_json::json!(3));
+            assert!(!result.truncated);
+
+            // GROUP BY on a real column returns the expected shape.
+            let grouped = store
+                .query_sql("SELECT role, count(*) AS n FROM records GROUP BY role")
+                .await
+                .unwrap();
+            assert_eq!(grouped.columns, vec!["role".to_string(), "n".to_string()]);
+            assert_eq!(grouped.rows.len(), 1);
+            assert_eq!(grouped.rows[0][0], serde_json::json!(ROLE_ASSISTANT));
+            assert_eq!(grouped.rows[0][1], serde_json::json!(3));
+
+            // The blob column is not exposed to SQL.
+            let err = store
+                .query_sql("SELECT binary_payload FROM records")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LanceError::InvalidInput { .. }));
+
+            // A non-SELECT is rejected as invalid input (→ 400 at the API).
+            let rejected = store.query_sql("DELETE FROM records").await.unwrap_err();
+            assert!(matches!(rejected, LanceError::InvalidInput { .. }));
+        });
+    }
+
+    #[test]
+    fn query_sql_on_empty_experiment_returns_zero_rows() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = RolloutStore::open(&uri).await.unwrap();
+            let result = store.query_sql("SELECT id FROM records").await.unwrap();
+            assert_eq!(result.columns, vec!["id".to_string()]);
+            assert!(result.rows.is_empty());
+            assert!(!result.truncated);
+        });
+    }
+
+    /// `add` and `flush` must land on separate histograms, and `flush` must
+    /// report which of its three paths it took.
+    ///
+    /// This is the core of "split the latency": at the HTTP layer these two are
+    /// one route (flush is a query param), so if they are not distinguished here
+    /// they cannot be distinguished anywhere.
+    #[test]
+    fn add_and_flush_emit_distinct_labelled_histograms() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("rollouts.lance")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let store = RolloutStore::open(&uri).await.unwrap();
+                // A flush with no resident writer: the `noop` fast path.
+                store.flush().await.unwrap();
+                store.add(&[assistant_record("row-0")]).await.unwrap();
+                // Now there is a writer with buffered rows: the `sealed` path.
+                store.flush().await.unwrap();
+            });
+        });
+
+        let mut add_samples = 0usize;
+        let mut flush_outcomes: Vec<String> = Vec::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if key.kind() != MetricKind::Histogram {
+                continue;
+            }
+            let name = key.key().name().to_string();
+            let labels: Vec<(String, String)> = key
+                .key()
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            let count = match value {
+                DebugValue::Histogram(v) => v.len(),
+                _ => 0,
+            };
+            if name == crate::metrics::ROLLOUT_ADD_DURATION {
+                add_samples += count;
+                // No `result` label: an error label would double this
+                // histogram's series count (one per bucket, twice) to describe
+                // the latency of a rare event. Errors are counted instead.
+                assert!(
+                    labels.is_empty(),
+                    "add latency must stay unlabelled to bound cardinality; got {labels:?}"
+                );
+            } else if name == crate::metrics::ROLLOUT_FLUSH_DURATION {
+                assert_eq!(
+                    labels.len(),
+                    1,
+                    "flush should carry exactly `outcome`, no result label; got {labels:?}"
+                );
+                let outcome = labels
+                    .iter()
+                    .find(|(k, _)| k == "outcome")
+                    .map(|(_, v)| v.clone())
+                    .expect("flush must carry an outcome label");
+                for _ in 0..count {
+                    flush_outcomes.push(outcome.clone());
+                }
+            }
+        }
+
+        assert_eq!(add_samples, 1, "one add should record exactly one sample");
+        flush_outcomes.sort();
+        // The two flushes took genuinely different paths; collapsing them into
+        // one series is what makes the flush histogram unreadable in production,
+        // since `noop` is by far the common case and is near-zero.
+        assert_eq!(
+            flush_outcomes,
+            vec!["noop".to_string(), "sealed".to_string()],
+            "flush should distinguish the no-op fast path from real sealing"
+        );
+    }
+
+    /// Guards the cardinality contract: latency histograms must never carry a
+    /// label whose domain is unbounded (a store URI, shard id, experiment name)
+    /// or redundant with a counter (`result`).
+    ///
+    /// Every label combination times every bucket is a separate exported series,
+    /// and in Datadog a separately-billed custom metric, so this is a cost
+    /// regression test as much as a correctness one.
+    #[test]
+    fn latency_histograms_carry_only_bounded_labels() {
+        use metrics_util::debugging::DebuggingRecorder;
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join("rollouts.lance")
+            .to_string_lossy()
+            .into_owned();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let store = RolloutStore::open(&uri).await.unwrap();
+                store.add(&[assistant_record("row-0")]).await.unwrap();
+                store.flush().await.unwrap();
+            });
+        });
+
+        // Closed sets only. `result` is intentionally absent: it belongs on a
+        // counter, where it costs one series instead of one per bucket.
+        let allowed: &[(&str, &[&str])] = &[
+            ("outcome", &["sealed", "noop", "fenced"]),
+            (
+                "phase",
+                &["seal", "read", "append", "claim_epoch", "drain", "delete"],
+            ),
+        ];
+
+        // Enabling Lance I/O metrics adds its own histogram to this recorder.
+        // Keep its label policy separate: application histograms must not gain
+        // operation/base labels just because a dependency uses them.
+        let lance_io_allowed: &[(&str, &[&str])] = &[
+            ("base", &["file"]),
+            (
+                "operation",
+                &[
+                    "get",
+                    "head",
+                    "put",
+                    "put_part",
+                    "complete_multipart",
+                    "abort_multipart",
+                    "list",
+                    "copy",
+                    "rename",
+                    "delete",
+                ],
+            ),
+        ];
+
+        for (key, _, _, _) in snapshotter.snapshot().into_vec() {
+            if key.kind() != MetricKind::Histogram {
+                continue;
+            }
+            let allowed = if key.key().name() == "lance_object_store_request_duration_seconds" {
+                lance_io_allowed
+            } else {
+                allowed
+            };
+            for label in key.key().labels() {
+                let (k, v) = (label.key(), label.value());
+                let allowed_values = allowed
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, vs)| *vs)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "histogram {} carries unexpected label `{k}`; latency labels must \
+                             come from a closed, documented set",
+                            key.key().name()
+                        )
+                    });
+                assert!(
+                    allowed_values.contains(&v),
+                    "histogram {} label {k}={v} is outside its documented domain {allowed_values:?}",
+                    key.key().name()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reference_validation_tests;
+
+#[cfg(test)]
+#[path = "rollout_store/staging_cancellation_tests.rs"]
+mod staging_cancellation_tests;
+
+#[cfg(test)]
+#[path = "rollout_store/reclamation_accounting_tests.rs"]
+mod reclamation_accounting_tests;

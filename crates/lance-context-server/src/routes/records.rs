@@ -1,0 +1,1260 @@
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::Response;
+use axum::Json;
+use lance_context_api::{
+    AddRecordsRequest, AddRecordsResponse, DeleteRecordResponse, GetRecordResponse,
+    ListRecordsResponse, RecordDto, UpdateRecordRequest, UpdateRecordResponse, UpsertRecordRequest,
+    UpsertRecordResponse, UpsertRecordsRequest, UpsertRecordsResponse, UpsertResultDto,
+};
+use lance_context_core::{
+    patch_from_dto, record_from_add_request, record_to_dto, ContextRecord, ContextStore,
+    LifecycleQueryOptions, RecordFilters,
+};
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::error::AppError;
+use crate::state::AppState;
+
+async fn get_context_record_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    id: &str,
+) -> Result<Option<ContextRecord>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store.get(id).await.map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return Ok(record);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store.get(id).await.map_err(AppError::from_lance)
+}
+
+async fn materialize_context_payload(
+    store: &ContextStore,
+    record: Option<ContextRecord>,
+    id: &str,
+) -> Result<Option<(ContextRecord, Vec<u8>)>, AppError> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if record.payload_uri.is_none() {
+        return Err(AppError::InvalidRequest(format!(
+            "record '{}' has no external payload reference to fetch",
+            id
+        )));
+    }
+    let bytes = store
+        .fetch_payload(id)
+        .await
+        .map_err(AppError::from_lance)?
+        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
+    Ok(Some((record, bytes)))
+}
+
+async fn fetch_context_payload_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    id: &str,
+) -> Result<Option<(ContextRecord, Vec<u8>)>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return materialize_context_payload(&store, record, id).await;
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
+    materialize_context_payload(&store, record, id).await
+}
+
+async fn get_context_by_external_id_refreshing_on_miss(
+    store_lock: &RwLock<ContextStore>,
+    external_id: &str,
+) -> Result<Option<ContextRecord>, AppError> {
+    {
+        let store = store_lock.read().await;
+        let record = store
+            .get_by_external_id(external_id)
+            .await
+            .map_err(AppError::from_lance)?;
+        if record.is_some() || store.is_version_pinned() {
+            return Ok(record);
+        }
+    }
+
+    let mut store = store_lock.write().await;
+    if !store.is_version_pinned() {
+        store.refresh_latest().await.map_err(AppError::from_lance)?;
+    }
+    store
+        .get_by_external_id(external_id)
+        .await
+        .map_err(AppError::from_lance)
+}
+
+pub async fn add_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<AddRecordsRequest>,
+) -> Result<(axum::http::StatusCode, Json<AddRecordsResponse>), AppError> {
+    if req.records.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "records array must not be empty".to_string(),
+        ));
+    }
+
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let run_id = Uuid::new_v4().to_string();
+    let mut ids = Vec::with_capacity(req.records.len());
+    let mut core_records = Vec::with_capacity(req.records.len());
+
+    for r in &req.records {
+        let id = Uuid::new_v4().to_string();
+        ids.push(id.clone());
+        core_records.push(record_from_add_request(r, id, run_id.clone()));
+    }
+
+    let count = core_records.len();
+    // Read lock: `add` is `&self` now that the resident writer lives behind the
+    // storage layer's own mutex, so concurrent appends no longer serialize on
+    // this store's RwLock.
+    let store = store_lock.read().await;
+    let version = store
+        .add(&core_records)
+        .await
+        .map_err(AppError::from_lance)?;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(AddRecordsResponse {
+            version,
+            ids,
+            count,
+        }),
+    ))
+}
+
+pub async fn upsert_record(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpsertRecordRequest>,
+) -> Result<(axum::http::StatusCode, Json<UpsertRecordResponse>), AppError> {
+    if req.key != "external_id" {
+        return Err(AppError::InvalidRequest(format!(
+            "upsert key '{}' is not supported; use 'external_id'",
+            req.key
+        )));
+    }
+    if req.record.external_id.as_deref().is_none_or(str::is_empty) {
+        return Err(AppError::InvalidRequest(
+            "upsert requires record.external_id".to_string(),
+        ));
+    }
+
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let record = record_from_add_request(
+        &req.record,
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+    );
+    let mut store = store_lock.write().await;
+    let result = store
+        .upsert_by_external_id(record)
+        .await
+        .map_err(AppError::from_lance)?;
+    let status = if result.inserted {
+        axum::http::StatusCode::CREATED
+    } else {
+        axum::http::StatusCode::OK
+    };
+
+    Ok((
+        status,
+        Json(UpsertRecordResponse {
+            version: result.version,
+            inserted: result.inserted,
+            replaced_id: result.replaced_id,
+            record: record_to_dto(result.record),
+        }),
+    ))
+}
+
+pub async fn upsert_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpsertRecordsRequest>,
+) -> Result<(axum::http::StatusCode, Json<UpsertRecordsResponse>), AppError> {
+    if req.key != "external_id" {
+        return Err(AppError::InvalidRequest(format!(
+            "upsert key '{}' is not supported; use 'external_id'",
+            req.key
+        )));
+    }
+    if req.records.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "records array must not be empty".to_string(),
+        ));
+    }
+    for (index, record) in req.records.iter().enumerate() {
+        if record.external_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::InvalidRequest(format!(
+                "upsert requires record.external_id (records[{index}])"
+            )));
+        }
+    }
+
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let core_records: Vec<ContextRecord> = req
+        .records
+        .iter()
+        .map(|r| record_from_add_request(r, Uuid::new_v4().to_string(), Uuid::new_v4().to_string()))
+        .collect();
+
+    let mut store = store_lock.write().await;
+    let results = store
+        .upsert_many_by_external_id(core_records)
+        .await
+        .map_err(AppError::from_lance)?;
+    let version = results
+        .last()
+        .map(|r| r.version)
+        .unwrap_or_else(|| store.version());
+
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(UpsertRecordsResponse {
+            version,
+            results: results
+                .into_iter()
+                .map(|r| UpsertResultDto {
+                    inserted: r.inserted,
+                    replaced_id: r.replaced_id,
+                    record: record_to_dto(r.record),
+                })
+                .collect(),
+        }),
+    ))
+}
+
+pub async fn update_record(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateRecordRequest>,
+) -> Result<Json<UpdateRecordResponse>, AppError> {
+    if req.patch.is_empty() {
+        return Err(AppError::InvalidRequest(
+            "update requires at least one patch field".to_string(),
+        ));
+    }
+
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let patch = patch_from_dto(&req.patch);
+    let mut store = store_lock.write().await;
+    let result = match (&req.id, &req.external_id) {
+        (Some(id), None) => store.update_by_id(id, patch).await,
+        (None, Some(external_id)) => store.update_by_external_id(external_id, patch).await,
+        (None, None) => {
+            return Err(AppError::InvalidRequest(
+                "update requires either id or external_id".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(AppError::InvalidRequest(
+                "update accepts only one of id or external_id".to_string(),
+            ));
+        }
+    }
+    .map_err(AppError::from_lance)?;
+
+    Ok(Json(match result {
+        Some(result) => UpdateRecordResponse {
+            version: result.version,
+            updated: true,
+            replaced_id: Some(result.replaced_id),
+            record: Some(record_to_dto(result.record)),
+        },
+        None => UpdateRecordResponse {
+            version: store.version(),
+            updated: false,
+            replaced_id: None,
+            record: None,
+        },
+    }))
+}
+
+pub async fn get_record(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<GetRecordResponse>, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let record = get_context_record_refreshing_on_miss(&store_lock, &id).await?;
+
+    Ok(Json(GetRecordResponse {
+        record: record.map(record_to_dto),
+    }))
+}
+
+/// Resolve a record's external payload reference to its raw bytes.
+///
+/// Returns the bytes with the record's `content_type` (defaulting to
+/// `application/octet-stream`). `404` if no such record; `400` if the record
+/// carries no external payload reference.
+pub async fn fetch_payload(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let (record, bytes) = fetch_context_payload_refreshing_on_miss(&store_lock, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Record '{}' does not exist", id)))?;
+
+    let content_type = if record.content_type.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        record.content_type
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .map_err(|err| AppError::Internal(err.to_string()))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ExternalIdParams {
+    pub external_id: String,
+}
+
+pub async fn get_record_by_external_id(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<ExternalIdParams>,
+) -> Result<Json<GetRecordResponse>, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let record =
+        get_context_by_external_id_refreshing_on_miss(&store_lock, &params.external_id).await?;
+
+    Ok(Json(GetRecordResponse {
+        record: record.map(record_to_dto),
+    }))
+}
+
+pub async fn delete_record(
+    State(state): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Json<DeleteRecordResponse>, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let mut store = store_lock.write().await;
+    let deleted = store
+        .delete_by_id(&id)
+        .await
+        .map_err(AppError::from_lance)?;
+    let version = store.version();
+
+    Ok(Json(DeleteRecordResponse { deleted, version }))
+}
+
+pub async fn delete_record_by_external_id(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<ExternalIdParams>,
+) -> Result<Json<DeleteRecordResponse>, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let mut store = store_lock.write().await;
+    let deleted = store
+        .delete_by_external_id(&params.external_id)
+        .await
+        .map_err(AppError::from_lance)?;
+    let version = store.version();
+
+    Ok(Json(DeleteRecordResponse { deleted, version }))
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ListParams {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// JSON object encoding `RecordFilters`, URL-encoded into the query string.
+    pub filters: Option<String>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_retired: bool,
+}
+
+pub async fn list_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ListRecordsResponse>, AppError> {
+    let filters = params
+        .filters
+        .as_deref()
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .map_err(|err| AppError::InvalidRequest(format!("invalid filters JSON: {err}")))
+                .and_then(|value| {
+                    RecordFilters::from_json_value(value).map_err(AppError::InvalidRequest)
+                })
+        })
+        .transpose()?;
+
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let store = store_lock.read().await;
+    let records = store
+        .list_filtered_with_options(
+            params.limit,
+            params.offset,
+            filters.as_ref(),
+            LifecycleQueryOptions::new(params.include_expired, params.include_retired),
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+
+    let dtos: Vec<RecordDto> = records.into_iter().map(record_to_dto).collect();
+
+    Ok(Json(ListRecordsResponse { records: dtos }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct RelatedParams {
+    pub target_id: String,
+    pub relation: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_expired: bool,
+    #[serde(default)]
+    pub include_retired: bool,
+}
+
+pub async fn related_records(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<RelatedParams>,
+) -> Result<Json<ListRecordsResponse>, AppError> {
+    let store_lock = state.get_or_open_context_store(&name).await?;
+
+    let store = store_lock.read().await;
+    let records = store
+        .list_related_with_options(
+            &params.target_id,
+            params.relation.as_deref(),
+            params.limit,
+            LifecycleQueryOptions::new(params.include_expired, params.include_retired),
+        )
+        .await
+        .map_err(AppError::from_lance)?;
+
+    let dtos: Vec<RecordDto> = records.into_iter().map(record_to_dto).collect();
+
+    Ok(Json(ListRecordsResponse { records: dtos }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::{Path, Query, State};
+    use axum::Json;
+    use chrono::{Duration, Utc};
+    use lance_context_api::{
+        AddRecordRequest, AddRecordsRequest, RecordPatchDto, RelationshipDto, UpdateRecordRequest,
+        UpsertRecordRequest, UpsertRecordsRequest,
+    };
+    use lance_context_core::{ContextStore, ContextStoreOptions};
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    use super::*;
+    use crate::state::AppState;
+
+    async fn test_state(context_name: &str) -> (Arc<AppState>, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let uri = dir
+            .path()
+            .join(format!("{context_name}.lance"))
+            .to_string_lossy()
+            .to_string();
+        let store = ContextStore::open(&uri).await.unwrap();
+        let state = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+        state
+            .stores
+            .write()
+            .await
+            .insert(context_name.to_string(), Arc::new(RwLock::new(store)));
+        (state, dir)
+    }
+
+    fn text_record(text: &str) -> AddRecordRequest {
+        AddRecordRequest {
+            role: "user".to_string(),
+            content_type: "text/plain".to_string(),
+            text_payload: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn point_reads_refresh_a_base_advanced_by_an_external_writer() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let cached = state.get_or_open_context_store(context_name).await.unwrap();
+        let cached_version = cached.read().await.version();
+        let mut writer = ContextStore::open_existing_with_options(
+            &state.context_uri(context_name),
+            ContextStoreOptions {
+                shard_id: Some("external-writer".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut request = text_record("externally merged");
+        request.external_id = Some("external-record".to_string());
+        let record = record_from_add_request(
+            &request,
+            "merged-context-record".to_string(),
+            "external-run".to_string(),
+        );
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 1);
+        // HTTP point reads must see the external writer's unmerged WAL, just
+        // as list/external-id reads do; a base refresh alone cannot find it.
+        let Json(unmerged) = get_record(
+            State(state.clone()),
+            Path((context_name.to_string(), record.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unmerged.record.unwrap().text_payload, record.text_payload);
+        assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+        assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
+        assert!(writer.version() > cached.read().await.version());
+
+        let Json(found) = get_record(
+            State(state.clone()),
+            Path((context_name.to_string(), record.id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, record.id);
+        // A protected read checks out its own fresh dataset. A successful read
+        // does not need to mutate the shared handle under an exclusive lock.
+        assert_eq!(cached.read().await.version(), cached_version);
+
+        let mut next_record = record.clone();
+        next_record.id = "second-context-record".to_string();
+        next_record.external_id = Some("second-external-record".to_string());
+        next_record.text_payload = Some("second external commit".to_string());
+        writer
+            .add(std::slice::from_ref(&next_record))
+            .await
+            .unwrap();
+        for merged in [false, true] {
+            if merged {
+                assert_eq!(writer.cleanup_wal().await.unwrap(), 1);
+            }
+            let Json(found) = get_record(
+                State(state.clone()),
+                Path((context_name.to_string(), next_record.id.clone())),
+            )
+            .await
+            .unwrap();
+            let found = found.record.unwrap();
+            assert_eq!(found.id, next_record.id);
+            assert_eq!(found.text_payload, next_record.text_payload);
+            assert_eq!(cached.read().await.version(), cached_version);
+        }
+
+        let Json(found) = get_record_by_external_id(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: "external-record".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.record.unwrap().id, record.id);
+    }
+
+    #[tokio::test]
+    async fn fetch_payload_returns_bytes_404_and_400() {
+        let context_name = "ctx";
+        let (state, dir) = test_state(context_name).await;
+        let object_uri = dir.path().join("media.bin").to_string_lossy().to_string();
+        let payload = b"external media bytes".to_vec();
+
+        // Offload the object through the store's object-store path.
+        {
+            let stores = state.stores.read().await;
+            let store = stores.get(context_name).unwrap().read().await;
+            store.put_payload(&object_uri, &payload).await.unwrap();
+        }
+
+        // Add a record that references the object instead of inlining bytes.
+        let record = AddRecordRequest {
+            role: "user".to_string(),
+            content_type: "image/png".to_string(),
+            payload_uri: Some(object_uri.clone()),
+            payload_size: Some(payload.len() as i64),
+            ..Default::default()
+        };
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let id = add_response.ids[0].clone();
+
+        // The payload endpoint streams the resolved bytes with the content type.
+        let resp = fetch_payload(
+            State(state.clone()),
+            Path((context_name.to_string(), id.clone())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), payload.as_slice());
+
+        // Unknown id -> 404.
+        let missing = fetch_payload(
+            State(state.clone()),
+            Path((context_name.to_string(), "does-not-exist".to_string())),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(missing, AppError::NotFound(_)));
+
+        // Record without an external reference -> 400.
+        let (_, Json(inline)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![text_record("inline only")],
+            }),
+        )
+        .await
+        .unwrap();
+        let inline_id = inline.ids[0].clone();
+        let no_ref = fetch_payload(State(state), Path((context_name.to_string(), inline_id)))
+            .await
+            .unwrap_err();
+        assert!(matches!(no_ref, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn get_and_delete_by_external_id() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let external_id = "s3://bucket/path/doc.md#chunk?index=1";
+        let mut record = text_record("stable source chunk");
+        record.external_id = Some(external_id.to_string());
+
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(get_response) = get_record_by_external_id(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: external_id.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_response.record.unwrap().text_payload.as_deref(),
+            Some("stable source chunk")
+        );
+
+        let Json(delete_response) = delete_record_by_external_id(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: external_id.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(delete_response.deleted);
+        assert!(delete_response.version >= add_response.version);
+
+        let Json(missing_response) = get_record_by_external_id(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: external_id.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(missing_response.record.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_by_internal_id_returns_false_when_already_absent() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![text_record("temporary note")],
+            }),
+        )
+        .await
+        .unwrap();
+        let id = add_response.ids[0].clone();
+
+        let Json(delete_response) = delete_record(
+            State(state.clone()),
+            Path((context_name.to_string(), id.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(delete_response.deleted);
+
+        let Json(second_response) =
+            delete_record(State(state), Path((context_name.to_string(), id)))
+                .await
+                .unwrap();
+        assert!(!second_response.deleted);
+    }
+
+    #[tokio::test]
+    async fn upsert_by_external_id_inserts_then_replaces_visible_record() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let external_id = "doc-123#chunk-1";
+
+        let mut first = text_record("old value");
+        first.external_id = Some(external_id.to_string());
+        let (insert_status, Json(inserted)) = upsert_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordRequest {
+                record: first,
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(insert_status, axum::http::StatusCode::CREATED);
+        assert!(inserted.inserted);
+        assert!(inserted.replaced_id.is_none());
+
+        let mut replacement = text_record("new value");
+        replacement.external_id = Some(external_id.to_string());
+        let (replace_status, Json(replaced)) = upsert_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordRequest {
+                record: replacement,
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replace_status, axum::http::StatusCode::OK);
+        assert!(!replaced.inserted);
+        assert_eq!(
+            replaced.replaced_id.as_deref(),
+            Some(inserted.record.id.as_str())
+        );
+        assert_eq!(
+            replaced.record.supersedes_id.as_deref(),
+            Some(inserted.record.id.as_str())
+        );
+
+        let Json(response) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(
+            response.records[0].text_payload.as_deref(),
+            Some("new value")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_inserts_and_replaces() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut a = text_record("a-old");
+        a.external_id = Some("ext-a".to_string());
+        let mut b = text_record("b-value");
+        b.external_id = Some("ext-b".to_string());
+
+        // First batch: two inserts.
+        let (status, Json(first)) = upsert_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![a, b],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(first.results.len(), 2);
+        assert!(first.results.iter().all(|r| r.inserted));
+        let a_id = first.results[0].record.id.clone();
+
+        // Second batch: replace ext-a, insert ext-c.
+        let mut a_new = text_record("a-new");
+        a_new.external_id = Some("ext-a".to_string());
+        let mut c = text_record("c-value");
+        c.external_id = Some("ext-c".to_string());
+        let (_, Json(second)) = upsert_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![a_new, c],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!second.results[0].inserted);
+        assert_eq!(
+            second.results[0].replaced_id.as_deref(),
+            Some(a_id.as_str())
+        );
+        assert!(second.results[1].inserted);
+
+        // ext-a now resolves to the replacement; three external_ids visible.
+        let Json(after) = get_record_by_external_id(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(ExternalIdParams {
+                external_id: "ext-a".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after.record.unwrap().text_payload.as_deref(), Some("a-new"));
+
+        let Json(listed) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.records.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_rejects_empty() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let err = upsert_records(
+            State(state),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn upsert_records_batch_requires_external_id() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let err = upsert_records(
+            State(state),
+            Path(context_name.to_string()),
+            Json(UpsertRecordsRequest {
+                records: vec![text_record("no external id")],
+                key: "external_id".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn update_by_external_id_patches_visible_record() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let external_id = "doc-123#chunk-1";
+
+        let mut record = text_record("stable value");
+        record.external_id = Some(external_id.to_string());
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![record],
+            }),
+        )
+        .await
+        .unwrap();
+        let old_id = add_response.ids[0].clone();
+
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some(external_id.to_string()),
+                patch: RecordPatchDto {
+                    metadata: Some(serde_json::json!({"revision": 2})),
+                    relationships: Some(vec![RelationshipDto {
+                        target_id: "doc-123".to_string(),
+                        relation: "derived_from".to_string(),
+                        weight: None,
+                    }]),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(updated.updated);
+        assert_eq!(updated.replaced_id.as_deref(), Some(old_id.as_str()));
+        let record = updated.record.unwrap();
+        assert_ne!(record.id, old_id);
+        assert_eq!(record.external_id.as_deref(), Some(external_id));
+        assert_eq!(record.text_payload.as_deref(), Some("stable value"));
+        assert_eq!(record.metadata, Some(serde_json::json!({"revision": 2})));
+        assert_eq!(record.relationships.len(), 1);
+        assert_eq!(record.supersedes_id.as_deref(), Some(old_id.as_str()));
+
+        let Json(response) = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                limit: None,
+                offset: None,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(response.records[0].id, record.id);
+    }
+
+    #[tokio::test]
+    async fn related_records_filters_by_target_and_relation() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+        let mut related = text_record("record that cites the runbook");
+        related.relationships = vec![RelationshipDto {
+            target_id: "doc://runbook#chunk-1".to_string(),
+            relation: "cites".to_string(),
+            weight: Some(0.75),
+        }];
+
+        let _ = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![related, text_record("unrelated record")],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = related_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(RelatedParams {
+                target_id: "doc://runbook#chunk-1".to_string(),
+                relation: Some("cites".to_string()),
+                limit: Some(10),
+                include_expired: false,
+                include_retired: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.records.len(), 1);
+        assert_eq!(
+            response.records[0].text_payload.as_deref(),
+            Some("record that cites the runbook")
+        );
+        assert_eq!(response.records[0].relationships.len(), 1);
+    }
+
+    async fn list_with(
+        state: &Arc<AppState>,
+        context_name: &str,
+        params: ListParams,
+    ) -> Vec<RecordDto> {
+        let Json(response) = list_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Query(params),
+        )
+        .await
+        .unwrap();
+        response.records
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_metadata_and_builtin_fields() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut alpha = text_record("alpha");
+        alpha.metadata = Some(serde_json::json!({"tenant": "acme"}));
+        let mut bravo = text_record("bravo");
+        bravo.role = "assistant".to_string();
+        bravo.metadata = Some(serde_json::json!({"tenant": "globex"}));
+        let mut charlie = text_record("charlie");
+        charlie.metadata = Some(serde_json::json!({"tenant": "acme"}));
+        let _ = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![alpha, bravo, charlie],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Metadata filter restricts to tenant=acme (alpha + charlie).
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                filters: Some(r#"{"tenant": "acme"}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let texts: Vec<&str> = records
+            .iter()
+            .filter_map(|r| r.text_payload.as_deref())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(texts.contains(&"alpha"));
+        assert!(texts.contains(&"charlie"));
+
+        // Built-in field filter restricts to role=assistant (bravo).
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                filters: Some(r#"{"role": "assistant"}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text_payload.as_deref(), Some("bravo"));
+    }
+
+    #[tokio::test]
+    async fn list_respects_expired_visibility() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let fresh = text_record("fresh");
+        let mut stale = text_record("stale");
+        stale.expires_at = Some(Utc::now() - Duration::hours(1));
+        let _ = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![fresh, stale],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Default listing hides the expired record.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text_payload.as_deref(), Some("fresh"));
+
+        // include_expired surfaces it.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_expired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_respects_retired_visibility() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let mut original = text_record("v1");
+        original.external_id = Some("doc-1".to_string());
+        let (_, Json(add_response)) = add_records(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![original],
+            }),
+        )
+        .await
+        .unwrap();
+        let old_id = add_response.ids[0].clone();
+
+        let Json(updated) = update_record(
+            State(state.clone()),
+            Path(context_name.to_string()),
+            Json(UpdateRecordRequest {
+                id: None,
+                external_id: Some("doc-1".to_string()),
+                patch: RecordPatchDto {
+                    metadata: Some(serde_json::json!({"revision": 2})),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(updated.updated);
+
+        // Default listing returns only the visible successor.
+        let records = list_with(&state, context_name, ListParams::default()).await;
+        assert_eq!(records.len(), 1);
+        assert_ne!(records[0].id, old_id);
+
+        // include_retired surfaces the superseded original too.
+        let records = list_with(
+            &state,
+            context_name,
+            ListParams {
+                include_retired: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|r| r.id == old_id));
+    }
+
+    #[tokio::test]
+    async fn list_rejects_invalid_filters_json() {
+        let context_name = "ctx";
+        let (state, _dir) = test_state(context_name).await;
+
+        let result = list_records(
+            State(state),
+            Path(context_name.to_string()),
+            Query(ListParams {
+                filters: Some("not json".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+    }
+
+    /// A second server instance (empty cache, shared data dir) must lazily open
+    /// a context created elsewhere instead of 404ing — the multi-replica bug.
+    #[tokio::test]
+    async fn second_instance_lazily_opens_context_created_elsewhere() {
+        let context_name = "ctx";
+        let (state_a, dir) = test_state(context_name).await;
+
+        // Instance A writes a record.
+        let _ = add_records(
+            State(state_a.clone()),
+            Path(context_name.to_string()),
+            Json(AddRecordsRequest {
+                records: vec![text_record("hello")],
+            }),
+        )
+        .await
+        .expect("write on instance A");
+
+        // Instance B: fresh AppState over the same data dir, empty cache.
+        let state_b = Arc::new(AppState::new_for_test(dir.path().to_path_buf()).await);
+
+        let Json(list) = list_records(
+            State(state_b.clone()),
+            Path(context_name.to_string()),
+            Query(ListParams::default()),
+        )
+        .await
+        .expect("instance B lazily opens the context instead of 404");
+        assert_eq!(list.records.len(), 1);
+
+        // Reading a context that was never created anywhere still 404s.
+        let err = list_records(
+            State(state_b),
+            Path("no-such-context".to_string()),
+            Query(ListParams::default()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+}

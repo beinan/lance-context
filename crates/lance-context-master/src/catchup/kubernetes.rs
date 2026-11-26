@@ -1,0 +1,796 @@
+use super::{
+    outcome::{self, JobOutcome},
+    store::Record,
+    CatchupConfig, Result,
+};
+use crate::config::MasterConfig;
+use reqwest::{Client, Method, StatusCode};
+use serde_json::{json, Value};
+use std::{path::Path, time::Duration};
+
+const SERVICE_ACCOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+pub(super) fn read_template(config: &CatchupConfig) -> Result<Value> {
+    let path = config
+        .pod_template
+        .as_ref()
+        .ok_or("missing catch-up PodSpec template")?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read catch-up template: {e}"))?;
+    if bytes.len() > 65_536 {
+        return Err("catch-up template exceeds 64 KiB".into());
+    }
+    let spec: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_template(&spec)?;
+    Ok(spec)
+}
+fn validate_template(spec: &Value) -> Result<()> {
+    let containers = spec["containers"]
+        .as_array()
+        .ok_or("template requires containers")?;
+    if containers.len() != 1
+        || spec.get("initContainers").is_some()
+        || spec.get("ephemeralContainers").is_some()
+        || spec.get("nodeName").is_some()
+    {
+        return Err("catch-up requires one container, no init containers or nodeName".into());
+    }
+    let c = &containers[0];
+    let image = c["image"].as_str().ok_or("missing image")?;
+    if !image.rsplit_once("@sha256:").is_some_and(|(_, digest)| {
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        return Err("catch-up image must be pinned by SHA-256 digest".into());
+    }
+    if !c["command"].as_array().is_some_and(|a| {
+        a.len() == 1
+            && a[0]
+                .as_str()
+                .is_some_and(|s| s.ends_with("lance-context-master"))
+    }) {
+        return Err("catch-up command must run the native lance-context-master binary".into());
+    }
+    for resource in ["cpu", "memory"] {
+        let request = &c["resources"]["requests"][resource];
+        let limit = &c["resources"]["limits"][resource];
+        if request.as_str().is_none_or(|s| s.is_empty() || s == "0") || request != limit {
+            return Err("catch-up requires equal, nonzero CPU/memory requests and limits".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) struct Kubernetes {
+    client: Client,
+    base: String,
+    token_file: String,
+    pods_base: String,
+}
+impl Kubernetes {
+    pub fn in_cluster(config: &CatchupConfig) -> Result<Self> {
+        let ca = std::fs::read(Path::new(SERVICE_ACCOUNT).join("ca.crt"))
+            .map_err(|e| format!("read Kubernetes CA: {e}"))?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca).map_err(|e| e.to_string())?)
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            client,
+            base: format!(
+                "https://kubernetes.default.svc/apis/batch/v1/namespaces/{}/jobs",
+                config.namespace
+            ),
+            token_file: format!("{SERVICE_ACCOUNT}/token"),
+            pods_base: format!(
+                "https://kubernetes.default.svc/api/v1/namespaces/{}/pods",
+                config.namespace
+            ),
+        })
+    }
+    async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<(StatusCode, Value)> {
+        // Re-read projected tokens so long-lived masters survive token rotation.
+        let token = std::fs::read_to_string(&self.token_file)
+            .map_err(|e| format!("read Kubernetes token: {e}"))?;
+        let patch = method == Method::PATCH;
+        let mut request = self.client.request(method, url).bearer_auth(token.trim());
+        if patch {
+            request = request.header("Content-Type", "application/json-patch+json");
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        let body = response.json().await.map_err(|e| e.to_string())?;
+        Ok((status, body))
+    }
+    pub async fn reconcile(
+        &self,
+        config: &MasterConfig,
+        record: &Record,
+        stop: bool,
+    ) -> Result<(Option<String>, Option<JobOutcome>)> {
+        let (status, mut job) = self
+            .request(Method::GET, &format!("{}/{}", self.base, record.job), None)
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            if let Some(uid) = &record.job_uid {
+                // Deletion/preemption can remove the Job before its terminal
+                // status is collected. Only exact, stopped child Pods establish
+                // resource retirement; absence alone proves nothing about an
+                // old process on a partitioned node. Storage recovery is still
+                // required by normal admission before any successor can write.
+                let pods = self.job_pods(uid).await?;
+                if confirmed_retired_children(record, uid, &pods) {
+                    return Ok((Some(uid.clone()), Some(JobOutcome::Failed)));
+                }
+                return Err(
+                    "catch-up Job missing; no exact terminal Pod evidence; reservation retained"
+                        .into(),
+                );
+            }
+            if stop {
+                return Err(
+                    "catch-up Job missing after confirmation or startup stall; reservation retained"
+                        .into(),
+                );
+            }
+            let desired = render_job(config, record, read_template(&config.catchup)?);
+            let (created, body) = self
+                .request(Method::POST, &self.base, Some(&desired))
+                .await?;
+            // Ambiguous response and conflict both reconcile by the same name.
+            if created == StatusCode::CONFLICT {
+                return Ok((None, None));
+            }
+            if !created.is_success() {
+                return Err(format!("Kubernetes Job creation returned {created}"));
+            }
+            job = body;
+        } else if !status.is_success() {
+            return Err(format!("Kubernetes Job lookup returned {status}"));
+        }
+        if job["metadata"]["annotations"]["lance-context/target"] != record.target
+            || job["metadata"]["labels"]["lance-context/catchup"] != "native-v1"
+        {
+            return Err("Job identity mismatch; refusing adoption".into());
+        }
+        let uid = job["metadata"]["uid"]
+            .as_str()
+            .ok_or("Job has no UID")?
+            .to_string();
+        if record
+            .job_uid
+            .as_ref()
+            .is_some_and(|expected| expected != &uid)
+        {
+            return Err("Job UID changed; refusing adoption or termination".into());
+        }
+        let terminal = job["status"]["conditions"]
+            .as_array()
+            .and_then(|conditions| {
+                conditions.iter().find_map(|c| {
+                    if c["status"] != "True" {
+                        return None;
+                    }
+                    match c["type"].as_str() {
+                        Some("Complete") => Some(true),
+                        Some("Failed") => Some(false),
+                        _ => None,
+                    }
+                })
+            });
+        let Some(success) = terminal else {
+            if stop && record.job_uid.is_some() {
+                let uid = job["metadata"]["uid"].as_str().ok_or("Job has no UID")?;
+                let version = job["metadata"]["resourceVersion"]
+                    .as_str()
+                    .ok_or("Job has no resourceVersion")?;
+                // Only a confirmed stall enables a deadline. CAS prevents a
+                // delayed controller from touching a replaced/changed Job.
+                let patch = json!([
+                    {"op":"test","path":"/metadata/uid","value":uid},
+                    {"op":"test","path":"/metadata/resourceVersion","value":version},
+                    {"op":"add","path":"/spec/activeDeadlineSeconds","value":1}
+                ]);
+                let (status, _) = self
+                    .request(
+                        Method::PATCH,
+                        &format!("{}/{}", self.base, record.job),
+                        Some(&patch),
+                    )
+                    .await?;
+                if !status.is_success() {
+                    return Err(format!("stalled Job termination returned {status}"));
+                }
+                tracing::warn!(target = %record.target, job = %record.job,
+                    "confirmed no-progress catch-up; requested Job termination, retaining ownership");
+            }
+            return Ok((Some(uid), None));
+        };
+        // Older Kubernetes versions publish Failed while Pods still terminate.
+        // Check Job UID and every Pod phase before giving the resource slot back.
+        let items = self.job_pods(&uid).await?;
+        if items
+            .iter()
+            .any(|p| !matches!(p["status"]["phase"].as_str(), Some("Succeeded" | "Failed")))
+        {
+            return Ok((Some(uid), None));
+        }
+        Ok((
+            Some(uid),
+            Some(outcome::terminal_outcome(record, &job, &items, success)?),
+        ))
+    }
+
+    async fn job_pods(&self, uid: &str) -> Result<Vec<Value>> {
+        if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err("invalid Job UID".into());
+        }
+        let url = format!(
+            "{}?labelSelector=batch.kubernetes.io%2Fcontroller-uid%3D{uid}&limit=16",
+            self.pods_base
+        );
+        let (status, pods) = self.request(Method::GET, &url, None).await?;
+        if !status.is_success()
+            || pods["metadata"]["continue"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        {
+            return Err("cannot confirm catch-up Pods terminated".into());
+        }
+        pods["items"]
+            .as_array()
+            .cloned()
+            .ok_or("invalid Pod list".into())
+    }
+}
+
+fn confirmed_retired_children(record: &Record, uid: &str, pods: &[Value]) -> bool {
+    !pods.is_empty()
+        && pods.iter().all(|pod| {
+            pod["metadata"]["uid"]
+                .as_str()
+                .is_some_and(|uid| !uid.is_empty())
+                && pod["metadata"]["ownerReferences"]
+                    .as_array()
+                    .is_some_and(|owners| {
+                        owners.iter().any(|o| {
+                            o["uid"] == uid
+                                && o["name"] == record.job
+                                && o["kind"] == "Job"
+                                && o["controller"] == true
+                        })
+                    })
+                && matches!(
+                    pod["status"]["phase"].as_str(),
+                    Some("Failed" | "Succeeded")
+                )
+                && pod["spec"]["restartPolicy"] == "Never"
+                && pod["spec"]["containers"]
+                    .as_array()
+                    .is_some_and(|c| c.len() == 1)
+                && pod["status"]["containerStatuses"]
+                    .as_array()
+                    .is_some_and(|statuses| {
+                        statuses.len() == 1
+                            && statuses[0]["restartCount"] == 0
+                            && statuses[0]["state"]["terminated"]["finishedAt"]
+                                .as_str()
+                                .is_some_and(|s| !s.is_empty())
+                            && statuses[0]["state"]["terminated"]["exitCode"]
+                                .as_i64()
+                                .is_some()
+                            && statuses[0]["name"] == pod["spec"]["containers"][0]["name"]
+                    })
+        })
+}
+
+pub(super) fn render_job(config: &MasterConfig, record: &Record, mut spec: Value) -> Value {
+    let mut env = spec["containers"][0]["env"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut shards = config.catchup.shards.clone();
+    if !shards.is_empty() {
+        let start = record.attempt.saturating_sub(1) as usize % shards.len();
+        shards.rotate_left(start);
+    }
+    let overrides = [
+        ("DATA_DIR", config.data_dir.clone()),
+        ("WORKER_ENDPOINTS", config.worker_endpoints.join(",")),
+        (
+            "ROLLOUT_APPEND_TARGETS",
+            config.append.rollout_append_targets.join(","),
+        ),
+        (
+            "ROLLOUT_APPEND_CONCURRENCY",
+            config.append.rollout_append_concurrency.to_string(),
+        ),
+        (
+            "ROLLOUT_APPEND_MAX_GENERATIONS",
+            config.append.rollout_append_max_generations.to_string(),
+        ),
+        (
+            "ROLLOUT_APPEND_MAX_BYTES",
+            config.append.rollout_append_max_bytes.to_string(),
+        ),
+        (
+            "ROLLOUT_KEY_INDEX_TYPE",
+            config.key_index_type.as_str().into(),
+        ),
+        ("ETCD_ENDPOINTS", config.etcd.etcd_endpoints.join(",")),
+        ("ETCD_PREFIX", config.etcd.etcd_prefix.clone()),
+        ("CATCHUP_ENABLED", "false".into()),
+        (
+            "CATCHUP_PIPELINE_ENABLED",
+            config.catchup.pipeline_enabled.to_string(),
+        ),
+        (
+            "CATCHUP_BULK_KEY_DELETE_TARGETS",
+            config.catchup.bulk_key_delete_targets.join(","),
+        ),
+        (
+            "CATCHUP_PARALLEL_UPSERT_IO_TARGETS",
+            config.catchup.parallel_upsert_io_targets.join(","),
+        ),
+        (
+            "CATCHUP_STAGING_TARGETS",
+            config.catchup.staging_targets.join(","),
+        ),
+        (
+            "CATCHUP_STAGING_CONCURRENCY",
+            config.catchup.staging_concurrency.to_string(),
+        ),
+        (
+            "CATCHUP_GROUPED_TARGETS",
+            config.catchup.grouped_targets.join(","),
+        ),
+        (
+            "CATCHUP_GROUPED_SHARDS",
+            config.catchup.grouped_shards.to_string(),
+        ),
+        (
+            "CATCHUP_GROUPED_PREPARE_MAX_BYTES",
+            config.catchup.grouped_prepare_max_bytes.to_string(),
+        ),
+        (
+            "CATCHUP_GROUPED_PARALLEL_ENCODING",
+            config.catchup.grouped_parallel_encoding.to_string(),
+        ),
+        ("CATCHUP_TARGET", record.target.clone()),
+        ("CATCHUP_JOB_NAME", record.job.clone()),
+        ("CATCHUP_ATTEMPT_ID", record.attempt.to_string()),
+        ("CATCHUP_OUTCOME_PATH", outcome::RECEIPT_PATH.into()),
+        ("CATCHUP_SHARDS", shards.join(",")),
+        (
+            "CATCHUP_MERGE_MAX_GENERATIONS",
+            config.catchup.merge_max_generations.to_string(),
+        ),
+        (
+            "CATCHUP_MERGE_MAX_BYTES",
+            config.catchup.merge_max_bytes.to_string(),
+        ),
+        (
+            "CATCHUP_MERGE_MEMORY_BYTES",
+            config.catchup.merge_memory_bytes.to_string(),
+        ),
+        ("MERGE_OWNED_TARGETS", record.target.clone()),
+        ("MERGE_DRAIN_TARGETS", String::new()),
+        ("CATCHUP_SLICE_SECS", config.catchup.slice_secs.to_string()),
+        (
+            "MAINTENANCE_IDLE_TIMEOUT_SECS",
+            config.maintenance.maintenance_idle_timeout_secs.to_string(),
+        ),
+        ("ROLLOUT_CACHE_BYTES", "134217728".into()),
+    ];
+    for (name, value) in overrides {
+        env.retain(|e| e["name"] != name);
+        env.push(json!({"name": name, "value": value}));
+    }
+    env.retain(|e| e["name"] != "CATCHUP_POD_UID");
+    env.push(
+        json!({"name":"CATCHUP_POD_UID","valueFrom":{"fieldRef":{"fieldPath":"metadata.uid"}}}),
+    );
+    spec["containers"][0]["env"] = json!(env);
+    spec["containers"][0]["terminationMessagePath"] = json!(outcome::RECEIPT_PATH);
+    spec["containers"][0]["terminationMessagePolicy"] = json!("File");
+    spec["containers"][0]["args"] = json!([]);
+    spec["restartPolicy"] = json!("Never");
+    spec["preemptionPolicy"] = json!("Never");
+    spec["terminationGracePeriodSeconds"] = json!(30);
+    spec.as_object_mut()
+        .expect("validated PodSpec")
+        .remove("activeDeadlineSeconds");
+    // Dedicated executors need storage/etcd, never Kubernetes permissions.
+    spec["automountServiceAccountToken"] = json!(false);
+    json!({"apiVersion":"batch/v1","kind":"Job", "metadata":{"name":record.job,
+        "namespace":config.catchup.namespace,"labels":{"lance-context/catchup":"native-v1"},
+        "annotations":{"lance-context/target":record.target}},
+        "spec":{"parallelism":1,"completions":1,"backoffLimit":0,
+            "ttlSecondsAfterFinished":86400,
+            "template":{"metadata":{"labels":{"lance-context/catchup":"native-v1"}},"spec":spec}}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::State, routing::get, Json, Router};
+    use clap::Parser;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Mock {
+        creates: AtomicUsize,
+        terminal: AtomicBool,
+        patches: AtomicUsize,
+        pods_stopped: AtomicBool,
+        job: std::sync::Mutex<Option<Value>>,
+        pod_override: std::sync::Mutex<Option<Value>>,
+    }
+    async fn create(
+        State(mock): State<Arc<Mock>>,
+        Json(mut job): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        mock.creates.fetch_add(1, Ordering::SeqCst);
+        job["metadata"]["uid"] = json!("test-uid");
+        job["metadata"]["resourceVersion"] = json!("1");
+        *mock.job.lock().unwrap() = Some(job);
+        // The API committed the Job but the caller received an error.
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({})))
+    }
+    async fn lookup(State(mock): State<Arc<Mock>>) -> (StatusCode, Json<Value>) {
+        let Some(mut job) = mock.job.lock().unwrap().clone() else {
+            return (StatusCode::NOT_FOUND, Json(json!({})));
+        };
+        if mock.terminal.load(Ordering::SeqCst) {
+            job["status"] = json!({"conditions":[{"type":"Failed","status":"True"}]});
+        }
+        (StatusCode::OK, Json(job))
+    }
+    async fn patch(
+        State(mock): State<Arc<Mock>>,
+        Json(patch): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let mut guard = mock.job.lock().unwrap();
+        let job = guard.as_mut().unwrap();
+        assert_eq!(patch[0]["path"], "/metadata/uid");
+        assert_eq!(patch[1]["path"], "/metadata/resourceVersion");
+        if patch[0]["value"] != job["metadata"]["uid"]
+            || patch[1]["value"] != job["metadata"]["resourceVersion"]
+        {
+            return (StatusCode::CONFLICT, Json(json!({})));
+        }
+        assert_eq!(patch[2]["value"], 1);
+        mock.patches.fetch_add(1, Ordering::SeqCst);
+        job["spec"]["activeDeadlineSeconds"] = json!(1);
+        (StatusCode::OK, Json(job.clone()))
+    }
+    async fn pods(State(mock): State<Arc<Mock>>) -> Json<Value> {
+        if let Some(pods) = mock.pod_override.lock().unwrap().clone() {
+            return Json(pods);
+        }
+        Json(
+            json!({"items":[{"status":{"phase":if mock.pods_stopped.load(Ordering::SeqCst) {"Failed"} else {"Running"}}}]}),
+        )
+    }
+    #[test]
+    fn rendered_staging_target_override_round_trips_through_startup() {
+        let record: Record = serde_json::from_value(json!({
+            "target":"hot", "job":"job", "job_uid":"job-uid", "slot":0,
+            "attempt":1, "active":true, "reason":"test", "pending_at_admission":1000,
+            "created_at_ms":0, "finished_at_ms":null, "consecutive_failures":0,
+            "needs_attention":false, "next_retry_ms":0, "outcome":null
+        }))
+        .unwrap();
+        let mut config = MasterConfig::parse_from(["master"]);
+        for targets in [vec![], vec!["hot".to_string(), "other".to_string()]] {
+            config.catchup.staging_targets = targets.clone();
+            // Explicit override must win over the template's opt-in.
+            let job = render_job(
+                &config,
+                &record,
+                json!({"containers":[{
+                    "name":"executor", "env":[{"name":"CATCHUP_STAGING_TARGETS","value":"inherited"}]
+                }]}),
+            );
+            let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap();
+            let values: Vec<_> = env
+                .iter()
+                .filter(|v| v["name"] == "CATCHUP_STAGING_TARGETS")
+                .collect();
+            assert_eq!(values.len(), 1);
+            let value = values[0]["value"].as_str().unwrap();
+            assert_eq!(value, targets.join(","));
+            // CLI and env values share clap's value parser; no process-global
+            // environment mutation is needed to exercise the generated value.
+            let parsed = MasterConfig::try_parse_from([
+                "master",
+                "--staging-targets",
+                value,
+                "--target",
+                "hot",
+                "--job-name",
+                "job",
+                "--shards",
+                "writer0",
+            ])
+            .unwrap();
+            parsed.catchup.validate().unwrap();
+            assert_eq!(
+                parsed.catchup.staging_targets.iter().any(|t| t == "hot"),
+                !targets.is_empty()
+            );
+            assert!(!parsed
+                .catchup
+                .staging_targets
+                .iter()
+                .any(|t| t == "inherited"));
+        }
+        for value in [",", "hot,", ",hot", "hot,,other", "*", "hot,*"] {
+            let parsed =
+                MasterConfig::try_parse_from(["master", "--staging-targets", value]).unwrap();
+            assert!(
+                parsed.catchup.validate().is_err(),
+                "accepted malformed list {value:?}"
+            );
+        }
+        for width in ["0", "9"] {
+            let parsed = MasterConfig::try_parse_from([
+                "master",
+                "--staging-targets",
+                "",
+                "--staging-concurrency",
+                width,
+            ])
+            .unwrap();
+            assert!(parsed.catchup.validate().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_is_adopted_and_terminating_pods_retain_capacity() {
+        let mock = Arc::new(Mock {
+            creates: AtomicUsize::new(0),
+            terminal: AtomicBool::new(false),
+            patches: AtomicUsize::new(0),
+            pods_stopped: AtomicBool::new(false),
+            job: std::sync::Mutex::new(None),
+            pod_override: std::sync::Mutex::new(None),
+        });
+        let app = Router::new()
+            .route("/jobs", axum::routing::post(create))
+            .route("/jobs/{name}", get(lookup).patch(patch))
+            .route("/pods", get(pods))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let template = dir.path().join("pod.json");
+        std::fs::write(&template, json!({"containers":[{"name":"executor","command":["lance-context-master"],"image":format!("native@sha256:{}","a".repeat(64)),"resources":{"requests":{"cpu":"1","memory":"8Gi"},"limits":{"cpu":"1","memory":"8Gi"}}}]}).to_string()).unwrap();
+        let mut config = MasterConfig::parse_from(["master"]);
+        config.catchup.pod_template = Some(template.to_string_lossy().into());
+        let client = Kubernetes {
+            client: Client::new(),
+            base: format!("http://{addr}/jobs"),
+            pods_base: format!("http://{addr}/pods"),
+            token_file: token.to_string_lossy().into(),
+        };
+        let mut record = Record {
+            target: "hot".into(),
+            job: "lc-catchup-test".into(),
+            job_uid: None,
+            slot: 0,
+            attempt: 1,
+            active: true,
+            termination_requested: false,
+            reason: "test".into(),
+            pending_at_admission: 1000,
+            created_at_ms: 0,
+            finished_at_ms: None,
+            consecutive_failures: 0,
+            needs_attention: false,
+            next_retry_ms: 0,
+            outcome: None,
+            progress: None,
+        };
+        assert!(client.reconcile(&config, &record, false).await.is_err());
+        assert_eq!(
+            client.reconcile(&config, &record, false).await.unwrap().1,
+            None
+        );
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 1);
+        record.job_uid = Some("test-uid".into());
+        assert_eq!(mock.patches.load(Ordering::SeqCst), 0);
+        client.reconcile(&config, &record, true).await.unwrap();
+        assert_eq!(mock.patches.load(Ordering::SeqCst), 1);
+        record.job_uid = Some("replaced-uid".into());
+        assert!(client
+            .reconcile(&config, &record, true)
+            .await
+            .unwrap_err()
+            .contains("UID changed"));
+        assert_eq!(mock.patches.load(Ordering::SeqCst), 1);
+        record.job_uid = Some("test-uid".into());
+        mock.terminal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            client.reconcile(&config, &record, false).await.unwrap().1,
+            None
+        );
+        mock.pods_stopped.store(true, Ordering::SeqCst);
+        assert_eq!(
+            client.reconcile(&config, &record, false).await.unwrap().1,
+            Some(JobOutcome::Failed)
+        );
+        // Simulate Job deletion before the controller collected terminal status.
+        *mock.job.lock().unwrap() = None;
+        assert!(client.reconcile(&config, &record, false).await.is_err());
+        *mock.pod_override.lock().unwrap() = Some(json!({"items":[{
+            "metadata":{"uid":"pod-uid","ownerReferences":[{"uid":"test-uid",
+                "name":record.job,"kind":"Job","controller":true}]},
+            "spec":{"restartPolicy":"Never","containers":[{"name":"executor"}]},
+            "status":{"phase":"Failed","containerStatuses":[{"name":"executor","restartCount":0,
+                "state":{"terminated":{"exitCode":137,"finishedAt":"2026-10-06T00:00:00Z"}}}]}
+        }]}));
+        assert_eq!(
+            client.reconcile(&config, &record, false).await.unwrap().1,
+            Some(JobOutcome::Failed)
+        );
+        assert_eq!(
+            mock.creates.load(Ordering::SeqCst),
+            1,
+            "must not recreate a missing confirmed Job under the old name"
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn terminal_deferred_job_releases_its_slot_without_touching_other_execution() {
+        use super::super::{reconcile_record, store::Inventory};
+        let (_dir, state) = super::super::tests::fixture().await.unwrap();
+        let inventory = Inventory::new(&state);
+        inventory.reserve("hot", "test", 1000, 0).await.unwrap();
+        let record = inventory.get("hot").await.unwrap().unwrap();
+        // A different operation arrived after admission but before our claim.
+        let coordinator = state.task_store.merge_coordinator();
+        let other = lance_context_merge::Execution::new("hot", "master:other", "other-owner", 1);
+        state
+            .task_store
+            .etcd_client()
+            .clone()
+            .put(
+                lance_context_merge::execution_key(&state.config.etcd.etcd_prefix, "hot"),
+                serde_json::to_vec(&other).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut job = render_job(
+            &state.config,
+            &record,
+            read_template(&state.config.catchup).unwrap(),
+        );
+        job["metadata"]["uid"] = json!("job-uid");
+        let message = json!({"version":1, "outcome":"deferred_before_claim",
+            "target":"hot", "job":record.job, "attempt":record.attempt.to_string(),
+            "pod_uid":"pod-uid"})
+        .to_string();
+        let pods = json!({"items":[{"metadata":{"uid":"pod-uid","ownerReferences":[{
+            "uid":"job-uid","name":record.job,"kind":"Job","controller":true}]},
+            "status":{"phase":"Failed","containerStatuses":[{"name":"catchup", "restartCount":0,
+                "state":{"terminated":{"exitCode":75,"message":message}}}]}}]});
+        let mock = Arc::new(Mock {
+            creates: AtomicUsize::new(0),
+            terminal: AtomicBool::new(true),
+            patches: AtomicUsize::new(0),
+            pods_stopped: AtomicBool::new(true),
+            job: std::sync::Mutex::new(Some(job)),
+            pod_override: std::sync::Mutex::new(Some(pods)),
+        });
+        let app = Router::new()
+            .route("/jobs/{name}", get(lookup).patch(patch))
+            .route("/pods", get(self::pods))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let token = _dir.path().join("kube-token");
+        std::fs::write(&token, "test").unwrap();
+        let kube = Kubernetes {
+            client: Client::new(),
+            base: format!("http://{addr}/jobs"),
+            pods_base: format!("http://{addr}/pods"),
+            token_file: token.to_string_lossy().into(),
+        };
+        // A code 75 with lost terminal evidence remains unresolved even if
+        // another execution is healthy. No failure debt or ownership is reset.
+        let valid_pods = mock.pod_override.lock().unwrap().clone().unwrap();
+        let mut missing_receipt = valid_pods.clone();
+        missing_receipt["items"][0]["status"]["containerStatuses"][0]["state"]["terminated"]
+            ["message"] = json!("");
+        *mock.pod_override.lock().unwrap() = Some(missing_receipt);
+        reconcile_record(&state, &inventory, &kube, record.clone())
+            .await
+            .unwrap();
+        let unresolved = inventory.get("hot").await.unwrap().unwrap();
+        assert!(unresolved.active);
+        assert!(unresolved.needs_attention);
+        assert_eq!(unresolved.consecutive_failures, 0);
+        assert_eq!(inventory.active().await.unwrap().len(), 1);
+        *mock.pod_override.lock().unwrap() = Some(valid_pods);
+        reconcile_record(&state, &Inventory::new(&state), &kube, unresolved)
+            .await
+            .unwrap();
+        let done = inventory.get("hot").await.unwrap().unwrap();
+        assert!(!done.active);
+        assert_eq!(done.outcome.as_deref(), Some("deferred_before_claim"));
+        assert_eq!(done.consecutive_failures, 0);
+        assert!(inventory.active().await.unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_value(coordinator.get("hot").await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(other).unwrap()
+        );
+        assert_eq!(mock.patches.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.creates.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn missing_job_requires_exact_terminal_children_not_absence_or_pod_phase_alone() {
+        let record: Record = serde_json::from_value(json!({
+            "target":"hot", "job":"job", "job_uid":"job-uid", "slot":0,
+            "attempt":1, "active":true, "reason":"test", "pending_at_admission":1000,
+            "created_at_ms":0, "finished_at_ms":null, "consecutive_failures":0,
+            "needs_attention":false, "next_retry_ms":0, "outcome":null
+        }))
+        .unwrap();
+        let pod = json!({"metadata":{"uid":"pod", "ownerReferences":[{
+            "uid":"job-uid", "name":"job", "kind":"Job", "controller":true}]},
+            "spec":{"restartPolicy":"Never", "containers":[{"name":"executor"}]},
+            "status":{"phase":"Failed", "containerStatuses":[{"name":"executor", "restartCount":0,
+                "state":{"terminated":{"exitCode":137,"finishedAt":"2026-10-06T00:00:00Z"}}}]}});
+        assert!(confirmed_retired_children(
+            &record,
+            "job-uid",
+            std::slice::from_ref(&pod)
+        ));
+        assert!(!confirmed_retired_children(&record, "job-uid", &[]));
+        for (pointer, value) in [
+            ("/metadata/uid", json!("")),
+            ("/metadata/ownerReferences/0/uid", json!("other")),
+            ("/status/phase", json!("Running")),
+            ("/status/containerStatuses/0/restartCount", json!(1)),
+            ("/status/containerStatuses/0/state/terminated", json!(null)),
+            ("/spec/restartPolicy", json!("Always")),
+        ] {
+            let mut changed = pod.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !confirmed_retired_children(&record, "job-uid", &[changed]),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_unbounded_templates_are_rejected() {
+        assert!(validate_template(&json!({"containers":[]})).is_err());
+        assert!(validate_template(&json!({"containers":[{"image":"native:latest"}]})).is_err());
+    }
+}

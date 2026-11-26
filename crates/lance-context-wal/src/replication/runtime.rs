@@ -1,0 +1,1188 @@
+//! Bounded asynchronous callers over dedicated, durable Raft group workers.
+//!
+//! Each group has one owner thread; groups retain their shared physical engine
+//! and failure fence. Storage and payload validation never run on the caller's
+//! async executor. Only Node::poll completions answer commits and quorum reads.
+//! Queue admission, cached status and peer enqueue are not durable acknowledgments.
+//!
+//! A transport must authenticate peers/callers, enforce frame limits before
+//! allocation, hold outbound ownership through transmission, and implement
+//! snapshot transfer and maintenance. This module is the worker layer, not a
+//! network listener, automatic maintenance scheduler, or complete ingestion service.
+//!
+//! Service JSON accepts `runtime.raft_max_inflight_msgs` (1–256, default 16).
+//! It bounds unacknowledged AppendEntries messages per follower per group and
+//! can change on restart without migrating durable policy. It does not raise
+//! transport byte credits or the uncommitted-byte limit. Size experiments against
+//! replication bandwidth and durable-ack latency; monitor queueing, memory,
+//! refusals and ACK tails as well as throughput.
+use super::{
+    producer, publication as p, query, source, source_read, Node, Outcome, Packet, Status,
+};
+use crate::record::{Batch, RecordKind};
+use anyhow::{ensure, Context, Result};
+use protobuf::Message as _;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    task::{Context as TaskContext, Poll},
+    thread::{self, JoinHandle, Thread},
+    time::{Duration, Instant},
+};
+use tokio::sync::{mpsc as async_mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+
+#[cfg(feature = "peer-transport")]
+pub mod client;
+mod images;
+mod peer_observation;
+pub use peer_observation::{PeerDiskRefusal, PeerRejections};
+mod poll_observation;
+pub use poll_observation::{EngineWriteObservation, PollObservation};
+mod append_observation;
+use append_observation::AppendTiming;
+pub use append_observation::{AppendIntervals, AppendObservation};
+#[cfg(feature = "peer-transport")]
+pub mod peer;
+
+/// Logical owned frame bytes and requests shared across all physical groups.
+/// Counts do not include caller allocations or an oversized allocation pinned
+/// by a small Bytes slice. The transport must account for those owners too.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "service", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "service", serde(default, deny_unknown_fields))]
+pub struct Options {
+    pub data_requests: usize,
+    pub data_bytes: usize,
+    pub control_requests: usize,
+    pub control_bytes: usize,
+    pub peer_requests: usize,
+    pub peer_bytes: usize,
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
+    pub tick_interval: Duration,
+    /// Maximum commands from each lane before polling durable Raft progress.
+    pub batch_requests: usize,
+    /// Bound the control prefix, then end the batch after a peer/data round
+    /// consumes this wall-time budget. Every batch visits peers and, unless
+    /// draining a checkpoint, data at least once.
+    /// Cannot preempt a single operation or bound a poll's persistence latency.
+    #[cfg_attr(feature = "service", serde(with = "crate::service::duration_millis"))]
+    pub batch_time: Duration,
+    /// Overlap ordinary peer messages with local persistence. Persistence-bound
+    /// replies, snapshots and client completions retain their existing barriers.
+    /// Experimental; disabled until a controlled comparison supports it.
+    pub pipeline_replication: bool,
+    /// Maximum unacknowledged AppendEntries messages per follower and group.
+    /// This local tuning does not change durable policy or byte admission limits.
+    pub raft_max_inflight_msgs: usize,
+    /// Run ordinary Ready writes on a bounded native worker. Checkpoint and
+    /// snapshot publication retain their ordered barriers. Experimental.
+    pub async_persistence: bool,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            data_requests: 128,
+            data_bytes: 64 << 20,
+            control_requests: 64,
+            control_bytes: 4 << 20,
+            peer_requests: 128,
+            peer_bytes: 64 << 20,
+            tick_interval: Duration::from_millis(100),
+            batch_requests: 32,
+            batch_time: Duration::from_millis(1),
+            pipeline_replication: false,
+            raft_max_inflight_msgs: 16,
+            async_persistence: false,
+        }
+    }
+}
+impl Options {
+    pub(crate) fn validate(&self) -> Result<()> {
+        for (count, bytes) in [
+            (self.data_requests, self.data_bytes),
+            (self.control_requests, self.control_bytes),
+            (self.peer_requests, self.peer_bytes),
+        ] {
+            ensure!(
+                (1..=4096).contains(&count) && (4096..=256 * 1024 * 1024).contains(&bytes),
+                "invalid runtime credit limits"
+            );
+        }
+        ensure!(
+            (1..=256).contains(&self.batch_requests)
+                && (1..=256).contains(&self.raft_max_inflight_msgs)
+                && (Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.batch_time)
+                && self.tick_interval >= Duration::from_millis(10)
+                && self.tick_interval <= Duration::from_secs(1),
+            "invalid runtime scheduling options"
+        );
+        Ok(())
+    }
+}
+
+/// Typed commands preserve Node's existing validation and durable formats.
+/// This scheduling enum is not a network or persisted wire format.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Command {
+    Append { group: u64, batch: Batch },
+    Acquire(p::Acquire),
+    Plan(p::PlanRequest),
+    Prepare(p::PrepareRequest),
+    Bootstrap(p::BootstrapManifest),
+    Reserve(p::ReserveManifest),
+    Confirm(p::ConfirmPublication),
+    Advance(p::AdvancePublication),
+    RetireHistory(p::RetireManifestHistory),
+    Pin(source::Permit),
+    Close(source::ClosurePermit),
+    Producer(producer::Command),
+}
+impl Command {
+    fn group(&self, catalog: u64) -> u64 {
+        match self {
+            Self::Append { group, .. } => *group,
+            Self::Pin(p) => p.selection().group,
+            Self::Close(p) => p.closure().group,
+            Self::Producer(p) => p.group,
+            _ => catalog,
+        }
+    }
+    fn execute(self, node: &mut Node, token: u64) -> Result<()> {
+        match self {
+            Self::Append { group, batch } => node.propose(group, token, batch),
+            Self::Acquire(p) => node.acquire_publisher(token, p),
+            Self::Plan(p) => node.plan_publication(token, p),
+            Self::Prepare(p) => node.prepare_publication(token, p),
+            Self::Bootstrap(p) => node.bootstrap_manifest(token, p),
+            Self::Reserve(p) => node.reserve_manifest(token, p),
+            Self::Confirm(p) => node.confirm_publication(token, p),
+            Self::Advance(p) => node.advance_publication(token, p),
+            Self::RetireHistory(p) => node.retire_manifest_history(token, p),
+            Self::Pin(p) => node.pin_source(token, p),
+            Self::Close(p) => node.close_source(token, p),
+            Self::Producer(p) => node.producer_command(token, p),
+        }
+    }
+}
+
+/// Dropping this future does not revoke a queued or possibly committed command.
+/// Credits cover queued, executing and completed-but-unconsumed replies. A
+/// cancelled receiver leaves its credits with the worker until completion/stop.
+/// Treat every error/cancellation as uncertain and reconcile the original identity.
+pub struct Pending<T>(oneshot::Receiver<Completed<T>>);
+struct Completed<T> {
+    result: Result<T>,
+    _credit: Credit,
+}
+impl<T> Future for Pending<T> {
+    type Output = Result<T>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.0).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(value)) => Poll::Ready(value.result),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(SubmissionFailure::WorkerStopped.into())),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SubmissionFailure {
+    RequestCredits,
+    ByteCredits,
+    QueueUnavailable,
+    WorkerStopped,
+}
+impl std::fmt::Display for SubmissionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RequestCredits => "runtime request credits exhausted",
+            Self::ByteCredits => "runtime byte credits exhausted",
+            Self::QueueUnavailable => "runtime queue unavailable; reconcile original request",
+            Self::WorkerStopped => "replica worker stopped; outcome unknown",
+        })
+    }
+}
+impl std::error::Error for SubmissionFailure {}
+
+struct Credits {
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    capacity_bytes: usize,
+    capacity_slots: usize,
+    rejected_slots: AtomicU64,
+    rejected_bytes: AtomicU64,
+}
+
+/// Local admission counters, shared across the node's Raft groups. Fields are
+/// sampled independently, so this is not an atomic snapshot or a quorum result.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdmissionLane {
+    pub capacity_requests: usize,
+    pub used_requests: usize,
+    pub capacity_bytes: usize,
+    pub used_bytes: usize,
+    /// Attempts rejected while acquiring a request permit.
+    pub rejected_requests: u64,
+    /// Attempts rejected while acquiring byte permits, after a request permit.
+    pub rejected_bytes: u64,
+}
+
+/// Physical runtime admission, excluding the transport's separate budgets.
+#[derive(Clone, Debug, Serialize)]
+pub struct Admission {
+    pub data: AdmissionLane,
+    pub control: AdmissionLane,
+    pub incoming_peers: AdmissionLane,
+    pub outgoing_peers: AdmissionLane,
+}
+
+fn increment_rejection(counter: &AtomicU64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_add(1))
+    });
+}
+
+struct Credit {
+    _slot: OwnedSemaphorePermit,
+    _bytes: OwnedSemaphorePermit,
+}
+impl Credits {
+    fn new(slots: usize, bytes: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(slots)),
+            bytes: Arc::new(Semaphore::new(bytes)),
+            capacity_bytes: bytes,
+            capacity_slots: slots,
+            rejected_slots: AtomicU64::new(0),
+            rejected_bytes: AtomicU64::new(0),
+        }
+    }
+    fn observation(&self) -> AdmissionLane {
+        AdmissionLane {
+            capacity_requests: self.capacity_slots,
+            used_requests: self.capacity_slots - self.slots.available_permits(),
+            capacity_bytes: self.capacity_bytes,
+            used_bytes: self.capacity_bytes - self.bytes.available_permits(),
+            rejected_requests: self.rejected_slots.load(Ordering::Relaxed),
+            rejected_bytes: self.rejected_bytes.load(Ordering::Relaxed),
+        }
+    }
+    fn reserve(&self, bytes: usize) -> Result<Credit> {
+        let slot = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .inspect_err(|_| increment_rejection(&self.rejected_slots))
+            .map_err(|_| SubmissionFailure::RequestCredits)?;
+        let bytes = u32::try_from(
+            bytes
+                .checked_add(256)
+                .context("runtime frame size overflow")?,
+        )?;
+        let bytes = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .inspect_err(|_| increment_rejection(&self.rejected_bytes))
+            .map_err(|_| SubmissionFailure::ByteCredits)?;
+        Ok(Credit {
+            _slot: slot,
+            _bytes: bytes,
+        })
+    }
+}
+struct Completion<T> {
+    reply: oneshot::Sender<Completed<T>>,
+    _credit: Credit,
+}
+impl<T> Completion<T> {
+    fn finish(self, result: Result<T>) {
+        let _ = self.reply.send(Completed {
+            result,
+            _credit: self._credit,
+        });
+    }
+}
+enum Work {
+    // Keep the data lane inline; only larger control metadata needs boxing.
+    Append(u64, Batch, Instant, Completion<Outcome>),
+    Commit(u64, Box<Command>, Completion<Outcome>),
+    Query(u64, query::Query, Completion<query::Outcome>),
+    ReadSource(source_read::Request, Completion<source_read::Observation>),
+    Campaign(Completion<()>),
+    #[cfg(feature = "peer-transport")]
+    Fetch(u64, Instant, Completion<Option<Batch>>),
+    Local(LocalWork),
+    Checkpoint(Box<images::CheckpointWork>),
+}
+type AfterPoll = Box<dyn FnOnce() + Send>;
+type LocalWork = Box<dyn FnOnce(&mut Node) -> AfterPoll + Send>;
+struct PeerWork {
+    packet: Packet,
+    credit: Credit,
+}
+struct Route {
+    data: mpsc::SyncSender<Work>,
+    control: mpsc::SyncSender<Work>,
+    peers: mpsc::SyncSender<PeerWork>,
+    wake: Thread,
+    observation: Arc<Mutex<Observation>>,
+}
+struct Shared {
+    #[cfg(feature = "peer-transport")]
+    appends: client::observation::Counters,
+    stopped: AtomicBool,
+    token: AtomicU64,
+    data: Credits,
+    control: Credits,
+    incoming: Credits,
+    outgoing: Credits,
+    dropped_outgoing: AtomicU64,
+    rejected_incoming: AtomicU64,
+    peer_rejections: Mutex<PeerRejections>,
+}
+
+/// A stale, local observation. Its timestamp does not establish quorum freshness.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    pub status: Status,
+    /// Persisted image boundary; local scheduling data, not a quorum result.
+    pub checkpoint_index: u64,
+    /// First retained durable log entry, sampled with the checkpoint boundary.
+    /// A snapshot needs a suffix starting at its index plus one; a later first
+    /// index means that suffix is no longer available from this local store.
+    pub first_retained_index: u64,
+    pub observed_at: Instant,
+    pub polling: bool,
+    pub stopped: bool,
+    pub failure: Option<String>,
+    /// Completed local fetch work. Excludes RPC admission and reply transport.
+    pub fetch: FetchObservation,
+    /// Completed durable polls and native write timings on this worker thread.
+    pub durable_poll: PollObservation,
+    /// Separate native-worker timing and pending ownership when asynchronous
+    /// persistence is enabled. Its I/O does not run inside durable_poll.
+    pub persistence: Option<PersistenceObservation>,
+    /// Per-append completed intervals, grouped by the worker's outcome.
+    pub append: AppendObservation,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PersistenceObservation {
+    pub pending_readies: usize,
+    pub pending_checkpoint: bool,
+    pub pending_entries: usize,
+    pub pending_bytes: usize,
+    pub deferred_bytes: usize,
+    /// Original I/O operations, excluding time queued before the native worker.
+    pub io: PollObservation,
+}
+
+/// Bounded cumulative timings for serviced local fetch requests, including
+/// missing records and failures. These are wall times, not CPU or quorum data.
+/// Queued requests dropped on shutdown are not completed work and are excluded.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FetchObservation {
+    pub completed: u64,
+    pub found: u64,
+    pub missing: u64,
+    pub failed: u64,
+    pub body_bytes: u64,
+    pub queue_micros: u64,
+    pub queue_max_micros: u64,
+    pub service_micros: u64,
+    pub service_max_micros: u64,
+}
+
+#[cfg(feature = "peer-transport")]
+impl FetchObservation {
+    fn record(&mut self, queued: Duration, service: Duration, result: &Result<Option<Batch>>) {
+        let micros = |duration: Duration| duration.as_micros().min(u64::MAX as u128) as u64;
+        let queued = micros(queued);
+        let service = micros(service);
+        self.completed = self.completed.saturating_add(1);
+        self.queue_micros = self.queue_micros.saturating_add(queued);
+        self.queue_max_micros = self.queue_max_micros.max(queued);
+        self.service_micros = self.service_micros.saturating_add(service);
+        self.service_max_micros = self.service_max_micros.max(service);
+        match result {
+            Ok(Some(batch)) => {
+                self.found = self.found.saturating_add(1);
+                self.body_bytes = self.body_bytes.saturating_add(batch.body.len() as u64);
+            }
+            Ok(None) => self.missing = self.missing.saturating_add(1),
+            Err(_) => self.failed = self.failed.saturating_add(1),
+        }
+    }
+}
+
+/// Keep this owner alive while encoding/transmitting its packet. A full outbox
+/// drops peer traffic without blocking persistence workers; Raft retransmits.
+pub struct Outbound {
+    packet: Packet,
+    _credit: Option<Credit>,
+    image: Option<Arc<super::checkpoint::Image>>,
+    snapshot_feedback: Option<images::SnapshotFeedback>,
+}
+impl Outbound {
+    pub fn packet(&self) -> &Packet {
+        &self.packet
+    }
+    /// Captured with the outgoing snapshot, before a later checkpoint can
+    /// replace it. Retain this owner through transfer and report its outcome.
+    pub fn snapshot_image(&self) -> Option<&Arc<super::checkpoint::Image>> {
+        self.image.as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub struct Handle {
+    disk: Option<Arc<crate::admission::Budget>>,
+    #[cfg(feature = "service")]
+    log_file_headroom: u64,
+    #[cfg(feature = "peer-transport")]
+    images: std::sync::Weak<super::images::Owner>,
+    routes: Arc<BTreeMap<u64, Route>>,
+    shared: Arc<Shared>,
+    catalog: u64,
+    cluster: uuid::Uuid,
+    layout: [u8; 32],
+    policy: [u8; 32],
+    id: u64,
+    voters: Arc<BTreeMap<u64, Vec<u64>>>,
+    max_record: usize,
+}
+impl Handle {
+    fn route(&self, group: u64) -> Result<&Route> {
+        ensure!(
+            !self.shared.stopped.load(Ordering::Acquire),
+            "replica runtime stopped; outcome unknown"
+        );
+        self.routes
+            .get(&group)
+            .context("group not hosted by runtime")
+    }
+    fn token(&self) -> Result<u64> {
+        let mut current = self.shared.token.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .context("runtime request tokens exhausted")?;
+            match self.shared.token.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+    fn enqueue(&self, route: &Route, work: Work, data: bool) -> Result<()> {
+        let queue = if data { &route.data } else { &route.control };
+        queue
+            .try_send(work)
+            .map_err(|_| SubmissionFailure::QueueUnavailable)?;
+        route.wake.unpark();
+        Ok(())
+    }
+    pub fn commit(&self, command: Command) -> Result<Pending<Outcome>> {
+        let group = command.group(self.catalog);
+        let route = self.route(group)?;
+        let data = matches!(command, Command::Append { .. });
+        if let Command::Append { batch, .. } = &command {
+            ensure!(
+                batch.meta.kind == RecordKind::Data,
+                "use typed commands for control records"
+            );
+            batch
+                .meta
+                .check_body_length(batch.body.len(), self.max_record)?;
+        }
+        let size = usize::try_from(bincode::serialized_size(&command)?)?;
+        let credit = if data {
+            &self.shared.data
+        } else {
+            &self.shared.control
+        }
+        // Catalog replies can include a previously selected manifest, larger
+        // than this request. Reserve a conservative logical response allowance.
+        .reserve(if data { size } else { size.max(16 * 1024) })?;
+        let (reply, receive) = oneshot::channel();
+        let completion = Completion {
+            reply,
+            _credit: credit,
+        };
+        let token = self.token()?;
+        let work = match command {
+            Command::Append { batch, .. } => Work::Append(token, batch, Instant::now(), completion),
+            control => Work::Commit(token, Box::new(control), completion),
+        };
+        self.enqueue(route, work, data)?;
+        Ok(Pending(receive))
+    }
+    pub fn query(&self, group: u64, query: query::Query) -> Result<Pending<query::Outcome>> {
+        let route = self.route(group)?;
+        let response_bytes = match &query {
+            query::Query::Publisher { .. } => p::MAX_TABLE_BYTES + 4096,
+            query::Query::Pin { .. } | query::Query::SourcePin { .. } => {
+                source::MAX_PIN_BYTES + 4096
+            }
+            query::Query::Accepted { limit, .. } | query::Query::AcceptedBucket { limit, .. } => {
+                ensure!((1..=128).contains(limit), "invalid accepted query bounds");
+                256 * limit + 1024
+            }
+            _ => 16 * 1024,
+        };
+        let credit = self
+            .shared
+            .control
+            .reserve(response_bytes.max(usize::try_from(bincode::serialized_size(&query)?)?))?;
+        let (reply, receive) = oneshot::channel();
+        self.enqueue(
+            route,
+            Work::Query(
+                self.token()?,
+                query,
+                Completion {
+                    reply,
+                    _credit: credit,
+                },
+            ),
+            false,
+        )?;
+        Ok(Pending(receive))
+    }
+    /// Consume a bounded, already applied source prefix. The observation can
+    /// lag a newer leader and is never a quorum read or publication authority.
+    pub fn read_source(
+        &self,
+        group: u64,
+        request: source_read::Request,
+    ) -> Result<Pending<source_read::Observation>> {
+        let route = self.route(group)?;
+        ensure!(
+            (1..=128).contains(&request.limit),
+            "invalid committed source bounds"
+        );
+        let credit = self
+            .shared
+            .control
+            .reserve(256 * request.limit + 1024 + source::MAX_CLOSED_BYTES)?;
+        let (reply, receive) = oneshot::channel();
+        self.enqueue(
+            route,
+            Work::ReadSource(
+                request,
+                Completion {
+                    reply,
+                    _credit: credit,
+                },
+            ),
+            false,
+        )?;
+        Ok(Pending(receive))
+    }
+
+    /// Starts an election; success is not a leadership or durability receipt.
+    pub fn campaign(&self, group: u64) -> Result<Pending<()>> {
+        let route = self.route(group)?;
+        let credit = self.shared.control.reserve(0)?;
+        let (reply, receive) = oneshot::channel();
+        self.enqueue(
+            route,
+            Work::Campaign(Completion {
+                reply,
+                _credit: credit,
+            }),
+            false,
+        )?;
+        Ok(Pending(receive))
+    }
+
+    /// Ask this group's local leader to transfer through ordinary Raft. False
+    /// means this node is not the leader or is already the target. True means
+    /// only that the request was issued, not that the target became leader.
+    /// No client transport endpoint exposes this local operation.
+    pub fn transfer_leader(&self, group: u64, target: u64) -> Result<Pending<bool>> {
+        self.local(group, move |node| node.transfer_leader(group, target))
+    }
+    /// Authenticated transport enqueues a bounded decoded packet. Only the
+    /// worker validates entry payloads; Ok here is not peer persistence.
+    pub fn step(&self, packet: Packet) -> Result<()> {
+        let route = self.route(packet.group)?;
+        ensure!(
+            packet.cluster == self.cluster
+                && packet.layout == self.layout
+                && packet.policy == self.policy,
+            "foreign peer scope or policy"
+        );
+        ensure!(
+            packet.message.to == self.id
+                && packet.message.from != self.id
+                && self.voters[&packet.group].contains(&packet.message.from),
+            "foreign peer route"
+        );
+        ensure!(
+            packet.message.snapshot.is_none(),
+            "snapshot transfer requires separate durable installation"
+        );
+        let bytes = packet.message.compute_size() as usize;
+        ensure!(bytes <= 16 << 20, "oversized peer message");
+        let credit = self.shared.incoming.reserve(bytes)?;
+        route
+            .peers
+            .try_send(PeerWork { packet, credit })
+            .map_err(|_| anyhow::anyhow!("runtime peer queue unavailable"))?;
+        route.wake.unpark();
+        Ok(())
+    }
+    pub fn observation(&self, group: u64) -> Result<Observation> {
+        let route = self.routes.get(&group).context("group not hosted")?;
+        Ok(route
+            .observation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("observation poisoned"))?
+            .clone())
+    }
+    pub fn peer_drops(&self) -> (u64, u64) {
+        (
+            self.shared.dropped_outgoing.load(Ordering::Relaxed),
+            self.shared.rejected_incoming.load(Ordering::Relaxed),
+        )
+    }
+    /// Node-wide causes of packets rejected by the durable workers after queue
+    /// admission. Queue and transport refusals have their own counters.
+    pub fn peer_rejections(&self) -> PeerRejections {
+        self.shared.peer_rejections.lock().unwrap().clone()
+    }
+    /// Observe bounded local admission without contacting peers or allocating
+    /// payloads. Successful admissions do not update rejection counters.
+    pub fn admission(&self) -> Admission {
+        Admission {
+            data: self.shared.data.observation(),
+            control: self.shared.control.observation(),
+            incoming_peers: self.shared.incoming.observation(),
+            outgoing_peers: self.shared.outgoing.observation(),
+        }
+    }
+}
+
+pub struct Runtime {
+    handle: Handle,
+    workers: Vec<JoinHandle<Result<()>>>,
+}
+impl Runtime {
+    /// Pass an already opened, configured node with any required signing keys.
+    /// Queue credits do not establish physical disk bounds. Configure the Node's
+    /// shared disk admission, maintenance and snapshot transfer before ingress.
+    pub fn spawn(
+        mut node: Node,
+        options: Options,
+    ) -> Result<(Self, async_mpsc::Receiver<Outbound>)> {
+        options.validate()?;
+        node.healthy()?;
+        if options.async_persistence {
+            super::async_persist::window(&options, &node.limits)?;
+        }
+        // Membership is static. Apply the local window to every hosted peer
+        // before ownership moves to workers; raft-rs retains it across elections.
+        for (group, state) in &mut node.groups {
+            for &peer in &node.layout.groups[group] {
+                state
+                    .raw
+                    .raft
+                    .adjust_max_inflight_msgs(peer, options.raft_max_inflight_msgs);
+            }
+        }
+        let shared = Arc::new(Shared {
+            #[cfg(feature = "peer-transport")]
+            appends: client::observation::Counters::default(),
+            stopped: AtomicBool::new(false),
+            token: AtomicU64::new(1),
+            data: Credits::new(options.data_requests, options.data_bytes),
+            control: Credits::new(options.control_requests, options.control_bytes),
+            incoming: Credits::new(options.peer_requests, options.peer_bytes),
+            outgoing: Credits::new(options.peer_requests, options.peer_bytes),
+            dropped_outgoing: AtomicU64::new(0),
+            rejected_incoming: AtomicU64::new(0),
+            peer_rejections: Mutex::new(PeerRejections::default()),
+        });
+        let (outbox, receive) = async_mpsc::channel(options.peer_requests);
+        let mut handle = Handle {
+            disk: node.images.store().disk_budget().cloned(),
+            #[cfg(feature = "service")]
+            log_file_headroom: node.images.store().allocation_headroom()?,
+            #[cfg(feature = "peer-transport")]
+            images: Arc::downgrade(&node.images),
+            routes: Arc::new(BTreeMap::new()),
+            shared: shared.clone(),
+            catalog: p::control_group(&node.layout),
+            cluster: node.layout.cluster,
+            layout: node.layout_hash,
+            policy: node.policy,
+            id: node.id,
+            voters: Arc::new(
+                node.layout
+                    .groups
+                    .iter()
+                    .filter(|(_, voters)| voters.contains(&node.id))
+                    .map(|(&group, voters)| (group, voters.clone()))
+                    .collect(),
+            ),
+            max_record: node.limits.max_record_bytes as usize,
+        };
+        // Validate every initial view before starting any thread. A failure
+        // must not leave an earlier group detached and still owning its log.
+        let nodes = node
+            .into_groups()
+            .into_iter()
+            .map(|node| {
+                let group = *node.groups.keys().next().context("empty worker group")?;
+                let status = node.status(group)?;
+                let checkpoint_index = node.checkpoint_index(group)?;
+                let first_retained_index =
+                    raft::Storage::first_index(node.groups[&group].raw.store())?;
+                Ok((node, group, status, checkpoint_index, first_retained_index))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut routes = BTreeMap::new();
+        let mut workers: Vec<JoinHandle<Result<()>>> = Vec::new();
+        for (node, group, status, checkpoint_index, first_retained_index) in nodes {
+            let observation = Arc::new(Mutex::new(Observation {
+                fetch: FetchObservation::default(),
+                durable_poll: PollObservation::default(),
+                persistence: None,
+                append: AppendObservation::default(),
+                status,
+                checkpoint_index,
+                first_retained_index,
+                observed_at: Instant::now(),
+                polling: false,
+                stopped: false,
+                failure: None,
+            }));
+            let (data, dr) = mpsc::sync_channel(options.data_requests);
+            let (control, cr) = mpsc::sync_channel(options.control_requests);
+            let (peers, pr) = mpsc::sync_channel(options.peer_requests);
+            let (snapshot_feedback, snapshot_results) = mpsc::sync_channel(options.peer_requests);
+            let worker = Worker {
+                node,
+                group,
+                data: dr,
+                control: cr,
+                peers: pr,
+                snapshot_feedback,
+                snapshot_results,
+                snapshot_attempt: 0,
+                snapshot_attempts: BTreeMap::new(),
+                shared: shared.clone(),
+                outbox: outbox.clone(),
+                observation: observation.clone(),
+                options: options.clone(),
+                writes: BTreeMap::new(),
+                reads: BTreeMap::new(),
+                checkpoint: None,
+            };
+            let join = match thread::Builder::new()
+                .name(format!("wal-group-{group}"))
+                .spawn(move || worker.run())
+            {
+                Ok(join) => join,
+                Err(error) => {
+                    shared.stopped.store(true, Ordering::Release);
+                    for worker in &workers {
+                        worker.thread().unpark();
+                    }
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error.into());
+                }
+            };
+            routes.insert(
+                group,
+                Route {
+                    data,
+                    control,
+                    peers,
+                    wake: join.thread().clone(),
+                    observation,
+                },
+            );
+            workers.push(join);
+        }
+        handle.routes = Arc::new(routes);
+        drop(outbox);
+        Ok((Self { handle, workers }, receive))
+    }
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+    fn stop(&self) {
+        self.handle.shared.stopped.store(true, Ordering::Release);
+        for route in self.handle.routes.values() {
+            route.wake.unpark();
+        }
+    }
+    /// Await before reopening the original directories. Dropping/timing out
+    /// this future cannot cancel an in-flight filesystem write or its join.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.stop();
+        let workers = std::mem::take(&mut self.workers);
+        tokio::task::spawn_blocking(move || {
+            let mut failure = None;
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failure = Some(e),
+                    Err(_) => failure = Some(anyhow::anyhow!("replica worker panicked")),
+                }
+            }
+            failure.map_or(Ok(()), Err)
+        })
+        .await?
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct Worker {
+    node: Node,
+    group: u64,
+    data: mpsc::Receiver<Work>,
+    control: mpsc::Receiver<Work>,
+    peers: mpsc::Receiver<PeerWork>,
+    snapshot_feedback: mpsc::SyncSender<images::SnapshotResult>,
+    snapshot_results: mpsc::Receiver<images::SnapshotResult>,
+    snapshot_attempt: u64,
+    snapshot_attempts: BTreeMap<u64, u64>,
+    shared: Arc<Shared>,
+    outbox: async_mpsc::Sender<Outbound>,
+    observation: Arc<Mutex<Observation>>,
+    options: Options,
+    writes: BTreeMap<u64, PendingWrite>,
+    reads: BTreeMap<u64, Completion<query::Outcome>>,
+    checkpoint: Option<Box<images::CheckpointWork>>,
+}
+struct PendingWrite {
+    reply: Completion<Outcome>,
+    append: Option<AppendTiming>,
+}
+impl Worker {
+    fn track_write(&mut self, token: u64, pending: PendingWrite, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                self.writes.insert(token, pending);
+            }
+            Err(e) => {
+                self.finish_write(pending, Err(e));
+            }
+        }
+    }
+    fn finish_write(&self, pending: PendingWrite, result: Result<Outcome>) {
+        if let Some(timing) = pending.append {
+            // Capture before the diagnostic lock; never add sampling contention
+            // to the measured consensus/completion interval.
+            let finished = Instant::now();
+            self.observation
+                .lock()
+                .unwrap()
+                .append
+                .record(timing, finished, &result);
+        }
+        pending.reply.finish(result);
+    }
+    fn work(&mut self, work: Work, after_poll: &mut Vec<AfterPoll>) {
+        match work {
+            Work::Append(token, batch, queued, reply) => {
+                let dequeued = Instant::now();
+                let result = self.node.propose(self.group, token, batch);
+                let pending = PendingWrite {
+                    reply,
+                    append: Some(AppendTiming {
+                        queued,
+                        dequeued,
+                        proposed: Instant::now(),
+                    }),
+                };
+                self.track_write(token, pending, result);
+            }
+            Work::Commit(token, command, reply) => {
+                let result = command.execute(&mut self.node, token);
+                self.track_write(
+                    token,
+                    PendingWrite {
+                        reply,
+                        append: None,
+                    },
+                    result,
+                );
+            }
+            Work::Query(token, query, reply) => match self.node.query(self.group, token, query) {
+                Ok(()) => {
+                    self.reads.insert(token, reply);
+                }
+                Err(e) => {
+                    reply.finish(Err(e));
+                }
+            },
+            Work::ReadSource(request, reply) => {
+                // Like Fetch, this reads only previously durable applied state.
+                // It does not release a pending commit or fresh quorum read.
+                reply.finish(self.node.read_source(self.group, &request));
+            }
+            Work::Campaign(reply) => match self.node.campaign(self.group) {
+                Ok(()) => after_poll.push(Box::new(move || reply.finish(Ok(())))),
+                Err(e) => {
+                    reply.finish(Err(e));
+                }
+            },
+            #[cfg(feature = "peer-transport")]
+            Work::Fetch(index, queued_at, reply) => {
+                // Only previously durable applied state is readable here. The
+                // owned, validated payload needs no subsequent poll; this does
+                // not release commits, quorum reads, or image mutations early.
+                let started = Instant::now();
+                let result = self.node.read_accepted(self.group, index);
+                let service = started.elapsed();
+                self.observation.lock().unwrap().fetch.record(
+                    started.duration_since(queued_at),
+                    service,
+                    &result,
+                );
+                reply.finish(result);
+            }
+            Work::Local(work) => after_poll.push(work(&mut self.node)),
+            Work::Checkpoint(work) => self.queue_checkpoint(work),
+        }
+    }
+    fn drive(&mut self) -> Result<()> {
+        if self.options.async_persistence {
+            self.node.enable_async_persistence(&self.options)?;
+        }
+        let mut next_tick = Instant::now() + self.options.tick_interval;
+        while !self.shared.stopped.load(Ordering::Acquire) {
+            let mut activity = self.node.take_persistence_notification();
+            let mut peer_credits = Vec::new();
+            let mut after_poll = Vec::new();
+            let batch_started = Instant::now();
+            for round in 0..self.options.batch_requests {
+                let mut any = false;
+                if let Ok(result) = self.snapshot_results.try_recv() {
+                    self.snapshot_result(&result)?;
+                    peer_credits.push(result.credit);
+                    any = true;
+                }
+                if round == 0 {
+                    // Already queued reads can share this poll's fresh quorum
+                    // barrier before expensive data work consumes the budget.
+                    // Bound both count and time, and visit peers and eligible
+                    // data below so a busy control lane cannot starve
+                    // replication or writes. Later arrivals wait for a new poll.
+                    for _ in 0..self.options.batch_requests {
+                        let Ok(work) = self.control.try_recv() else {
+                            break;
+                        };
+                        self.work(work, &mut after_poll);
+                        any = true;
+                        if batch_started.elapsed() >= self.options.batch_time {
+                            break;
+                        }
+                    }
+                }
+                if let Ok(peer) = self.peers.try_recv() {
+                    let from = peer.packet.message.from;
+                    let kind = peer.packet.message.get_msg_type();
+                    if let Err(error) = self.node.step(peer.packet) {
+                        self.shared
+                            .peer_rejections
+                            .lock()
+                            .unwrap()
+                            .record(self.group, from, kind, &error);
+                        self.shared
+                            .rejected_incoming
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    peer_credits.push(peer.credit);
+                    any = true;
+                }
+                // Keep admitted writes in their bounded lane until the old
+                // persistence window drains. Dequeuing them here would turn
+                // our own checkpoint pause into PendingCapacity refusals.
+                // Peer/control work and ticks must keep making progress.
+                if !self.checkpoint_draining() {
+                    if let Ok(work) = self.data.try_recv() {
+                        self.work(work, &mut after_poll);
+                        any = true;
+                    }
+                }
+                activity |= any;
+                if !any || batch_started.elapsed() >= self.options.batch_time {
+                    break;
+                }
+            }
+            if Instant::now() >= next_tick {
+                self.node.tick()?;
+                next_tick = Instant::now() + self.options.tick_interval;
+                activity = true;
+            }
+            activity |= self.install_drained_checkpoint(&mut after_poll)?;
+            if activity {
+                self.observation.lock().unwrap().polling = true;
+                let poll_started = Instant::now();
+                let events = if self.options.pipeline_replication {
+                    let shared = &self.shared;
+                    let outbox = &self.outbox;
+                    self.node.poll_with_early_messages(|packet| {
+                        // Move the packet, including shared payload buffers,
+                        // through the same node-wide outbound credits. A full
+                        // transport never blocks the durable owner thread.
+                        let bytes = packet.message.compute_size() as usize;
+                        if let Ok(credit) = shared.outgoing.reserve(bytes) {
+                            if outbox
+                                .try_send(Outbound {
+                                    packet,
+                                    _credit: Some(credit),
+                                    image: None,
+                                    snapshot_feedback: None,
+                                })
+                                .is_ok()
+                            {
+                                return;
+                            }
+                        }
+                        shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                    })
+                } else {
+                    self.node.poll()
+                };
+                let elapsed = poll_started.elapsed();
+                self.observation
+                    .lock()
+                    .unwrap()
+                    .durable_poll
+                    .record(elapsed, events.is_ok());
+                let events = events?;
+                for done in events.completions {
+                    let pending = self
+                        .writes
+                        .remove(&done.request)
+                        .context("uncorrelated durable completion")?;
+                    self.finish_write(pending, Ok(done.outcome));
+                }
+                for done in events.reads {
+                    let pending = self
+                        .reads
+                        .remove(&done.request)
+                        .context("uncorrelated quorum read")?;
+                    pending.finish(Ok(done.outcome));
+                }
+                for packet in events.messages {
+                    let destination = packet.message.to;
+                    let snapshot = packet.message.snapshot.is_some();
+                    let image = if snapshot {
+                        match self
+                            .node
+                            .snapshot_image(packet.group, packet.message.get_snapshot())
+                        {
+                            Ok(image) => Some(image),
+                            Err(_) => {
+                                self.node.report_snapshot(self.group, destination, false)?;
+                                self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let bytes = packet.message.compute_size() as usize;
+                    let credit = match self.shared.outgoing.reserve(bytes) {
+                        Ok(credit) => credit,
+                        Err(_) => {
+                            if snapshot {
+                                self.node.report_snapshot(self.group, destination, false)?;
+                            }
+                            self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let snapshot_feedback = if snapshot {
+                        Some(self.snapshot_feedback(&packet)?)
+                    } else {
+                        None
+                    };
+                    // A rejected snapshot owner reports failure via its reserved
+                    // feedback lane. Do not also report it inline.
+                    if self
+                        .outbox
+                        .try_send(Outbound {
+                            packet,
+                            _credit: Some(credit),
+                            image,
+                            snapshot_feedback,
+                        })
+                        .is_err()
+                    {
+                        self.shared.dropped_outgoing.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                for completion in after_poll {
+                    completion();
+                }
+                let status = self.node.status(self.group)?;
+                let checkpoint_index = self.node.checkpoint_index(self.group)?;
+                let first_retained_index =
+                    raft::Storage::first_index(self.node.groups[&self.group].raw.store())?;
+                let mut observation = self.observation.lock().unwrap();
+                observation.status = status;
+                observation.checkpoint_index = checkpoint_index;
+                observation.first_retained_index = first_retained_index;
+                observation.persistence = self.node.persistence_observation(self.group);
+                observation.observed_at = Instant::now();
+                observation.polling = false;
+            }
+            drop(peer_credits);
+            if !activity {
+                thread::park_timeout(next_tick.saturating_duration_since(Instant::now()));
+            }
+        }
+        Ok(())
+    }
+    fn run(mut self) -> Result<()> {
+        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drive()))
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "replica worker panicked; outstanding outcomes unknown"
+                ))
+            });
+        if let Err(error) = self.node.shutdown_persistence() {
+            result = Err(error);
+        }
+        if result.is_err() {
+            self.shared.stopped.store(true, Ordering::Release);
+        }
+        let mut observation = self.observation.lock().unwrap();
+        observation.persistence = self.node.persistence_observation(self.group);
+        observation.polling = false;
+        observation.stopped = true;
+        observation.failure = result.as_ref().err().map(ToString::to_string);
+        drop(observation);
+        // Dropping all queued and pending completions resolves receivers as
+        // uncertain and releases credits. Never manufacture a successful ACK.
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;

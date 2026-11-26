@@ -1,0 +1,11 @@
+# Debug builds walk DataFusion's optimizer recursively inside Lance's
+# merge_insert; with two commits per WAL merge (delete-only merge_insert,
+# then append) that walk overflows the 2 MiB default stack of a test thread
+# under `cargo test`. Release builds fit. Give test threads 8 MiB.
+[env]
+RUST_MIN_STACK = "8388608"
+# Tests merge multi-megabyte blob rows through Lance's merge_insert, whose
+# DataFusion pool defaults to 150 MB per partition. Several such tests
+# running at once in one process intermittently exhaust it ("Not enough
+# memory to continue external sort"). 1 GiB per partition, as in production.
+LANCE_MEM_POOL_SIZE = "1073741824"

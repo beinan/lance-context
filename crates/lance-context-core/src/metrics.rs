@@ -1,0 +1,403 @@
+//! Feature-gated metrics shim.
+//!
+//! Call sites use [`observe_duration!`] and [`count!`] unconditionally; when the
+//! `metrics` feature is off these expand to nothing (the timing `Instant` is not
+//! even taken), so a consumer embedding this crate pays zero cost and takes no
+//! dependency.
+//!
+//! Metric names and label conventions live here so they cannot drift between the
+//! emission site and the bucket configuration in `lance-context-metrics`.
+//!
+//! # Cardinality
+//!
+//! Every label combination times every histogram bucket is a separate exported
+//! series — and in Datadog, a separately-billed custom metric. Two rules keep
+//! that bounded:
+//!
+//! 1. **No unbounded labels.** Never a dataset URI, store name, experiment, or
+//!    shard id. Those belong in a tracing span, which is queryable without
+//!    multiplying series.
+//! 2. **Failures are counted, not timed.** A `result="error"` label doubles a
+//!    histogram's series count to describe the *latency distribution of a rare
+//!    event*, which is almost never actionable. The actionable signal is the
+//!    rate, so errors get a flat counter (1 series) and histograms measure the
+//!    success path only.
+
+/// Register Lance's object-store metric descriptions on the current recorder.
+/// Call after installing the application's recorder when `lance-io-metrics` is
+/// enabled. This does not install or replace a recorder. Lance's storage metrics
+/// use their own outcome and label conventions; scheme labels are the default.
+#[cfg(feature = "lance-io-metrics")]
+pub use lance_io::object_store::metrics::describe_metrics as describe_lance_io_metrics;
+
+/// Successful storage put latency: admission, insertion and WAL/index visibility.
+/// Includes sealing when the store enables `seal_on_put`.
+/// Unlabelled: failures are counted by [`ROLLOUT_ADD_ERRORS`] instead.
+pub const ROLLOUT_ADD_DURATION: &str = "rollout_add_duration_seconds";
+
+/// Failed [`crate::RolloutStore::add`] calls.
+pub const ROLLOUT_ADD_ERRORS: &str = "rollout_add_errors_total";
+
+/// Latency of one [`crate::RolloutStore::flush`] — sealing the memtable so
+/// previously added rows become readable.
+///
+/// Label `outcome`:
+/// - `sealed` — a memtable was actually sealed and drained (real work)
+/// - `noop`   — no resident writer, returned immediately (the common case)
+/// - `fenced` — the epoch was superseded by a merge; nothing to flush
+///
+/// `outcome` is kept despite the cardinality cost because the three paths differ
+/// by orders of magnitude: without it the distribution is dominated by near-zero
+/// `noop` samples and its high percentiles say nothing about real flush cost.
+pub const ROLLOUT_FLUSH_DURATION: &str = "rollout_flush_duration_seconds";
+
+/// Failed [`crate::RolloutStore::flush`] calls.
+pub const ROLLOUT_FLUSH_ERRORS: &str = "rollout_flush_errors_total";
+
+/// Per-phase latency of a WAL self-merge. Label `phase`:
+/// `seal` | `read` | `append` | `claim_epoch` | `drain` | `delete`.
+pub const ROLLOUT_WAL_MERGE_DURATION: &str = "rollout_wal_merge_duration_seconds";
+
+/// Failed WAL self-merge phases, labelled by the `phase` that failed. A merge
+/// aborts on the first failing phase, so this also identifies where it died.
+pub const ROLLOUT_WAL_MERGE_ERRORS: &str = "rollout_wal_merge_errors_total";
+
+/// Prepared groups split before publication. Bounded `reason` labels distinguish
+/// `aggregate_byte_cap`, `workspace_unavailable` and `workspace_unbounded`.
+pub const ROLLOUT_WAL_GROUP_SPLITS: &str = "rollout_wal_group_splits_total";
+
+/// Flushed MemWAL generations pending merge on one shard, sampled once per
+/// shard on every LSM read (`wal_shard_snapshots`). Unlabelled: the store and
+/// shard go on the accompanying `warn!` span, not on the series.
+///
+/// This is the read-amplification signal. Every pending generation is a
+/// separate dataset the read path must open, so a shard whose count climbs into
+/// the hundreds means its owner's merge has stopped keeping up — the failure
+/// that took a worker fleet down at ~12k pending generations across 20 shards
+/// before it was noticed in crash logs.
+pub const ROLLOUT_WAL_PENDING_GENERATIONS: &str = "rollout_wal_pending_generations";
+
+/// Time a merge spent waiting for its initial reservation from the
+/// process-wide merge memory budget. Near zero when the budget is not the
+/// bottleneck; a rising tail means merges are queueing on memory, which is the
+/// intended behaviour under load rather than an error.
+pub const ROLLOUT_MERGE_BUDGET_WAIT: &str = "rollout_merge_budget_wait_seconds";
+
+/// Emit a histogram sample in seconds. No-op without the `metrics` feature.
+#[cfg(feature = "metrics")]
+macro_rules! observe_duration {
+    ($name:expr, $elapsed:expr $(, $k:expr => $v:expr)* $(,)?) => {
+        ::metrics::histogram!($name $(, $k => $v)*).record($elapsed.as_secs_f64())
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! observe_duration {
+    ($name:expr, $elapsed:expr $(, $k:expr => $v:expr)* $(,)?) => {{
+        let _ = &$elapsed;
+    }};
+}
+
+/// Emit a histogram sample of a plain value (a count, not a duration). No-op
+/// without the `metrics` feature.
+#[cfg(feature = "metrics")]
+macro_rules! observe_value {
+    ($name:expr, $value:expr $(, $k:expr => $v:expr)* $(,)?) => {
+        ::metrics::histogram!($name $(, $k => $v)*).record($value as f64)
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! observe_value {
+    ($name:expr, $value:expr $(, $k:expr => $v:expr)* $(,)?) => {{
+        let _ = &$value;
+    }};
+}
+
+/// Increment a counter by one. No-op without the `metrics` feature.
+///
+/// The disabled arm still expands to a unit *expression* rather than an empty
+/// block, so a `match` whose arms are `observe_duration!`/`count!` keeps both
+/// arms inhabited and does not collapse into a clippy `single_match` warning
+/// when the feature is off.
+#[cfg(feature = "metrics")]
+macro_rules! count {
+    ($name:expr $(, $k:expr => $v:expr)* $(,)?) => {
+        ::metrics::counter!($name $(, $k => $v)*).increment(1)
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! count {
+    ($name:expr $(, $k:expr => $v:expr)* $(,)?) => {{
+        let _ = $name;
+    }};
+}
+
+/// Start a timer, or evaluate to `()` when metrics are compiled out.
+#[cfg(feature = "metrics")]
+macro_rules! timer_start {
+    () => {
+        std::time::Instant::now()
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! timer_start {
+    () => {
+        ()
+    };
+}
+
+/// Elapsed time since a [`timer_start!`], or a zero duration when compiled out.
+#[cfg(feature = "metrics")]
+macro_rules! timer_elapsed {
+    ($t:expr) => {
+        $t.elapsed()
+    };
+}
+
+#[cfg(not(feature = "metrics"))]
+macro_rules! timer_elapsed {
+    ($t:expr) => {{
+        let _ = &$t;
+        std::time::Duration::ZERO
+    }};
+}
+
+/// Time one WAL-merge phase: record its duration on success, or increment the
+/// phase-labelled error counter on failure. Evaluates to the wrapped `Result`.
+///
+/// Keeps the success/failure split identical across all six phases, which is
+/// what stops `result` creeping back onto the histogram.
+macro_rules! observe_phase {
+    ($phase:expr, $body:expr) => {{
+        let __start = $crate::metrics::timer_start!();
+        let __result = $body;
+        if __result.is_ok() {
+            $crate::merge_write_scope::checkpoint();
+        }
+        match &__result {
+            Ok(_) => $crate::metrics::observe_duration!(
+                $crate::metrics::ROLLOUT_WAL_MERGE_DURATION,
+                $crate::metrics::timer_elapsed!(__start),
+                "phase" => $phase,
+            ),
+            Err(_) => $crate::metrics::count!(
+                $crate::metrics::ROLLOUT_WAL_MERGE_ERRORS,
+                "phase" => $phase,
+            ),
+        }
+        __result
+    }};
+}
+
+pub(crate) use {
+    count, observe_duration, observe_phase, observe_value, timer_elapsed, timer_start,
+};
+
+/// Per-writer bridge from actual background flush attempts to process metrics.
+/// No store/shard labels: use Pod tags for charts and structured logs for identity.
+#[cfg(feature = "metrics")]
+#[derive(Debug)]
+pub(crate) struct MemtableFlushMetrics {
+    health: crate::flush_health::WriterHealth,
+    // Gauges are additive across resident retry queues in this process.
+    pending: std::sync::Mutex<(usize, usize)>,
+}
+
+#[cfg(feature = "metrics")]
+impl Default for MemtableFlushMetrics {
+    fn default() -> Self {
+        use lance::dataset::mem_wal::observer::MemtableFlushPhase;
+        // Register bounded outcome series before the first event, so a scrape
+        // can establish a zero baseline. New writers must not reset totals.
+        for phase in [
+            MemtableFlushPhase::WalWait,
+            MemtableFlushPhase::IndexWait,
+            MemtableFlushPhase::Prepare,
+            MemtableFlushPhase::Publish,
+        ] {
+            ::metrics::counter!("rollout_memtable_flush_phase_errors_total", "phase" => phase.as_str())
+                .increment(0);
+            ::metrics::counter!("rollout_memtable_flush_phase_abandoned_total", "phase" => phase.as_str())
+                .increment(0);
+        }
+        for result in ["ok", "error"] {
+            ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => result)
+                .increment(0);
+        }
+        ::metrics::counter!("rollout_memtable_flush_retries_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_unresolved_writer_drops_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_rows_total").increment(0);
+        ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(0);
+        ::metrics::counter!("rollout_wal_flushes_total").increment(0);
+        ::metrics::counter!("rollout_memtable_flush_backpressure_rejections_total").increment(0);
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations").increment(0.0);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes").increment(0.0);
+        Self {
+            health: crate::flush_health::WriterHealth::new(String::new(), String::new()),
+            pending: std::sync::Mutex::new((0, 0)),
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl MemtableFlushMetrics {
+    pub(crate) fn new(uri: &str, shard: uuid::Uuid) -> Self {
+        let mut metrics = Self::default();
+        metrics.health = crate::flush_health::WriterHealth::new(uri.to_owned(), shard.to_string());
+        metrics
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
+    fn on_wal_flush(&self, duration: std::time::Duration, bytes: usize) {
+        ::metrics::histogram!("rollout_wal_flush_duration_seconds").record(duration.as_secs_f64());
+        ::metrics::counter!("rollout_wal_flushes_total").increment(1);
+        ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(bytes as u64);
+    }
+
+    fn on_memtable_flush_phase_start(
+        &self,
+        phase: lance::dataset::mem_wal::observer::MemtableFlushPhase,
+    ) {
+        ::metrics::gauge!("rollout_memtable_flush_phase_in_flight", "phase" => phase.as_str())
+            .increment(1.0);
+    }
+
+    fn on_memtable_flush_phase_finish(
+        &self,
+        phase: lance::dataset::mem_wal::observer::MemtableFlushPhase,
+        duration: std::time::Duration,
+        outcome: lance::dataset::mem_wal::observer::FlushPhaseOutcome,
+    ) {
+        use lance::dataset::mem_wal::observer::FlushPhaseOutcome;
+        ::metrics::gauge!("rollout_memtable_flush_phase_in_flight", "phase" => phase.as_str())
+            .decrement(1.0);
+        match outcome {
+            FlushPhaseOutcome::Ok => {
+                ::metrics::histogram!("rollout_memtable_flush_phase_duration_seconds", "phase" => phase.as_str())
+                    .record(duration.as_secs_f64());
+            }
+            FlushPhaseOutcome::Error => {
+                ::metrics::counter!("rollout_memtable_flush_phase_errors_total", "phase" => phase.as_str())
+                    .increment(1);
+            }
+            FlushPhaseOutcome::Abandoned => {
+                ::metrics::counter!("rollout_memtable_flush_phase_abandoned_total", "phase" => phase.as_str())
+                    .increment(1);
+            }
+        }
+    }
+
+    fn on_memtable_flush(&self, duration: std::time::Duration, rows: usize) {
+        self.health.completed();
+        ::metrics::counter!("rollout_memtable_flush_rows_total").increment(rows as u64);
+        ::metrics::histogram!("rollout_memtable_flush_duration_seconds")
+            .record(duration.as_secs_f64());
+        ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => "ok").increment(1);
+    }
+
+    fn on_memtable_flush_error(&self) {
+        ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => "error")
+            .increment(1);
+    }
+
+    fn on_memtable_flush_stage(&self, generation: u64, stage: &'static str) {
+        self.health.stage(generation, stage);
+    }
+
+    fn on_memtable_flush_failure(&self, generation: u64, error: &lance_core::Error) {
+        self.health.failed(
+            generation,
+            error.fence_reason().is_some(),
+            &error.to_string(),
+        );
+    }
+
+    fn on_memtable_flush_retry(&self) {
+        self.health.retry();
+        ::metrics::counter!("rollout_memtable_flush_retries_total").increment(1);
+    }
+
+    fn on_memtable_flush_retry_state(&self, generations: usize, bytes: usize) {
+        self.health.queue(generations, bytes);
+        let mut previous = self.pending.lock().unwrap();
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations")
+            .increment(generations as f64 - previous.0 as f64);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes")
+            .increment(bytes as f64 - previous.1 as f64);
+        *previous = (generations, bytes);
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl Drop for MemtableFlushMetrics {
+    fn drop(&mut self) {
+        // These gauges describe live retry queues, not a durable recovery ledger.
+        let (generations, bytes) = *self.pending.get_mut().unwrap();
+        ::metrics::gauge!("rollout_memtable_flush_retry_generations").decrement(generations as f64);
+        ::metrics::gauge!("rollout_memtable_flush_retry_bytes").decrement(bytes as f64);
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::*;
+    use lance::dataset::mem_wal::observer::{FlushPhaseOutcome, MemtableFlushPhase, WalObserver};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::time::Duration;
+
+    #[test]
+    fn phase_counters_have_a_baseline_and_survive_new_writers() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let counter = |name: &str, phase: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "phase" && l.value() == phase))
+                    .then_some(value)
+                    .and_then(|value| match value {
+                        DebugValue::Counter(value) => Some(value),
+                        _ => None,
+                    })
+                })
+        };
+        ::metrics::with_local_recorder(&recorder, || {
+            let observer = MemtableFlushMetrics::default();
+            for phase in [
+                MemtableFlushPhase::WalWait,
+                MemtableFlushPhase::IndexWait,
+                MemtableFlushPhase::Prepare,
+                MemtableFlushPhase::Publish,
+            ] {
+                for (name, outcome) in [
+                    (
+                        "rollout_memtable_flush_phase_errors_total",
+                        FlushPhaseOutcome::Error,
+                    ),
+                    (
+                        "rollout_memtable_flush_phase_abandoned_total",
+                        FlushPhaseOutcome::Abandoned,
+                    ),
+                ] {
+                    assert_eq!(counter(name, phase.as_str()), Some(0));
+                    observer.on_memtable_flush_phase_start(phase);
+                    observer.on_memtable_flush_phase_finish(phase, Duration::ZERO, outcome);
+                    assert_eq!(counter(name, phase.as_str()), Some(1));
+                    let _another_writer = MemtableFlushMetrics::default();
+                    assert_eq!(counter(name, phase.as_str()), Some(1));
+                }
+            }
+        });
+    }
+}

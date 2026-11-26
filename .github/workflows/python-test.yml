@@ -1,0 +1,223 @@
+name: Python Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - python/**
+      - crates/**
+      - .github/workflows/python-test.yml
+      - scripts/ci/install-manylinux-deps.sh
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C debuginfo=0 -C codegen-units=16"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-wheel:
+    name: build-wheel-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64
+            manylinux: "2_28"
+            wheel-pattern: "*manylinux_2_28_x86_64.whl"
+          - name: linux-aarch64
+            os: ubuntu-24.04
+            target: aarch64
+            manylinux: "2_28"
+            wheel-pattern: "*manylinux_2_28_aarch64.whl"
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            wheel-pattern: "*macosx_11_0_arm64.whl"
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+      - name: Build manylinux wheel (Debug Mode)
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --out dist
+          working-directory: python
+          manylinux: ${{ matrix.manylinux }}
+          target: ${{ matrix.target }}
+          rust-toolchain: stable
+          sccache: "true"
+          before-script-linux: |
+            bash ../scripts/ci/install-manylinux-deps.sh
+            PROTOC_VERSION=25.6
+            curl -LsS -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+            python3 - <<'PY'
+            from zipfile import ZipFile
+            ZipFile("/tmp/protoc.zip").extractall("/tmp/protoc")
+            PY
+            install -m 0755 /tmp/protoc/bin/protoc /usr/local/bin/protoc
+            cp -R /tmp/protoc/include/* /usr/local/include/
+            protoc --version
+      - name: Build macOS wheel (Debug Mode)
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --out dist
+          working-directory: python
+          target: ${{ matrix.target }}
+          rust-toolchain: stable
+          sccache: "true"
+      - name: Verify wheel tag
+        run: |
+          ls python/dist/${{ matrix.wheel-pattern }}
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.name }}
+          path: python/dist/*.whl
+
+  test:
+    runs-on: ubuntu-24.04
+    # Raised from 30: this job now also builds lance-context-server so that
+    # tests/test_rollout_remote.py actually runs instead of skipping itself.
+    timeout-minutes: 45
+    needs: build-wheel
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-deps"
+          # The root workspace entry covers `cargo build -p lance-context-server`
+          # below; without it that build cache-misses on every run.
+          workspaces: |
+            .
+            crates/lance-context-core
+            python
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Create virtual environment and install dependencies
+        working-directory: python
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install pytest pytest-asyncio
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheel-linux-x86_64
+          path: python/dist
+      - name: Install wheel
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          WHEEL=$(ls dist/*.whl)
+          uv pip install "${WHEEL}[lance-python,tests]"
+
+      - name: Build server binary
+        # tests/test_rollout_remote.py spins up target/debug/lance-context-server
+        # as a subprocess -- it is the only coverage of the remote/HTTP client
+        # path, and without this step the whole file skips itself.
+        run: cargo build -p lance-context-server
+
+      - name: Run tests
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          pytest -v
+      - name: Run doctests
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          # Import as a module, not a file path: `python -m doctest <path>`
+          # imports by filename, which breaks the package-relative imports in
+          # __init__.py. Runs against the installed wheel and fails on any
+          # failing doctest.
+          python -c "import doctest, sys, lance_context; \
+            r = doctest.testmod(lance_context); \
+            print(r); \
+            sys.exit(1 if r.failed else 0)"
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+      - name: Install linting tools
+        working-directory: python
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install ruff pyright
+      - name: Run ruff format check
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          ruff format --check .
+      - name: Run ruff lint
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          ruff check .
+      - name: Run pyright type check
+        working-directory: python
+        run: |
+          source .venv/bin/activate
+          pyright

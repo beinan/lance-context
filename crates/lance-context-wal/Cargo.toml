@@ -1,0 +1,100 @@
+[package]
+name = "lance-context-wal"
+version = "0.6.7"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Independent Rust WAL experiments owned by lance-context"
+
+[features]
+service = ["peer-transport", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:clap", "dep:prometheus", "tokio/signal", "tokio/rt-multi-thread"]
+peer-transport = ["runtime", "vectored-io", "dep:tokio-rustls", "tokio/net", "tokio/time", "tokio/macros"]
+runtime = ["replication", "dep:tokio", "tokio/sync", "tokio/rt"]
+# Real Lance materialization/recovery qualification; normal WAL replicas do not link Lance.
+lance-integration = ["replication", "ipc", "arrow-contract", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:object_store", "dep:async-trait", "dep:futures", "dep:serde_json", "dep:prost"]
+client-journal = ["dep:anyhow", "dep:raft-engine", "raft-engine/internals", "dep:bytes", "dep:serde", "dep:serde_json", "dep:tokio", "tokio/sync"]
+replication = ["raft-log", "record", "contract", "dep:bincode", "dep:slog", "dep:ring", "uuid/v4", "serde/rc"]
+raft-log = ["placement", "admission", "dep:raft", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:protobuf"]
+vectored-io = ["dep:bytes", "dep:tokio"]
+runner = ["dep:anyhow", "dep:clap", "dep:libc", "dep:serde", "dep:serde_json", "dep:sha2"]
+contract = ["dep:serde", "dep:sha2"]
+arrow-contract = ["contract", "dep:arrow-schema", "arrow-schema/serde", "dep:serde_json"]
+record = ["dep:bytes", "bytes/serde", "dep:serde", "dep:ring", "dep:uuid"]
+placement = ["dep:anyhow", "dep:serde", "dep:serde_json", "dep:sha2", "dep:uuid"]
+admission = ["dep:anyhow", "dep:serde"]
+ipc = ["dep:anyhow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-ipc", "dep:arrow-schema", "dep:bytes"]
+lab = ["ipc", "dep:clap", "dep:hdrhistogram", "dep:raft-engine", "raft-engine/internals", "dep:raft-proto", "dep:serde_json"]
+
+[dependencies]
+prometheus = { version = "0.13", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"], optional = true }
+lance = { version = "14.0.2", optional = true }
+lance-table = { version = "14.0.2", optional = true }
+lance-io = { version = "14.0.2", optional = true }
+object_store = { version = "0.14.2", optional = true }
+prost = { version = "0.14", optional = true }
+async-trait = { version = "0.1.92", optional = true }
+futures = { version = "0.3", optional = true }
+ring = { version = "0.17", optional = true }
+bincode = { version = "1.3", optional = true }
+slog = { version = "2", optional = true }
+tokio = { version = "1", features = ["io-util"], optional = true }
+anyhow = { version = "1", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-buffer = { version = "58", optional = true }
+arrow-ipc = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+bytes = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+hdrhistogram = { version = "7", optional = true }
+libc = { version = "0.2", optional = true }
+raft-engine = { path = "../../vendor/raft-engine", version = "=0.4.2", default-features = false, optional = true }
+raft-proto = { version = "=0.7.0", optional = true }
+raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"], optional = true }
+protobuf = { version = "2", features = ["bytes"], optional = true }
+serde_json = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = { version = "0.10", optional = true }
+uuid = { version = "1", features = ["serde"], optional = true }
+
+[dev-dependencies]
+rcgen = "0.14"
+sha2 = "0.10"
+libc = "0.2"
+slog = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+bincode = "1.3"
+arrow-ipc = { version = "58", features = ["zstd"] }
+tempfile = "3"
+
+[[bin]]
+name = "context-wal-node"
+path = "src/bin/node.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "context-wal-bench-node"
+path = "src/bin/bench_node.rs"
+required-features = ["service"]
+
+[[bin]]
+name = "context-wal-runner"
+path = "src/bin/runner.rs"
+required-features = ["runner"]
+
+[[bin]]
+name = "context-wal-resource"
+path = "src/bin/resource.rs"
+required-features = ["runner"]
+
+[[bin]]
+name = "context-wal-lab"
+path = "src/bin/lab.rs"
+required-features = ["lab"]
+
+[[test]]
+name = "node_service"
+required-features = ["service"]

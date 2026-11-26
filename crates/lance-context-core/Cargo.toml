@@ -1,0 +1,75 @@
+[package]
+name = "lance-context-core"
+version = "0.6.7"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Lance Devs <dev@lancedb.com>"]
+repository = "https://github.com/lancedb/lance-context"
+readme = "README.md"
+description = "Multimodal, versioned context storage for agentic workflows"
+keywords = ["context", "multimodal", "lance", "agents", "storage"]
+categories = ["database", "data-structures", "science"]
+
+[features]
+default = ["metrics"]
+# Emit Prometheus metrics for store operations (add/flush/WAL merge latency).
+# Optional so downstream consumers embedding this library are not forced to take
+# the `metrics` dependency; call sites compile to nothing when disabled.
+metrics = ["dep:metrics"]
+# Opt-in storage diagnostics; share the application's existing metrics recorder.
+lance-io-metrics = ["metrics", "lance/metrics"]
+
+[dependencies]
+async-trait = "0.1.92"
+lance-table = "14.0.2"
+# Keep this direct dependency a path as well as a workspace patch so maturin
+# includes the backport when rebuilding Python wheels from a source archive.
+lance-io = { version = "14.0.2", path = "../../vendor/lance-io" }
+lance-core = { version = "14.0.2", path = "../../vendor/lance-core" }
+lance-file = "14.0.2"
+object_store = "0.14.2"
+base64 = "0.22"
+bytes = "1"
+roaring = "0.11"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-cast = "58"
+arrow-ipc = "58"
+arrow-json = "58"
+arrow-schema = "58"
+arrow-select = "58"
+parquet-variant = "=58.3.0"
+parquet-variant-compute = "=58.3.0"
+parquet-variant-json = "=58.3.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+datafusion = { version = "54", default-features = false, features = ["nested_expressions"] }
+lance = { version = "14.0.2", path = "../../vendor/lance" }
+lance-context-api = { version = "0.6.7", path = "../lance-context-api" }
+lance-index = "14.0.2"
+lance-namespace = "14.0.2"
+# Version-matched with lance-context-server/-master so one process-wide recorder
+# serves every crate.
+metrics = { version = "0.24", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+futures = "0.3"
+tokio = { version = "1", features = ["sync", "time", "fs"] }
+clap = { version = "4", features = ["derive", "env"] }
+etcd-client = { version = "0.19", features = ["tls"] }
+tracing = "0.1"
+uuid = { version = "1.20.0", features = ["v4", "v5", "v7"] }
+
+[dev-dependencies]
+# Snapshotting recorder so tests can assert which metric series an operation
+# emitted, without installing a process-global Prometheus exporter.
+metrics-util = { version = "0.19", default-features = false, features = ["debugging"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
+
+[[example]]
+name = "annotation_column_update"
+required-features = ["lance-io-metrics"]
+
+[[example]]
+name = "automatic_shredding"
+required-features = ["lance-io-metrics"]

@@ -1,0 +1,1933 @@
+//! Admin JSON API routes (PR A: read-only observability endpoints).
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::Response;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+
+use lance_context_api::{
+    CompactJobStatus, EnqueueTaskRequest, ExperimentDetail, ExperimentListResponse,
+    ExperimentRecordsResponse, ExperimentSummary, RepairRecord, SqlQueryRequest, SqlQueryResponse,
+    TaskCooldown, TaskKind, TaskListResponse, TaskRecord, TaskState,
+};
+use lance_context_core::{rollout_record_to_dto, ListSource, RolloutFilters, RolloutStore};
+use tokio::sync::RwLock;
+
+use crate::error::MasterError;
+use crate::scanner;
+use crate::scheduler;
+use crate::state::MasterState;
+use crate::stats_store::StatRow;
+
+/// Query params for the experiment listing.
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn default_limit() -> usize {
+    50
+}
+
+fn default_records_limit() -> usize {
+    25
+}
+
+/// Query params for the paginated task list.
+#[derive(Debug, Deserialize)]
+pub struct TaskListParams {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+
+/// Query params for the detail endpoint.
+#[derive(Debug, Deserialize)]
+pub struct DetailParams {
+    /// When true, open the dataset and recompute metrics on-demand rather than
+    /// returning the last scanned snapshot.
+    #[serde(default)]
+    pub fresh: bool,
+}
+
+/// Query params for server-side rollout record filtering and pagination.
+#[derive(Debug, Deserialize)]
+pub struct RecordListParams {
+    #[serde(default = "default_records_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub rollout_id: Option<String>,
+    #[serde(default)]
+    pub problem_id: Option<String>,
+    #[serde(default)]
+    pub dataset: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub policy_version: Option<String>,
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+    #[serde(default)]
+    pub include_in_training: Option<bool>,
+    /// Data source to scan: `fragments` (base table only, the default), `wal`
+    /// (pending MemWAL generations only), or `all` (the union). Absent/empty
+    /// defaults to `fragments`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Parse the `source` query param into a [`ListSource`]. Absent or empty →
+/// `Fragments` (the fast default); an explicitly unknown value is rejected.
+fn parse_list_source(raw: Option<&str>) -> Result<ListSource, MasterError> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("fragments") => Ok(ListSource::Fragments),
+        Some("wal") => Ok(ListSource::Wal),
+        Some("all") => Ok(ListSource::All),
+        Some(other) => Err(MasterError::InvalidRequest(format!(
+            "invalid source '{other}': expected one of fragments, wal, all"
+        ))),
+    }
+}
+
+fn list_source_label(source: ListSource) -> &'static str {
+    match source {
+        ListSource::Fragments => "fragments",
+        ListSource::Wal => "wal",
+        ListSource::All => "all",
+    }
+}
+
+/// `GET /api/v1/experiments`
+///
+/// Without `search`, returns the experiments the stats table holds — the ones
+/// written recently enough not to have been retired. That is the useful default
+/// view at scale: a flat list of every experiment ever created is neither
+/// renderable nor interesting once there are tens of thousands of them.
+///
+/// With `search`, falls back to the registry for names the stats table no
+/// longer holds, and observes those on demand. Retirement therefore removes an
+/// experiment from the *default* list but never makes it unfindable.
+pub async fn list_experiments(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<ExperimentListResponse>, MasterError> {
+    let search = params.search.as_deref().filter(|s| !s.is_empty());
+
+    // Try the authoritative table, but never block on it.
+    //
+    // `state.stats` is an exclusive mutex held for the whole write phase of a
+    // scan round. This handler is the only source for the default view, so a
+    // bare `lock().await` here -- with no timeout, no fallback, and no
+    // `TimeoutLayer` on the router -- meant a slow round wedged the UI
+    // outright. Serving the previous snapshot with `stale: true` is strictly
+    // better: the data is at most one scan interval old, and the caller can
+    // see that it is.
+    let (mut experiments, mut total, stale) = match state.stats.try_lock() {
+        Ok(mut stats) => {
+            let total = stats.count(search).await.map_err(MasterError::from_lance)?;
+            let rows = stats
+                .list(search, params.limit, params.offset)
+                .await
+                .map_err(MasterError::from_lance)?;
+            let experiments: Vec<ExperimentSummary> =
+                rows.into_iter().map(|r| r.into_summary()).collect();
+            (experiments, total, false)
+        }
+        Err(_) => {
+            metrics::counter!("master_experiments_served_stale_total").increment(1);
+            let cached = state.stats_cache.read().await.clone();
+            let matching: Vec<&StatRow> = cached
+                .iter()
+                .filter(|row| search.is_none_or(|q| row.name.contains(q)))
+                .collect();
+            let total = matching.len() as i64;
+            let experiments: Vec<ExperimentSummary> = matching
+                .into_iter()
+                .skip(params.offset)
+                .take(params.limit)
+                .map(|row| row.clone().into_summary())
+                .collect();
+            tracing::debug!(
+                returned = experiments.len(),
+                "stats lock busy; serving cached experiment list"
+            );
+            (experiments, total, true)
+        }
+    };
+
+    if let Some(query) = search {
+        // Retired experiments have no stats row, so a search that only consulted
+        // the stats table would silently omit them. The registry is the
+        // authoritative list of what exists.
+        //
+        // Skipped when serving stale: this branch takes the registry write lock
+        // and then opens datasets on demand via `observe_cold`. We are already
+        // here because the process is busy, so doing the most expensive work in
+        // the handler is exactly wrong -- it would turn lock contention into a
+        // second, slower stall. Retired experiments are simply omitted from a
+        // degraded search; the next uncontended request finds them.
+        if stale {
+            tracing::debug!("stats lock busy; skipping registry search fallback");
+        } else {
+            let known: HashSet<String> = experiments.iter().map(|e| e.name.clone()).collect();
+            let matches: Vec<_> = state
+                .registry
+                .list()
+                .await
+                .map_err(MasterError::from_lance)?
+                .into_iter()
+                .filter(|entry| entry.name.contains(query) && !known.contains(&entry.name))
+                .collect();
+
+            total += matches.len() as i64;
+
+            // Observe the retired matches this page needs. Bounded by the page
+            // size: a search matching thousands of cold experiments must not open
+            // thousands of datasets to render one page.
+            let want = params.limit.saturating_sub(experiments.len());
+            for entry in matches.into_iter().take(want) {
+                match scanner::observe_cold(&state, &entry.name, &entry.uri).await {
+                    Ok(summary) => experiments.push(summary),
+                    Err(e) => {
+                        tracing::warn!(
+                            store = %entry.name,
+                            error = %e,
+                            "search: failed to observe retired experiment"
+                        );
+                    }
+                }
+            }
+        }
+        experiments.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    Ok(Json(ExperimentListResponse {
+        experiments,
+        total,
+        stale,
+    }))
+}
+
+/// `GET /api/v1/experiments/{name}`
+pub async fn get_experiment(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+    Query(params): Query<DetailParams>,
+) -> Result<Json<ExperimentDetail>, MasterError> {
+    if params.fresh {
+        // Recompute this one experiment now, updating the stats table as a
+        // side effect, then read it back.
+        let entry = state
+            .registry
+            .get(&name)
+            .await
+            .map_err(MasterError::from_lance)?
+            .ok_or_else(|| {
+                MasterError::NotFound(format!("experiment '{}' does not exist", name))
+            })?;
+        scanner::refresh_one(&state, &entry.name, &entry.uri)
+            .await
+            .map_err(MasterError::from_lance)?;
+    }
+    let cached = {
+        let mut stats = state.stats.lock().await;
+        stats.get(&name).await.map_err(MasterError::from_lance)?
+    };
+    if let Some(row) = cached {
+        return Ok(Json(ExperimentDetail {
+            summary: row.into_summary(),
+        }));
+    }
+
+    // No stats row: either retired, or never scanned. Resolve through the
+    // registry and observe on demand rather than reporting it as missing.
+    let entry = state
+        .registry
+        .get(&name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
+    let summary = scanner::observe_cold(&state, &entry.name, &entry.uri)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(ExperimentDetail { summary }))
+}
+
+/// `GET /api/v1/experiments/{name}/records`
+pub async fn list_experiment_records(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+    Query(params): Query<RecordListParams>,
+) -> Result<Json<ExperimentRecordsResponse>, MasterError> {
+    let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
+    let limit = params.limit.clamp(1, 100);
+    let source = parse_list_source(params.source.as_deref())?;
+    let filters = RolloutFilters {
+        id: non_empty(params.id),
+        rollout_id: non_empty(params.rollout_id),
+        problem_id: non_empty(params.problem_id),
+        dataset: non_empty(params.dataset),
+        role: non_empty(params.role),
+        content_type: non_empty(params.content_type),
+        policy_version: non_empty(params.policy_version),
+        artifact_type: non_empty(params.artifact_type),
+        include_in_training: params.include_in_training,
+    };
+    let page = store
+        .list_filtered_source(&filters, limit, params.offset, source)
+        .await
+        .map_err(MasterError::from_lance)?;
+
+    Ok(Json(ExperimentRecordsResponse {
+        records: page
+            .records
+            .into_iter()
+            .map(rollout_record_to_dto)
+            .collect(),
+        has_more: page.has_more,
+        limit,
+        offset: params.offset,
+        source: list_source_label(source).to_string(),
+    }))
+}
+
+/// `POST /api/v1/experiments/{name}/query` — run a read-only `SELECT` against
+/// one experiment's rollout records (exposed as a table named `records`,
+/// merged base ∪ pending WAL view). Non-`SELECT` or malformed SQL returns 400.
+pub async fn query_experiment_sql(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+    Json(body): Json<SqlQueryRequest>,
+) -> Result<Json<SqlQueryResponse>, MasterError> {
+    let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
+    let result = store
+        .query_sql(&body.sql)
+        .await
+        .map_err(MasterError::from_lance_user)?;
+    let row_count = result.rows.len();
+    Ok(Json(SqlQueryResponse {
+        columns: result.columns,
+        rows: result.rows,
+        row_count,
+        truncated: result.truncated,
+    }))
+}
+
+/// `GET /api/v1/experiments/{name}/records/{id}/blob`
+pub async fn download_experiment_blob(
+    State(state): State<Arc<MasterState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<Response, MasterError> {
+    let store = open_registered_store(&state, &name).await?;
+    let mut store = store.write().await;
+    store
+        .refresh_latest()
+        .await
+        .map_err(MasterError::from_lance)?;
+    // Single base-first scan returns the row metadata and its payload together,
+    // instead of a separate get_by_id + get_blob (two point scans over the same
+    // shard) as before.
+    let (record, payload) = store
+        .get_record_with_blob(&id)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("record '{}' does not exist", id)))?;
+    let bytes =
+        payload.ok_or_else(|| MasterError::NotFound(format!("record '{}' has no blob", id)))?;
+
+    let content_type = HeaderValue::from_str(&record.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let filename = blob_filename(&record);
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .map_err(|err| MasterError::Internal(err.to_string()))?;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .body(blob_stream_body(bytes))
+        .map_err(|err| MasterError::Internal(err.to_string()))
+}
+
+/// Frame size for chunked blob download responses (see [`blob_stream_body`]).
+const BLOB_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Build a chunked [`Body`] from an owned blob so the HTTP send path never holds
+/// a second full-blob copy and a slow client applies backpressure at frame
+/// granularity. `Bytes` frames are refcounted slices of one allocation, so no
+/// per-frame copy of the payload is made.
+fn blob_stream_body(bytes: Vec<u8>) -> Body {
+    let buf = bytes::Bytes::from(bytes);
+    let chunks = (0..buf.len())
+        .step_by(BLOB_STREAM_CHUNK_BYTES.max(1))
+        .map(move |start| {
+            let end = (start + BLOB_STREAM_CHUNK_BYTES).min(buf.len());
+            Ok::<_, std::convert::Infallible>(buf.slice(start..end))
+        });
+    Body::from_stream(futures::stream::iter(chunks))
+}
+
+/// `POST /api/v1/rescan` — trigger one immediate full scan.
+pub async fn rescan(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    let n = scanner::scan_once(&state)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(serde_json::json!({ "scanned": n })))
+}
+
+/// `POST /api/v1/experiments/{name}/rescan`
+///
+/// Re-observe one store now and persist its stats row, so the next merge
+/// sweep sees its real pending-generation count instead of waiting up to a
+/// scan interval. Same work as `GET /experiments/{name}?fresh=true`, exposed
+/// as a POST because operators reach for it to *change* scheduler input.
+pub async fn rescan_experiment(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+) -> Result<Json<ExperimentDetail>, MasterError> {
+    let entry = state
+        .registry
+        .get(&name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
+    scanner::refresh_one(&state, &entry.name, &entry.uri)
+        .await
+        .map_err(MasterError::from_lance)?;
+    let row = state
+        .stats
+        .lock()
+        .await
+        .get(&name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| {
+            MasterError::Internal(format!("stats row for '{}' missing after refresh", name))
+        })?;
+    Ok(Json(ExperimentDetail {
+        summary: row.into_summary(),
+    }))
+}
+
+/// Map a task's terminal `detail` string back into the fragment counts the
+/// legacy `CompactJobStatus::Done` shape carries. Best-effort: unparsable
+/// details yield zeros (the UI only needs the state to stop polling).
+fn parse_fragment_detail(detail: Option<&str>) -> (usize, usize) {
+    // Detail format: "removed {r} / added {a} fragments".
+    let parse = |s: &str, key: &str| -> usize {
+        s.split_whitespace()
+            .skip_while(|w| *w != key)
+            .nth(1)
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0)
+    };
+    match detail {
+        Some(d) => (parse(d, "removed"), parse(d, "added")),
+        None => (0, 0),
+    }
+}
+
+/// Project a [`TaskRecord`] into the legacy [`CompactJobStatus`] shape so the
+/// existing compaction UI keeps working while the queue view rolls out.
+fn task_to_compact_status(task: &TaskRecord) -> CompactJobStatus {
+    match task.state {
+        TaskState::Queued => CompactJobStatus::Queued,
+        TaskState::Running => CompactJobStatus::Running,
+        TaskState::Done => {
+            let (fragments_removed, fragments_added) =
+                parse_fragment_detail(task.detail.as_deref());
+            CompactJobStatus::Done {
+                fragments_removed,
+                fragments_added,
+            }
+        }
+        TaskState::Failed => CompactJobStatus::Failed {
+            error: task.error.clone().unwrap_or_default(),
+        },
+    }
+}
+
+/// The most recent `Compact` task for `name`, if any (by `enqueued_at`).
+async fn latest_compact_task(
+    state: &Arc<MasterState>,
+    name: &str,
+) -> lance::Result<Option<TaskRecord>> {
+    Ok(state
+        .task_store
+        .list()
+        .await?
+        .into_iter()
+        .filter(|t| t.kind == TaskKind::Compact && t.target == name)
+        .max_by_key(|t| t.enqueued_at))
+}
+
+/// `POST /api/v1/experiments/{name}/compact` — enqueue a manual compaction.
+/// Returns 202 Accepted with the (possibly de-duped) job status. Retained for
+/// backward compatibility; internally this is just a `Compact` task.
+pub async fn compact_experiment(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<CompactJobStatus>), MasterError> {
+    // Only enqueue known experiments.
+    let exists = state
+        .target_uri(&name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .is_some();
+    if !exists {
+        return Err(MasterError::NotFound(format!(
+            "experiment '{}' does not exist",
+            name
+        )));
+    }
+    let task = scheduler::enqueue(&state, TaskKind::Compact, &name)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok((StatusCode::ACCEPTED, Json(task_to_compact_status(&task))))
+}
+
+/// `GET /api/v1/experiments/{name}/compact/status` — latest compaction job
+/// state for an experiment (`None` when never requested).
+pub async fn compact_status(
+    State(state): State<Arc<MasterState>>,
+    Path(name): Path<String>,
+) -> Result<Json<CompactJobStatus>, MasterError> {
+    Ok(
+        match latest_compact_task(&state, &name)
+            .await
+            .map_err(MasterError::from_lance)?
+        {
+            Some(task) => Json(task_to_compact_status(&task)),
+            None => Json(CompactJobStatus::None),
+        },
+    )
+}
+
+/// `POST /api/v1/tasks` — enqueue a task of any kind. Returns 202 Accepted with
+/// the (possibly de-duped) task record.
+pub async fn enqueue_task(
+    State(state): State<Arc<MasterState>>,
+    Json(req): Json<EnqueueTaskRequest>,
+) -> Result<(StatusCode, Json<TaskRecord>), MasterError> {
+    if state
+        .target_uri(&req.target)
+        .await
+        .map_err(MasterError::from_lance)?
+        .is_none()
+    {
+        return Err(MasterError::NotFound(format!(
+            "maintenance target '{}' does not exist",
+            req.target
+        )));
+    }
+    if let Some(tag) = req.snapshot_tag {
+        if req.kind != TaskKind::IndexId
+            || !req.depends_on.is_empty()
+            || state.registered_target(&req.target).is_none()
+        {
+            return Err(MasterError::InvalidRequest(
+                "snapshot_tag requires a registered-table index_id task without dependencies"
+                    .into(),
+            ));
+        }
+        lance::dataset::refs::check_valid_tag(&tag)
+            .map_err(|error| MasterError::InvalidRequest(error.to_string()))?;
+        let task = state
+            .task_store
+            .enqueue_index_snapshot(&req.target, &tag)
+            .await
+            .map_err(MasterError::from_lance)?;
+        return Ok((StatusCode::ACCEPTED, Json(task)));
+    }
+    let task = scheduler::enqueue_with_deps(&state, req.kind, &req.target, req.depends_on)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// `GET /api/v1/scheduler/cooldowns` — targets the auto-sweeps are skipping
+/// because they failed repeatedly, with the failure count, when the cooldown
+/// lapses, and the last error. A store in this list is broken in a way that
+/// retrying will not fix (a manifest naming a missing fragment, for example);
+/// a manual `POST /tasks` still enqueues it.
+pub async fn list_cooldowns(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<TaskCooldown>>, MasterError> {
+    state
+        .task_store
+        .list_cooldowns()
+        .await
+        .map(Json)
+        .map_err(MasterError::from_lance)
+}
+
+#[derive(Deserialize, Default)]
+pub struct DemandQuery {
+    pub target: Option<String>,
+    /// List mode only: at most this many tables, highest pending first.
+    /// Default 200, max 2000.
+    pub limit: Option<usize>,
+    /// List mode only: include tables with zero pending generations.
+    #[serde(default)]
+    pub include_idle: bool,
+}
+
+/// One table's demand as the planner sees it. The full record is included
+/// only for a single-target query; the list view carries the summary.
+#[derive(Debug, Serialize)]
+pub struct DemandView {
+    pub target: String,
+    pub pending_generations: u64,
+    pub pending_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_ms: Option<i64>,
+    pub shards: usize,
+    pub observed_revision: i64,
+    pub updated_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<lance_context_merge::demand::TableDemand>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DemandReport {
+    /// Whether some master currently holds planner leadership.
+    pub leader: Option<crate::planner::LeaderRecord>,
+    /// Tables in the cache (list mode), before `limit`/`include_idle`.
+    pub total_tables: usize,
+    /// Tables with pending > 0 in the cache (list mode).
+    pub tables_with_pending: usize,
+    pub tables: Vec<DemandView>,
+}
+
+/// `GET /api/v1/scheduler/demand[?target=|?limit=&include_idle=]` — the
+/// planner's demand cache, folded from per-shard watermark events.
+/// Read-only. With `target`, one table with its full record. Without, a
+/// paged read of the whole cache (13k tables is tens of pages) reduced to a
+/// bounded, pending-sorted summary so the response is never the size of
+/// the cache. Absent while no planner has run.
+pub async fn scheduler_demand(
+    State(state): State<Arc<MasterState>>,
+    Query(query): Query<DemandQuery>,
+) -> Result<Json<DemandReport>, MasterError> {
+    use lance_context_merge::demand::TableDemand;
+    let keys = crate::planner::Keys::new(&state.config.etcd.etcd_prefix);
+    let client = state.task_store.etcd_client();
+    let leader = client
+        .clone()
+        .get(keys.leader(), None)
+        .await
+        .map_err(|e| MasterError::Internal(e.to_string()))?
+        .kvs()
+        .first()
+        .and_then(|kv| serde_json::from_slice(kv.value()).ok());
+    let prefix = keys.demand_prefix();
+    let view = |key: &[u8], record: TableDemand, full: bool| {
+        let key = String::from_utf8_lossy(key);
+        let target = key
+            .strip_prefix(prefix.as_str())
+            .and_then(crate::planner::unhex)
+            .unwrap_or_else(|| key.to_string());
+        DemandView {
+            target,
+            pending_generations: record.pending_generations(),
+            pending_bytes: record.pending_bytes(),
+            oldest_pending_ms: record.oldest_pending_ms(),
+            shards: record.shards.len(),
+            observed_revision: record.observed_revision,
+            updated_ms: record.updated_ms,
+            record: full.then_some(record),
+        }
+    };
+    if let Some(target) = &query.target {
+        if target.is_empty() || target.len() > 512 {
+            return Err(MasterError::InvalidRequest("invalid target".into()));
+        }
+        let got = client
+            .clone()
+            .get(keys.demand(target), None)
+            .await
+            .map_err(|e| MasterError::Internal(e.to_string()))?;
+        let tables: Vec<DemandView> = got
+            .kvs()
+            .iter()
+            .filter_map(|kv| {
+                serde_json::from_slice::<TableDemand>(kv.value())
+                    .ok()
+                    .map(|r| view(kv.key(), r, true))
+            })
+            .collect();
+        let with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+        return Ok(Json(DemandReport {
+            leader,
+            total_tables: tables.len(),
+            tables_with_pending: with_pending,
+            tables,
+        }));
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 2000);
+    let (kvs, _) = crate::planner::read_prefix_paged(client, &prefix)
+        .await
+        .map_err(MasterError::Internal)?;
+    let total_tables = kvs.len();
+    let mut tables: Vec<DemandView> = kvs
+        .iter()
+        .filter_map(|kv| {
+            serde_json::from_slice::<TableDemand>(&kv.value)
+                .ok()
+                .map(|r| view(&kv.key, r, false))
+        })
+        .collect();
+    let tables_with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+    if !query.include_idle {
+        tables.retain(|t| t.pending_generations > 0);
+    }
+    tables.sort_by_key(|t| std::cmp::Reverse(t.pending_generations));
+    tables.truncate(limit);
+    Ok(Json(DemandReport {
+        leader,
+        total_tables,
+        tables_with_pending,
+        tables,
+    }))
+}
+
+/// `GET /api/v1/scheduler/executors` — every live executor heartbeat with
+/// its headroom computed from durable assignments, never from the sampled
+/// free bytes. An executor with assignments but no heartbeat appears as
+/// draining with zero totals.
+pub async fn scheduler_executors(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<crate::executors::Headroom>>, MasterError> {
+    let keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
+    let headroom = crate::executors::load_headroom(state.task_store.etcd_client(), &keys)
+        .await
+        .map_err(MasterError::Internal)?;
+    Ok(Json(headroom.into_values().collect()))
+}
+
+/// `GET /api/v1/scheduler/repairs` — base-table repairs the master performed,
+/// most recent first: which fragments were dropped from which store, when,
+/// and how many rows they held.
+pub async fn list_repairs(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<RepairRecord>>, MasterError> {
+    state
+        .task_store
+        .list_repairs()
+        .await
+        .map(Json)
+        .map_err(MasterError::from_lance)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RegistryParams {
+    /// `rollout` (default), `generic`, or `datagen`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+fn registry_pair<'a>(
+    state: &'a MasterState,
+    kind: Option<&str>,
+) -> Result<(&'a Arc<dyn lance_context_core::StoreRegistry>, &'static str), MasterError> {
+    match kind.unwrap_or("rollout") {
+        "rollout" => Ok((&state.registry, "rollout")),
+        "generic" => Ok((&state.generic_registry, "generic")),
+        "datagen" => Ok((&state.datagen_registry, "datagen")),
+        other => Err(MasterError::InvalidRequest(format!(
+            "unknown registry kind '{other}' (rollout|generic|datagen)"
+        ))),
+    }
+}
+
+/// Compare names, URIs and creation timestamps. A live comparison is only an
+/// observation; freeze all registry writers and reconcile all three kinds
+/// before cutover. An empty diff is not permission for a rolling backend flip.
+pub async fn registry_diff(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<RegistryParams>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    let (registry, kind) = registry_pair(&state, params.kind.as_deref())?;
+    let Some(mirrored) = registry
+        .as_any()
+        .downcast_ref::<lance_context_core::MirroredRegistry>()
+    else {
+        return Err(MasterError::InvalidRequest(
+            "REGISTRY_MIRROR is not configured; nothing to diff".to_string(),
+        ));
+    };
+    let diff = lance_context_core::diff_registries(&*mirrored.primary, &*mirrored.mirror)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(serde_json::json!({
+        "kind": kind,
+        "only_in_primary": diff.only_in_primary,
+        "only_in_mirror": diff.only_in_mirror,
+        "mismatched": diff.mismatched,
+        "cutover_requires_quiescence": true,
+    })))
+}
+
+/// `POST /api/v1/registry/backfill?kind=` — reconcile the complete primary
+/// snapshot, including changed values and deletions. The master also does this on
+/// startup and every maintenance round; this is for forcing it.
+pub async fn registry_backfill(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<RegistryParams>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    let (registry, kind) = registry_pair(&state, params.kind.as_deref())?;
+    let Some(mirrored) = registry
+        .as_any()
+        .downcast_ref::<lance_context_core::MirroredRegistry>()
+    else {
+        return Err(MasterError::InvalidRequest(
+            "REGISTRY_MIRROR is not configured; nothing to backfill".to_string(),
+        ));
+    };
+    let copied = lance_context_core::backfill_registry(&*mirrored.primary, &*mirrored.mirror)
+        .await
+        .map_err(MasterError::from_lance)?;
+    Ok(Json(serde_json::json!({ "kind": kind, "copied": copied })))
+}
+
+/// `GET /api/v1/tasks` — paginated tasks (queue + recent history), newest first.
+pub async fn list_tasks(
+    State(state): State<Arc<MasterState>>,
+    Query(params): Query<TaskListParams>,
+) -> Result<Json<TaskListResponse>, MasterError> {
+    let mut tasks = state
+        .task_store
+        .list()
+        .await
+        .map_err(MasterError::from_lance)?;
+    tasks.sort_by_key(|t| std::cmp::Reverse(t.enqueued_at));
+    let total = tasks.len();
+    let limit = params.limit.clamp(1, 200);
+    let page = tasks.into_iter().skip(params.offset).take(limit).collect();
+    Ok(Json(TaskListResponse {
+        tasks: page,
+        total,
+        limit,
+        offset: params.offset,
+    }))
+}
+
+/// `GET /api/v1/tasks/{id}` — a single task by id.
+pub async fn get_task(
+    State(state): State<Arc<MasterState>>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskRecord>, MasterError> {
+    match state
+        .task_store
+        .get(&id)
+        .await
+        .map_err(MasterError::from_lance)?
+    {
+        Some(task) => Ok(Json(task)),
+        None => Err(MasterError::NotFound(format!("task '{}' not found", id))),
+    }
+}
+
+/// `GET /api/v1/tasks/{id}/admission` explains this master's current task
+/// preconditions. On demand only: two bounded etcd reads, no fleet/payload scan,
+/// claim, recovery, or fencing action. Pool capacity and the final claim CAS
+/// remain separate; a successful precheck is not permission to replace an owner.
+async fn task_admission(
+    State(state): State<Arc<MasterState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, MasterError> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(MasterError::InvalidRequest("invalid task id".into()));
+    }
+    let diagnostic = state
+        .task_store
+        .explain_admission(&id)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("task '{id}' not found")))?;
+    let executor = state.admission.status();
+    let executor_blocker = if !executor.accepting {
+        Some("executor_draining")
+    } else if diagnostic.kind == TaskKind::MergeWal && !state.config.maintenance.claim_wal_merges {
+        Some("wal_claims_disabled")
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "executor_id": executor.executor_id,
+        "executor_accepting": executor.accepting,
+        "wal_claims_enabled": state.config.maintenance.claim_wal_merges,
+        "executor_blocker": executor_blocker,
+        "diagnostic": diagnostic,
+    })))
+}
+
+/// Call through the exact Pod endpoint. The process identity prevents a load
+/// balancer or replacement Pod from draining a different executor by mistake.
+#[derive(Deserialize)]
+pub struct DrainRequest {
+    pub executor_id: String,
+}
+
+async fn executor_status(State(state): State<Arc<MasterState>>) -> Json<crate::admission::Status> {
+    Json(state.admission.status())
+}
+
+#[derive(Deserialize)]
+struct MergeProgressQuery {
+    target: String,
+}
+
+/// What `/merge-progress` can say about a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MergeProgressStatus {
+    /// Execution, progress sequence and a matching work report were read
+    /// at one etcd revision.
+    Reported,
+    /// An execution exists but has published no work report for its
+    /// current progress sequence (older executor binary, or not yet).
+    ProgressDetailsUnavailable,
+    /// A MergeWal task is live but no execution record exists: a legacy
+    /// worker RPC with no telemetry. Not evidence of health.
+    ProgressUnknown,
+    /// No live task and no execution record.
+    NoActiveRecord,
+}
+
+/// Typed response for `GET /api/v1/merge-progress?target=`. Field names are
+/// a contract; add fields, never rename them.
+#[derive(Debug, Serialize)]
+struct MergeProgressReport {
+    target: String,
+    status: MergeProgressStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<lance_context_merge::Execution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<lance_context_merge::progress::ExecutionProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_report: Option<serde_json::Value>,
+    /// etcd revision the execution/progress/work triple was read at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<i64>,
+    sampled_at_ms: u64,
+}
+
+/// Exact target reads only. A live task/lease without execution telemetry is
+/// explicitly unknown, not evidence that a legacy merge is making progress.
+/// Execution, progress and work report come from one etcd revision, so the
+/// caller never has to retry on a torn read.
+async fn merge_progress(
+    State(state): State<Arc<MasterState>>,
+    Query(query): Query<MergeProgressQuery>,
+) -> Result<Json<MergeProgressReport>, MasterError> {
+    if query.target.is_empty() || query.target.len() > 512 {
+        return Err(MasterError::InvalidRequest("invalid merge target".into()));
+    }
+    let coordinator = state.task_store.merge_coordinator();
+    let task_id = state
+        .task_store
+        .get_active_id(TaskKind::MergeWal, &query.target)
+        .await
+        .map_err(MasterError::from_lance)?;
+    let sampled_at_ms = lance_context_merge::failure::now_ms();
+    let Some(snapshot) = coordinator
+        .progress_snapshot(&query.target)
+        .await
+        .map_err(MasterError::Internal)?
+    else {
+        return Ok(Json(MergeProgressReport {
+            target: query.target,
+            status: if task_id.is_some() {
+                MergeProgressStatus::ProgressUnknown
+            } else {
+                MergeProgressStatus::NoActiveRecord
+            },
+            task_id,
+            execution: None,
+            progress: None,
+            work_report: None,
+            revision: None,
+            sampled_at_ms,
+        }));
+    };
+    Ok(Json(MergeProgressReport {
+        target: query.target,
+        status: if snapshot.work_report.is_some() {
+            MergeProgressStatus::Reported
+        } else {
+            MergeProgressStatus::ProgressDetailsUnavailable
+        },
+        task_id,
+        execution: Some(snapshot.execution),
+        progress: snapshot.progress,
+        work_report: snapshot.work_report,
+        revision: Some(snapshot.revision),
+        sampled_at_ms,
+    }))
+}
+
+async fn drain_executor(
+    State(state): State<Arc<MasterState>>,
+    Json(request): Json<DrainRequest>,
+) -> Result<Json<crate::admission::Status>, StatusCode> {
+    if state.admission.status().executor_id != request.executor_id {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(Json(state.admission.begin_drain()))
+}
+
+/// Build the admin API router (mounted under `/api/v1`).
+pub fn api_router() -> Router<Arc<MasterState>> {
+    Router::new()
+        .route(
+            "/stores/{kind}/{name}/flush",
+            post(crate::publication::flush_table),
+        )
+        .route("/executor", get(executor_status))
+        .route("/merge-retirements", post(crate::legacy_retirement::route))
+        .route("/merge-progress", get(merge_progress))
+        .route("/executor/drain", post(drain_executor))
+        .route("/experiments", get(list_experiments))
+        .route("/experiments/{name}", get(get_experiment))
+        .route(
+            "/experiments/{name}/key-index-coverage",
+            get(crate::index_coverage::handler),
+        )
+        .route("/experiments/{name}/records", get(list_experiment_records))
+        .route("/experiments/{name}/query", post(query_experiment_sql))
+        .route(
+            "/experiments/{name}/records/{id}/blob",
+            get(download_experiment_blob),
+        )
+        .route("/experiments/{name}/compact", post(compact_experiment))
+        .route("/experiments/{name}/compact/status", get(compact_status))
+        .route("/experiments/{name}/rescan", post(rescan_experiment))
+        .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route(
+            "/catchup",
+            post(crate::catchup::trigger).get(crate::catchup::status),
+        )
+        .route("/scheduler/cooldowns", get(list_cooldowns))
+        .route("/scheduler/demand", get(scheduler_demand))
+        .route("/scheduler/executors", get(scheduler_executors))
+        .route("/scheduler/repairs", get(list_repairs))
+        .route("/registry/diff", get(registry_diff))
+        .route("/registry/backfill", post(registry_backfill))
+        .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/admission", get(task_admission))
+        .route("/rescan", post(rescan))
+}
+
+async fn open_registered_store(
+    state: &MasterState,
+    name: &str,
+) -> Result<Arc<RwLock<RolloutStore>>, MasterError> {
+    let entry = state
+        .registry
+        .get(name)
+        .await
+        .map_err(MasterError::from_lance)?
+        .ok_or_else(|| MasterError::NotFound(format!("experiment '{}' does not exist", name)))?;
+    state
+        .get_or_open_record_store(name, &entry.uri)
+        .await
+        .map_err(MasterError::from_lance)
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
+}
+
+fn blob_filename(record: &lance_context_core::RolloutRecord) -> String {
+    let candidate = record
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("filename"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&record.id);
+    let sanitized: String = candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(180)
+        .collect();
+    if sanitized.is_empty() {
+        "rollout-blob".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MasterConfig;
+    use chrono::Utc;
+    use lance_context_core::{generate_id, RolloutRecord, RolloutRegistry, RolloutStore};
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn test_config(dir: &TempDir) -> MasterConfig {
+        MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
+            append: Default::default(),
+            managed_store_kind: None,
+            catchup: Default::default(),
+            wal_tail: Default::default(),
+            planner: Default::default(),
+            maintenance: Default::default(),
+            merge_rollout: Default::default(),
+            data_dir: dir.path().to_string_lossy().to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            stats_scan_interval_secs: 0,
+            backlog_metrics_max_age_secs: 900,
+            scan_concurrency: 4,
+            rollout_cache_bytes: 2 * 1024 * 1024 * 1024,
+            stats_maintenance_every_n_scans: 0,
+            stats_history_ttl_secs: 3_600,
+            stats_cold_retire_secs: 0,
+            compaction_interval_secs: 0,
+            min_fragments: 16,
+            target_rows_per_fragment: 1_048_576,
+            compaction_concurrency: 1,
+            compaction_threads: 1,
+            compaction_batch_size: 8,
+            compaction_max_source_fragments: 32,
+            index_after_compaction: false,
+            index_interval_secs: 0,
+            key_index_type: Default::default(),
+            index_before_merge: false,
+            compaction_max_bytes_per_file: 1024 * 1024 * 1024,
+            merge_wal_interval_secs: 0,
+            merge_wal_min_generations: 8,
+            merge_wal_admission_targets: vec![],
+            worker_endpoints: vec![],
+            table_flush_timeout_secs: 20,
+            worker_discovery: Default::default(),
+            task_concurrency: 4,
+            merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: test_etcd_endpoints(),
+                etcd_prefix: format!("/lance-context/test/{}", generate_id()),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
+            etcd_lease_ttl_secs: 5,
+            task_history_limit: 1_000,
+            task_history_ttl_secs: 86_400,
+            task_cooldown_after_failures: 3,
+            task_cooldown_base_secs: 600,
+            task_cooldown_max_secs: 21_600,
+            ui_dir: None,
+        }
+    }
+
+    fn test_etcd_endpoints() -> Vec<String> {
+        std::env::var("ETCD_TEST_ENDPOINTS")
+            .map(|value| value.split(',').map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn enqueue_task_uses_target_registry_and_preserves_generic_identity() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new({
+            let mut cfg = test_config(&dir);
+            cfg.managed_store_kind = Some("events".into());
+            cfg
+        })
+        .await
+        .unwrap();
+        state
+            .generic_registry
+            .upsert("shared", &state.generic_uri("shared"))
+            .await
+            .unwrap();
+        let router = api_router().with_state(state.clone());
+        let request = |target: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/tasks")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"kind": "merge_wal", "target": target}).to_string(),
+                ))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request("generic:shared"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let generic: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(generic.target, "generic:shared");
+
+        // Existence in the other registry must never authorize admission.
+        state
+            .registry
+            .upsert("rollout-only", &state.rollout_uri("rollout-only"))
+            .await
+            .unwrap();
+        for target in [
+            "shared",
+            "generic:rollout-only",
+            "generic:missing",
+            "missing",
+            "events:shared",
+            "events:rollout-only",
+            "events:missing",
+        ] {
+            let response = router.clone().oneshot(request(target)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+        }
+        assert_eq!(state.task_store.list().await.unwrap().len(), 1);
+
+        state
+            .registry
+            .upsert("shared", &state.rollout_uri("shared"))
+            .await
+            .unwrap();
+        let response = router.clone().oneshot(request("shared")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let rollout: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rollout.target, "shared");
+        assert_ne!(generic.id, rollout.id);
+
+        state
+            .managed_registry
+            .as_ref()
+            .unwrap()
+            .upsert(
+                "shared",
+                &format!("{}/custom-location.lance", dir.path().display()),
+            )
+            .await
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request("events:shared"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let registered: TaskRecord = serde_json::from_slice(&body).unwrap();
+        assert_eq!(registered.target, "events:shared");
+        assert_ne!(registered.id, generic.id);
+        assert_ne!(registered.id, rollout.id);
+
+        for expected in [&generic, &rollout, &registered] {
+            let response = router
+                .clone()
+                .oneshot(request(&expected.target))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .unwrap();
+            let task: TaskRecord = serde_json::from_slice(&body).unwrap();
+            assert_eq!(task.id, expected.id);
+            assert_eq!(task.target, expected.target);
+        }
+        assert_eq!(state.task_store.list().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn admission_diagnostic_route_reports_local_gates_and_never_claims() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config(&dir);
+        config.maintenance.claim_wal_merges = false;
+        let state = MasterState::new(config).await.unwrap();
+        let task = state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let router = api_router().with_state(state.clone());
+        let request = || {
+            Request::builder()
+                .uri(format!("/tasks/{}/admission", task.id))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["executor_id"], state.admission.status().executor_id);
+        assert_eq!(report["executor_blocker"], "wal_claims_disabled");
+        assert_eq!(
+            report["diagnostic"]["reason"],
+            "admission_preconditions_satisfied"
+        );
+        state.admission.begin_drain();
+        let response = router.clone().oneshot(request()).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["executor_blocker"], "executor_draining");
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        for (id, expected) in [
+            (generate_id(), StatusCode::NOT_FOUND),
+            ("x".repeat(129), StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/tasks/{id}/admission"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn merge_progress_never_calls_a_live_legacy_task_healthy() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "legacy", vec![])
+            .await
+            .unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        let Json(report) = merge_progress(
+            State(state.clone()),
+            Query(MergeProgressQuery {
+                target: "legacy".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, MergeProgressStatus::ProgressUnknown);
+        assert_eq!(report.task_id.as_deref(), Some(claim.task.id.as_str()));
+        assert!(report.work_report.is_none());
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["status"], "progress_unknown");
+        assert!(wire.get("execution").is_none(), "absent fields are omitted");
+        state
+            .task_store
+            .finish(claim, Ok("done".into()))
+            .await
+            .unwrap();
+        let Json(report) = merge_progress(
+            State(state),
+            Query(MergeProgressQuery {
+                target: "legacy".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, MergeProgressStatus::NoActiveRecord);
+    }
+
+    fn test_record(id: &str, with_blob: bool) -> RolloutRecord {
+        let bytes = with_blob.then(|| b"master-blob".to_vec());
+        RolloutRecord {
+            id: id.to_string(),
+            rollout_id: "rollout-1".to_string(),
+            problem_id: "problem-1".to_string(),
+            dataset: Some("gsm8k".to_string()),
+            sequence_order: 1,
+            role: if with_blob { "artifact" } else { "assistant" }.to_string(),
+            created_at: Utc::now(),
+            content: Some("answer".to_string()),
+            content_type: if with_blob { "image/png" } else { "text/plain" }.to_string(),
+            model_input_string: None,
+            model_output_string: None,
+            rationale: None,
+            problem_text: None,
+            user_metadata: None,
+            input_tokens: None,
+            output_tokens: Some(vec![1, 2]),
+            num_input_tokens: None,
+            num_output_tokens: Some(2),
+            output_logprobs: None,
+            input_logprobs: None,
+            ref_logprobs: None,
+            loss_mask: None,
+            advantage: None,
+            reward: Some(1.0),
+            raw_reward: None,
+            grader_id: None,
+            score: Some(0.9),
+            include_in_training: Some(true),
+            exclude_reason: None,
+            policy_version: Some("policy-a".to_string()),
+            relationships: Vec::new(),
+            payload_size: bytes.as_ref().map(|bytes| bytes.len() as i64),
+            binary_payload: bytes,
+            payload_checksum: None,
+            artifact_type: with_blob.then(|| "screenshot".to_string()),
+            metadata: with_blob.then(|| json!({"filename": "grade result.png"})),
+        }
+    }
+
+    /// Create N experiments via core, register them, scan, and assert the stats
+    /// table + list endpoint reflect them.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_populates_and_list_returns_experiments() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        for i in 0..3 {
+            let name = format!("exp-{i}");
+            let uri = state.rollout_uri(&name);
+            // Creating the store materializes an (empty) base table on disk.
+            RolloutStore::open(&uri).await.unwrap();
+            state.registry.upsert(&name, &uri).await.unwrap();
+        }
+
+        let scanned = scanner::scan_once(&state).await.unwrap();
+        assert_eq!(scanned, 3);
+
+        let Json(resp) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: None,
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.total, 3);
+        assert_eq!(resp.experiments.len(), 3);
+        assert_eq!(resp.experiments[0].name, "exp-0");
+
+        // Search narrows.
+        let Json(one) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: Some("exp-1".to_string()),
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.total, 1);
+        assert_eq!(one.experiments[0].name, "exp-1");
+    }
+
+    /// Real registry, WAL manifests, Lance stats commit and shared etcd metric
+    /// publication. A missing new registry entry must invalidate completeness,
+    /// even when there is no previous row available to carry over.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn backlog_scan_publication_tracks_wal_and_unknown_registry_entries() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("metrics-hot");
+        let store = RolloutStore::open(&uri).await.unwrap();
+        state.registry.upsert("metrics-hot", &uri).await.unwrap();
+        for id in ["a", "b"] {
+            store.add(&[test_record(id, false)]).await.unwrap();
+            store.flush().await.unwrap();
+        }
+        scanner::scan_once(&state).await.unwrap();
+        let (full, first_revision) = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(full.validate());
+        assert_eq!(full.stores, 1);
+        assert_eq!(full.generations, 2);
+        assert_eq!(full.largest_shard, 2);
+        assert_eq!(full.failed_observations, 0);
+        assert!(full.committed_ms >= full.oldest_observation_ms);
+        let row = state
+            .stats
+            .lock()
+            .await
+            .get("metrics-hot")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.generations, row.pending_wal_generations as u64);
+
+        let missing = dir.path().join("does-not-exist.lance");
+        state
+            .registry
+            .upsert("unreadable", missing.to_str().unwrap())
+            .await
+            .unwrap();
+        scanner::scan_once(&state).await.unwrap();
+        let (partial, second_revision) = state
+            .task_store
+            .read_backlog_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second_revision > first_revision);
+        assert_eq!(partial.generations, 2);
+        assert_eq!(partial.stores, 1);
+        assert_eq!(partial.failed_observations, 1);
+    }
+
+    /// `/experiments` must answer even while a scan round holds the stats lock.
+    ///
+    /// This is the production wedge: the handler's only data source is an
+    /// exclusive `Mutex`, so a slow scan round (retirement, first-pass
+    /// maintenance) used to make the endpoint hang with no timeout and no
+    /// fallback. Holding the lock for the duration of the call reproduces that
+    /// exactly; the assertion is that we get a bounded, flagged response
+    /// instead of blocking.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn list_experiments_serves_cache_when_stats_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        for i in 0..2 {
+            let name = format!("exp-{i}");
+            let uri = state.rollout_uri(&name);
+            RolloutStore::open(&uri).await.unwrap();
+            state.registry.upsert(&name, &uri).await.unwrap();
+        }
+        // Populates both the stats table and the in-memory cache.
+        scanner::scan_once(&state).await.unwrap();
+
+        // Simulate a scan round in its write phase.
+        let held = state.stats.lock().await;
+
+        let listed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            list_experiments(
+                State(state.clone()),
+                Query(ListParams {
+                    search: None,
+                    limit: 50,
+                    offset: 0,
+                }),
+            ),
+        )
+        .await
+        .expect("must not block on the stats lock");
+
+        let Json(resp) = listed.unwrap();
+        assert!(resp.stale, "a cache-served response must be flagged stale");
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.experiments.len(), 2);
+
+        // Pagination and search still apply to the cached rows.
+        let Json(page) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: Some("exp-1".to_string()),
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(page.stale);
+        assert_eq!(page.experiments.len(), 1);
+        assert_eq!(page.experiments[0].name, "exp-1");
+
+        drop(held);
+
+        // Once the lock frees, the authoritative path is used again.
+        let Json(fresh) = list_experiments(
+            State(state.clone()),
+            Query(ListParams {
+                search: None,
+                limit: 50,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !fresh.stale,
+            "an uncontended request must read the stats table"
+        );
+        assert_eq!(fresh.total, 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_sees_registry_commits_from_another_handle() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let name = "external";
+        let uri = state.rollout_uri(name);
+        RolloutStore::open(&uri).await.unwrap();
+
+        let registry_uri = dir.path().join("_registry.rollout.lance");
+        let mut worker_registry =
+            RolloutRegistry::open_or_create(registry_uri.to_str().unwrap(), None)
+                .await
+                .unwrap();
+        worker_registry.upsert(name, &uri).await.unwrap();
+
+        let scanned = scanner::scan_once(&state).await.unwrap();
+        assert_eq!(scanned, 1);
+        assert!(state.stats.lock().await.get(name).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_reconciles_removed_experiments() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        let name = "gone";
+        let uri = state.rollout_uri(name);
+        RolloutStore::open(&uri).await.unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
+        scanner::scan_once(&state).await.unwrap();
+        assert!(state.stats.lock().await.get(name).await.unwrap().is_some());
+
+        // Remove from registry -> next scan drops the stats row.
+        state.registry.remove(name).await.unwrap();
+        scanner::scan_once(&state).await.unwrap();
+        assert!(state.stats.lock().await.get(name).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn get_experiment_not_found() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let res = get_experiment(
+            State(state),
+            Path("missing".to_string()),
+            Query(DetailParams { fresh: false }),
+        )
+        .await;
+        assert!(matches!(res, Err(MasterError::NotFound(_))));
+    }
+
+    /// The merge sweep reads the stats row; a rescan must make a store's
+    /// real pending count visible without waiting for the next scan round.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn rescan_experiment_refreshes_pending_generations() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let name = "behind";
+        let uri = state.rollout_uri(name);
+        let store = RolloutStore::open(&uri).await.unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
+        scanner::scan_once(&state).await.unwrap();
+        let before = state.stats.lock().await.get(name).await.unwrap().unwrap();
+        assert_eq!(before.pending_wal_generations, 0);
+
+        store.add(&[test_record("a", false)]).await.unwrap();
+        store.flush().await.unwrap();
+        store.add(&[test_record("b", false)]).await.unwrap();
+        store.flush().await.unwrap();
+
+        let Json(detail) = rescan_experiment(State(state.clone()), Path(name.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(detail.summary.pending_wal_generations, 2);
+        let after = state.stats.lock().await.get(name).await.unwrap().unwrap();
+        assert_eq!(after.pending_wal_generations, 2);
+
+        let res = rescan_experiment(State(state), Path("missing".to_string())).await;
+        assert!(matches!(res, Err(MasterError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fresh_detail_refreshes_only_requested_experiment() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+
+        for name in ["target", "other"] {
+            let uri = state.rollout_uri(name);
+            RolloutStore::open(&uri).await.unwrap();
+            state.registry.upsert(name, &uri).await.unwrap();
+        }
+
+        let Json(detail) = get_experiment(
+            State(state.clone()),
+            Path("target".to_string()),
+            Query(DetailParams { fresh: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.summary.name, "target");
+        assert!(state
+            .stats
+            .lock()
+            .await
+            .get("target")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .stats
+            .lock()
+            .await
+            .get("other")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn records_endpoint_filters_pages_and_rejects_unknown_experiment() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("records");
+        let store = RolloutStore::open(&uri).await.unwrap();
+        store
+            .add(&[
+                test_record("assistant-1", false),
+                test_record("artifact-1", true),
+            ])
+            .await
+            .unwrap();
+        // `add` only appends to this handle's in-memory memtable; the rows
+        // become visible to the separate handle the endpoint opens only once
+        // the memtable is sealed into a committed WAL generation. Flush rather
+        // than relaxing the assertions below.
+        store.flush().await.unwrap();
+        state.registry.upsert("records", &uri).await.unwrap();
+
+        let Json(page) = list_experiment_records(
+            State(state.clone()),
+            Path("records".to_string()),
+            Query(RecordListParams {
+                limit: 1,
+                offset: 0,
+                id: None,
+                rollout_id: Some("rollout-1".to_string()),
+                problem_id: None,
+                dataset: Some("gsm8k".to_string()),
+                role: Some("artifact".to_string()),
+                content_type: None,
+                policy_version: Some("policy-a".to_string()),
+                artifact_type: Some("screenshot".to_string()),
+                include_in_training: Some(true),
+                source: Some("all".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!page.has_more);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.records[0].id, "artifact-1");
+        assert!(page.records[0].binary_payload.is_none());
+        assert_eq!(page.source, "all");
+
+        let missing = list_experiment_records(
+            State(state),
+            Path("missing".to_string()),
+            Query(RecordListParams {
+                limit: 25,
+                offset: 0,
+                id: None,
+                rollout_id: None,
+                problem_id: None,
+                dataset: None,
+                role: None,
+                content_type: None,
+                policy_version: None,
+                artifact_type: None,
+                include_in_training: None,
+                source: None,
+            }),
+        )
+        .await;
+        assert!(matches!(missing, Err(MasterError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn query_endpoint_runs_select_and_rejects_mutations() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("records");
+        let store = RolloutStore::open(&uri).await.unwrap();
+        store
+            .add(&[
+                test_record("assistant-1", false),
+                test_record("artifact-1", true),
+            ])
+            .await
+            .unwrap();
+        // `add` only appends to this handle's in-memory memtable; the rows
+        // become visible to the separate handle the endpoint opens only once
+        // the memtable is sealed into a committed WAL generation. Flush rather
+        // than relaxing the assertions below.
+        store.flush().await.unwrap();
+        state.registry.upsert("records", &uri).await.unwrap();
+
+        // A valid SELECT returns rows over the merged view.
+        let Json(result) = query_experiment_sql(
+            State(state.clone()),
+            Path("records".to_string()),
+            Json(SqlQueryRequest {
+                sql: "SELECT count(*) AS n FROM records".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.columns, vec!["n".to_string()]);
+        assert_eq!(result.row_count, 1);
+        assert!(!result.truncated);
+
+        // A mutation is rejected as a 400-class InvalidRequest.
+        let rejected = query_experiment_sql(
+            State(state.clone()),
+            Path("records".to_string()),
+            Json(SqlQueryRequest {
+                sql: "DROP TABLE records".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(rejected, Err(MasterError::InvalidRequest(_))));
+
+        // Unknown experiment is a 404.
+        let missing = query_experiment_sql(
+            State(state),
+            Path("missing".to_string()),
+            Json(SqlQueryRequest {
+                sql: "SELECT 1".to_string(),
+            }),
+        )
+        .await;
+        assert!(matches!(missing, Err(MasterError::NotFound(_))));
+    }
+
+    #[test]
+    fn parse_list_source_maps_and_defaults() {
+        assert_eq!(parse_list_source(None).unwrap(), ListSource::Fragments);
+        assert_eq!(parse_list_source(Some("")).unwrap(), ListSource::Fragments);
+        assert_eq!(
+            parse_list_source(Some("fragments")).unwrap(),
+            ListSource::Fragments
+        );
+        assert_eq!(parse_list_source(Some("wal")).unwrap(), ListSource::Wal);
+        assert_eq!(parse_list_source(Some("all")).unwrap(), ListSource::All);
+        assert!(matches!(
+            parse_list_source(Some("bogus")),
+            Err(MasterError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn blob_endpoint_sets_download_headers_and_returns_bytes() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(test_config(&dir)).await.unwrap();
+        let uri = state.rollout_uri("blobs");
+        let store = RolloutStore::open(&uri).await.unwrap();
+        store
+            .add(&[
+                test_record("artifact-1", true),
+                test_record("assistant-1", false),
+            ])
+            .await
+            .unwrap();
+        // See the note in `records_endpoint_...`: rows are only visible to the
+        // handle the endpoint opens after the memtable is sealed.
+        store.flush().await.unwrap();
+        state.registry.upsert("blobs", &uri).await.unwrap();
+
+        let response = download_experiment_blob(
+            State(state.clone()),
+            Path(("blobs".to_string(), "artifact-1".to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"grade_result.png\""
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"master-blob");
+
+        let no_blob = download_experiment_blob(
+            State(state),
+            Path(("blobs".to_string(), "assistant-1".to_string())),
+        )
+        .await;
+        assert!(matches!(no_blob, Err(MasterError::NotFound(_))));
+    }
+}

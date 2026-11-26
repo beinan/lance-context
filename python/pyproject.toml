@@ -1,0 +1,83 @@
+[project]
+name = "lance-context"
+version = "0.6.7"
+dependencies = [
+    "pyarrow>=14",
+]
+description = "Multimodal, versioned context storage for agentic workflows"
+authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
+license = { file = "LICENSE" }
+repository = "https://github.com/lance-format/lance-context"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+keywords = ["context", "memory", "multimodal", "lance", "agents"]
+categories = ["database", "science"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.maturin]
+python-source = "python"
+python-packages = ["lance_context"]
+module-name = "lance_context._internal"
+
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+sentence-transformers = ["sentence-transformers>=2.0"]
+graph = ["lance-graph==0.5.4"]
+lance-python = [
+    "pylance>=14.0.2,<15",
+    "lance-namespace>=0.13.0,<0.14",
+    "lancedb==0.27.1",
+]
+# `moto[server]` pulls in flask + flask-cors so moto.server can be launched
+# as a subprocess for the S3 integration tests.
+tests = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "moto[s3,server]",
+    "boto3",
+    "botocore",
+    "pylance>=14.0.2,<15",
+    "lance-namespace>=0.13.0,<0.14",
+    "lancedb==0.27.1",
+]
+dev = ["ruff", "pyright"]
+
+[tool.pytest.ini_options]
+# `testpaths` is relative to this file (python/), so this resolves to
+# python/tests/ -- the real suite. Without it, running pytest from python/
+# with a bare `pytest` argument could collect python/python/tests/ instead.
+testpaths = ["tests"]
+asyncio_mode = "strict"
+# Fail on unregistered marks so a typo'd @pytest.mark.asyncio cannot silently
+# turn an async test into a no-op pass.
+addopts = "--strict-markers --strict-config"
+
+[tool.ruff]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = ["python/lance_context/__init__.py", "python/lance_context/api.py"]
+reportMissingTypeStubs = "warning"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"

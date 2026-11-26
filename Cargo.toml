@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/lance-context-merge",
+    "crates/lance-context-core",
+    "crates/lance-context-ingest",
+    "crates/lance-context-wal",
+    "crates/lance-context-metrics",
+    "crates/lance-context",
+    "crates/lance-context-api",
+    "crates/lance-context-server",
+    "crates/lance-context-master",
+    "crates/lance-context-client",
+    "python",
+]
+resolver = "2"
+exclude = ["vendor/raft-engine", "vendor/lance-io", "vendor/lance-core", "vendor/lance", "vendor/lance-encoding", "vendor/lance-datafusion"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.metadata]
+# reserved for future use
+
+# Lance 14 task ownership and storage error compatibility; see vendor/lance-io/BACKPORT.md.
+[patch.crates-io]
+# Arrow 58.3: allow equal dictionary offsets for legal empty object keys.
+# Pinned one-line validation fix; dependencies remain the released Arrow crates.
+parquet-variant = { git = "https://github.com/beinan/arrow-rs", rev = "3b82666c986414727c20b05d1cbb1c63a71a5877" }
+lance-io = { path = "vendor/lance-io" }
+# Scoped encoder lifetime tracking, Lance 14.0.2; see vendor/lance-core/BACKPORT.md.
+lance-core = { path = "vendor/lance-core" }
+lance = { path = "vendor/lance" }
+lance-encoding = { path = "vendor/lance-encoding" }
+lance-datafusion = { path = "vendor/lance-datafusion" }
+# Azure completion response-loss and singleton DELETE fixes; same object_store 0.14.2.
+# See vendor/lance-io/BACKPORT.md.
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "6e5253a3a9c0565c2b5b07ea304023d23422f8a1" }

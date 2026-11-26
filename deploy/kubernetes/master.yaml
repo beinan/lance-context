@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lance-context-master
+spec:
+  selector:
+    app: lance-context-master
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lance-context-master
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: lance-context-master
+  template:
+    metadata:
+      labels:
+        app: lance-context-master
+    spec:
+      containers:
+        - name: master
+          image: lance-context-master:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Replace with the same shared object-store prefix used by workers.
+            - name: DATA_DIR
+              value: s3://replace-me/rollouts
+            # Point this at a separate application etcd cluster, not the
+            # Kubernetes control-plane etcd.
+            - name: ETCD_ENDPOINTS
+              value: https://etcd-0.etcd:2379,https://etcd-1.etcd:2379,https://etcd-2.etcd:2379
+            - name: ETCD_PREFIX
+              value: /lance-context/master
+            - name: ETCD_LEASE_TTL_SECS
+              value: "30"
+            # Shared process-wide Lance index/metadata cache budget. Keep this
+            # below the pod memory limit to leave room for query working sets.
+            - name: ROLLOUT_CACHE_BYTES
+              value: "536870912"
+            # Compaction is process-wide serialized and incrementally rewrites
+            # small batches of source fragments. These defaults keep large
+            # inline payloads from multiplying into unbounded rewrite buffers.
+            - name: COMPACTION_CONCURRENCY
+              value: "1"
+            - name: COMPACTION_THREADS
+              value: "1"
+            - name: COMPACTION_BATCH_SIZE
+              value: "8"
+            - name: COMPACTION_MAX_SOURCE_FRAGMENTS
+              value: "32"
+            - name: COMPACTION_MAX_BYTES_PER_FILE
+              value: "1073741824"
+            - name: ETCD_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: lance-context-etcd
+                  key: username
+                  optional: true
+            - name: ETCD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: lance-context-etcd
+                  key: password
+                  optional: true
+            - name: ETCD_CA_CERT
+              value: /etc/lance-context/etcd/ca.crt
+            - name: ETCD_CLIENT_CERT
+              value: /etc/lance-context/etcd/tls.crt
+            - name: ETCD_CLIENT_KEY
+              value: /etc/lance-context/etcd/tls.key
+            - name: TASK_HISTORY_LIMIT
+              value: "1000"
+            # Master periodically fans a WAL merge out to every worker for any
+            # experiment with at least this many pending MemWAL generations.
+            # Set MERGE_WAL_INTERVAL_SECS to 0 to disable auto WAL merge.
+            - name: MERGE_WAL_INTERVAL_SECS
+              value: "600"
+            - name: MERGE_WAL_MIN_GENERATIONS
+              value: "8"
+            - name: MASTER_PORT
+              value: "8090"
+            - name: UI_DIR
+              value: /app/ui
+          ports:
+            - name: http
+              containerPort: 8090
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: etcd-tls
+              mountPath: /etc/lance-context/etcd
+              readOnly: true
+      volumes:
+        - name: etcd-tls
+          secret:
+            secretName: lance-context-etcd-client-tls
