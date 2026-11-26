@@ -9,6 +9,7 @@ use lance_context_core::MergeMemoryBudget;
 use std::sync::atomic::Ordering;
 
 mod memory;
+mod native_index;
 mod scale;
 use memory::Memory;
 
