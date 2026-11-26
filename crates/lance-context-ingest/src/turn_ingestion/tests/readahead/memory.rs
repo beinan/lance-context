@@ -77,7 +77,7 @@ impl Memory {
         Ok(())
     }
 
-    pub(super) fn report(&self, limit: usize) {
+    pub(super) fn report(&self, limit: usize, rows: usize, fragments: usize) {
         let peaks = self
             .counts
             .peaks
@@ -87,7 +87,7 @@ impl Memory {
         let backed = self.counts.backed_peak.load(Ordering::SeqCst);
         assert!(peak > 0 && peak <= limit && backed > 0 && backed <= peak);
         assert!(peaks[0] > 0 && peaks[1] > 0);
-        eprintln!("bounded native readahead: rows=20480 fragments=20 peak_accounted_bytes={peak} native_backed_peak={backed} Read_Decode_Index_DF_peaks={peaks:?} limit={limit}; all released");
+        eprintln!("bounded native readahead: rows={rows} fragments={fragments} peak_accounted_bytes={peak} native_backed_peak={backed} Read_Decode_Index_DF_peaks={peaks:?} limit={limit}; all released");
     }
 }
 

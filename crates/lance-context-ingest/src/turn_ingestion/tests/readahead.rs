@@ -9,6 +9,7 @@ use lance_context_core::MergeMemoryBudget;
 use std::sync::atomic::Ordering;
 
 mod memory;
+mod scale;
 use memory::Memory;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -108,6 +109,6 @@ async fn bounded_native_readahead_keeps_exact_keys_and_releases_admission() -> R
     drop(hit);
     drop(base);
     memory.released().await?;
-    memory.report(LIMIT);
+    memory.report(LIMIT, ROWS, 20);
     Ok(())
 }
