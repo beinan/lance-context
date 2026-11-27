@@ -1,4 +1,5 @@
-//! A real filesystem error pauses publication before catalog Prepare.
+//! A real filesystem error stops the owner before catalog Prepare; a fenced
+//! successor recovers the retained plan.
 use super::*;
 use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
 
@@ -91,16 +92,16 @@ pub(super) async fn fail(
             None
         }
     };
+    // Base contract: an I/O failure writing an uncommitted body exits the
+    // runtime with `PublicationWriteFailed`; a newly fenced owner recovers
+    // from the retained plan and WAL. The owner must not keep publishing.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            ensure!(
-                owner.0.try_wait()?.is_none(),
-                "owner exited on body write failure"
-            );
-            let log = std::fs::read_to_string(root.join("owner.log"))?;
-            if log.contains("annotation publication paused until fenced restart") {
+            if let Some(status) = owner.0.try_wait()? {
+                ensure!(!status.success(), "owner exited cleanly on write failure");
+                let log = std::fs::read_to_string(root.join("owner.log"))?;
                 ensure!(
-                    log.contains("Permission denied"),
+                    log.contains("fenced recovery required") && log.contains("Permission denied"),
                     "unexpected failure: {log}"
                 );
                 return Ok::<_, anyhow::Error>(());

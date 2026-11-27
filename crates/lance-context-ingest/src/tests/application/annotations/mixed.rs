@@ -284,15 +284,8 @@ async fn exercise(failure: Failure) -> Result<()> {
                 imported.completion.index,
             )
             .await?;
-            // A failed body upload leaves the owner and its ACKed narrow
-            // view available through both ingresses until a fenced restart.
-            for base in &bases[1..=2] {
-                let current = read(&client, base).await?;
-                assert_eq!(current.status.as_deref(), Some(current_status));
-                assert_eq!(current.score, Some(current_score));
-            }
-            assert!(owner.0.try_wait()?.is_none());
-            owner.stop().await?;
+            // A failed body upload exits the owner (`PublicationWriteFailed`);
+            // the fixture above already observed its non-zero exit.
             // An exited owner must yield an explicit unavailable response,
             // not a successful stale base read or an invented missing turn.
             for base in &bases[1..=2] {
