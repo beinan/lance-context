@@ -16,11 +16,15 @@ use std::io::Cursor;
 /// be withdrawn, rather than remapped, by a stable-row-ID rewrite.
 pub const TURN_ID_INDEX_NAME: &str = "lance_context_turn_id";
 
+/// Name of the managed ZoneMap on a turn table's routing column (for example
+/// `session_id`). Like the turn-ID ZoneMap, a rewrite withdraws its coverage.
+pub const TURN_ROUTING_INDEX_NAME: &str = "lance_context_turn_routing";
+
 /// Whether a covered address-domain index may be left out of a rewrite's
 /// remaps. On a stable-row-ID table, Lance's Rewrite commit withdraws the
 /// rewritten fragments from such an index's coverage, so reads of them fall
 /// back to an exact scan until the owner rebuilds that coverage. This is only
-/// accepted for the managed turn-ID ZoneMap: other address indexes, unknown
+/// accepted for the managed turn-ID and routing ZoneMaps: other address indexes, unknown
 /// detail types and system indexes still require an eager remap. Prepare and
 /// recovery validation must both use this one predicate.
 pub fn rewrite_withdraws_coverage(
@@ -29,7 +33,7 @@ pub fn rewrite_withdraws_coverage(
 ) -> bool {
     base.manifest().uses_stable_row_ids()
         && !lance_index::is_system_index(index)
-        && index.name == TURN_ID_INDEX_NAME
+        && (index.name == TURN_ID_INDEX_NAME || index.name == TURN_ROUTING_INDEX_NAME)
         && index.results_are_row_addrs()
         && !index.supports_eager_remap()
         && index.index_details.as_ref().is_some_and(|details| {

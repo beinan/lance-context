@@ -327,10 +327,17 @@ impl Runtime {
         shard: Shard,
         spec: &crate::turn_ingestion::TurnIngestionSpec,
     ) -> Result<(Service, Self)> {
+        // Address-domain BTree remaps and status indexes stay with the
+        // consumer. Managed ZoneMaps are withdrawn by a rewrite and rebuilt
+        // here, so they keep the full-body dedup lookup prunable.
         ensure!(
-            configuration.publication.turn_id_index.is_none()
+            configuration
+                .publication
+                .turn_id_index
+                .as_ref()
+                .is_none_or(|i| i.index_type == materializer::TurnIdIndexType::Zonemap)
                 && configuration.publication.status_index.is_none(),
-            "single body indexing is supplied by its consumer"
+            "single body indexing is supplied by its consumer, except managed ZoneMaps"
         );
         Self::connect_mode(
             client,
