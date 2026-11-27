@@ -8,6 +8,14 @@ const MAX_REQUESTS: usize = 8;
 // well as requests/keys; decode reservations still charge the apply budget.
 const MAX_ROWS: usize = 2048;
 const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
+// Full-body windows: a history lookup is one scan of the whole base, so its
+// cost is per scan, not per key. The window is bounded by the key workspace
+// admitted against the reserved lookup budget (`PrefetchStop::KeyBound`), not
+// by these sanity ceilings. Only the first `MAX_REQUESTS`/`MAX_PAYLOAD_BYTES`
+// of decoded bodies stay resident; later records keep only their keys and are
+// re-read from the durable WAL when they become the ordered head.
+const MAX_BODY_WINDOW_REQUESTS: usize = 1 << 16;
+const MAX_BODY_WINDOW_PAYLOAD_BYTES: u64 = 1 << 40;
 
 #[derive(Default)]
 pub(super) struct Lookup {
@@ -213,11 +221,30 @@ pub(super) async fn fetch(
                         decoded,
                         input_allocation,
                         _reservation: reservation,
+                        keys_only: false,
                     })
                 })
                 .await?
             })
             .await?,
+    ))
+}
+
+/// Exact key count and conservative lookup-workspace charge of one record.
+/// Summing per record over-counts the per-query field-name term; that only
+/// makes the window bound stricter than `prepare_lookup` admission.
+fn key_charge(service: &Service, pending: &Pending) -> Result<(usize, usize)> {
+    let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
+        bail!("immutable body cannot contain patches")
+    };
+    let spec = service
+        .ingress
+        .turn_spec
+        .as_ref()
+        .context("missing body spec")?;
+    Ok((
+        rows.len(),
+        spec.lookup_workspace(rows.iter().map(|row| row.turn.len()))?,
     ))
 }
 
@@ -237,12 +264,32 @@ pub(super) async fn prepare(
         let mut bytes = queued.iter().fold(head.meta.body_bytes, |bytes, pending| {
             bytes.saturating_add(pending.meta.body_bytes)
         });
+        let mut resident = std::iter::once(head)
+            .chain(queued.iter())
+            .filter(|pending| !pending.keys_only)
+            .fold((0usize, 0u64), |(n, b), pending| {
+                (n + 1, b.saturating_add(pending.meta.body_bytes))
+            });
+        // Half the reserved lookup budget, so the foreground window and one
+        // speculative successor can both hold their key workspace.
+        let key_limit = service
+            .lookup_budget
+            .as_ref()
+            .map_or(0, |budget| budget.limit() / 2);
+        let mut key_workspace = 0usize;
+        let mut keys = 0usize;
+        for pending in std::iter::once(head).chain(queued.iter()) {
+            let (n, w) = key_charge(service, pending)?;
+            keys += n;
+            key_workspace = key_workspace.saturating_add(w);
+        }
         let mut local_end = false;
+        let mut keys_only = 0usize;
         let stop = loop {
-            if queued.len() + 1 >= MAX_REQUESTS {
+            if queued.len() + 1 >= MAX_BODY_WINDOW_REQUESTS {
                 break PrefetchStop::RequestBound;
             }
-            if bytes >= MAX_PAYLOAD_BYTES {
+            if bytes >= MAX_BODY_WINDOW_PAYLOAD_BYTES {
                 break PrefetchStop::ByteBound;
             }
             if page.entries.is_empty() {
@@ -263,16 +310,38 @@ pub(super) async fn prepare(
             let Some((index, meta)) = page.entries.first().cloned() else {
                 break PrefetchStop::PageExhausted;
             };
-            if meta.body_bytes > MAX_PAYLOAD_BYTES - bytes {
+            if meta.body_bytes > MAX_BODY_WINDOW_PAYLOAD_BYTES - bytes {
                 break PrefetchStop::ByteBound;
             }
-            let Some(next) = fetch(service, index, meta).await? else {
+            // Decode workspace is transient and admitted by `fetch`, one
+            // record at a time; it is released below if the body is dropped.
+            let Some(mut next) = fetch(service, index, meta).await? else {
                 break PrefetchStop::Admission;
             };
+            let (n, w) = key_charge(service, &next)?;
+            if key_workspace.saturating_add(w) > key_limit {
+                // The shared query would be refused by lookup admission.
+                // Keep the metadata entry; this record starts a later window.
+                break PrefetchStop::KeyBound;
+            }
+            let retain = resident.0 < MAX_REQUESTS
+                && next.meta.body_bytes <= MAX_PAYLOAD_BYTES.saturating_sub(resident.1);
+            if retain {
+                resident = (resident.0 + 1, resident.1 + next.meta.body_bytes);
+            } else {
+                next.drop_body();
+                keys_only += 1;
+            }
+            keys += n;
+            key_workspace += w;
             bytes += next.meta.body_bytes;
             queued.push_back(next);
             page.entries.remove(0);
         };
+        {
+            let mut observed = service.shared.body_lookups.lock().unwrap();
+            observed.prefetch.record_keys(keys, key_workspace, keys_only);
+        }
         service
             .shared
             .body_lookups
