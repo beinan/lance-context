@@ -5,6 +5,7 @@ use super::*;
 use crate::annotations::{runtime::Runtime, Completed, MutationResult, Service};
 use lance_context_wal::replication::publication as p;
 
+mod body_read;
 #[cfg(feature = "service")]
 mod forward;
 mod owner;
@@ -68,6 +69,7 @@ enum Operation {
     Replace,
     Update,
     Read,
+    ReadBody,
     FilterStatus,
     SelectedBody,
     Close,
@@ -80,13 +82,17 @@ impl Operation {
             Self::Replace => "replace-producer",
             Self::Update => "update",
             Self::Read => "read",
+            Self::ReadBody => "read-body",
             Self::FilterStatus => "filter-status",
             Self::SelectedBody => "selected-body",
             Self::Close => "close",
         }
     }
     fn is_write(self) -> bool {
-        !matches!(self, Self::Read | Self::FilterStatus | Self::SelectedBody)
+        !matches!(
+            self,
+            Self::Read | Self::ReadBody | Self::FilterStatus | Self::SelectedBody
+        )
     }
 }
 
