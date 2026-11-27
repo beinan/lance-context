@@ -186,16 +186,15 @@ impl Ahead {
                 let deadline = tokio::time::Instant::now() + batch_wait;
                 prefetch::coalesce(&service, &head, &mut page, &mut tail, cut, deadline).await?;
             }
-            // Without an opt-in wait, preserve promotion-time batching
-            // rather than launching a one-record query at each source gap.
-            let query = if deferred && batch_wait.is_zero() {
-                None
-            } else {
-                let Some(query) = Query::new(&service, &head, &tail, true)? else {
-                    return Ok(Loaded::Unavailable);
-                };
-                Some(query)
+            // Start the successor's key-only query as soon as the page
+            // yields keys, even without an opt-in wait, so its scan overlaps
+            // the foreground apply instead of starting at promotion. Records
+            // committed later are fetched by their own window. Exactness is
+            // unchanged: apply revalidates the captured base.
+            let Some(query) = Query::new(&service, &head, &tail, true)? else {
+                return Ok(Loaded::Unavailable);
             };
+            let query = Some(query);
             Ok(Loaded::Ready(Box::new(Window {
                 head,
                 tail,

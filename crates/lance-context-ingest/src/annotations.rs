@@ -219,6 +219,12 @@ impl Service {
             .await?)
     }
 
+    /// Hold the ordered gate as a publisher install would.
+    #[cfg(test)]
+    pub(crate) async fn ordered_lock_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.shared.ordered.lock().await
+    }
+
     #[cfg(test)]
     pub(crate) fn apply_attempts(&self) -> u64 {
         self.shared
@@ -995,9 +1001,13 @@ impl Driver {
                 outcome = self.step() => if let Err(error) = outcome { break Err(error); }
             }
             if self.service.shared.progress.borrow().through == before {
+                // Idle backoff still drives the retained successor lookup.
                 tokio::select! {
                     _ = &mut shutdown => break Ok(()),
-                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    _ = pipeline::drive(
+                        tokio::time::sleep(Duration::from_millis(5)),
+                        &mut self.ahead,
+                    ) => {}
                 }
             }
         };
@@ -1204,7 +1214,9 @@ impl Driver {
         }
         pipeline::tick(&mut self.ahead).await;
         let ordered_wait = service.shared.phases.enter(Phase::AnnotationOrderedWait);
-        let _ordered = service.shared.ordered.lock().await;
+        // The successor keeps scanning while this window waits for the
+        // ordered gate (e.g. behind publisher install).
+        let _ordered = pipeline::drive(service.shared.ordered.lock(), &mut self.ahead).await;
         ordered_wait.complete();
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
             self.ahead = None;
