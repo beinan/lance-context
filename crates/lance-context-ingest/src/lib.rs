@@ -52,6 +52,8 @@ mod producer_replacement;
 pub mod reader;
 pub mod receipt;
 pub use producer_replacement::{ProducerReplacement, ProducerReplacementFenced};
+#[cfg(feature = "streaming-producer")]
+pub mod streaming;
 pub mod turn_ingestion;
 #[cfg(feature = "worker")]
 pub mod worker;
