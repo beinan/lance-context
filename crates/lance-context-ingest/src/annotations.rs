@@ -125,6 +125,24 @@ struct Pending {
     // Input address and complete allocation size, when known at reception.
     input_allocation: Option<(usize, usize)>,
     _reservation: MergeReservation,
+    /// Decoded bodies were released after key extraction to widen a lookup
+    /// window. The record is durable in the WAL; it is re-fetched and decoded
+    /// again before it becomes the ordered head. Only keys stay resident.
+    keys_only: bool,
+}
+
+impl Pending {
+    /// Keep only keys. Key strings are bounded by the window's key workspace
+    /// (`PrefetchStop::KeyBound` against the reserved lookup budget), so the
+    /// per-record frame/decode reservation is returned to the apply budget.
+    fn drop_body(&mut self) {
+        if let mixed::Decoded::Creates { bodies, .. } = &mut self.decoded {
+            *bodies = Vec::new();
+        }
+        self.input_allocation = None;
+        self._reservation.shrink_to(0);
+        self.keys_only = true;
+    }
 }
 
 pub struct Driver {
@@ -1022,6 +1040,25 @@ impl Driver {
             return Ok(());
         }
         if self.pending.is_none() {
+            if let Some(stub) = self.lookahead.front().filter(|p| p.keys_only) {
+                // Rehydrate before popping: cancellation or admission pressure
+                // leaves the keys-only record (and its lookup coverage) intact.
+                let (index, meta) = (stub.index, stub.meta.clone());
+                let Some(full) = prefetch::fetch(service, index, meta).await? else {
+                    Self::record_pressure(
+                        service,
+                        &mut self.pressure_episode,
+                        ApplyBackpressure::ApplyMemory,
+                    );
+                    return Ok(());
+                };
+                {
+                    let mut observed = service.shared.body_lookups.lock().unwrap();
+                    observed.prefetch.body_refetches =
+                        observed.prefetch.body_refetches.saturating_add(1);
+                }
+                self.lookahead[0] = full;
+            }
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
                 self.lookup = prefetch::Lookup::default();
