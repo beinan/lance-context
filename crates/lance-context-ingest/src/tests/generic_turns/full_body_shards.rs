@@ -1,5 +1,5 @@
-//! Two session shards of one logical full-body table. HTTP writes and selected
-//! manifests are real; unmaterialized body reads use the existing Service API.
+//! Two session shards of one logical full-body table. Writes, unpublished body
+//! reads and selected manifests cross the real owner/forwarder HTTP stack.
 //! Three local WAL nodes host two RF3 groups; this is not a scale benchmark.
 use super::http::{journal, keys, transport, Server};
 use super::*;
@@ -170,6 +170,39 @@ async fn check(service: &Service, spec: &TurnIngestionSpec, expected: &RecordBat
     Ok(())
 }
 
+async fn check_http(
+    client: &reqwest::Client,
+    ingress: &reqwest::Url,
+    spec: &TurnIngestionSpec,
+    expected: &RecordBatch,
+) -> Result<()> {
+    let key = spec.row_key(expected, 0, 4096)?;
+    let response = client
+        .post(ingress.join(&format!(
+            "api/v1/annotations/{}/full-body",
+            binding().qualified_table
+        ))?)
+        .json(&crate::http::annotations::PointRequest { turn: key.clone() })
+        .timeout(DEADLINE)
+        .send()
+        .await?;
+    let status = response.status();
+    ensure!(
+        status == reqwest::StatusCode::OK,
+        "body read for {key} returned {status}: {}",
+        response.text().await?
+    );
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        crate::http::ARROW_FILE
+    );
+    assert_eq!(
+        ipc::decode(response.bytes().await?, spec.body_schema().clone())?,
+        vec![expected.clone()]
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_body_session_shards_read_unpublished_and_drain_independently_after_restart(
 ) -> Result<()> {
@@ -238,7 +271,10 @@ async fn exercise() -> Result<()> {
             storage,
         });
     }
-    let uploads = MergeMemoryBudget::new(8 << 20);
+    // Three concurrent cold HTTP reads each reserve a forward response and
+    // owner scan (3 * max_record_bytes each), plus encoded output. Keep one
+    // shared finite pool sized for that concurrency; pressure has its own test.
+    let uploads = MergeMemoryBudget::new(32 << 20);
     let (a, ra) = shards[0].owner(&c, &layout, &spec, uploads.clone()).await?;
     let (b, rb) = shards[1].owner(&c, &layout, &spec, uploads).await?;
     let oa = Owner::new(&ra, keys()?, Default::default())?;
@@ -263,6 +299,7 @@ async fn exercise() -> Result<()> {
     )?;
     let ingress_a = Server::start(first.router()).await?;
     let ingress_b = Server::start(second.router()).await?;
+    let reader = transport()?;
     let (entered, resume) = faults.pause_data_write();
     let (_stop_a, task_a) = run_owner(ra);
     let (stop_b, task_b) = run_owner(rb);
@@ -300,6 +337,8 @@ async fn exercise() -> Result<()> {
     tokio::time::timeout(DEADLINE, entered).await??;
     assert_eq!(other_a.selected_full_body().await?.rows, Some(0));
     check(&a, &spec, &input[0]).await?;
+    check_http(&reader, &ingress_b.base, &spec, &input[0]).await?;
+    assert!(other_a.selected_full_body().await?.through < ack_a.completion.index);
 
     // Independent producer through the other ingress cannot replace a body
     // already visible in frozen staging, even with different payload bytes.
@@ -307,6 +346,7 @@ async fn exercise() -> Result<()> {
     let duplicate = other_a.append(0, shards[0].wire(&spec, &changed)?).await?;
     assert_eq!(duplicate.completion.result, MutationResult::Applied);
     check(&a, &spec, &input[0]).await?;
+    check_http(&reader, &ingress_a.base, &spec, &input[0]).await?;
     let wrong = request(
         &a,
         &producer(&a, 3).await?,
@@ -323,6 +363,13 @@ async fn exercise() -> Result<()> {
     assert_eq!(writer_b.selected_full_body().await?.rows, Some(1));
     assert_eq!(other_a.selected_full_body().await?.rows, Some(0));
     check(&b, &spec, &input[1]).await?;
+    // Both routes accept either session, independent of registration order.
+    // Equal row IDs on distinct sessions must return their different bodies.
+    tokio::try_join!(
+        check_http(&reader, &ingress_a.base, &spec, &input[1]),
+        check_http(&reader, &ingress_b.base, &spec, &input[0]),
+    )
+    .context("concurrent published and frozen HTTP reads")?;
 
     // Kill A before its frozen upload completes. B must still accept and
     // materialize another body without A advancing its publication cut.
@@ -334,6 +381,7 @@ async fn exercise() -> Result<()> {
     shards[1].drained(&c, &b, extra.completion.index).await?;
     assert_eq!(writer_b.selected_full_body().await?.rows, Some(2));
     check(&b, &spec, &extra_b).await?;
+    check_http(&reader, &ingress_a.base, &spec, &extra_b).await?;
     writer_a.shutdown().await?;
     other_a.shutdown().await?;
     writer_b.shutdown().await?;
@@ -360,11 +408,33 @@ async fn exercise() -> Result<()> {
         )
         .await?;
     }
-    let uploads = MergeMemoryBudget::new(8 << 20);
+    let uploads = MergeMemoryBudget::new(32 << 20);
     let (a, ra) = shards[0].owner(&c, &layout, &spec, uploads.clone()).await?;
     let (b, rb) = shards[1].owner(&c, &layout, &spec, uploads).await?;
+    let oa = Owner::new(&ra, keys()?, Default::default())?;
+    let ob = Owner::new(&rb, keys()?, Default::default())?;
+    let server_a = Server::start(oa.router()).await?;
+    let server_b = Server::start(ob.router()).await?;
+    let forwarder = Forwarder::new(
+        vec![
+            (b.ingress().clone(), server_b.base.to_string()),
+            (a.ingress().clone(), server_a.base.to_string()),
+        ],
+        keys()?,
+        Default::default(),
+        "test-only-token-012345678901234567890".into(),
+    )?;
+    let ingress = Server::start(forwarder.router()).await?;
     let (stop_a, task_a) = run_owner(ra);
     let (stop_b, task_b) = run_owner(rb);
+    // Fresh owners recover the unpublished suffix before serving point reads.
+    // The test requires no producer retry or new write to restore visibility.
+    tokio::try_join!(
+        check_http(&reader, &ingress.base, &spec, &input[0]),
+        check_http(&reader, &ingress.base, &spec, &input[1]),
+        check_http(&reader, &ingress.base, &spec, &extra_b),
+    )
+    .context("concurrent HTTP reads after WAL restart")?;
     check(&a, &spec, &input[0]).await?;
     check(&b, &spec, &input[1]).await?;
     check(&b, &spec, &extra_b).await?;
@@ -383,6 +453,12 @@ async fn exercise() -> Result<()> {
     let repeated = request(&a, &original_lane, 1, shards[0].wire(&spec, &input[0])?).await?;
     assert_eq!(a.submit(&repeated, DEADLINE).await?, ack_a.completion);
     check(&a, &spec, &input[0]).await?;
+    forwarder.shutdown().await;
+    ingress.shutdown().await?;
+    oa.shutdown().await;
+    ob.shutdown().await;
+    server_a.shutdown().await?;
+    server_b.shutdown().await?;
     stop_a.send(()).unwrap();
     stop_b.send(()).unwrap();
     task_a.await??;
