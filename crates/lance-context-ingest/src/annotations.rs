@@ -1242,7 +1242,14 @@ impl Driver {
                 .phases
                 .measure(
                     Phase::AnnotationFullBodyApply,
-                    service.apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap()),
+                    // Keep the successor's key-only scan progressing while
+                    // this window applies. It was captured against an older
+                    // base; exactness still comes from apply-time staged and
+                    // covered-publication validation (stale => fresh lookup).
+                    pipeline::drive(
+                        service.apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap()),
+                        &mut self.ahead,
+                    ),
                 )
                 .await?
             {

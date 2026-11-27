@@ -334,3 +334,47 @@ pub(super) async fn tick(ahead: &mut Option<Ahead>) {
     })
     .await
 }
+
+/// Drive `foreground` to completion, also polling the speculative successor
+/// on each wakeup. The foreground is polled first so it claims native
+/// capacity before speculative work; the successor never gates completion.
+/// No task is spawned: dropping this future drops neither the successor nor
+/// its retained records, which stay owned by the driver's `ahead` slot.
+pub(super) async fn drive<F: std::future::Future>(foreground: F, ahead: &mut Option<Ahead>) -> F::Output {
+    let mut foreground = std::pin::pin!(foreground);
+    futures::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = foreground.as_mut().poll(cx) {
+            return Poll::Ready(output);
+        }
+        if let Some(ahead) = ahead {
+            ahead.poll(cx, None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drive_returns_foreground_without_successor() {
+        let mut ahead = None;
+        assert_eq!(drive(async { 7 }, &mut ahead).await, 7);
+    }
+
+    #[tokio::test]
+    async fn drive_completes_pending_foreground() {
+        let mut ahead = None;
+        let out = drive(
+            async {
+                tokio::task::yield_now().await;
+                3
+            },
+            &mut ahead,
+        )
+        .await;
+        assert_eq!(out, 3);
+    }
+}
