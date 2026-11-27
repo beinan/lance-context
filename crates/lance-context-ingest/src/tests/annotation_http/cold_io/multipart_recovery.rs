@@ -117,7 +117,6 @@ async fn exercise() -> Result<()> {
     fixture::seed_with_binding(&c, &narrow, &body, large_binding()).await?;
     let base = annotation_publication::read(&c, &narrow, None).await?;
     let (a, runtime) = owner(&c, &narrow, &body).await?;
-    let (_, _, recovery_cut) = runtime.http_binding();
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let mut failed_upload = gates.lose_put_reply();
 
@@ -185,45 +184,26 @@ async fn exercise() -> Result<()> {
     assert_eq!(plan.plan.sources[&10].records[0].0, acknowledged[0].1.index);
 
     failed_upload.release();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !a
-            .phase_observation()
-            .iter()
-            .any(|phase| phase.phase == "annotation_body_write" && phase.failed == 1)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    // The object exists but no native commit was attempted. Keep acknowledged
-    // values readable until an explicit fenced restart resolves the old cut.
-    assert!(!task.is_finished(), "lost upload reply stopped owned reads");
-    for row in 0..ROWS {
-        let current = a
-            .get_owned(
-                &format!("large-{row}"),
-                recovery_cut,
-                Duration::from_secs(1),
-            )
-            .await?
-            .context("acknowledged annotation missing after upload error")?;
-        assert_eq!(
-            current.status.as_deref(),
-            Some(if row == 0 { "reviewed" } else { "pending" })
-        );
-        assert_eq!(current.score, (row == 0).then_some(0.9));
-        assert_eq!(
-            current.labels,
-            std::collections::BTreeSet::from(["imported".into()])
-        );
-    }
+    // Base contract: an I/O failure writing an uncommitted body exits the
+    // runtime with `PublicationWriteFailed`; a newly fenced owner recovers
+    // from the retained plan and WAL. No native commit is attempted.
+    let error = tokio::time::timeout(Duration::from_secs(30), task)
+        .await??
+        .expect_err("lost upload reply must stop the owner for fenced recovery");
+    assert!(
+        error.is::<crate::annotations::runtime::PublicationWriteFailed>(),
+        "{error:#}"
+    );
+    assert!(a
+        .phase_observation()
+        .iter()
+        .any(|phase| phase.phase == "annotation_body_write" && phase.failed == 1));
     assert!(a
         .phase_observation()
         .iter()
         .all(|phase| phase.phase != "annotation_body_commit" || phase.started == 0));
     assert_eq!(gates.multipart_completions.load(Ordering::SeqCst), 1);
-    stop.send(()).unwrap();
-    task.await??;
+    drop(stop);
     let stopped = annotation_publication::state(&c).await?;
     assert_eq!(stopped.progress.pending.as_ref(), Some(&plan));
     assert!(stopped.progress.prepared.is_none());

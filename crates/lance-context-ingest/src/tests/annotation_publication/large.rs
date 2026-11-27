@@ -358,9 +358,10 @@ async fn recover_inner(
         )
         .await?
         .unwrap_err();
+        // Runtime::run wraps publisher errors ("annotation publisher stopped").
         assert!(
             matches!(
-                error.to_string().as_str(),
+                error.root_cause().to_string().as_str(),
                 "annotation retained manifest exceeds collection workspace"
                     | "retained index metadata exceeds collection workspace"
             ),
